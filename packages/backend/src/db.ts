@@ -177,4 +177,75 @@ export async function initDb(): Promise<void> {
   await p.query(
     `ALTER TABLE mobile_inquiries ADD COLUMN IF NOT EXISTS estimated_total NUMERIC(12,2) NOT NULL DEFAULT 0`,
   );
+  await p.query(
+    `ALTER TABLE mobile_inquiries ADD COLUMN IF NOT EXISTS event_city TEXT NOT NULL DEFAULT ''`,
+  );
+  await p.query(
+    `ALTER TABLE mobile_inquiries ADD COLUMN IF NOT EXISTS event_setting TEXT NOT NULL DEFAULT ''`,
+  );
+  await p.query(
+    `ALTER TABLE mobile_inquiries ADD COLUMN IF NOT EXISTS service_included TEXT NOT NULL DEFAULT ''`,
+  );
+  await p.query(
+    `ALTER TABLE mobile_inquiries ADD COLUMN IF NOT EXISTS formality_level TEXT NOT NULL DEFAULT ''`,
+  );
+  await p.query(
+    `ALTER TABLE mobile_inquiries ADD COLUMN IF NOT EXISTS food_tasting_requested BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
+
+  await p.query(`ALTER TABLE mobile_users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'customer'`);
+  await p.query(`ALTER TABLE mobile_users ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`);
+
+  await p.query(`ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS order_source TEXT NOT NULL DEFAULT 'MOBILE_APP'`);
+  await p.query(`ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT NOT NULL DEFAULT ''`);
+  await p.query(
+    `ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS cashier_amount_received NUMERIC(12,2)`,
+  );
+  await p.query(`ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS cashier_change NUMERIC(12,2)`);
+
+  await p.query(`ALTER TABLE mobile_orders ALTER COLUMN user_email DROP NOT NULL`);
+
+  await p.query(
+    `ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS fulfillment_stage TEXT NOT NULL DEFAULT 'PENDING_CASHIER'`,
+  );
+  await p.query(
+    `ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS delivery_tracking_url TEXT NOT NULL DEFAULT ''`,
+  );
+
+  await p.query(
+    `ALTER TABLE mobile_profiles ADD COLUMN IF NOT EXISTS delivery_map_confirmed BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
+  await p.query(`ALTER TABLE mobile_profiles ADD COLUMN IF NOT EXISTS delivery_lat DOUBLE PRECISION`);
+  await p.query(`ALTER TABLE mobile_profiles ADD COLUMN IF NOT EXISTS delivery_lng DOUBLE PRECISION`);
+
+  await p.query(
+    `ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS order_lines_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb`,
+  );
+  await p.query(
+    `ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS pos_claimed BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
+
+  await p.query(`ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS supplemental_payment_proof TEXT`);
+  await p.query(`ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS cashier_secondary_amount_received NUMERIC(12,2)`);
+  await p.query(
+    `ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS balance_proof_pending_review BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
+
+  await p.query(`
+    UPDATE mobile_orders
+    SET fulfillment_stage = 'IN_PREPARATION'
+    WHERE fulfillment_stage = 'PENDING_CASHIER'
+      AND order_source = 'POS'
+  `);
+  await p.query(`
+    UPDATE mobile_orders
+    SET fulfillment_stage = 'IN_PREPARATION'
+    WHERE fulfillment_stage = 'PENDING_CASHIER'
+      AND order_source = 'MOBILE_APP'
+      AND user_email IS NOT NULL
+      AND (
+        upper(status) LIKE '%ORDER CONFIRMED%'
+        OR upper(status) LIKE '%OVERPAYMENT%'
+      )
+  `);
 }
