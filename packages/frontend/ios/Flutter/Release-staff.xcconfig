@@ -1,0 +1,3 @@
+#include "Release.xcconfig"
+PRODUCT_BUNDLE_IDENTIFIER = com.curatering.staff
+APP_DISPLAY_NAME = Macrina Staff

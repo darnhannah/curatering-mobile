@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -10,17 +11,37 @@ import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:pdf/pdf.dart' as pdf;
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-/// When `true` (pass `--dart-define=POS_LOGIN=true`), login hides sign-up — for cashier POS builds.
-const bool kPosLoginBuild = bool.fromEnvironment('POS_LOGIN', defaultValue: false);
+import 'customer_local_notifications.dart';
+
+/// Optional logical flavor at Dart level (`customer` / `staff`).
+const String kAppFlavor = String.fromEnvironment('APP_FLAVOR', defaultValue: 'customer');
+/// When `true`, login hides sign-up for staff/POS builds.
+const bool kPosLoginBuild = bool.fromEnvironment('POS_LOGIN', defaultValue: false) || kAppFlavor == 'staff';
+
+/// Paths declared under `flutter.assets` in pubspec.yaml.
+class AppBrandAssets {
+  AppBrandAssets._();
+  static const String logo = 'assets/images/macrinasLogo.png';
+  /// Login / welcome hero (customer).
+  static const String logoLogin = 'assets/images/macrinasLogo2.png';
+  static const String qrCode = 'assets/images/QRCode_Curatering.jpg';
+}
+
+Future<void> runCurateringApp({bool forcePosLogin = false}) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initCustomerLocalNotifications();
+  final prefs = await SharedPreferences.getInstance();
+  final savedThemeMode = prefs.getString('theme_mode');
+  runApp(CurateringApp(savedThemeMode: savedThemeMode, forcePosLogin: forcePosLogin));
+}
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  final prefs = await SharedPreferences.getInstance();
-  final savedApiBase = prefs.getString('api_base');
-  final savedThemeMode = prefs.getString('theme_mode');
-  runApp(CurateringApp(savedApiBase: savedApiBase, savedThemeMode: savedThemeMode));
+  await runCurateringApp();
 }
 
 ThemeData buildAppLightTheme() {
@@ -55,25 +76,226 @@ ThemeData buildAppDarkTheme() {
   );
 }
 
-class CurateringApp extends StatefulWidget {
-  const CurateringApp({super.key, this.savedApiBase, this.savedThemeMode});
+class _SessionExpiredDialog extends StatefulWidget {
+  const _SessionExpiredDialog({required this.onFinished});
+  final VoidCallback onFinished;
 
-  /// Loaded from SharedPreferences in [main] before the first frame (so API calls never briefly use localhost).
-  final String? savedApiBase;
+  @override
+  State<_SessionExpiredDialog> createState() => _SessionExpiredDialogState();
+}
+
+class _SessionExpiredDialogState extends State<_SessionExpiredDialog> {
+  static const int _initialCountdown = 5;
+  int _remaining = _initialCountdown;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      if (_remaining <= 1) {
+        _timer?.cancel();
+        widget.onFinished();
+        return;
+      }
+      setState(() => _remaining--);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Session expired'),
+      content: Text(
+        'Your token has expired. Please log in again.\n\n'
+        'Returning to sign-in in $_remaining…',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            _timer?.cancel();
+            widget.onFinished();
+          },
+          child: const Text('OK'),
+        ),
+      ],
+    );
+  }
+}
+
+class CurateringApp extends StatefulWidget {
+  const CurateringApp({super.key, this.savedThemeMode, this.forcePosLogin = false});
+
   /// `'light'` / `'dark'` from [SharedPreferences]; default is light.
   final String? savedThemeMode;
+  final bool forcePosLogin;
 
   @override
   State<CurateringApp> createState() => _CurateringAppState();
 }
 
-class _CurateringAppState extends State<CurateringApp> {
+class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserver {
   late final AppState appState;
+  final GlobalKey<NavigatorState> _rootNavKey = GlobalKey<NavigatorState>();
+  Timer? _backgroundLogoutTimer;
+  static const Duration _backgroundLogoutDelay = Duration(minutes: 3);
+  /// Customer-only: prompt when payment confirmation still pending after 10 minutes.
+  Timer? _paymentStallTimer;
+  String? _paymentWatchEmail;
+  final Set<String> _stallPromptedOrderNos = <String>{};
+  Timer? _customerNotifPollTimer;
+  final Set<String> _lastAttentionOrderSnapshot = <String>{};
 
   @override
   void initState() {
     super.initState();
-    appState = AppState(savedApiBase: widget.savedApiBase, savedThemeMode: widget.savedThemeMode);
+    WidgetsBinding.instance.addObserver(this);
+    appState = AppState(savedThemeMode: widget.savedThemeMode);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _backgroundLogoutTimer?.cancel();
+    _paymentStallTimer?.cancel();
+    _customerNotifPollTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _backgroundLogoutTimer?.cancel();
+      _backgroundLogoutTimer = null;
+      if (appState.userEmail != null && appState.userRole == 'customer') {
+        _pollCustomerAttentionNotifications();
+      }
+      return;
+    }
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.detached) {
+      if (appState.userEmail == null) return;
+      _backgroundLogoutTimer?.cancel();
+      _backgroundLogoutTimer = Timer(_backgroundLogoutDelay, () {
+        if (!mounted || appState.userEmail == null) return;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || appState.userEmail == null) return;
+          _showSessionExpiredOnRoot();
+        });
+      });
+    }
+  }
+
+  Future<void> _pollCustomerAttentionNotifications() async {
+    if (appState.userEmail == null || appState.userRole != 'customer') return;
+    await appState.loadNotifications();
+    if (!mounted) return;
+    final next = appState.orderNosWithUnreadAttention;
+    if (_lastAttentionOrderSnapshot.isEmpty) {
+      _lastAttentionOrderSnapshot.addAll(next);
+      return;
+    }
+    for (final id in next) {
+      if (!_lastAttentionOrderSnapshot.contains(id)) {
+        await showCashierReviewReminderIfNew(id);
+      }
+    }
+    _lastAttentionOrderSnapshot
+      ..clear()
+      ..addAll(next);
+  }
+
+  void _showSessionExpiredOnRoot() {
+    final navCtx = _rootNavKey.currentContext;
+    if (navCtx == null) return;
+    showDialog<void>(
+      context: navCtx,
+      barrierDismissible: false,
+      builder: (ctx) => _SessionExpiredDialog(
+        onFinished: () {
+          if (Navigator.of(ctx).canPop()) {
+            Navigator.of(ctx).pop();
+          }
+          final nav = _rootNavKey.currentState;
+          while (nav != null && nav.canPop()) {
+            nav.pop();
+          }
+          appState.logout();
+        },
+      ),
+    );
+  }
+
+  void _tickPaymentStallWatchdog() {
+    if (!mounted || appState.userEmail == null || appState.userRole != 'customer') return;
+    final now = DateTime.now();
+    for (final o in appState.orders) {
+      if (!customerOrderPendingTab(o)) continue;
+      if (now.difference(o.createdAt) <= const Duration(minutes: 10)) continue;
+      if (_stallPromptedOrderNos.contains(o.orderNo)) continue;
+      _stallPromptedOrderNos.add(o.orderNo);
+      final navCtx = _rootNavKey.currentContext;
+      if (navCtx == null || !navCtx.mounted) return;
+      showDialog<void>(
+        context: navCtx,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: Text(o.orderNo),
+          content: const Text(
+            'This order is still waiting for payment confirmation after 10 minutes. '
+            'Would you like to cancel it, or keep waiting? You can follow up from My Orders.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                showDialog<void>(
+                  context: navCtx,
+                  builder: (confirmCtx) => AlertDialog(
+                    title: const Text('Cancel order?'),
+                    content: Text(
+                      'Cancel ${o.orderNo}? It will move to Cancelled orders.',
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.of(confirmCtx).pop(), child: const Text('No')),
+                      FilledButton(
+                        onPressed: () async {
+                          Navigator.of(confirmCtx).pop();
+                          final err = await appState.cancelOrderAsCustomer(orderId: o.id);
+                          if (!navCtx.mounted) return;
+                          if (err != null) {
+                            ScaffoldMessenger.of(navCtx).showSnackBar(SnackBar(content: Text(err)));
+                          } else {
+                            ScaffoldMessenger.of(navCtx).showSnackBar(
+                              SnackBar(content: Text('${o.orderNo} cancelled')),
+                            );
+                          }
+                        },
+                        child: const Text('Yes, cancel'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+              child: const Text('Cancel order'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Keep waiting'),
+            ),
+          ],
+        ),
+      );
+      break;
+    }
   }
 
   @override
@@ -81,19 +303,55 @@ class _CurateringAppState extends State<CurateringApp> {
     return AnimatedBuilder(
       animation: appState,
       builder: (context, _) {
+        final email = appState.userEmail;
+        if (email == null) {
+          _backgroundLogoutTimer?.cancel();
+          _backgroundLogoutTimer = null;
+        }
+
+        if (email == null) {
+          _paymentStallTimer?.cancel();
+          _paymentStallTimer = null;
+          _paymentWatchEmail = null;
+          _stallPromptedOrderNos.clear();
+          _customerNotifPollTimer?.cancel();
+          _customerNotifPollTimer = null;
+          _lastAttentionOrderSnapshot.clear();
+        } else if (appState.userRole == 'customer' && email != _paymentWatchEmail) {
+          _paymentWatchEmail = email;
+          _paymentStallTimer?.cancel();
+          _stallPromptedOrderNos.clear();
+          _paymentStallTimer = Timer.periodic(const Duration(seconds: 40), (_) => _tickPaymentStallWatchdog());
+          _customerNotifPollTimer?.cancel();
+          _lastAttentionOrderSnapshot.clear();
+          _customerNotifPollTimer = Timer.periodic(const Duration(seconds: 90), (_) => _pollCustomerAttentionNotifications());
+          WidgetsBinding.instance.addPostFrameCallback((_) => _pollCustomerAttentionNotifications());
+        }
+
         return MaterialApp(
+          key: ValueKey(appState.authSessionKey),
+          navigatorKey: _rootNavKey,
           debugShowCheckedModeBanner: false,
-          title: "Macrina's Kitchen and Catering",
+          title: widget.forcePosLogin
+              ? "Macrina's Kitchen and Catering Management"
+              : "Macrina's Kitchen and Catering",
           theme: buildAppLightTheme(),
           darkTheme: buildAppDarkTheme(),
           themeMode: appState.themeMode,
+          builder: (context, child) => child ?? const SizedBox.shrink(),
           home: appState.userEmail == null
-              ? AuthScreen(state: appState, cashierMode: kPosLoginBuild)
+              ? AuthScreen(
+                  key: ValueKey(appState.authSessionKey),
+                  state: appState,
+                  cashierMode: widget.forcePosLogin || kPosLoginBuild,
+                )
               : _PostLoginWelcomeScope(
                   state: appState,
                   child: appState.isCashier
                       ? PosShellScreen(state: appState)
-                      : RestaurantMenuScreen(state: appState),
+                      : appState.isManagerOrSupervisor
+                          ? ManagerCateringShellScreen(state: appState)
+                          : RestaurantMenuScreen(state: appState),
                 ),
         );
       },
@@ -148,6 +406,8 @@ class _PostLoginWelcomeScopeState extends State<_PostLoginWelcomeScope> {
 }
 
 const Duration _apiTimeout = Duration(seconds: 30);
+/// Manager catering list can return many rows; allow a longer read than generic APIs.
+const Duration _managerCateringListTimeout = Duration(seconds: 120);
 
 /// Local Node backend is HTTP-only; [https] to these hosts breaks TLS handshakes.
 bool _devBackendHttpHost(String host) {
@@ -157,7 +417,6 @@ bool _devBackendHttpHost(String host) {
   return false;
 }
 
-/// Order: saved preference from install → `--dart-define=API_BASE` → localhost default.
 /// Postgres / JSON sometimes returns numbers as strings — never cast blindly with `as num`.
 int jsonToInt(dynamic v, [int fallback = 0]) {
   if (v == null) return fallback;
@@ -190,17 +449,201 @@ DateTime jsonToDateTime(dynamic v, DateTime fallback) {
   }
 }
 
+DateTime? jsonTryDateTime(dynamic v) {
+  if (v == null) return null;
+  try {
+    return DateTime.parse(v.toString());
+  } catch (_) {
+    return null;
+  }
+}
+
+String formatDateTimeLocal(DateTime dt) {
+  final l = dt.toLocal();
+  return '${l.year}-${l.month.toString().padLeft(2, '0')}-${l.day.toString().padLeft(2, '0')} '
+      '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+}
+
+String managerEventSettingDisplayLabel(String raw) {
+  final t = raw.trim().toLowerCase();
+  if (t == 'closed') return 'Closed space';
+  if (t == 'open') return 'Open space';
+  if (t.isEmpty) return '';
+  return raw.trim();
+}
+
+String managerStageListTimestampLabel(String stage) {
+  switch (stage) {
+    case 'for_processing':
+      return 'In For Processing since';
+    case 'for_post_analysis':
+      return 'In Post-Analysis since';
+    case 'completed':
+      return 'Last updated';
+    default:
+      return 'Stage entered';
+  }
+}
+
+dynamic _unwrapCateringMenuItem(dynamic m) {
+  var cur = m;
+  for (var i = 0; i < 8; i++) {
+    if (cur is String) {
+      final t = cur.trim();
+      if (t.startsWith('[')) {
+        try {
+          cur = jsonDecode(t);
+          continue;
+        } catch (_) {}
+      }
+      if (t.startsWith('{')) {
+        try {
+          cur = jsonDecode(t);
+          continue;
+        } catch (_) {}
+      }
+      return t;
+    }
+    if (cur is List) {
+      if (cur.isEmpty) return '';
+      cur = cur.first;
+      continue;
+    }
+    break;
+  }
+  return cur;
+}
+
+String dishNameFromCateringMenuEntry(dynamic m) {
+  dynamic cur = m;
+  for (var depth = 0; depth < 14; depth++) {
+    final u = _unwrapCateringMenuItem(cur);
+    if (u is Map) {
+      final n = '${u['name'] ?? u['item_name'] ?? u['dish'] ?? u['dishName'] ?? ''}'.trim();
+      if (n.isNotEmpty) return n;
+    }
+    var raw = u.toString().trim();
+    if (raw.isEmpty) return '';
+    if (raw.startsWith('[') || (raw.startsWith('{') && raw.contains('"name"'))) {
+      try {
+        final j = jsonDecode(raw);
+        cur = j;
+        continue;
+      } catch (_) {}
+    }
+    if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+      cur = raw.substring(1, raw.length - 1);
+      continue;
+    }
+    final lb = raw.indexOf('{');
+    if (lb != -1 && raw.contains('"name"')) {
+      try {
+        cur = jsonDecode(raw.substring(lb));
+        continue;
+      } catch (_) {}
+    }
+    if (raw.startsWith('[')) {
+      raw = raw.replaceAll('[', '').replaceAll(']', '').trim();
+    }
+    return raw;
+  }
+  return '$m'.trim();
+}
+
+/// Normalizes `selected_dishes` / `menu` from API (list, JSON string, or mixed).
+List<String> inquirySelectedDishLabels(dynamic sd) {
+  if (sd == null) return [];
+  if (sd is Map) {
+    final one = dishNameFromCateringMenuEntry(sd);
+    return one.isEmpty ? [] : [one];
+  }
+  if (sd is List) {
+    final list = normalizeCateringMenuList(List<dynamic>.from(sd));
+    return list.map(dishNameFromCateringMenuEntry).where((s) => s.trim().isNotEmpty).toList();
+  }
+  if (sd is String) {
+    final t = sd.trim();
+    if (t.isEmpty) return [];
+    try {
+      final j = jsonDecode(t);
+      return inquirySelectedDishLabels(j);
+    } catch (_) {
+      return [dishNameFromCateringMenuEntry(t)];
+    }
+  }
+  return [dishNameFromCateringMenuEntry(sd)];
+}
+
+String? imageBase64FromCateringMenuEntry(dynamic m) {
+  final u = _unwrapCateringMenuItem(m);
+  if (u is Map) {
+    final img = u['image_base64'];
+    if (img != null && '$img'.trim().isNotEmpty) return '$img';
+  }
+  return null;
+}
+
+List<dynamic> normalizeCateringMenuList(List<dynamic> menu) {
+  if (menu.length == 1 && menu.first is String) {
+    final t = (menu.first as String).trim();
+    if (t.startsWith('[')) {
+      try {
+        final j = jsonDecode(t);
+        if (j is List<dynamic>) return j;
+      } catch (_) {}
+    }
+  }
+  return menu;
+}
+
+String formatScheduleSlotLine(dynamic s) {
+  if (s is String) {
+    final t = s.trim();
+    if (t.startsWith('[') || t.startsWith('{')) {
+      try {
+        return formatScheduleSlotLine(jsonDecode(t));
+      } catch (_) {}
+    }
+    return t;
+  }
+  if (s is Map) {
+    final label = s['label'];
+    if (label != null && '$label'.trim().isNotEmpty) return '$label'.trim();
+    final date = s['date'];
+    final from = s['from'];
+    final to = s['to'];
+    if (date != null && from != null && to != null) return '$date  $from – $to';
+    if (date != null) return '$date';
+  }
+  if (s is List) {
+    return s.map((e) => formatScheduleSlotLine(e)).where((x) => x.trim().isNotEmpty).join('\n');
+  }
+  return s.toString();
+}
+
 /// OpenStreetMap Nominatim requires a descriptive User-Agent.
 const String kNominatimUserAgent = 'CurateringMobile/1.0 (support@macrina.local)';
 
-String resolveInitialApiBase(String? savedFromPrefs) {
-  final s = savedFromPrefs?.trim();
-  if (s != null && s.isNotEmpty) {
-    return normalizeApiBase(s);
-  }
+/// Single API root for release apps — **no UI**. Configure one of:
+/// - `flutter build ... --dart-define=DEFAULT_API_BASE=https://api.example.com` (recommended for CI/release)
+/// - Set [kProductionApiBase] below for a fixed URL in source (optional)
+/// - `flutter run ... --dart-define=API_BASE=http://192.168.x.x:8080` for local dev only
+///
+/// Resolution order: `API_BASE` → `DEFAULT_API_BASE` → [kProductionApiBase] → localhost (dev/emulator).
+const String kProductionApiBase = '';
+
+String resolveInitialApiBase() {
   const env = String.fromEnvironment('API_BASE', defaultValue: '');
   if (env.isNotEmpty) {
     return normalizeApiBase(env);
+  }
+  const bakedDefault = String.fromEnvironment('DEFAULT_API_BASE', defaultValue: '');
+  if (bakedDefault.isNotEmpty) {
+    return normalizeApiBase(bakedDefault);
+  }
+  final fixed = kProductionApiBase.trim();
+  if (fixed.isNotEmpty) {
+    return normalizeApiBase(fixed);
   }
   return 'http://localhost:8080';
 }
@@ -259,6 +702,20 @@ class AppColors {
   static const ink = Color(0xFF201B16);
 }
 
+/// Customer inquiry + manager new-event dropdown (display labels).
+const List<String> kMobileEventTypeChoices = [
+  'Birthday',
+  'Wedding',
+  'Baptism',
+  'Corporate',
+  'Sports',
+  'Government',
+  'Social event',
+  'Reunion',
+  'Gala',
+  'Other',
+];
+
 class MenuItemData {
   const MenuItemData({
     required this.id,
@@ -266,7 +723,9 @@ class MenuItemData {
     required this.description,
     required this.price,
     required this.dips,
+    this.ingredients = const [],
     this.category = '',
+    this.dishType = '',
     this.imageBase64,
   });
 
@@ -275,7 +734,10 @@ class MenuItemData {
   final String description;
   final double price;
   final List<String> dips;
+  final List<String> ingredients;
   final String category;
+  /// From `menu_dishes.type` when exposed by the API (`dish_type`).
+  final String dishType;
   final String? imageBase64;
 
   /// Matches customer Restaurant tab: tag `restaurant` or subcategories (rice meals, silog, pasta, etc.).
@@ -291,8 +753,11 @@ class MenuItemData {
     return false;
   }
 
-  /// Bucket for POS filter chips: ALL uses empty filter; otherwise keys match display labels lowercased.
+  /// Bucket for filtering when `dish_type` is empty (legacy heuristic from category).
   String get restaurantMenuBucket {
+    final t = dishType.trim().toLowerCase();
+    if (t == 'other' || t == 'special') return 'others';
+    if (t.isNotEmpty) return t;
     final c = category.toLowerCase().trim();
     if (c.contains('drink') || c.contains('beverage')) return 'drinks';
     if (c.contains('sandwich')) return 'sandwiches';
@@ -300,6 +765,32 @@ class MenuItemData {
     if (c.contains('silog')) return 'silog meals';
     if (c.contains('rice')) return 'rice meals';
     return 'others';
+  }
+
+  /// Stable section key for chips and grouping (lowercase).
+  String get restaurantSectionKey => restaurantMenuBucket;
+
+  /// Heading text when grouping by type (preserve DB casing when type is set).
+  String get restaurantSectionLabel {
+    final tl = dishType.trim().toLowerCase();
+    if (tl == 'restaurant') return 'Menu';
+    if (tl == 'other' || tl == 'special') return 'Others';
+    final t = dishType.trim();
+    if (t.isNotEmpty) return t;
+    switch (restaurantMenuBucket) {
+      case 'rice meals':
+        return 'Rice meals';
+      case 'silog meals':
+        return 'Silog meals';
+      case 'pasta':
+        return 'Pasta';
+      case 'sandwiches':
+        return 'Sandwiches';
+      case 'drinks':
+        return 'Drinks';
+      default:
+        return 'Others';
+    }
   }
 
   bool get isCateringDish {
@@ -328,6 +819,10 @@ class ProfileData {
     this.deliveryMapConfirmed = false,
     this.deliveryLat,
     this.deliveryLng,
+    this.loyaltyPoints = 0,
+    this.loyaltyPointsRestaurant = 0,
+    this.loyaltyPointsCatering = 0,
+    this.deliveryAddresses = const [],
   });
 
   String fullName;
@@ -336,6 +831,24 @@ class ProfileData {
   bool deliveryMapConfirmed;
   double? deliveryLat;
   double? deliveryLng;
+  int loyaltyPoints;
+  int loyaltyPointsRestaurant;
+  int loyaltyPointsCatering;
+  List<String> deliveryAddresses;
+}
+
+class LoyaltyHistoryItem {
+  LoyaltyHistoryItem({
+    required this.orderNo,
+    required this.pointsDelta,
+    required this.createdAt,
+    this.source = 'restaurant',
+  });
+  final String orderNo;
+  final int pointsDelta;
+  final DateTime createdAt;
+  /// `restaurant` (mobile/POS) vs `catering` (completed events).
+  final String source;
 }
 
 class OrderLineItem {
@@ -385,6 +898,7 @@ class OrderData {
     required this.status,
     required this.total,
     required this.createdAt,
+    this.updatedAt,
     this.paymentUploaded = false,
     this.paymentProofBase64,
     this.lines = const [],
@@ -404,6 +918,8 @@ class OrderData {
     this.supplementalPaymentProofBase64,
     this.cashierSecondaryAmountReceived,
     this.balanceProofPendingReview = false,
+    this.customerDisplayName,
+    this.loyaltyPointsEarned = 0,
   });
 
   final int id;
@@ -411,6 +927,8 @@ class OrderData {
   final String status;
   final double total;
   final DateTime createdAt;
+  /// Last server update (e.g. walk-in claimed).
+  final DateTime? updatedAt;
   final bool paymentUploaded;
   /// Raw proof image from API (same field stored by backend); may be large.
   final String? paymentProofBase64;
@@ -434,6 +952,10 @@ class OrderData {
   final double? cashierSecondaryAmountReceived;
   /// Cashier must review supplemental proof + enter amount.
   final bool balanceProofPendingReview;
+  /// Resolved customer name for cashier lists (from customer_profiles join).
+  final String? customerDisplayName;
+  /// Points earned for this order once confirmed (floor of total); from API `loyalty_points_earned`.
+  final int loyaltyPointsEarned;
 }
 
 OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> lines) {
@@ -447,6 +969,7 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
     status: '${map['status']}',
     total: jsonToDouble(map['total']),
     createdAt: jsonToDateTime(map['created_at'], DateTime.now()),
+    updatedAt: map['updated_at'] != null ? jsonToDateTime(map['updated_at'], DateTime.now()) : null,
     paymentUploaded: jsonToBool(map['payment_uploaded']),
     paymentProofBase64: proofStr.isNotEmpty ? proofStr : null,
     lines: lines,
@@ -467,7 +990,22 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
     cashierSecondaryAmountReceived:
         map['cashier_secondary_amount_received'] != null ? jsonToDouble(map['cashier_secondary_amount_received']) : null,
     balanceProofPendingReview: jsonToBool(map['balance_proof_pending_review']),
+    customerDisplayName: () {
+      final v = map['customer_display_name'];
+      if (v == null) return null;
+      final s = '$v'.trim();
+      return s.isEmpty ? null : s;
+    }(),
+    loyaltyPointsEarned: jsonToInt(map['loyalty_points_earned']),
   );
+}
+
+String cashierCustomerLabel(OrderData o) {
+  final n = o.customerDisplayName?.trim();
+  if (n != null && n.isNotEmpty) return n;
+  final dn = o.deliveryName.trim();
+  if (dn.isNotEmpty) return dn;
+  return o.userEmail ?? '—';
 }
 
 bool orderLooksCompleted(OrderData o) {
@@ -479,17 +1017,24 @@ bool orderLooksCompleted(OrderData o) {
       u.contains('CLOSED');
 }
 
+bool customerOrderCancelled(OrderData o) {
+  final u = o.status.toUpperCase();
+  return u.contains('CANCEL');
+}
+
 bool customerOrderPendingTab(OrderData o) {
+  if (customerOrderCancelled(o)) return false;
   if (orderLooksCompleted(o)) return false;
   final u = o.status.toUpperCase();
-  return u.contains('WAITING FOR ORDER CONFIRMATION') ||
+  return u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+      u.contains('WAITING FOR ORDER CONFIRMATION') ||
       u.contains('WAITING FOR ORDER') ||
       u.contains('PAYMENT INSUFFICIENT') ||
       u.contains('INSUFFICIENT');
 }
 
 bool customerOrderConfirmedTab(OrderData o) {
-  if (orderLooksCompleted(o)) return false;
+  if (orderLooksCompleted(o) || customerOrderCancelled(o)) return false;
   return !customerOrderPendingTab(o);
 }
 
@@ -506,6 +1051,41 @@ String fulfillmentStageReadable(String stage) {
     default:
       return stage;
   }
+}
+
+String statusReadable(String status) {
+  final up = status.toUpperCase();
+  if (up.contains('WAITING FOR ORDER CONFIRMATION')) return 'WAITING FOR PAYMENT CONFIRMATION';
+  if (up.contains('ORDER CONFIRMED')) return status.replaceAll(RegExp('ORDER CONFIRMED', caseSensitive: false), 'PAYMENT CONFIRMED');
+  if (up.contains('PAYMENT INSUFFICIENT')) {
+    return 'PAYMENT INSUFFICIENT - PAY REMAINDER';
+  }
+  return status;
+}
+
+void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
+  showDialog<void>(
+    context: context,
+    builder: (ctx) => Dialog(
+      insetPadding: const EdgeInsets.all(12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            title: Text(title),
+            trailing: IconButton(onPressed: () => Navigator.pop(ctx), icon: const Icon(Icons.close)),
+          ),
+          Flexible(
+            child: InteractiveViewer(
+              minScale: 0.6,
+              maxScale: 4,
+              child: Image.memory(bytes, fit: BoxFit.contain),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
 }
 
 class InquiryRecord {
@@ -536,10 +1116,14 @@ class InquiryRecord {
     this.serviceIncluded = '',
     this.formalityLevel = '',
     this.foodTastingRequested = false,
+    this.loyaltyPointsEarned = 0,
+    this.transactionNo = '',
   });
 
   final int id;
   final String inquiryNo;
+  /// From `event_orders` / `catering_orders` when set.
+  final String transactionNo;
   final String inquiryType;
   final String eventTitle;
   final String eventType;
@@ -564,8 +1148,29 @@ class InquiryRecord {
   final String serviceIncluded;
   final String formalityLevel;
   final bool foodTastingRequested;
+  /// Estimated loyalty points for completed catering/event (matches backend floor of total cost).
+  final int loyaltyPointsEarned;
 
-  bool get isWaiting => status.toUpperCase() == 'SUBMITTED' || status.toUpperCase() == 'PENDING';
+  bool get isCompletedBooking {
+    final s = status.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '_').replaceAll('-', '_');
+    return s == 'completed';
+  }
+
+  /// Primary label for lists (prefer DB transaction number).
+  String get displayTransactionRef =>
+      transactionNo.trim().isNotEmpty ? transactionNo.trim() : inquiryNo;
+
+  bool get isWaiting {
+    final s = status.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '_').replaceAll('-', '_');
+    const waiting = {
+      'submitted',
+      'pending',
+      'online_inquiries',
+      'online_inquiry',
+      'new_event',
+    };
+    return waiting.contains(s);
+  }
 }
 
 class SubmitOrderResult {
@@ -586,9 +1191,185 @@ class SetMenuData {
   final List<String> dishes;
 }
 
+class CateringEventRecord {
+  CateringEventRecord({
+    required this.id,
+    required this.orderKind,
+    required this.status,
+    required this.source,
+    required this.customerName,
+    required this.contactPerson,
+    required this.contactNumber,
+    required this.emailAddress,
+    required this.address,
+    required this.guestCount,
+    required this.totalCost,
+    required this.eventTitle,
+    required this.eventType,
+    required this.createdAt,
+    required this.updatedAt,
+    this.stageEnteredAt,
+    this.transactionNo = '',
+    this.paymentMethod = 'cash',
+    this.costBreakdown = const [],
+    this.laborCost = 0,
+    this.travelCost = 0,
+    this.additionalCosts = const [],
+    this.downPaymentAmount = 0,
+    this.downPaymentStatus = '',
+    this.fullPaymentAmount = 0,
+    this.fullPaymentStatus = '',
+    this.postAnalysis = const {},
+    this.checklist = const [],
+    this.scheduleSlots = const [],
+    this.menu = const [],
+    this.themeDesign = const {},
+    this.serviceIncluded = '',
+    this.formalityLevel = '',
+    this.eventSetting = '',
+    this.schedulePreview = '',
+    this.processingScheduleOverlaps = 0,
+  });
+  final String id;
+  final String orderKind;
+  final String status;
+  final String source;
+  final String customerName;
+  final String contactPerson;
+  final String contactNumber;
+  final String emailAddress;
+  final String address;
+  final int guestCount;
+  final double totalCost;
+  final String eventTitle;
+  final String eventType;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+  final DateTime? stageEnteredAt;
+  final String transactionNo;
+  final String paymentMethod;
+  final List<dynamic> costBreakdown;
+  final double laborCost;
+  final double travelCost;
+  final List<dynamic> additionalCosts;
+  final double downPaymentAmount;
+  final String downPaymentStatus;
+  final double fullPaymentAmount;
+  final String fullPaymentStatus;
+  final Map<String, dynamic> postAnalysis;
+  final List<dynamic> checklist;
+  final List<dynamic> scheduleSlots;
+  final List<dynamic> menu;
+  final Map<String, dynamic> themeDesign;
+  final String serviceIncluded;
+  final String formalityLevel;
+  /// From `theme_design.event_setting` when list uses `summary: true`.
+  final String eventSetting;
+  /// Short date/time line from first `schedule_slots` entry (list summary).
+  final String schedulePreview;
+  /// For `for_processing` list: how many *other* active orders overlap this event's schedule.
+  final int processingScheduleOverlaps;
+
+  factory CateringEventRecord.fromApiMap(Map<String, dynamic> m) {
+    return CateringEventRecord(
+      id: '${m['id']}',
+      orderKind: '${m['order_kind'] ?? 'event'}',
+      status: '${m['status'] ?? ''}',
+      source: '${m['source'] ?? ''}',
+      customerName: '${m['customer_name'] ?? ''}',
+      contactPerson: '${m['contact_person'] ?? ''}',
+      contactNumber: '${m['contact_number'] ?? ''}',
+      emailAddress: '${m['email_address'] ?? ''}',
+      address: '${m['address'] ?? ''}',
+      guestCount: jsonToInt(m['guest_count']),
+      totalCost: jsonToDouble(m['total_cost']),
+      eventTitle: '${m['event_title'] ?? ''}',
+      eventType: '${m['event_type'] ?? ''}',
+      createdAt: jsonToDateTime(m['created_at'], DateTime.now()),
+      updatedAt: jsonToDateTime(m['updated_at'], DateTime.now()),
+      stageEnteredAt: jsonTryDateTime(m['stage_entered_at']),
+      transactionNo: '${m['transaction_no'] ?? ''}',
+      paymentMethod: '${m['payment_method'] ?? 'cash'}',
+      costBreakdown: (m['cost_breakdown'] is List) ? (m['cost_breakdown'] as List<dynamic>) : const [],
+      laborCost: jsonToDouble(m['labor_cost']),
+      travelCost: jsonToDouble(m['travel_cost']),
+      additionalCosts: (m['additional_costs'] is List) ? (m['additional_costs'] as List<dynamic>) : const [],
+      downPaymentAmount: jsonToDouble(m['down_payment_amount']),
+      downPaymentStatus: '${m['down_payment_status'] ?? ''}',
+      fullPaymentAmount: jsonToDouble(m['full_payment_amount']),
+      fullPaymentStatus: '${m['full_payment_status'] ?? ''}',
+      postAnalysis: () {
+        final pa = m['post_analysis'];
+        if (pa is Map<String, dynamic>) return pa;
+        if (pa is Map) return Map<String, dynamic>.from(pa.map((k, v) => MapEntry('$k', v)));
+        return const <String, dynamic>{};
+      }(),
+      checklist: (m['checklist'] is List) ? (m['checklist'] as List<dynamic>) : const [],
+      scheduleSlots: () {
+        final raw = m['schedule_slots'];
+        if (raw is List) return List<dynamic>.from(raw);
+        if (raw is Map) return [raw];
+        if (raw is String && raw.trim().isNotEmpty) {
+          try {
+            final j = jsonDecode(raw);
+            if (j is List) return List<dynamic>.from(j);
+            if (j is Map) return [j];
+          } catch (_) {}
+        }
+        return <dynamic>[];
+      }(),
+      menu: () {
+        final raw = m['menu'];
+        if (raw is List) return List<dynamic>.from(raw);
+        if (raw is String && raw.trim().startsWith('[')) {
+          try {
+            final j = jsonDecode(raw);
+            if (j is List) return List<dynamic>.from(j);
+          } catch (_) {}
+        }
+        return <dynamic>[];
+      }(),
+      themeDesign: () {
+        final raw = m['theme_design'];
+        if (raw is Map<String, dynamic>) return raw;
+        if (raw is Map) {
+          return Map<String, dynamic>.from(
+            raw.map((key, value) => MapEntry(key.toString(), value)),
+          );
+        }
+        if (raw is String && raw.trim().startsWith('{')) {
+          try {
+            final j = jsonDecode(raw);
+            if (j is Map<String, dynamic>) return j;
+            if (j is Map) {
+              return Map<String, dynamic>.from(
+                j.map((key, value) => MapEntry(key.toString(), value)),
+              );
+            }
+          } catch (_) {}
+        }
+        return <String, dynamic>{};
+      }(),
+      serviceIncluded: '${m['service_included'] ?? ''}',
+      formalityLevel: '${m['formality_level'] ?? ''}',
+      eventSetting: '${m['event_setting'] ?? ''}',
+      schedulePreview: '${m['schedule_preview'] ?? ''}',
+      processingScheduleOverlaps: jsonToInt(m['processing_schedule_overlaps']),
+    );
+  }
+}
+
+/// Full payment treated as confirmed when the manager sets [manager_full_payment_confirmed] or legacy cashier amounts match [totalComputed].
+bool cateringFullPaymentConfirmed(CateringEventRecord r, double totalComputed) {
+  if (r.postAnalysis['manager_full_payment_confirmed'] == true) return true;
+  final fullPaymentStatus = r.fullPaymentStatus.trim().toLowerCase();
+  final hasAmt = r.fullPaymentAmount > 0 && r.fullPaymentAmount >= totalComputed * 0.99;
+  return hasAmt && (fullPaymentStatus.isEmpty || fullPaymentStatus == 'paid');
+}
+
 class AppState extends ChangeNotifier {
-  AppState({String? savedApiBase, String? savedThemeMode})
-      : apiBase = resolveInitialApiBase(savedApiBase),
+  AppState({String? savedThemeMode})
+      : apiBase = resolveInitialApiBase(),
         themeMode = savedThemeMode == 'dark' ? ThemeMode.dark : ThemeMode.light;
 
   String apiBase;
@@ -602,22 +1383,31 @@ class AppState extends ChangeNotifier {
   final List<InquiryRecord> inquiries = [];
   final List<SetMenuData> setMenus = [];
   String checkoutNote = '';
-  /// `customer` or `cashier` from login API.
+  /// Persists chosen delivery line for checkout when navigating away from [CheckoutScreen].
+  String? checkoutSelectedAddress;
+  /// `customer`, `cashier`, `manager`, or `supervisor` from login API.
   String userRole = 'customer';
   String cashierDisplayName = '';
   final List<OrderData> cashierOnlineOrders = [];
   final List<OrderData> cashierOrderHistory = [];
   final List<OrderData> cashierWalkInPreparing = [];
   final List<OrderData> cashierWalkInComplete = [];
+  final List<CateringEventRecord> managerCateringRows = [];
+  final List<LoyaltyHistoryItem> loyaltyHistory = [];
   bool showLoginWelcomeDialog = false;
+  /// Bumped on [logout] so [AuthScreen] state resets (fixes staff re-login without app restart).
+  int authSessionKey = 0;
+  int unreadNotificationsCount = 0;
+  final Set<String> orderNosWithUnreadAttention = <String>{};
+  bool get hasCashierAttentionBadge => cashierOnlineOrders.any((o) => o.balanceProofPendingReview);
+  bool get hasManagerAttentionBadge =>
+      managerCateringRows.any((r) => r.status == 'new_event' || r.status == 'online_inquiries');
+  bool get hasAnyAttentionBadge =>
+      unreadNotificationsCount > 0 || hasCashierAttentionBadge || hasManagerAttentionBadge;
 
   bool get isCashier => userRole == 'cashier';
-
-  void setApiBase(String value) {
-    apiBase = normalizeApiBase(value);
-    notifyListeners();
-    SharedPreferences.getInstance().then((p) => p.setString('api_base', apiBase));
-  }
+  bool get isManager => userRole == 'manager';
+  bool get isManagerOrSupervisor => userRole == 'manager' || userRole == 'supervisor';
 
   void setThemeMode(ThemeMode mode) {
     if (themeMode == mode) return;
@@ -659,6 +1449,8 @@ class AppState extends ChangeNotifier {
         await loadMenu();
         await loadCashierOnlineOrders();
         await loadCashierWalkInQueues();
+      } else if (isManagerOrSupervisor) {
+        await Future.wait([loadMenu(), loadSetMenus(), loadManagerCateringByStage('new_event')]);
       } else {
         await Future.wait([
           loadMenu(),
@@ -667,6 +1459,8 @@ class AppState extends ChangeNotifier {
           loadOrders(),
           loadInquiries(),
         ]);
+        await restoreCustomerDraftAfterLogin();
+        await loadNotifications();
       }
       showLoginWelcomeDialog = true;
       notifyListeners();
@@ -677,6 +1471,28 @@ class AppState extends ChangeNotifier {
   }
 
   /// Returns null on success.
+  /// How many proposed windows overlap active For Processing orders (public API).
+  Future<int> countCateringScheduleConflicts(List<Map<String, String>> windows) async {
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/catering/schedule-conflicts'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'windows': windows}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return 0;
+      final decoded = jsonDecode(res.body);
+      if (decoded is! Map) return 0;
+      final raw = decoded['conflict_window_count'];
+      if (raw is int) return raw;
+      if (raw is num) return raw.toInt();
+      return 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
   Future<String?> requestSignupOtp(String email) async {
     try {
       final res = await http
@@ -732,7 +1548,180 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<String?> requestPasswordReset({
+    required String identity,
+    required String channel,
+    required String role,
+  }) async {
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/auth/request-password-reset'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'identity': identity.trim(),
+              'channel': channel,
+              'role': role,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not request password reset'}';
+        } catch (_) {
+          return 'Could not request password reset (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  Future<String?> resetPasswordWithOtp({
+    required String identity,
+    required String otp,
+    required String password,
+    required String role,
+  }) async {
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/auth/reset-password'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'identity': identity.trim(),
+              'otp': otp.trim(),
+              'password': password,
+              'role': role,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Password reset failed'}';
+        } catch (_) {
+          return 'Password reset failed (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  Future<void> clearPersistedCustomerDraft() async {
+    final e = userEmail?.toLowerCase();
+    if (e == null) return;
+    final p = await SharedPreferences.getInstance();
+    await p.remove('customer_tray_v1_$e');
+    await p.remove('customer_checkout_note_v1_$e');
+    await p.remove('customer_checkout_addr_v1_$e');
+  }
+
+  Future<void> restoreCustomerDraftAfterLogin() async {
+    if (userEmail == null || userRole != 'customer') return;
+    final prefs = await SharedPreferences.getInstance();
+    final k = userEmail!.toLowerCase();
+    checkoutNote = prefs.getString('customer_checkout_note_v1_$k') ?? checkoutNote;
+    checkoutSelectedAddress = prefs.getString('customer_checkout_addr_v1_$k');
+    final raw = prefs.getString('customer_tray_v1_$k');
+    tray.clear();
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final list = jsonDecode(raw) as List<dynamic>;
+        for (final e in list) {
+          final m = e as Map<String, dynamic>;
+          final id = '${m['id']}';
+          final dip = '${m['dip'] ?? ''}';
+          final qty = jsonToInt(m['qty']);
+          MenuItemData? foundItem;
+          for (final x in menu) {
+            if (x.id == id) {
+              foundItem = x;
+              break;
+            }
+          }
+          if (foundItem != null && qty > 0) {
+            tray.add(CartItem(menu: foundItem, dip: dip, qty: qty));
+          }
+        }
+      } catch (_) {}
+    }
+    notifyListeners();
+  }
+
+  Future<void> _persistCustomerTraySnapshot() async {
+    if (userEmail == null || userRole != 'customer') return;
+    final prefs = await SharedPreferences.getInstance();
+    final k = userEmail!.toLowerCase();
+    final lines = tray
+        .map(
+          (e) => <String, dynamic>{
+            'id': e.menu.id,
+            'dip': e.dip,
+            'qty': e.qty,
+          },
+        )
+        .toList();
+    await prefs.setString('customer_tray_v1_$k', jsonEncode(lines));
+  }
+
+  void updateCheckoutDraftNote(String v) {
+    checkoutNote = v;
+    notifyListeners();
+    final em = userEmail?.toLowerCase();
+    if (userRole != 'customer' || em == null) return;
+    SharedPreferences.getInstance().then((p) => p.setString('customer_checkout_note_v1_$em', v));
+  }
+
+  void updateCheckoutDraftAddress(String? v) {
+    checkoutSelectedAddress = v;
+    notifyListeners();
+    final em = userEmail?.toLowerCase();
+    if (userRole != 'customer' || em == null) return;
+    SharedPreferences.getInstance().then((p) {
+      if (v == null || v.trim().isEmpty) {
+        p.remove('customer_checkout_addr_v1_$em');
+      } else {
+        p.setString('customer_checkout_addr_v1_$em', v.trim());
+      }
+    });
+  }
+
+  Future<String?> cancelOrderAsCustomer({required int orderId}) async {
+    if (userEmail == null) return 'Not signed in';
+    try {
+      final res = await http
+          .patch(
+            _uri('/api/mobile/orders/$orderId/cancel-customer'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'user_email': userEmail}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not cancel'}';
+        } catch (_) {
+          return 'Could not cancel (${res.statusCode})';
+        }
+      }
+      await loadOrders();
+      notifyListeners();
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
   void logout() {
+    final persistedEmail = userEmail?.toLowerCase();
+    authSessionKey++;
+    unreadNotificationsCount = 0;
+    orderNosWithUnreadAttention.clear();
     userEmail = null;
     loginPassword = '';
     userRole = 'customer';
@@ -741,6 +1730,8 @@ class AppState extends ChangeNotifier {
     cashierOrderHistory.clear();
     cashierWalkInPreparing.clear();
     cashierWalkInComplete.clear();
+    managerCateringRows.clear();
+    loyaltyHistory.clear();
     showLoginWelcomeDialog = false;
     profile = ProfileData();
     menu.clear();
@@ -749,6 +1740,15 @@ class AppState extends ChangeNotifier {
     inquiries.clear();
     setMenus.clear();
     checkoutNote = '';
+    checkoutSelectedAddress = null;
+    if (persistedEmail != null) {
+      SharedPreferences.getInstance().then((p) async {
+        await p.remove('customer_tray_v1_$persistedEmail');
+        await p.remove('customer_checkout_note_v1_$persistedEmail');
+        await p.remove('customer_checkout_addr_v1_$persistedEmail');
+      });
+    }
+    clearCustomerNotificationDedupe();
     notifyListeners();
   }
 
@@ -765,13 +1765,17 @@ class AppState extends ChangeNotifier {
         body.map((e) {
           final map = e as Map<String, dynamic>;
           final dipValues = map['dips'] is List ? (map['dips'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
+          final ingValues =
+              map['ingredients'] is List ? (map['ingredients'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
           return MenuItemData(
             id: '${map['id']}',
             name: '${map['name']}',
             description: '${map['description']}',
             price: jsonToDouble(map['price']),
             dips: dipValues,
+            ingredients: ingValues,
             category: '${map['category'] ?? ''}',
+            dishType: '${map['dish_type'] ?? ''}',
             imageBase64: map['image_base64'] != null ? '${map['image_base64']}' : null,
           );
         }),
@@ -806,6 +1810,14 @@ class AppState extends ChangeNotifier {
     final res = await http.get(_uri('/api/mobile/profile', {'user_email': userEmail!}));
     if (res.statusCode != 200) return;
     final map = jsonDecode(res.body) as Map<String, dynamic>;
+    final addrList = <String>[];
+    final rawAddrs = map['delivery_addresses'];
+    if (rawAddrs is List) {
+      for (final e in rawAddrs) {
+        final s = '$e'.trim();
+        if (s.isNotEmpty) addrList.add(s);
+      }
+    }
     profile = ProfileData(
       fullName: '${map['full_name'] ?? ''}',
       contactNumber: '${map['contact_number'] ?? ''}',
@@ -813,7 +1825,33 @@ class AppState extends ChangeNotifier {
       deliveryMapConfirmed: jsonToBool(map['delivery_map_confirmed']),
       deliveryLat: map['delivery_lat'] != null ? jsonToDouble(map['delivery_lat']) : null,
       deliveryLng: map['delivery_lng'] != null ? jsonToDouble(map['delivery_lng']) : null,
+      loyaltyPoints: jsonToInt(map['loyalty_points']),
+      loyaltyPointsRestaurant: jsonToInt(map['loyalty_points_restaurant']),
+      loyaltyPointsCatering: jsonToInt(map['loyalty_points_catering']),
+      deliveryAddresses: addrList,
     );
+    await loadLoyaltyHistory();
+    notifyListeners();
+  }
+
+  Future<void> loadLoyaltyHistory() async {
+    if (userEmail == null) return;
+    final res = await http.get(_uri('/api/mobile/loyalty-history', {'user_email': userEmail!}));
+    if (res.statusCode != 200) return;
+    final body = jsonDecode(res.body);
+    if (body is! List) return;
+    loyaltyHistory
+      ..clear()
+      ..addAll(
+        body.whereType<Map<String, dynamic>>().map(
+          (m) => LoyaltyHistoryItem(
+            orderNo: '${m['order_no'] ?? ''}',
+            pointsDelta: jsonToInt(m['points_delta']),
+            createdAt: jsonToDateTime(m['created_at'], DateTime.now()),
+            source: '${m['source'] ?? 'restaurant'}'.toLowerCase().contains('catering') ? 'catering' : 'restaurant',
+          ),
+        ),
+      );
     notifyListeners();
   }
 
@@ -830,10 +1868,22 @@ class AppState extends ChangeNotifier {
         'delivery_map_confirmed': updated.deliveryMapConfirmed,
         if (updated.deliveryLat != null) 'delivery_lat': updated.deliveryLat,
         if (updated.deliveryLng != null) 'delivery_lng': updated.deliveryLng,
+        'delivery_addresses': updated.deliveryAddresses,
       }),
     );
     if (res.statusCode == 200) {
-      profile = updated;
+      profile = ProfileData(
+        fullName: updated.fullName,
+        contactNumber: updated.contactNumber,
+        deliveryAddress: updated.deliveryAddress,
+        deliveryMapConfirmed: updated.deliveryMapConfirmed,
+        deliveryLat: updated.deliveryLat,
+        deliveryLng: updated.deliveryLng,
+        loyaltyPoints: profile.loyaltyPoints,
+        loyaltyPointsRestaurant: profile.loyaltyPointsRestaurant,
+        loyaltyPointsCatering: profile.loyaltyPointsCatering,
+        deliveryAddresses: updated.deliveryAddresses,
+      );
       notifyListeners();
     }
   }
@@ -846,6 +1896,7 @@ class AppState extends ChangeNotifier {
       existing.first.qty += 1;
     }
     notifyListeners();
+    _persistCustomerTraySnapshot().catchError((_) {});
   }
 
   void changeQty(CartItem item, int delta) {
@@ -854,16 +1905,18 @@ class AppState extends ChangeNotifier {
       tray.remove(item);
     }
     notifyListeners();
+    _persistCustomerTraySnapshot().catchError((_) {});
   }
 
   void clearTray() {
     tray.clear();
     notifyListeners();
+    _persistCustomerTraySnapshot().catchError((_) {});
   }
 
   double get subtotal => tray.fold<double>(0, (sum, i) => sum + (i.qty * i.menu.price));
 
-  Future<SubmitOrderResult> submitOrder() async {
+  Future<SubmitOrderResult> submitOrder({bool clearCheckoutDraft = true}) async {
     if (userEmail == null || tray.isEmpty) {
       return SubmitOrderResult(error: 'Missing profile or empty tray');
     }
@@ -916,7 +1969,7 @@ class AppState extends ChangeNotifier {
       final order = OrderData(
         id: jsonToInt(map['id']),
         orderNo: '${map['order_no']}',
-        status: 'WAITING FOR ORDER CONFIRMATION',
+        status: 'WAITING FOR PAYMENT CONFIRMATION',
         total: jsonToDouble(map['total']),
         createdAt: DateTime.now(),
         paymentUploaded: false,
@@ -930,9 +1983,22 @@ class AppState extends ChangeNotifier {
         deliveryTime: 'NOW',
         orderSource: 'MOBILE_APP',
         fulfillmentStage: 'PENDING_CASHIER',
+        customerDisplayName: profile.fullName.trim().isNotEmpty ? profile.fullName.trim() : null,
+        loyaltyPointsEarned: 0,
       );
+      if (!clearCheckoutDraft) {
+        try {
+          await loadOrders();
+        } catch (_) {
+          orders.insert(0, order);
+        }
+        notifyListeners();
+        return SubmitOrderResult(order: order);
+      }
       checkoutNote = '';
-      clearTray();
+      tray.clear();
+      notifyListeners();
+      await clearPersistedCustomerDraft();
       try {
         await loadOrders();
       } catch (_) {
@@ -946,14 +2012,26 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> uploadPaymentProof(int orderId, XFile file) async {
-    final encoded = base64Encode(await file.readAsBytes());
-    await http.patch(
-      _uri('/api/mobile/orders/$orderId/payment'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'payment_proof': encoded}),
-    );
-    await loadOrders();
+  Future<bool> uploadPaymentProof(int orderId, XFile file) async {
+    try {
+      final encoded = base64Encode(await file.readAsBytes());
+      final res = await http.patch(
+        _uri('/api/mobile/orders/$orderId/payment'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'payment_proof': encoded}),
+      );
+      await loadOrders();
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> clearCheckoutAfterSuccessfulOrderAndPayment() async {
+    checkoutNote = '';
+    tray.clear();
+    notifyListeners();
+    await clearPersistedCustomerDraft();
   }
 
   Future<void> loadOrders() async {
@@ -973,6 +2051,9 @@ class AppState extends ChangeNotifier {
       ..clear()
       ..addAll(parsed);
     notifyListeners();
+    if (!isCashier && !isManagerOrSupervisor) {
+      await loadNotifications();
+    }
   }
 
   Future<String?> submitInquiry(Map<String, dynamic> payload) async {
@@ -999,6 +2080,321 @@ class AppState extends ChangeNotifier {
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
     }
+  }
+
+  Future<void> loadManagerCateringByStage(String stage) async {
+    if (userEmail == null || !isManagerOrSupervisor) return;
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/pos/catering/list'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'stage': stage,
+              'summary': true,
+            }),
+          )
+          .timeout(_managerCateringListTimeout);
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! List) return;
+      managerCateringRows
+        ..clear()
+        ..addAll(
+          body.whereType<Map<String, dynamic>>().map(CateringEventRecord.fromApiMap),
+        );
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Full catering/event row for manager detail (list uses [loadManagerCateringByStage] with summary strips).
+  Future<CateringEventRecord?> loadManagerCateringItem({required String id, required String orderKind}) async {
+    if (userEmail == null || !isManagerOrSupervisor) return null;
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/pos/catering/item'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'id': id,
+              'order_kind': orderKind,
+            }),
+          )
+          .timeout(_managerCateringListTimeout);
+      if (res.statusCode != 200) return null;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return null;
+      return CateringEventRecord.fromApiMap(body);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<String?> managerCreateNewEvent({
+    required String orderKind,
+    required String eventTitle,
+    required String eventType,
+    required String customerName,
+    required String contactPerson,
+    required String contactNumber,
+    required String emailAddress,
+    required String address,
+    required int guestCount,
+    required String paymentMethod,
+    required List<Map<String, dynamic>> costBreakdown,
+    required int laborMaleCount,
+    required int laborFemaleCount,
+    required double laborManualException,
+    required double travelCost,
+    double? manualTotalCost,
+    List<dynamic> scheduleSlots = const [],
+    List<dynamic> menu = const [],
+    Map<String, dynamic> themeDesign = const {},
+    String formalityLevel = '',
+  }) async {
+    if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/pos/catering/new-event'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'order_kind': orderKind,
+              'event_title': eventTitle,
+              'event_type': eventType,
+              'customer_name': customerName,
+              'contact_person': contactPerson,
+              'contact_number': contactNumber,
+              'email_address': emailAddress,
+              'address': address,
+              'guest_count': guestCount,
+              'payment_method': paymentMethod,
+              'cost_breakdown': costBreakdown,
+              'labor_male_count': laborMaleCount,
+              'labor_female_count': laborFemaleCount,
+              'labor_manual_exception': laborManualException,
+              'travel_cost': travelCost,
+              if (manualTotalCost != null) 'manual_total_cost': manualTotalCost,
+              'schedule_slots': scheduleSlots,
+              'menu': menu,
+              'theme_design': themeDesign,
+              'formality_level': formalityLevel,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 201) return 'Could not create event';
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  Future<String?> managerAdvanceCateringStage({
+    required String id,
+    required String orderKind,
+    required String status,
+    double? downPaymentAmount,
+    double? fullPaymentAmount,
+    Map<String, dynamic>? postAnalysis,
+    List<dynamic>? checklist,
+    List<String>? actualEventImages,
+    List<Map<String, dynamic>>? additionalCosts,
+    double? laborCost,
+    double? travelCost,
+    double? totalCost,
+    List<Map<String, dynamic>>? costBreakdown,
+    Map<String, dynamic>? themeDesign,
+    List<dynamic>? menu,
+  }) async {
+    if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
+    try {
+      final res = await http
+          .patch(
+            _uri('/api/mobile/pos/catering/$id/stage'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'order_kind': orderKind,
+              'status': status,
+              if (downPaymentAmount != null) 'down_payment_amount': downPaymentAmount,
+              if (fullPaymentAmount != null) 'full_payment_amount': fullPaymentAmount,
+              if (postAnalysis != null) 'post_analysis': postAnalysis,
+              if (checklist != null) 'checklist': checklist,
+              if (actualEventImages != null) 'actual_event_images': actualEventImages,
+              if (additionalCosts != null) 'additional_costs': additionalCosts,
+              if (laborCost != null) 'labor_cost': laborCost,
+              if (travelCost != null) 'travel_cost': travelCost,
+              if (totalCost != null) 'total_cost': totalCost,
+              if (costBreakdown != null) 'cost_breakdown': costBreakdown,
+              if (themeDesign != null) 'theme_design': themeDesign,
+              if (menu != null) 'menu': menu,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return 'Could not update stage';
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  /// Persist catering record while still in New Event / Online Inquiries (no stage transition).
+  Future<String?> managerSaveCateringDraft({
+    required String id,
+    required String orderKind,
+    required Map<String, dynamic> draft,
+  }) async {
+    if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
+    try {
+      final res = await http
+          .patch(
+            _uri('/api/mobile/pos/catering/$id/draft'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'order_kind': orderKind,
+              ...draft,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not save'}';
+        } catch (_) {
+          return 'Could not save (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  /// Merge keys into `post_analysis` (e.g. manager payment confirmations). Manager-only for payment flags on server.
+  Future<String?> managerPatchCateringPostAnalysis({
+    required String id,
+    required String orderKind,
+    required Map<String, dynamic> patch,
+  }) async {
+    if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
+    try {
+      final res = await http
+          .patch(
+            _uri('/api/mobile/pos/catering/$id/post-analysis-patch'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'order_kind': orderKind,
+              'patch': patch,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return 'Could not update record';
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  /// Migrates the row between `catering_orders` and `event_orders` (draft stages only; server-enforced).
+  Future<String?> managerSwitchCateringOrderKind({
+    required String id,
+    required String fromKind,
+    required String toKind,
+  }) async {
+    if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/pos/catering/$id/switch-order-kind'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'from_order_kind': fromKind,
+              'to_order_kind': toKind,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not switch inquiry type'}';
+        } catch (_) {
+          return 'Could not switch inquiry type (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  Future<Map<String, dynamic>?> managerInvoicePreview({
+    required String id,
+    required String orderKind,
+  }) async {
+    try {
+      final res = await http
+          .get(
+            _uri('/api/mobile/pos/catering/$id/invoice-preview', {'order_kind': orderKind}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return null;
+      final b = jsonDecode(res.body);
+      return b is Map<String, dynamic> ? b : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> loadNotifications() async {
+    if (userEmail == null || isCashier || isManagerOrSupervisor) return;
+    try {
+      final res = await http.get(_uri('/api/mobile/notifications', {'user_email': userEmail!})).timeout(_apiTimeout);
+      if (res.statusCode != 200) return;
+      final map = jsonDecode(res.body);
+      if (map is! Map<String, dynamic>) return;
+      unreadNotificationsCount = jsonToInt(map['unread_count']);
+      orderNosWithUnreadAttention.clear();
+      final raw = map['notifications'];
+      if (raw is List) {
+        final re = RegExp(r'\[([^\]]+)\]');
+        for (final e in raw) {
+          if (e is! Map<String, dynamic>) continue;
+          if (e['is_read'] == true) continue;
+          final msg = '${e['message'] ?? ''}';
+          final m = re.firstMatch(msg);
+          final id = m?.group(1)?.trim();
+          if (id != null && id.isNotEmpty) orderNosWithUnreadAttention.add(id);
+        }
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> markAllNotificationsRead() async {
+    if (userEmail == null) return;
+    try {
+      await http
+          .patch(
+            _uri('/api/mobile/notifications/read-all'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'user_email': userEmail}),
+          )
+          .timeout(_apiTimeout);
+      await loadNotifications();
+    } catch (_) {}
   }
 
   Future<String?> submitHelpRequest({
@@ -1043,16 +2439,7 @@ class AppState extends ChangeNotifier {
     for (final e in body) {
       try {
         final map = e as Map<String, dynamic>;
-        List<String> dishes = [];
-        final sd = map['selected_dishes'];
-        if (sd is String) {
-          try {
-            final dec = jsonDecode(sd);
-            if (dec is List) dishes = dec.map((x) => '$x').toList();
-          } catch (_) {}
-        } else if (sd is List) {
-          dishes = sd.map((x) => '$x').toList();
-        }
+        final dishes = inquirySelectedDishLabels(map['selected_dishes']);
         parsed.add(
           InquiryRecord(
             id: jsonToInt(map['id']),
@@ -1081,6 +2468,8 @@ class AppState extends ChangeNotifier {
             serviceIncluded: '${map['service_included'] ?? ''}',
             formalityLevel: '${map['formality_level'] ?? ''}',
             foodTastingRequested: jsonToBool(map['food_tasting_requested']),
+            loyaltyPointsEarned: jsonToInt(map['loyalty_points_earned']),
+            transactionNo: '${map['transaction_no'] ?? ''}',
           ),
         );
       } catch (_) {}
@@ -1281,6 +2670,33 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<String?> cashierRemindInsufficientOrder({required int orderId}) async {
+    if (userEmail == null || !isCashier) return 'Not signed in';
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/pos/online-orders/$orderId/remind-balance'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not send follow-up'}';
+        } catch (_) {
+          return 'Could not send follow-up (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
   Future<String?> submitPosWalkInOrder({
     required String paymentMethod,
     required double amountReceived,
@@ -1346,8 +2762,14 @@ class _AuthScreenState extends State<AuthScreen> {
   final passwordController = TextEditingController();
   final confirmPasswordController = TextEditingController();
   final otpController = TextEditingController();
+  final forgotIdentityController = TextEditingController();
+  final forgotOtpController = TextEditingController();
+  final forgotNewPasswordController = TextEditingController();
+  final forgotConfirmPasswordController = TextEditingController();
   bool signupMode = false;
   bool otpSent = false;
+  bool forgotRequested = false;
+  String forgotChannel = 'email';
   bool busy = false;
 
   @override
@@ -1356,6 +2778,10 @@ class _AuthScreenState extends State<AuthScreen> {
     passwordController.dispose();
     confirmPasswordController.dispose();
     otpController.dispose();
+    forgotIdentityController.dispose();
+    forgotOtpController.dispose();
+    forgotNewPasswordController.dispose();
+    forgotConfirmPasswordController.dispose();
     super.dispose();
   }
 
@@ -1367,13 +2793,21 @@ class _AuthScreenState extends State<AuthScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF242424),
       body: SafeArea(
         child: Column(
           children: [
             const SizedBox(height: 50),
-            const Text('WELCOME', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
+            const Text(
+              'WELCOME',
+              style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: Colors.white),
+            ),
             const SizedBox(height: 30),
-            const CircleAvatar(radius: 52, backgroundColor: Colors.white, child: Icon(Icons.restaurant, size: 42)),
+            SizedBox(
+              height: 104,
+              width: 104,
+              child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
+            ),
             const SizedBox(height: 24),
             Expanded(
               child: Container(
@@ -1485,6 +2919,117 @@ class _AuthScreenState extends State<AuthScreen> {
                           ),
                           child: const Text('LOG IN'),
                         ),
+                        const SizedBox(height: 8),
+                        TextButton(
+                          onPressed: busy
+                              ? null
+                              : () async {
+                                  await showDialog<void>(
+                                    context: context,
+                                    builder: (ctx) => StatefulBuilder(
+                                      builder: (ctx, setDialogState) => AlertDialog(
+                                        title: const Text('Forgot password'),
+                                        content: SingleChildScrollView(
+                                          child: Column(
+                                            mainAxisSize: MainAxisSize.min,
+                                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                                            children: [
+                                              TextField(
+                                                controller: forgotIdentityController,
+                                                decoration: InputDecoration(
+                                                  labelText: widget.cashierMode ? 'Email' : 'Email or phone',
+                                                ),
+                                              ),
+                                              const SizedBox(height: 8),
+                                              if (!widget.cashierMode)
+                                                DropdownButtonFormField<String>(
+                                                  value: forgotChannel,
+                                                  decoration: const InputDecoration(labelText: 'Notification channel'),
+                                                  items: const [
+                                                    DropdownMenuItem(value: 'email', child: Text('Email')),
+                                                    DropdownMenuItem(value: 'phone', child: Text('Phone')),
+                                                  ],
+                                                  onChanged: (v) => setDialogState(() => forgotChannel = v ?? 'email'),
+                                                ),
+                                              const SizedBox(height: 10),
+                                              FilledButton(
+                                                onPressed: () async {
+                                                  final identity = forgotIdentityController.text.trim();
+                                                  if (identity.isEmpty) {
+                                                    await _toast('Enter your account email/phone');
+                                                    return;
+                                                  }
+                                                  final err = await widget.state.requestPasswordReset(
+                                                    identity: identity,
+                                                    channel: widget.cashierMode ? 'email' : forgotChannel,
+                                                    role: widget.cashierMode ? 'cashier' : 'customer',
+                                                  );
+                                                  if (err != null) {
+                                                    await _toast(err);
+                                                    return;
+                                                  }
+                                                  setDialogState(() => forgotRequested = true);
+                                                  await _toast(
+                                                    (widget.cashierMode || forgotChannel == 'email')
+                                                        ? 'Reset OTP sent. Check your email.'
+                                                        : 'Reset request submitted. Check your phone notifications.',
+                                                  );
+                                                },
+                                                child: const Text('REQUEST RESET OTP'),
+                                              ),
+                                              if (forgotRequested) ...[
+                                                const SizedBox(height: 10),
+                                                TextField(
+                                                  controller: forgotOtpController,
+                                                  decoration: const InputDecoration(labelText: 'Reset OTP'),
+                                                ),
+                                                const SizedBox(height: 8),
+                                                TextField(
+                                                  controller: forgotNewPasswordController,
+                                                  obscureText: true,
+                                                  decoration: const InputDecoration(labelText: 'New password (min 8)'),
+                                                ),
+                                                const SizedBox(height: 8),
+                                                TextField(
+                                                  controller: forgotConfirmPasswordController,
+                                                  obscureText: true,
+                                                  decoration: const InputDecoration(labelText: 'Confirm new password'),
+                                                ),
+                                                const SizedBox(height: 10),
+                                                FilledButton(
+                                                  onPressed: () async {
+                                                    if (forgotNewPasswordController.text != forgotConfirmPasswordController.text) {
+                                                      await _toast('Passwords do not match');
+                                                      return;
+                                                    }
+                                                    final err = await widget.state.resetPasswordWithOtp(
+                                                      identity: forgotIdentityController.text,
+                                                      otp: forgotOtpController.text,
+                                                      password: forgotNewPasswordController.text,
+                                                      role: widget.cashierMode ? 'cashier' : 'customer',
+                                                    );
+                                                    if (err != null) {
+                                                      await _toast(err);
+                                                      return;
+                                                    }
+                                                    if (context.mounted) Navigator.pop(ctx);
+                                                    await _toast('Password reset successful. Log in with your new password.');
+                                                  },
+                                                  child: const Text('RESET PASSWORD'),
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                        ),
+                                        actions: [
+                                          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                },
+                          child: const Text('FORGOT PASSWORD?'),
+                        ),
                       ],
                       if (!widget.cashierMode)
                         TextButton(
@@ -1528,6 +3073,32 @@ class _LabeledInput extends StatelessWidget {
   }
 }
 
+const double _tabletBreakpoint = 900;
+
+/// Wider layouts show more dish cards per row (customer menu + cashier POS).
+int restaurantGridCrossAxisCount(double width) {
+  if (width >= 1100) return 5;
+  if (width >= 850) return 4;
+  if (width >= 600) return 3;
+  return 2;
+}
+
+Widget _adaptiveScaffoldBody(BuildContext context, Widget body) {
+  final width = MediaQuery.sizeOf(context).width;
+  if (width < _tabletBreakpoint) return body;
+  final maxWidth = width >= 1400 ? 1200.0 : 1000.0;
+  return Align(
+    alignment: Alignment.topCenter,
+    child: ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: body,
+      ),
+    ),
+  );
+}
+
 class AppScaffold extends StatelessWidget {
   const AppScaffold({
     super.key,
@@ -1535,6 +3106,7 @@ class AppScaffold extends StatelessWidget {
     required this.title,
     required this.body,
     this.showTrayShortcut = true,
+    this.forceDrawerLeading = false,
     this.actions,
   });
 
@@ -1542,21 +3114,78 @@ class AppScaffold extends StatelessWidget {
   final String title;
   final Widget body;
   final bool showTrayShortcut;
+  /// When true (e.g. restaurant menu root), always show the drawer menu icon instead of a back arrow.
+  final bool forceDrawerLeading;
   final List<Widget>? actions;
 
   @override
   Widget build(BuildContext context) {
     final qty = state.tray.fold<int>(0, (s, e) => s + e.qty);
+    final pendingAttentionExists = state.orders.isEmpty
+        ? state.orderNosWithUnreadAttention.isNotEmpty
+        : state.orders
+            .where((o) => customerOrderPendingTab(o))
+            .any((o) => state.orderNosWithUnreadAttention.contains(o.orderNo));
+    final showAttentionDot = state.unreadNotificationsCount > 0 || pendingAttentionExists;
     return Scaffold(
       appBar: AppBar(
-        leading: Navigator.of(context).canPop()
-            ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.of(context).pop())
-            : Builder(
-                builder: (context) => IconButton(
-                  icon: const Icon(Icons.menu),
-                  onPressed: () => Scaffold.of(context).openDrawer(),
-                ),
-              ),
+        leading: forceDrawerLeading && state.userEmail != null
+            ? Builder(
+                builder: (context) {
+                  return Stack(
+                    clipBehavior: Clip.none,
+                    alignment: Alignment.center,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.menu),
+                        onPressed: () => Scaffold.of(context).openDrawer(),
+                      ),
+                      if (showAttentionDot)
+                        Positioned(
+                          right: 6,
+                          top: 6,
+                          child: Container(
+                            width: 10,
+                            height: 10,
+                            decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              )
+            : Navigator.of(context).canPop()
+                ? IconButton(
+                    icon: const Icon(Icons.arrow_back),
+                    onPressed: () async {
+                      final nav = Navigator.of(context);
+                      await nav.maybePop();
+                    },
+                  )
+                : Builder(
+                    builder: (context) {
+                      return Stack(
+                        clipBehavior: Clip.none,
+                        alignment: Alignment.center,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.menu),
+                            onPressed: () => Scaffold.of(context).openDrawer(),
+                          ),
+                          if (showAttentionDot)
+                            Positioned(
+                              right: 6,
+                              top: 6,
+                              child: Container(
+                                width: 10,
+                                height: 10,
+                                decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                              ),
+                            ),
+                        ],
+                      );
+                    },
+                  ),
         backgroundColor: AppColors.brand,
         title: Container(
           decoration: BoxDecoration(
@@ -1587,7 +3216,7 @@ class AppScaffold extends StatelessWidget {
         ],
       ),
       drawer: AppDrawer(state: state),
-      body: body,
+      body: _adaptiveScaffoldBody(context, body),
     );
   }
 }
@@ -1603,6 +3232,12 @@ class AppDrawer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final greet = state.profile.fullName.trim().isNotEmpty ? state.profile.fullName.trim() : (state.userEmail ?? '');
+    final pendingAttentionExists = state.orders.isEmpty
+        ? state.orderNosWithUnreadAttention.isNotEmpty
+        : state.orders
+            .where((o) => customerOrderPendingTab(o))
+            .any((o) => state.orderNosWithUnreadAttention.contains(o.orderNo));
+    final showAttentionDot = state.unreadNotificationsCount > 0 || pendingAttentionExists;
     return Drawer(
       child: ListView(
         children: [
@@ -1612,16 +3247,26 @@ class AppDrawer extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                const Text(
-                  "Macrina's Kitchen\nand Catering",
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900, height: 1.15),
-                ),
+                Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
+                const SizedBox(height: 10),
                 if (greet.isNotEmpty) Text('Hi, $greet!', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
               ],
             ),
           ),
           ListTile(title: const Text('My Profile'), onTap: () => open(context, MyProfileScreen(state: state))),
-          ListTile(title: const Text('My Orders'), onTap: () => open(context, MyOrdersScreen(state: state))),
+          ListTile(
+            title: const Text('My Orders'),
+            trailing: showAttentionDot
+                ? Container(
+                    width: 10,
+                    height: 10,
+                    decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                  )
+                : null,
+            onTap: () {
+              open(context, MyOrdersScreen(state: state));
+            },
+          ),
           ListTile(title: const Text('My Catering Inquiries'), onTap: () => open(context, MyInquiriesScreen(state: state))),
           ListTile(title: const Text('Your Tray'), onTap: () => open(context, TrayScreen(state: state))),
           ListTile(title: const Text('Restaurant Menu'), onTap: () => open(context, RestaurantMenuScreen(state: state))),
@@ -1633,9 +3278,29 @@ class AppDrawer extends StatelessWidget {
   }
 }
 
-class RestaurantMenuScreen extends StatelessWidget {
+class RestaurantMenuScreen extends StatefulWidget {
   const RestaurantMenuScreen({super.key, required this.state});
   final AppState state;
+
+  @override
+  State<RestaurantMenuScreen> createState() => _RestaurantMenuScreenState();
+}
+
+class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
+  String _search = '';
+  String _sectionFilter = 'ALL';
+
+  String _dishCardDescription(MenuItemData item) {
+    final raw = item.description.trim();
+    if (raw.isEmpty) return '';
+    final noRestaurant = raw.replaceAll(RegExp(r'\brestaurant\b', caseSensitive: false), '').replaceAll('• •', '•');
+    return noRestaurant
+        .replaceAll(RegExp(r'\s*\.\s*'), ' • ')
+        .replaceAll(RegExp(r'\s*•\s*'), ' • ')
+        .replaceAll(RegExp(r'\s{2,}'), ' ')
+        .replaceAll(RegExp(r'(^\s*•\s*|\s*•\s*$)'), '')
+        .trim();
+  }
 
   Future<void> _addToTray(BuildContext context, MenuItemData item) async {
     String selectedDip = '';
@@ -1663,69 +3328,356 @@ class RestaurantMenuScreen extends StatelessWidget {
       );
     }
     final dip = selectedDip == 'None' ? '' : selectedDip;
-    state.addToTray(item, dip: dip);
+    widget.state.addToTray(item, dip: dip);
     appSnack(context, 'Added ${item.name} to tray');
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final restaurantItems = state.menu.where((m) => m.isRestaurantDish).toList();
-    return AppScaffold(
-      state: state,
-      title: 'RESTAURANT',
-      body: Column(
+  Widget _dishCard(BuildContext context, MenuItemData item) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.border),
+        color: Colors.white,
+      ),
+      child: Column(
         children: [
-          const Padding(
-            padding: EdgeInsets.all(12),
-            child: TextField(decoration: InputDecoration(hintText: 'SEARCH')),
+          Expanded(
+            child: Container(
+              margin: const EdgeInsets.all(10),
+              color: AppColors.canvas,
+              child: _MenuThumb(item: item),
+            ),
+          ),
+          Text(item.name.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
+          if (_dishCardDescription(item).isNotEmpty)
+            Text(
+              _dishCardDescription(item).toUpperCase(),
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12),
+            ),
+          Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: () => _addToTray(context, item),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+            child: const Text('ADD TO TRAY'),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+
+  Widget _customerTraySidebar(BuildContext context, double subtotal) {
+    return Container(
+      width: 300,
+      decoration: BoxDecoration(
+        color: Colors.grey.shade50,
+        border: Border(left: BorderSide(color: Colors.grey.shade300)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+            child: Text('YOUR TRAY', style: TextStyle(fontWeight: FontWeight.w900, color: Colors.grey.shade900)),
           ),
           Expanded(
-            child: restaurantItems.isEmpty
-                ? const Center(child: Text('No restaurant menu items yet.\n(Tag dishes as category "restaurant" in the admin.)'))
-                : GridView.builder(
-                    padding: const EdgeInsets.all(12),
-                    itemCount: restaurantItems.length,
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 2,
-                      crossAxisSpacing: 10,
-                      mainAxisSpacing: 10,
-                      childAspectRatio: 0.74,
-                    ),
-                    itemBuilder: (context, index) {
-                      final item = restaurantItems[index];
-                      return Container(
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: AppColors.border),
-                          color: Colors.white,
-                        ),
-                        child: Column(
-                          children: [
-                            Expanded(
-                              child: Container(
-                                margin: const EdgeInsets.all(10),
-                                color: AppColors.canvas,
-                                child: _MenuThumb(item: item),
-                              ),
+            child: widget.state.tray.isEmpty
+                ? Center(child: Text('No dishes yet.', style: TextStyle(color: Colors.grey.shade600)))
+                : ListView.builder(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    itemCount: widget.state.tray.length,
+                    itemBuilder: (context, i) {
+                      final e = widget.state.tray[i];
+                      return Card(
+                        child: ListTile(
+                          dense: true,
+                          title: Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+                          subtitle: Text(e.dip.isEmpty ? '—' : e.dip, maxLines: 1),
+                          trailing: SizedBox(
+                            width: 108,
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                  icon: const Icon(Icons.remove_circle_outline, size: 22),
+                                  onPressed: () => widget.state.changeQty(e, -1),
+                                ),
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                                  child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                ),
+                                IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                  icon: const Icon(Icons.add_circle_outline, size: 22),
+                                  onPressed: () => widget.state.changeQty(e, 1),
+                                ),
+                              ],
                             ),
-                            Text(item.name.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
-                            Text(item.description.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontSize: 12)),
-                            Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                            const SizedBox(height: 8),
-                            FilledButton(
-                              onPressed: () => _addToTray(context, item),
-                              style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                              child: const Text('ADD TO TRAY'),
-                            ),
-                            const SizedBox(height: 8),
-                          ],
+                          ),
                         ),
                       );
                     },
                   ),
           ),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('Subtotal ₱${subtotal.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton(
+                        style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
+                        onPressed: () => widget.state.clearTray(),
+                        child: const Text('CANCEL'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FilledButton(
+                        style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                        onPressed: widget.state.tray.isEmpty
+                            ? null
+                            : () {
+                                Navigator.of(context).push<void>(
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => CheckoutScreen(state: widget.state),
+                                  ),
+                                );
+                              },
+                        child: const Text('CHECKOUT'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
         ],
       ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: widget.state,
+      builder: (context, _) {
+        final restaurantItems = widget.state.menu.where((m) => m.isRestaurantDish).toList();
+        final sectionLabels = <String, String>{};
+        for (final m in restaurantItems) {
+          final k = m.restaurantSectionKey;
+          sectionLabels.putIfAbsent(k, () => m.restaurantSectionLabel);
+        }
+        final sectionKeysSorted = sectionLabels.keys.toList()
+          ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+        final filtered = restaurantItems.where((m) {
+          final okSection =
+              _sectionFilter == 'ALL' || m.restaurantSectionKey == _sectionFilter;
+          final q = _search.trim().toLowerCase();
+          final okSearch = q.isEmpty || m.name.toLowerCase().contains(q) || m.description.toLowerCase().contains(q);
+          return okSection && okSearch;
+        }).toList();
+        final mq = MediaQuery.of(context);
+        final land = mq.orientation == Orientation.landscape;
+        var cw = restaurantGridCrossAxisCount(mq.size.width);
+        if (land && mq.size.shortestSide >= 600) {
+          cw = cw.clamp(2, 3);
+        }
+        var aspect = cw >= 4 ? 0.82 : 0.74;
+        if (land && mq.size.shortestSide >= 600) {
+          aspect = 0.62;
+        }
+        final gridDelegate = SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: cw,
+          crossAxisSpacing: 10,
+          mainAxisSpacing: 10,
+          childAspectRatio: aspect,
+        );
+        final allAlpha = List<MenuItemData>.from(filtered)
+          ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+        final subtotal = widget.state.tray.fold<double>(0, (s, e) => s + e.qty * e.menu.price);
+        final menuBody = Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: TextField(
+                decoration: const InputDecoration(hintText: 'SEARCH'),
+                onChanged: (v) => setState(() => _search = v),
+              ),
+            ),
+            SizedBox(
+              height: 44,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: FilterChip(
+                      label: const Text('ALL'),
+                      selected: _sectionFilter == 'ALL',
+                      onSelected: (_) => setState(() => _sectionFilter = 'ALL'),
+                    ),
+                  ),
+                  ...sectionKeysSorted.map((k) {
+                    final lab = sectionLabels[k] ?? k;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: FilterChip(
+                        label: Text(lab.toUpperCase()),
+                        selected: _sectionFilter == k,
+                        onSelected: (_) => setState(() => _sectionFilter = k),
+                      ),
+                    );
+                  }),
+                ],
+              ),
+            ),
+            Expanded(
+              child: filtered.isEmpty
+                  ? const Center(child: Text('No restaurant menu items in this filter.'))
+                  : _sectionFilter == 'ALL'
+                      ? GridView.builder(
+                          padding: const EdgeInsets.all(12),
+                          itemCount: allAlpha.length,
+                          gridDelegate: gridDelegate,
+                          itemBuilder: (context, index) => _dishCard(context, allAlpha[index]),
+                        )
+                      : GridView.builder(
+                          padding: const EdgeInsets.all(12),
+                          itemCount: filtered.length,
+                          gridDelegate: gridDelegate,
+                          itemBuilder: (context, index) => _dishCard(context, filtered[index]),
+                        ),
+            ),
+          ],
+        );
+        return AppScaffold(
+          state: widget.state,
+          title: 'MENU',
+          showTrayShortcut: false,
+          forceDrawerLeading: true,
+          body: LayoutBuilder(
+            builder: (context, constraints) {
+              // Tablet: fixed tray when screen is large enough; phones stay single-column (shortestSide < 600).
+              final sz = MediaQuery.sizeOf(context);
+              final useTabletTrayRail = sz.shortestSide >= 600 && sz.width >= 700;
+              if (useTabletTrayRail) {
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(child: menuBody),
+                    _customerTraySidebar(context, subtotal),
+                  ],
+                );
+              }
+              return Column(
+                children: [
+                  Expanded(child: menuBody),
+                  Container(
+                    decoration: const BoxDecoration(color: Colors.white, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (widget.state.tray.isNotEmpty) ...[
+                          SizedBox(
+                            height: 92,
+                            child: ListView.builder(
+                              scrollDirection: Axis.horizontal,
+                              itemCount: widget.state.tray.length,
+                              itemBuilder: (context, i) {
+                                final e = widget.state.tray[i];
+                                return Container(
+                                  width: 220,
+                                  margin: const EdgeInsets.only(right: 8),
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(color: AppColors.border),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          e.menu.name,
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                                        ),
+                                      ),
+                                      IconButton(
+                                        padding: EdgeInsets.zero,
+                                        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                        icon: const Icon(Icons.remove_circle_outline, size: 20),
+                                        onPressed: () => widget.state.changeQty(e, -1),
+                                      ),
+                                      Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                      IconButton(
+                                        padding: EdgeInsets.zero,
+                                        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                        icon: const Icon(Icons.add_circle_outline, size: 20),
+                                        onPressed: () => widget.state.changeQty(e, 1),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                        ],
+                        Text(
+                          'Subtotal ₱${subtotal.toStringAsFixed(2)}',
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: FilledButton(
+                                style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
+                                onPressed: () => widget.state.clearTray(),
+                                child: const Text('CANCEL'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: FilledButton(
+                                style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                                onPressed: widget.state.tray.isEmpty
+                                    ? null
+                                    : () {
+                                        Navigator.of(context).push<void>(
+                                          MaterialPageRoute<void>(
+                                            builder: (_) => CheckoutScreen(state: widget.state),
+                                          ),
+                                        );
+                                      },
+                                child: const Text('CHECKOUT'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        );
+      },
     );
   }
 }
@@ -1773,6 +3725,14 @@ class TrayScreen extends StatelessWidget {
                           final item = state.tray[index];
                           return Card(
                             child: ListTile(
+                              leading: SizedBox(
+                                width: 56,
+                                height: 56,
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: _MenuThumb(item: item.menu, compact: true),
+                                ),
+                              ),
                               title: Text(item.menu.name),
                               subtitle: Text('${item.dip.isEmpty ? 'No dip' : item.dip}\n₱${item.menu.price.toStringAsFixed(2)}'),
                               trailing: Row(
@@ -1835,11 +3795,33 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   bool showTray = true;
   bool showNotes = true;
   final noteController = TextEditingController();
+  final List<String> _deliveryAddresses = [];
+  String? _selectedDeliveryAddress;
 
   @override
   void initState() {
     super.initState();
     noteController.text = widget.state.checkoutNote;
+    final profile = widget.state.profile;
+    final fromProfile = List<String>.from(profile.deliveryAddresses);
+    final primary = profile.deliveryAddress.trim();
+    if (fromProfile.isNotEmpty) {
+      _deliveryAddresses.addAll(fromProfile);
+    } else if (primary.isNotEmpty) {
+      _deliveryAddresses.add(primary);
+    }
+    final savedSel = widget.state.checkoutSelectedAddress?.trim();
+    if (savedSel != null && savedSel.isNotEmpty && _deliveryAddresses.contains(savedSel)) {
+      _selectedDeliveryAddress = savedSel;
+    } else if (_deliveryAddresses.isNotEmpty) {
+      _selectedDeliveryAddress = _deliveryAddresses.first;
+    }
+  }
+
+  @override
+  void dispose() {
+    noteController.dispose();
+    super.dispose();
   }
 
   @override
@@ -1854,8 +3836,6 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
             child: ListView(
               padding: const EdgeInsets.all(12),
               children: [
-                const _OrderNoCard(),
-                const SizedBox(height: 10),
                 ToggleSection(
                   title: 'DELIVERY INFORMATION',
                   expanded: showDelivery,
@@ -1864,12 +3844,42 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                     children: [
                       LockedField(label: 'NAME', value: s.profile.fullName),
                       LockedField(label: 'CONTACT NUMBER', value: s.profile.contactNumber),
-                      LockedField(label: 'DELIVERY ADDRESS', value: s.profile.deliveryAddress),
+                      DropdownButtonFormField<String>(
+                        isExpanded: true,
+                        value: _selectedDeliveryAddress,
+                        decoration: const InputDecoration(labelText: 'DELIVERY ADDRESS'),
+                        items: _deliveryAddresses
+                            .map(
+                              (a) => DropdownMenuItem<String>(
+                                value: a,
+                                child: Text(
+                                  a,
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            )
+                            .toList(),
+                        onChanged: (v) {
+                          setState(() => _selectedDeliveryAddress = v);
+                          widget.state.updateCheckoutDraftAddress(v);
+                        },
+                      ),
+                      if (_deliveryAddresses.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            'Add addresses in My Profile first.',
+                            style: TextStyle(color: Colors.red.shade800, fontSize: 13),
+                          ),
+                        ),
                       const LockedField(label: 'TIME OF DELIVERY', value: 'NOW'),
                       const LockedField(label: 'MODE OF PAYMENT', value: 'GCASH ONLY'),
                     ],
                   ),
                 ),
+                const SizedBox(height: 10),
+                const _OrderNoCard(),
                 const SizedBox(height: 10),
                 ToggleSection(
                   title: 'YOUR TRAY',
@@ -1897,7 +3907,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                     controller: noteController,
                     maxLines: 4,
                     decoration: const InputDecoration(hintText: 'Write notes here...'),
-                    onChanged: (v) => s.checkoutNote = v,
+                    onChanged: s.updateCheckoutDraftNote,
                   ),
                 ),
               ],
@@ -1906,13 +3916,14 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
           SummaryFooter(
             lines: [SummaryLine('YOUR ORDER', '₱${s.subtotal.toStringAsFixed(2)}'), SummaryLine('TOTAL', '₱${s.subtotal.toStringAsFixed(2)}', isTotal: true)],
             secondaryLabel: 'CANCEL',
-            actionLabel: 'CONFIRM & PAY',
+            actionLabel: 'CONFIRM',
             onSecondary: () => Navigator.of(context).pop(),
             onAction: () async {
-              if (s.profile.deliveryAddress.trim().isEmpty) {
-                appSnack(context, 'Add a delivery address in My Profile first.');
+              if ((_selectedDeliveryAddress ?? '').trim().isEmpty) {
+                appSnack(context, 'Select your delivery address.');
                 return;
               }
+              s.profile.deliveryAddress = _selectedDeliveryAddress!.trim();
               if (!s.profile.deliveryMapConfirmed) {
                 appSnack(context, 'Open the map from My Profile, pin your location, and confirm before ordering.');
                 return;
@@ -1931,21 +3942,16 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 ),
               );
               if (okCheckout != true || !context.mounted) return;
-              showDialog<void>(
-                context: context,
-                barrierDismissible: false,
-                builder: (_) => const Center(child: CircularProgressIndicator()),
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => PaymentScreen(
+                    state: s,
+                    order: null,
+                    note: noteController.text,
+                    draftCheckout: true,
+                  ),
+                ),
               );
-              final result = await s.submitOrder();
-              if (!context.mounted) return;
-              Navigator.of(context).pop();
-              if (result.error != null) {
-                appSnack(context, result.error!);
-                return;
-              }
-              final order = result.order!;
-              appSnack(context, 'Order ${order.orderNo} placed');
-              Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => PaymentScreen(state: s, order: order, note: noteController.text)));
             },
           ),
         ],
@@ -1955,18 +3961,28 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 }
 
 class PaymentScreen extends StatefulWidget {
-  const PaymentScreen({super.key, required this.state, required this.order, required this.note});
+  const PaymentScreen({
+    super.key,
+    required this.state,
+    this.order,
+    required this.note,
+    this.draftCheckout = false,
+  });
   final AppState state;
-  final OrderData order;
+  final OrderData? order;
   final String note;
+  /// Checkout → payment without creating the server order yet (order is created when payment proof is uploaded).
+  final bool draftCheckout;
 
   @override
   State<PaymentScreen> createState() => _PaymentScreenState();
 }
 
 class _PaymentScreenState extends State<PaymentScreen> {
+  OrderData? _placedOrder;
   bool localProofUploaded = false;
   bool showPayment = true;
+  bool showTray = true;
   bool showNotes = true;
   bool showDelivery = true;
   XFile? uploadedFile;
@@ -1982,19 +3998,105 @@ class _PaymentScreenState extends State<PaymentScreen> {
   }
 
   OrderData? _syncedOrder(AppState s) {
+    final base = _placedOrder ?? widget.order;
+    if (base == null) return null;
     for (final o in s.orders) {
-      if (o.id == widget.order.id) return o;
+      if (o.id == base.id) return o;
     }
     return null;
   }
 
+  OrderData _draftSnapshot(AppState s) {
+    return OrderData(
+      id: 0,
+      orderNo: '—',
+      status: 'DRAFT',
+      total: s.subtotal,
+      createdAt: DateTime.now(),
+      lines: s.tray
+          .map(
+            (e) => OrderLineItem(
+              itemName: e.menu.name,
+              dip: e.dip,
+              qty: e.qty,
+              price: e.menu.price,
+            ),
+          )
+          .toList(),
+      userEmail: s.userEmail,
+      note: widget.note,
+      paymentMode: 'GCASH ONLY',
+      deliveryName: s.profile.fullName,
+      deliveryContact: s.profile.contactNumber,
+      deliveryAddress: s.profile.deliveryAddress,
+      deliveryTime: 'NOW',
+    );
+  }
+
+  Future<void> _pickAndUploadProof({required bool insufficient, ImageSource source = ImageSource.gallery}) async {
+    final picker = ImagePicker();
+    final file = await picker.pickImage(source: source);
+    if (file == null) return;
+    final bytes = await file.readAsBytes();
+    final s = widget.state;
+    if (widget.draftCheckout && _placedOrder == null) {
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const Center(child: CircularProgressIndicator()),
+      );
+      final result = await s.submitOrder(clearCheckoutDraft: false);
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      if (result.error != null) {
+        appSnack(context, result.error!);
+        return;
+      }
+      final newOrder = result.order!;
+      final ok = await s.uploadPaymentProof(newOrder.id, file);
+      if (!mounted) return;
+      if (!ok) {
+        appSnack(context, 'Could not upload payment proof. Try again.');
+        return;
+      }
+      await s.clearCheckoutAfterSuccessfulOrderAndPayment();
+      setState(() {
+        _placedOrder = newOrder;
+        uploadedFile = file;
+        _localProofBytes = bytes;
+        localProofUploaded = true;
+      });
+      await s.loadOrders();
+      appSnack(context, 'Payment proof uploaded — your order is placed.');
+      return;
+    }
+    final oid = (_placedOrder ?? widget.order)!.id;
+    final ok = await s.uploadPaymentProof(oid, file);
+    if (!mounted) return;
+    if (!ok) {
+      appSnack(context, 'Upload failed. Try again.');
+      return;
+    }
+    setState(() {
+      uploadedFile = file;
+      _localProofBytes = bytes;
+      localProofUploaded = true;
+    });
+    appSnack(context, insufficient ? 'Balance payment proof uploaded' : 'Payment proof uploaded');
+  }
+
   Widget _paymentProofPreview(OrderData? synced) {
     if (_localProofBytes != null) {
+      final bytes = _localProofBytes!;
       return Padding(
         padding: const EdgeInsets.only(top: 10),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(10),
-          child: Image.memory(_localProofBytes!, height: 160, fit: BoxFit.contain),
+        child: InkWell(
+          onTap: () => showProofFullScreen(context, bytes, title: 'Payment proof'),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.memory(bytes, height: 160, fit: BoxFit.contain),
+          ),
         ),
       );
     }
@@ -2004,9 +4106,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
         final bytes = base64Decode(b64);
         return Padding(
           padding: const EdgeInsets.only(top: 10),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: Image.memory(Uint8List.fromList(bytes), height: 160, fit: BoxFit.contain),
+          child: InkWell(
+            onTap: () => showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Payment proof'),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: Image.memory(Uint8List.fromList(bytes), height: 160, fit: BoxFit.contain),
+            ),
           ),
         );
       } catch (_) {}
@@ -2021,9 +4126,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
       final bytes = base64Decode(b64);
       return Padding(
         padding: const EdgeInsets.only(top: 10),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(10),
-          child: Image.memory(Uint8List.fromList(bytes), height: 140, fit: BoxFit.contain),
+        child: InkWell(
+          onTap: () => showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof'),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.memory(Uint8List.fromList(bytes), height: 140, fit: BoxFit.contain),
+          ),
         ),
       );
     } catch (_) {
@@ -2038,9 +4146,10 @@ class _PaymentScreenState extends State<PaymentScreen> {
     return ListenableBuilder(
       listenable: s,
       builder: (context, _) {
+        final isDraft = widget.draftCheckout && _placedOrder == null;
         final synced = _syncedOrder(s);
-        final orderForUi = synced ?? widget.order;
-        final insufficient = orderForUi.status.toUpperCase().contains('INSUFFICIENT');
+        final orderForUi = isDraft ? _draftSnapshot(s) : (synced ?? _placedOrder ?? widget.order!);
+        final insufficient = !isDraft && orderForUi.status.toUpperCase().contains('INSUFFICIENT');
         final paidSoFar = orderForUi.cashierAmountReceived ?? 0;
         final remainder = (orderForUi.total - paidSoFar).clamp(0, double.infinity);
         final supplementalOk =
@@ -2059,7 +4168,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                 child: ListView(
                   padding: const EdgeInsets.all(12),
                   children: [
-                    _OrderNoCard(displayNo: orderForUi.orderNo),
+                    _OrderNoCard(displayNo: isDraft ? null : orderForUi.orderNo),
                     const SizedBox(height: 10),
                     if (insufficient) ...[
                       Card(
@@ -2102,7 +4211,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
                             height: 140,
                             width: double.infinity,
                             color: Colors.white,
-                            child: const Icon(Icons.qr_code_2, size: 80),
+                            alignment: Alignment.center,
+                            padding: const EdgeInsets.all(8),
+                            child: Image.asset(
+                              AppBrandAssets.qrCode,
+                              fit: BoxFit.contain,
+                            ),
                           ),
                           const SizedBox(height: 12),
                           Row(
@@ -2115,25 +4229,18 @@ class _PaymentScreenState extends State<PaymentScreen> {
                                 ),
                               ),
                               OutlinedButton(
-                                onPressed: () async {
-                                  final picker = ImagePicker();
-                                  final file = await picker.pickImage(source: ImageSource.gallery);
-                                  if (file == null) return;
-                                  final bytes = await file.readAsBytes();
-                                  await s.uploadPaymentProof(widget.order.id, file);
-                                  if (!mounted) return;
-                                  setState(() {
-                                    uploadedFile = file;
-                                    _localProofBytes = bytes;
-                                    localProofUploaded = true;
-                                  });
-                                  appSnack(context, insufficient ? 'Balance payment proof uploaded' : 'Payment proof uploaded');
-                                },
+                                onPressed: () => _pickAndUploadProof(insufficient: insufficient),
                                 child: Text(
                                   insufficient
                                       ? (proofDone ? 'CHANGE BALANCE PROOF' : 'UPLOAD BALANCE PROOF')
                                       : (uploadedFile == null && !proofDone ? 'UPLOAD' : 'CHANGE PHOTO'),
                                 ),
+                              ),
+                              const SizedBox(width: 8),
+                              OutlinedButton.icon(
+                                onPressed: () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
+                                icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                                label: const Text('CAMERA'),
                               ),
                             ],
                           ),
@@ -2144,12 +4251,19 @@ class _PaymentScreenState extends State<PaymentScreen> {
                               const Text('Original payment proof', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
                               Padding(
                                 padding: const EdgeInsets.only(top: 6),
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(10),
-                                  child: Image.memory(
-                                    Uint8List.fromList(base64Decode(synced!.paymentProofBase64!)),
-                                    height: 120,
-                                    fit: BoxFit.contain,
+                                child: InkWell(
+                                  onTap: () => showProofFullScreen(
+                                    context,
+                                    Uint8List.fromList(base64Decode(synced.paymentProofBase64!)),
+                                    title: 'Original payment proof',
+                                  ),
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(10),
+                                    child: Image.memory(
+                                      Uint8List.fromList(base64Decode(synced!.paymentProofBase64!)),
+                                      height: 120,
+                                      fit: BoxFit.contain,
+                                    ),
                                   ),
                                 ),
                               ),
@@ -2159,14 +4273,48 @@ class _PaymentScreenState extends State<PaymentScreen> {
                             if (_localProofBytes != null)
                               Padding(
                                 padding: const EdgeInsets.only(top: 6),
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(10),
-                                  child: Image.memory(_localProofBytes!, height: 160, fit: BoxFit.contain),
+                                child: InkWell(
+                                  onTap: () => showProofFullScreen(context, _localProofBytes!, title: 'Balance payment proof'),
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(10),
+                                    child: Image.memory(_localProofBytes!, height: 160, fit: BoxFit.contain),
+                                  ),
                                 ),
                               )
                             else
                               _supplementalProofPreview(synced),
                           ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    ToggleSection(
+                      title: 'YOUR TRAY',
+                      expanded: showTray,
+                      onToggle: () => setState(() => showTray = !showTray),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (isDraft)
+                            ...s.tray.map(
+                              (e) => ListTile(
+                                dense: true,
+                                title: Text(e.menu.name),
+                                subtitle: Text(e.dip.isEmpty ? '-' : e.dip),
+                                trailing: Text('x${e.qty}  ₱${(e.qty * e.menu.price).toStringAsFixed(2)}'),
+                              ),
+                            )
+                          else if (orderForUi.lines.isEmpty)
+                            const Text('No tray lines available.')
+                          else
+                            ...orderForUi.lines.map(
+                              (l) => ListTile(
+                                dense: true,
+                                title: Text(l.itemName),
+                                subtitle: Text(l.dip.isEmpty ? '-' : l.dip),
+                                trailing: Text('x${l.qty}  ₱${(l.qty * l.price).toStringAsFixed(2)}'),
+                              ),
+                            ),
                         ],
                       ),
                     ),
@@ -2200,11 +4348,15 @@ class _PaymentScreenState extends State<PaymentScreen> {
                   SummaryLine('TOTAL', '₱${orderForUi.total.toStringAsFixed(2)}', isTotal: true),
                 ],
                 secondaryLabel: 'BACK',
-                actionLabel: 'CONFIRM PAYMENT',
+                actionLabel: 'SUBMIT ORDER',
                 onSecondary: () => Navigator.of(context).pop(),
                 onAction: () {
                   final syncedNow = _syncedOrder(s);
-                  final ordNow = syncedNow ?? widget.order;
+                  final ordNow = syncedNow ?? _placedOrder ?? widget.order;
+                  if (ordNow == null || ordNow.id == 0) {
+                    appSnack(context, 'Upload proof of payment first.');
+                    return;
+                  }
                   final insNow = ordNow.status.toUpperCase().contains('INSUFFICIENT');
                   final ok = insNow
                       ? (((syncedNow?.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false) || localProofUploaded))
@@ -2215,11 +4367,24 @@ class _PaymentScreenState extends State<PaymentScreen> {
                     appSnack(context, insNow ? 'Upload balance payment proof before continuing.' : 'Upload proof of payment before continuing.');
                     return;
                   }
-                  Navigator.of(context).pushReplacement(
-                    MaterialPageRoute<void>(
-                      builder: (_) => OrderStatusScreen(state: s, order: ordNow, paymentUploaded: true),
+                  showDialog<bool>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('Submit order?'),
+                      content: const Text('Please confirm all details before submitting this order.'),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Back')),
+                        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Submit order')),
+                      ],
                     ),
-                  );
+                  ).then((okSubmit) {
+                    if (okSubmit != true || !context.mounted) return;
+                    Navigator.of(context).pushReplacement(
+                      MaterialPageRoute<void>(
+                        builder: (_) => OrderStatusScreen(state: s, order: ordNow, paymentUploaded: true),
+                      ),
+                    );
+                  });
                 },
               ),
             ],
@@ -2261,7 +4426,7 @@ class OrderStatusScreen extends StatelessWidget {
                   children: [
                     Text(order.orderNo, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
-                    Text('Status: ${order.status}'),
+                    Text('Status: ${statusReadable(order.status)}'),
                     Text('Total: ₱${order.total.toStringAsFixed(2)}'),
                     Text('Payment proof: ${paymentUploaded ? 'Received' : 'Not uploaded yet'}'),
                     if (track.isNotEmpty) ...[
@@ -2337,12 +4502,69 @@ class MyOrdersScreen extends StatefulWidget {
 }
 
 class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProviderStateMixin {
+  bool _isInsufficient(OrderData o) => o.status.toUpperCase().contains('INSUFFICIENT');
+  bool _needsAttention(OrderData o) => widget.state.orderNosWithUnreadAttention.contains(o.orderNo);
+  bool _canFollowUp(OrderData o) {
+    final u = o.status.toUpperCase();
+    if (u.contains('PAYMENT INSUFFICIENT') || u.contains('INSUFFICIENT')) return false;
+    // Follow-up only when cashier confirmation is still needed (after the user paid the remainder).
+    return u.contains('WAITING FOR PAYMENT CONFIRMATION') || u.contains('WAITING FOR ORDER CONFIRMATION');
+  }
+
+  bool _canCustomerCancelOrder(OrderData o) {
+    if (customerOrderCancelled(o) || orderLooksCompleted(o)) return false;
+    final u = o.status.toUpperCase();
+    return u.contains('WAITING FOR PAYMENT') ||
+        u.contains('WAITING FOR ORDER') ||
+        u.contains('INSUFFICIENT');
+  }
+
+  Future<void> _confirmCancelOrder(OrderData o) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Cancel this order?'),
+        content: Text('Cancel ${o.orderNo}? It will appear under Cancelled orders.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes, cancel')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final err = await widget.state.cancelOrderAsCustomer(orderId: o.id);
+    if (!mounted) return;
+    appSnack(context, err ?? 'Order cancelled');
+  }
+  Color _fulfillmentStageColor(String stage) {
+    switch (stage.toUpperCase()) {
+      case 'OUT_FOR_DELIVERY':
+        return Colors.orange.shade800;
+      case 'IN_PREPARATION':
+        return Colors.blue.shade700;
+      case 'DELIVERED':
+        return Colors.green.shade700;
+      default:
+        return Colors.grey.shade700;
+    }
+  }
+  Future<void> _followUpOrder(OrderData o) async {
+    final err = await widget.state.submitHelpRequest(
+      area: 'Order Follow-up',
+      problem: 'Follow-up on pending order ${o.orderNo}',
+      desiredOutcome: 'Please update this order status or next action.',
+    );
+    if (!mounted) return;
+    appSnack(context, err ?? 'Follow-up sent');
+  }
+
   late TabController _tab;
+  String _search = '';
 
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 3, vsync: this);
+    _tab = TabController(length: 4, vsync: this);
   }
 
   @override
@@ -2355,11 +4577,20 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
     final all = widget.state.orders;
     switch (tabIndex) {
       case 0:
-        return all.where(customerOrderPendingTab).toList();
+        final pending = all.where(customerOrderPendingTab).toList();
+        pending.sort((a, b) {
+          final ai = (_isInsufficient(a) || _needsAttention(a)) ? 0 : 1;
+          final bi = (_isInsufficient(b) || _needsAttention(b)) ? 0 : 1;
+          if (ai != bi) return ai - bi;
+          return b.createdAt.compareTo(a.createdAt);
+        });
+        return pending;
       case 1:
         return all.where(customerOrderConfirmedTab).toList();
       case 2:
         return all.where(orderLooksCompleted).toList();
+      case 3:
+        return all.where(customerOrderCancelled).toList();
       default:
         return [];
     }
@@ -2382,7 +4613,13 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
   }
 
   Widget _tabBody(int tabIndex) {
-    final filtered = _ordersForTab(tabIndex);
+    final query = _search.trim().toLowerCase();
+    final filtered = _ordersForTab(tabIndex).where((o) {
+      if (query.isEmpty) return true;
+      return o.orderNo.toLowerCase().contains(query) ||
+          statusReadable(o.status).toLowerCase().contains(query) ||
+          fulfillmentStageReadable(o.fulfillmentStage).toLowerCase().contains(query);
+    }).toList();
     return RefreshIndicator(
       onRefresh: widget.state.loadOrders,
       child: filtered.isEmpty
@@ -2397,18 +4634,82 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
               itemCount: filtered.length,
               itemBuilder: (context, index) {
                 final o = filtered[index];
-                return Card(
-                  margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  child: ListTile(
-                    leading: _paymentThumb(o),
-                    title: Text(o.orderNo),
-                    subtitle: Text(
-                      tabIndex == 1
-                          ? '${fulfillmentStageReadable(o.fulfillmentStage)}\n${o.status}\n${o.createdAt.toLocal()}'
-                          : '${o.status}\n${o.createdAt.toLocal()}',
+                final alert = tabIndex == 0 && (_isInsufficient(o) || _needsAttention(o));
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Card(
+                        color: alert ? Colors.red.shade50 : null,
+                        child: ListTile(
+                          dense: true,
+                          visualDensity: VisualDensity.compact,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                          minVerticalPadding: 0,
+                          leading: _paymentThumb(o),
+                          title: Text(o.orderNo),
+                    subtitle: Text.rich(
+                      TextSpan(
+                        style: DefaultTextStyle.of(context).style.copyWith(height: 1.2, fontSize: 12.5),
+                        children: [
+                          TextSpan(
+                            text: '${fulfillmentStageReadable(o.fulfillmentStage)}\n',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w800,
+                              color: _fulfillmentStageColor(o.fulfillmentStage),
+                              height: 1.2,
+                            ),
+                          ),
+                          TextSpan(text: '${statusReadable(o.status)}'),
+                          if (o.loyaltyPointsEarned > 0 && tabIndex == 1)
+                            TextSpan(text: '\nLoyalty: +${o.loyaltyPointsEarned} pts'),
+                          TextSpan(text: '\n${o.createdAt.toLocal()}'),
+                        ],
+                      ),
                     ),
-                    isThreeLine: true,
-                    trailing: Text('₱${o.total.toStringAsFixed(2)}'),
+                    isThreeLine: false,
+                    trailing: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 200, minHeight: 0),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              '₱${o.total.toStringAsFixed(2)}',
+                              textAlign: TextAlign.end,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5),
+                            ),
+                          ),
+                          if (tabIndex == 0 && _canFollowUp(o)) ...[
+                            const SizedBox(width: 2),
+                            IconButton(
+                              tooltip: 'Follow up',
+                              padding: EdgeInsets.zero,
+                              visualDensity: VisualDensity.compact,
+                              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                              icon: const Icon(Icons.reply_outlined, size: 18),
+                              onPressed: () => _followUpOrder(o),
+                            ),
+                          ],
+                          if (tabIndex == 0 && _canCustomerCancelOrder(o)) ...[
+                            const SizedBox(width: 2),
+                            IconButton(
+                              tooltip: 'Cancel order',
+                              padding: EdgeInsets.zero,
+                              visualDensity: VisualDensity.compact,
+                              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                              icon: Icon(Icons.cancel_outlined, size: 18, color: Colors.red.shade800),
+                              onPressed: () => _confirmCancelOrder(o),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
                     onTap: () {
                       showDialog<void>(
                         context: context,
@@ -2420,8 +4721,10 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 _detailLine('Order no.', o.orderNo),
-                                _detailLine('Status', o.status),
+                                _detailLine('Status', statusReadable(o.status)),
                                 _detailLine('Fulfillment stage', fulfillmentStageReadable(o.fulfillmentStage)),
+                                if (o.loyaltyPointsEarned > 0)
+                                  _detailLine('Loyalty points from this order', '+${o.loyaltyPointsEarned} pts'),
                                 _detailLine('Placed', o.createdAt.toLocal().toString()),
                                 _detailLine('Account email', o.userEmail ?? '—'),
                                 const Divider(height: 24),
@@ -2507,6 +4810,19 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                         ),
                       );
                     },
+                        ),
+                      ),
+                      if (alert)
+                        Positioned(
+                          right: 18,
+                          top: 10,
+                          child: Container(
+                            width: 12,
+                            height: 12,
+                            decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                          ),
+                        ),
+                    ],
                   ),
                 );
               },
@@ -2542,10 +4858,14 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
   List<Widget> _buildProofPreview(String b64) {
     try {
       final bytes = base64Decode(b64.trim());
+      final asList = Uint8List.fromList(bytes);
       return [
-        ClipRRect(
-          borderRadius: BorderRadius.circular(10),
-          child: Image.memory(Uint8List.fromList(bytes), height: 220, fit: BoxFit.contain),
+        InkWell(
+          onTap: () => showProofFullScreen(context, asList),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.memory(asList, height: 220, fit: BoxFit.contain),
+          ),
         ),
       ];
     } catch (_) {
@@ -2568,36 +4888,61 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
     );
   }
 
+  bool _pendingTabHasUnreadAttention() {
+    final pendingNos = widget.state.orders.where(customerOrderPendingTab).map((e) => e.orderNo).toSet();
+    return widget.state.orderNosWithUnreadAttention.any((id) => pendingNos.contains(id));
+  }
+
   @override
   Widget build(BuildContext context) {
-    return AppScaffold(
-      state: widget.state,
-      title: 'MY ORDERS',
-      body: Column(
-        children: [
-          Material(
-            color: Colors.white,
-            child: TabBar(
-              controller: _tab,
-              isScrollable: true,
-              labelColor: AppColors.ink,
-              unselectedLabelColor: Colors.grey.shade700,
-              indicatorColor: AppColors.brand,
-              tabs: const [
-                Tab(text: 'Pending Confirmation'),
-                Tab(text: 'Confirmed Orders'),
-                Tab(text: 'Completed'),
-              ],
-            ),
+    return AnimatedBuilder(
+      animation: widget.state,
+      builder: (context, _) {
+        return AppScaffold(
+          state: widget.state,
+          title: 'MY ORDERS',
+          body: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: TextField(
+                  decoration: const InputDecoration(hintText: 'SEARCH ORDER NO OR STATUS'),
+                  onChanged: (v) => setState(() => _search = v),
+                ),
+              ),
+              Material(
+                color: Colors.white,
+                child: TabBar(
+                  controller: _tab,
+                  isScrollable: true,
+                  labelColor: AppColors.ink,
+                  unselectedLabelColor: Colors.grey.shade700,
+                  indicatorColor: AppColors.brand,
+                  tabs: [
+                    Tab(
+                      child: Badge(
+                        isLabelVisible: _pendingTabHasUnreadAttention(),
+                        backgroundColor: Colors.red,
+                        smallSize: 10,
+                        child: const Text('Pending Confirmation'),
+                      ),
+                    ),
+                    const Tab(text: 'Confirmed Orders'),
+                    const Tab(text: 'Completed'),
+                    const Tab(text: 'Cancelled'),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: TabBarView(
+                  controller: _tab,
+                  children: [_tabBody(0), _tabBody(1), _tabBody(2), _tabBody(3)],
+                ),
+              ),
+            ],
           ),
-          Expanded(
-            child: TabBarView(
-              controller: _tab,
-              children: [_tabBody(0), _tabBody(1), _tabBody(2)],
-            ),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -2617,6 +4962,8 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
   late bool deliveryMapConfirmedLocal;
   double? mapLat;
   double? mapLng;
+  late List<String> _savedAddresses;
+  final TextEditingController _newAddressManual = TextEditingController();
 
   @override
   void initState() {
@@ -2628,6 +4975,20 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
     deliveryMapConfirmedLocal = p.deliveryMapConfirmed;
     mapLat = p.deliveryLat;
     mapLng = p.deliveryLng;
+    _savedAddresses = List<String>.from(p.deliveryAddresses);
+    final primary = p.deliveryAddress.trim();
+    if (primary.isNotEmpty && !_savedAddresses.contains(primary)) {
+      _savedAddresses.insert(0, primary);
+    }
+  }
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    contactController.dispose();
+    addressController.dispose();
+    _newAddressManual.dispose();
+    super.dispose();
   }
 
   Future<void> _openMapsDialog() async {
@@ -2647,6 +5008,9 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
         mapLat = r.lat;
         mapLng = r.lng;
         deliveryMapConfirmedLocal = true;
+        if (r.address.trim().isNotEmpty && !_savedAddresses.contains(r.address.trim())) {
+          _savedAddresses.add(r.address.trim());
+        }
       });
       appSnack(context, 'Location pinned. Save your profile to keep coordinates and address.');
     }
@@ -2670,17 +5034,63 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                   const SizedBox(height: 10),
                   TextField(
                     controller: addressController,
-                    decoration: const InputDecoration(labelText: 'Delivery Address'),
+                    decoration: const InputDecoration(
+                      labelText: 'Primary delivery address',
+                      hintText: 'Street, building, landmarks…',
+                    ),
                     minLines: 2,
                     maxLines: 4,
                   ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _newAddressManual,
+                    decoration: const InputDecoration(
+                      labelText: 'Add another address (manual)',
+                      hintText: 'Type an address, then tap Add',
+                    ),
+                    minLines: 1,
+                    maxLines: 3,
+                  ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: () {
+                        final v = _newAddressManual.text.trim();
+                        if (v.isEmpty) return;
+                        setState(() {
+                          if (!_savedAddresses.contains(v)) _savedAddresses.add(v);
+                          _newAddressManual.clear();
+                        });
+                      },
+                      icon: const Icon(Icons.add_location_alt_outlined),
+                      label: const Text('Add to saved addresses'),
+                    ),
+                  ),
+                  if (_savedAddresses.isNotEmpty) ...[
+                    const Text('Saved addresses', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 6),
+                    ..._savedAddresses.map(
+                      (a) => Card(
+                        margin: const EdgeInsets.only(bottom: 6),
+                        child: ListTile(
+                          dense: true,
+                          title: Text(a, maxLines: 3),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.close, size: 20),
+                            onPressed: () => setState(() => _savedAddresses.remove(a)),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 12),
                   SizedBox(
                     width: double.infinity,
                     child: FilledButton.tonalIcon(
                       onPressed: _openMapsDialog,
                       icon: const Icon(Icons.map_outlined),
-                      label: const Text('OPEN MAP TO PIN LOCATION'),
+                      label: const Text('OPEN MAP TO PIN / SEARCH LOCATION'),
                       style: FilledButton.styleFrom(
                         padding: const EdgeInsets.symmetric(vertical: 14),
                         foregroundColor: AppColors.ink,
@@ -2692,8 +5102,8 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                     'Tap the map to drop a pin. We resolve the street address using OpenStreetMap (same coordinates you can verify in Google Maps).',
                     style: TextStyle(fontSize: 12, color: Colors.grey.shade800),
                   ),
+                  const SizedBox(height: 16),
                   if (mapLat != null && mapLng != null) ...[
-                    const SizedBox(height: 16),
                     const Text('Map preview', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
                     const SizedBox(height: 8),
                     SizedBox(
@@ -2726,20 +5136,115 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                         ),
                       ),
                     ),
+                    const SizedBox(height: 16),
                   ],
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'Loyalty (restaurant orders)',
+                                style: TextStyle(fontWeight: FontWeight.w800),
+                              ),
+                            ),
+                            Text(
+                              '${widget.state.profile.loyaltyPointsRestaurant} pts',
+                              style: const TextStyle(fontWeight: FontWeight.w900),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'Loyalty (catering / events)',
+                                style: TextStyle(fontWeight: FontWeight.w800),
+                              ),
+                            ),
+                            Text(
+                              '${widget.state.profile.loyaltyPointsCatering} pts',
+                              style: const TextStyle(fontWeight: FontWeight.w900),
+                            ),
+                          ],
+                        ),
+                        const Divider(height: 16),
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'Total Loyalty Points',
+                                style: TextStyle(fontWeight: FontWeight.w800),
+                              ),
+                            ),
+                            Text(
+                              '${widget.state.profile.loyaltyPoints} pts',
+                              style: const TextStyle(fontWeight: FontWeight.w900),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          height: 140,
+                          child: widget.state.loyaltyHistory.isEmpty
+                              ? const Align(
+                                  alignment: Alignment.topLeft,
+                                  child: Text('No loyalty history yet.'),
+                                )
+                              : ListView.separated(
+                                  padding: EdgeInsets.zero,
+                                  shrinkWrap: true,
+                                  itemCount: widget.state.loyaltyHistory.length,
+                                  separatorBuilder: (_, _) => const SizedBox(height: 10),
+                                  itemBuilder: (context, index) {
+                                    final h = widget.state.loyaltyHistory[index];
+                                    final label = h.orderNo.trim().isEmpty ? '******' : h.orderNo.trim();
+                                    final src = h.source == 'catering' ? 'Catering' : 'Restaurant';
+                                    return Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          '$label · $src · +${h.pointsDelta} pts',
+                                          style: const TextStyle(fontWeight: FontWeight.w700),
+                                        ),
+                                        Text(formatDateTimeLocal(h.createdAt)),
+                                      ],
+                                    );
+                                  },
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ],
               ),
             ),
             FilledButton(
               onPressed: () async {
+                final primary = addressController.text.trim();
+                final merged = <String>{..._savedAddresses};
+                if (primary.isNotEmpty) merged.add(primary);
                 await widget.state.saveProfile(
                   ProfileData(
                     fullName: nameController.text.trim(),
                     contactNumber: contactController.text.trim(),
-                    deliveryAddress: addressController.text.trim(),
+                    deliveryAddress: primary,
                     deliveryMapConfirmed: deliveryMapConfirmedLocal,
                     deliveryLat: mapLat,
                     deliveryLng: mapLng,
+                    loyaltyPoints: widget.state.profile.loyaltyPoints,
+                    loyaltyPointsRestaurant: widget.state.profile.loyaltyPointsRestaurant,
+                    loyaltyPointsCatering: widget.state.profile.loyaltyPointsCatering,
+                    deliveryAddresses: merged.toList(),
                   ),
                 );
                 if (!context.mounted) return;
@@ -2778,6 +5283,7 @@ class _MapPinPickerDialog extends StatefulWidget {
 
 class _MapPinPickerDialogState extends State<_MapPinPickerDialog> {
   late final MapController _mapController;
+  late final TextEditingController _searchCtl;
   late LatLng _pin;
   String _resolvedAddress = '';
   bool _busy = false;
@@ -2785,6 +5291,7 @@ class _MapPinPickerDialogState extends State<_MapPinPickerDialog> {
   @override
   void initState() {
     super.initState();
+    _searchCtl = TextEditingController(text: widget.initialSearchQuery);
     _mapController = MapController();
     _pin = LatLng(
       widget.initialLat ?? 14.5995,
@@ -2794,6 +5301,36 @@ class _MapPinPickerDialogState extends State<_MapPinPickerDialog> {
       await _centerFromSearchOrPin();
       await _reverse(_pin);
     });
+  }
+
+  Future<void> _searchTypedQuery() async {
+    final q = _searchCtl.text.trim();
+    if (q.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final uri = Uri.parse(
+        'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=1',
+      );
+      final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+      if (res.statusCode == 200) {
+        final list = jsonDecode(res.body) as List<dynamic>;
+        if (list.isNotEmpty) {
+          final m = list.first as Map<String, dynamic>;
+          final lat = jsonToDouble(m['lat']);
+          final lon = jsonToDouble(m['lon']);
+          final ll = LatLng(lat, lon);
+          if (mounted) setState(() => _pin = ll);
+          _mapController.move(ll, 16);
+          await _reverse(ll);
+          return;
+        }
+      }
+      if (mounted) appSnack(context, 'No results — try a nearby landmark or street.');
+    } catch (_) {
+      if (mounted) appSnack(context, 'Search failed — try again.');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _centerFromSearchOrPin() async {
@@ -2890,6 +5427,7 @@ class _MapPinPickerDialogState extends State<_MapPinPickerDialog> {
 
   @override
   void dispose() {
+    _searchCtl.dispose();
     _mapController.dispose();
     super.dispose();
   }
@@ -2908,6 +5446,31 @@ class _MapPinPickerDialogState extends State<_MapPinPickerDialog> {
               const Text(
                 'Tap the map where you want delivery. Address updates use OpenStreetMap data (coordinates match what you see in other map apps).',
                 style: TextStyle(height: 1.35, fontSize: 13),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _searchCtl,
+                      decoration: const InputDecoration(
+                        labelText: 'Search place or address',
+                        hintText: 'Barangay, street, landmark…',
+                      ),
+                      onSubmitted: (_) => _searchTypedQuery(),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    style: IconButton.styleFrom(
+                      backgroundColor: Theme.of(context).colorScheme.secondaryContainer,
+                      foregroundColor: Theme.of(context).colorScheme.onSecondaryContainer,
+                    ),
+                    onPressed: _busy ? null : _searchTypedQuery,
+                    icon: const Icon(Icons.search),
+                  ),
+                ],
               ),
               const SizedBox(height: 10),
               OutlinedButton.icon(
@@ -3009,28 +5572,32 @@ class InquiryScreen extends StatefulWidget {
 }
 
 class _InquiryScreenState extends State<InquiryScreen> {
-  static const List<String> _eventTypeChoices = ['Wedding', 'Corporate', 'Birthday', 'Debut', 'Seminar', 'Other'];
-
   String inquiryType = 'CATERING';
   bool curateOwn = false;
+  String menuSuggestionNote = '';
+  String themeSuggestionNote = '';
+  final themeNotesController = TextEditingController();
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
-  String menuSuggestionNote = '';
-  String themeSuggestionNote = '';
   final eventTitle = TextEditingController();
   final eventTypeOther = TextEditingController();
-  String eventTypeChoice = 'Wedding';
+  String eventTypeChoice = 'Birthday';
   final contactPerson = TextEditingController();
   final contactNumber = TextEditingController();
   final inquiryEmail = TextEditingController();
   final List<_InquiryEventWindow> _eventWindows = [_InquiryEventWindow()];
+  Timer? _scheduleConflictDebounce;
+  int _publicScheduleConflictCount = 0;
   final eventCity = TextEditingController();
   final note = TextEditingController();
   String eventSetting = 'open';
   String serviceIncluded = 'no';
   String formalityLevel = 'casual';
   bool foodTastingRequested = false;
+  final foodTastingDate = TextEditingController();
+  final foodTastingTime = TextEditingController();
+  final menuSearchController = TextEditingController();
 
   @override
   void initState() {
@@ -3039,10 +5606,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
     contactPerson.text = p.fullName;
     contactNumber.text = p.contactNumber;
     inquiryEmail.text = widget.state.userEmail ?? '';
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleConflictRefresh());
   }
 
   @override
   void dispose() {
+    _scheduleConflictDebounce?.cancel();
     guestCount.dispose();
     eventTitle.dispose();
     eventTypeOther.dispose();
@@ -3051,6 +5620,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
     inquiryEmail.dispose();
     eventCity.dispose();
     note.dispose();
+    foodTastingDate.dispose();
+    foodTastingTime.dispose();
+    menuSearchController.dispose();
+    themeNotesController.dispose();
     super.dispose();
   }
 
@@ -3091,6 +5664,44 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return parts.join('; ');
   }
 
+  String _scheduleSlotsJsonForSubmit() {
+    final slots = <Map<String, String>>[];
+    for (final w in _eventWindows) {
+      if (w.date == null || w.from == null || w.to == null) continue;
+      final d = w.date!;
+      final dateStr = '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+      final f =
+          '${w.from!.hour.toString().padLeft(2, '0')}:${w.from!.minute.toString().padLeft(2, '0')}';
+      final t = '${w.to!.hour.toString().padLeft(2, '0')}:${w.to!.minute.toString().padLeft(2, '0')}';
+      slots.add({'date': dateStr, 'from': f, 'to': t, 'label': '$dateStr from $f to $t'});
+    }
+    return jsonEncode(slots);
+  }
+
+  void _scheduleConflictRefresh() {
+    _scheduleConflictDebounce?.cancel();
+    _scheduleConflictDebounce = Timer(const Duration(milliseconds: 450), () async {
+      final slots = <Map<String, String>>[];
+      for (final w in _eventWindows) {
+        if (w.date == null || w.from == null || w.to == null) continue;
+        final d = w.date!;
+        final dateStr = '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+        slots.add({
+          'date': dateStr,
+          'from': '${w.from!.hour.toString().padLeft(2, '0')}:${w.from!.minute.toString().padLeft(2, '0')}',
+          'to': '${w.to!.hour.toString().padLeft(2, '0')}:${w.to!.minute.toString().padLeft(2, '0')}',
+        });
+      }
+      if (!mounted) return;
+      if (slots.isEmpty) {
+        setState(() => _publicScheduleConflictCount = 0);
+        return;
+      }
+      final n = await widget.state.countCateringScheduleConflicts(slots);
+      if (mounted) setState(() => _publicScheduleConflictCount = n);
+    });
+  }
+
   Future<void> _pickWindowDate(int index) async {
     final ctx = context;
     final w = _eventWindows[index];
@@ -3103,6 +5714,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     );
     if (!ctx.mounted || d == null) return;
     setState(() => _eventWindows[index].date = DateTime(d.year, d.month, d.day));
+    _scheduleConflictRefresh();
   }
 
   Future<void> _pickWindowFrom(int index) async {
@@ -3114,6 +5726,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     );
     if (!ctx.mounted || t == null) return;
     setState(() => _eventWindows[index].from = t);
+    _scheduleConflictRefresh();
   }
 
   Future<void> _pickWindowTo(int index) async {
@@ -3125,6 +5738,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     );
     if (!ctx.mounted || t == null) return;
     setState(() => _eventWindows[index].to = t);
+    _scheduleConflictRefresh();
   }
 
   double _estimatedCost() => _billableGuestCountForPricing() * kPesosPerPax;
@@ -3152,17 +5766,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
       final em = w.to!.hour * 60 + w.to!.minute;
       if (em <= sm) return 'End time must be after start time for each event.';
     }
-    final s = widget.state;
-    if (curateOwn) {
-      if (selectedDishes.isEmpty) return 'Select at least one dish for your curated menu.';
-    } else {
-      if (s.setMenus.isNotEmpty && selectedSetMenu == 'All Dishes') {
-        return 'Choose a set menu, or tap YES! to curate your own dishes.';
-      }
-    }
+    if (curateOwn && selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
     if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
     if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
       return 'Describe the event type for “Other”.';
+    }
+    if (foodTastingRequested &&
+        (foodTastingDate.text.trim().isEmpty || foodTastingTime.text.trim().isEmpty)) {
+      return 'Enter date and time for food tasting.';
     }
     final rawGuests = guestCount.text.trim();
     if (rawGuests.isEmpty) return 'Enter number of guests.';
@@ -3178,9 +5789,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         DropdownButtonFormField<String>(
-          value: _eventTypeChoices.contains(eventTypeChoice) ? eventTypeChoice : 'Other',
+          value: kMobileEventTypeChoices.contains(eventTypeChoice) ? eventTypeChoice : 'Other',
           decoration: const InputDecoration(labelText: 'Event type'),
-          items: _eventTypeChoices.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+          items: kMobileEventTypeChoices.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
           onChanged: (v) => setState(() => eventTypeChoice = v ?? 'Other'),
         ),
         if (eventTypeChoice == 'Other') ...[
@@ -3201,14 +5812,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
     final cateringMenu = state.menu.where((m) => m.isCateringDish).toList();
     final setMenuNames = ['All Dishes', ...state.setMenus.map((m) => m.name)];
     final effectiveSetMenu = setMenuNames.contains(selectedSetMenu) ? selectedSetMenu : 'All Dishes';
-    List<String> availableDishes;
-    if (effectiveSetMenu == 'All Dishes') {
-      availableDishes = cateringMenu.map((m) => m.name).toList();
-    } else {
-      final matches = state.setMenus.where((m) => m.name == effectiveSetMenu).toList();
-      final raw = matches.isEmpty ? <String>[] : matches.first.dishes;
-      availableDishes = raw.where((n) => cateringMenu.any((c) => c.name == n)).toList();
-    }
+    final q = menuSearchController.text.trim().toLowerCase();
+    final availableDishes = cateringMenu
+        .map((m) => m.name.trim())
+        .where((n) => n.isNotEmpty)
+        .toSet()
+        .where((n) => q.isEmpty || n.toLowerCase().contains(q))
+        .toList();
     final estimate = _estimatedCost();
     return AppScaffold(
       state: state,
@@ -3245,9 +5855,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
+                      TextField(controller: eventTitle, decoration: const InputDecoration(labelText: 'Event title')),
+                      const SizedBox(height: 8),
                       if (inquiryType == 'CATERING AND EVENT') ...[
-                        TextField(controller: eventTitle, decoration: const InputDecoration(labelText: 'Event title')),
-                        const SizedBox(height: 8),
                         _buildEventTypePicker(),
                         const SizedBox(height: 8),
                         Text('Formality level', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
@@ -3297,9 +5907,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                   if (_eventWindows.length > 1)
                                     IconButton(
                                       icon: const Icon(Icons.remove_circle_outline, color: AppColors.accent),
-                                      onPressed: () => setState(() {
-                                        if (_eventWindows.length > 1) _eventWindows.removeAt(index);
-                                      }),
+                                      onPressed: () {
+                                        setState(() {
+                                          if (_eventWindows.length > 1) _eventWindows.removeAt(index);
+                                        });
+                                        _scheduleConflictRefresh();
+                                      },
                                     ),
                                 ],
                               ),
@@ -3328,11 +5941,22 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       Align(
                         alignment: Alignment.centerLeft,
                         child: TextButton.icon(
-                          onPressed: () => setState(() => _eventWindows.add(_InquiryEventWindow())),
+                          onPressed: () {
+                            setState(() => _eventWindows.add(_InquiryEventWindow()));
+                            _scheduleConflictRefresh();
+                          },
                           icon: const Icon(Icons.add),
                           label: const Text('Add another day'),
                         ),
                       ),
+                      if (_publicScheduleConflictCount > 0)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            'This date/time conflicts with an event already in For Processing.',
+                            style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700, fontSize: 13),
+                          ),
+                        ),
                       const SizedBox(height: 8),
                       TextField(controller: eventCity, decoration: const InputDecoration(labelText: 'City of event')),
                       const SizedBox(height: 8),
@@ -3400,6 +6024,71 @@ class _InquiryScreenState extends State<InquiryScreen> {
                     ],
                   ),
                 ),
+                if (inquiryType == 'CATERING AND EVENT') ...[
+                  const SizedBox(height: 10),
+                  ToggleSection(
+                    title: 'EVENT THEME DESIGN',
+                    expanded: true,
+                    onToggle: () {},
+                    hideToggleIcon: true,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text('DO YOU ALREADY HAVE A THEME DIRECTION IN MIND?'),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: OutlinedButton(
+                                onPressed: () => setState(() {
+                                  themeSuggestionNote = '';
+                                }),
+                                child: const Text('YES, I HAVE A THEME'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: OutlinedButton(
+                                onPressed: () => setState(() {
+                                  themeSuggestionNote = 'No, please suggest a theme style for this event.';
+                                }),
+                                child: const Text('NO, SUGGEST A THEME'),
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (themeSuggestionNote.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          Text(themeSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
+                        ],
+                        const SizedBox(height: 10),
+                        const Text(
+                          'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
+                          style: TextStyle(height: 1.35),
+                        ),
+                        const SizedBox(height: 10),
+                        const Text(
+                          'You may attach inspiration links or filenames later with your coordinator; photos of the venue (indoor/outdoor, ceiling height) help us propose realistic installs.',
+                          style: TextStyle(height: 1.35),
+                        ),
+                        const SizedBox(height: 10),
+                        const Text(
+                          'If you already have hired stylists or florists, note their contact windows here so we can align catering service timing with their setup and strike.',
+                          style: TextStyle(height: 1.35),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: themeNotesController,
+                          maxLines: 4,
+                          decoration: const InputDecoration(
+                            labelText: 'Theme / styling notes',
+                            hintText: 'Palette, decor, lighting, florals, signage, layout ideas (no cost field)',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 10),
                 ToggleSection(
                   title: 'MENU',
@@ -3420,19 +6109,18 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                 selectedSetMenu = 'All Dishes';
                                 selectedDishes.clear();
                               }),
-                              child: const Text('YES!'),
+                              child: const Text('YES, CURATE MY OWN MENU'),
                             ),
                           ),
                           const SizedBox(width: 10),
                           Expanded(
-                            flex: 2,
                             child: OutlinedButton(
                               onPressed: () => setState(() {
                                 curateOwn = false;
                                 selectedDishes.clear();
                                 menuSuggestionNote = 'No, suggest me a menu instead.';
                               }),
-                              child: const Text('NO, SUGGEST ME A MENU INSTEAD', textAlign: TextAlign.center),
+                              child: const Text('NO, SUGGEST A MENU'),
                             ),
                           ),
                         ],
@@ -3441,140 +6129,165 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         const SizedBox(height: 8),
                         Text(menuSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
                       ],
-                      CheckboxListTile(
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Request food tasting'),
-                        value: foodTastingRequested,
-                        onChanged: (v) => setState(() => foodTastingRequested = v ?? false),
-                      ),
                       if (curateOwn) ...[
+                        CheckboxListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('With food tasting'),
+                          value: foodTastingRequested,
+                          onChanged: (v) => setState(() => foodTastingRequested = v ?? false),
+                        ),
+                        if (foodTastingRequested) ...[
+                          const Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text('Food Tasting Schedule', style: TextStyle(fontWeight: FontWeight.w700)),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: TextField(
+                                  controller: foodTastingDate,
+                                  readOnly: true,
+                                  decoration: const InputDecoration(hintText: 'date'),
+                                  onTap: () async {
+                                    final d = await showDatePicker(
+                                      context: context,
+                                      initialDate: DateTime.now(),
+                                      firstDate: DateTime.now().subtract(const Duration(days: 1)),
+                                      lastDate: DateTime.now().add(const Duration(days: 365 * 2)),
+                                    );
+                                    if (d == null) return;
+                                    setState(() {
+                                      foodTastingDate.text =
+                                          '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+                                    });
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: TextField(
+                                  controller: foodTastingTime,
+                                  readOnly: true,
+                                  decoration: const InputDecoration(hintText: 'time'),
+                                  onTap: () async {
+                                    final t = await showTimePicker(context: context, initialTime: const TimeOfDay(hour: 13, minute: 0));
+                                    if (t == null) return;
+                                    setState(() {
+                                      foodTastingTime.text =
+                                          '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+                                    });
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                         const SizedBox(height: 10),
+                        TextField(
+                          controller: menuSearchController,
+                          decoration: const InputDecoration(labelText: 'Search dishes', prefixIcon: Icon(Icons.search)),
+                          onChanged: (_) => setState(() {}),
+                        ),
+                        const SizedBox(height: 8),
                         DropdownButtonFormField<String>(
                           value: effectiveSetMenu,
-                          items: setMenuNames
-                              .map((name) => DropdownMenuItem(value: name, child: Text(name)))
-                              .toList(),
+                          items: setMenuNames.map((name) => DropdownMenuItem(value: name, child: Text(name))).toList(),
                           onChanged: (v) {
                             final next = v ?? 'All Dishes';
                             setState(() {
+                              final prev = selectedSetMenu;
+                              if (prev != next && prev != 'All Dishes') {
+                                final prevRows = state.setMenus.where((m) => m.name == prev).toList();
+                                if (prevRows.isNotEmpty) {
+                                  for (final d in prevRows.first.dishes) {
+                                    selectedDishes.remove(d);
+                                  }
+                                }
+                              }
                               selectedSetMenu = next;
-                              selectedDishes.clear();
                               if (next != 'All Dishes') {
                                 final rows = state.setMenus.where((m) => m.name == next).toList();
-                                if (rows.isNotEmpty) {
-                                  selectedDishes.addAll(rows.first.dishes);
-                                }
+                                if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
                               }
                             });
                           },
                         ),
                         const SizedBox(height: 8),
-                        ...availableDishes.map((dishName) {
-                          MenuItemData? dish;
-                          for (final c in cateringMenu) {
-                            if (c.name == dishName) {
-                              dish = c;
-                              break;
-                            }
-                          }
-                          final sel = selectedDishes.contains(dishName);
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 6),
-                            child: Material(
-                              color: sel ? AppColors.brand.withOpacity(0.35) : Colors.grey.shade100,
-                              borderRadius: BorderRadius.circular(10),
-                              child: InkWell(
-                                borderRadius: BorderRadius.circular(10),
-                                onTap: () => setState(() {
-                                  if (sel) {
-                                    selectedDishes.remove(dishName);
-                                  } else {
-                                    selectedDishes.add(dishName);
+                        LayoutBuilder(
+                          builder: (context, _) {
+                            final sorted = availableDishes.toList()
+                              ..sort((a, b) {
+                                final sa = selectedDishes.contains(a) ? 0 : 1;
+                                final sb = selectedDishes.contains(b) ? 0 : 1;
+                                if (sa != sb) return sa - sb;
+                                return a.toLowerCase().compareTo(b.toLowerCase());
+                              });
+                            final maxH = (MediaQuery.sizeOf(context).height * 0.38).clamp(220.0, 420.0);
+                            return SizedBox(
+                              height: maxH,
+                              child: ListView(
+                                shrinkWrap: false,
+                                children: sorted.map((dishName) {
+                                  MenuItemData? dish;
+                                  for (final c in cateringMenu) {
+                                    if (c.name == dishName) {
+                                      dish = c;
+                                      break;
+                                    }
                                   }
-                                }),
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                  child: Row(
-                                    children: [
-                                      ClipRRect(
-                                        borderRadius: BorderRadius.circular(6),
-                                        child: SizedBox(
-                                          width: 40,
-                                          height: 40,
-                                          child: dish != null ? _MenuThumb(item: dish, compact: true) : const Icon(Icons.fastfood, size: 22),
+                                  final sel = selectedDishes.contains(dishName);
+                                  return Padding(
+                                    padding: const EdgeInsets.only(bottom: 6),
+                                    child: Material(
+                                      color: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
+                                      borderRadius: BorderRadius.circular(10),
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(10),
+                                        onTap: () => setState(() {
+                                          if (sel) {
+                                            selectedDishes.remove(dishName);
+                                          } else {
+                                            selectedDishes.add(dishName);
+                                          }
+                                        }),
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                          child: Row(
+                                            children: [
+                                              ClipRRect(
+                                                borderRadius: BorderRadius.circular(6),
+                                                child: SizedBox(
+                                                  width: 40,
+                                                  height: 40,
+                                                  child: dish != null
+                                                      ? _MenuThumb(item: dish, compact: true)
+                                                      : const Icon(Icons.fastfood, size: 22),
+                                                ),
+                                              ),
+                                              const SizedBox(width: 10),
+                                              Expanded(child: Text(dishName, style: const TextStyle(fontSize: 13))),
+                                              Icon(
+                                                sel ? Icons.check_circle : Icons.circle_outlined,
+                                                size: 22,
+                                                color: sel ? AppColors.success : Colors.grey.shade500,
+                                              ),
+                                            ],
+                                          ),
                                         ),
                                       ),
-                                      const SizedBox(width: 10),
-                                      Expanded(child: Text(dishName, style: const TextStyle(fontSize: 13))),
-                                      Icon(
-                                        sel ? Icons.check_circle : Icons.circle_outlined,
-                                        size: 22,
-                                        color: sel ? AppColors.success : Colors.grey.shade500,
-                                      ),
-                                    ],
-                                  ),
-                                ),
+                                    ),
+                                  );
+                                }).toList(),
                               ),
-                            ),
-                          );
-                        }),
+                            );
+                          },
+                        ),
                       ],
                     ],
                   ),
                 ),
-                if (inquiryType == 'CATERING AND EVENT') ...[
-                  const SizedBox(height: 10),
-                  ToggleSection(
-                    title: 'EVENT THEME DESIGN',
-                    expanded: true,
-                    onToggle: () {},
-                    hideToggleIcon: true,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: OutlinedButton(
-                                onPressed: () => setState(() => themeSuggestionNote = ''),
-                                child: const Text('I HAVE A THEME IN MIND', textAlign: TextAlign.center),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: OutlinedButton(
-                                onPressed: () => setState(() {
-                                  themeSuggestionNote = 'No, suggest me a theme design instead.';
-                                }),
-                                child: const Text('NO, SUGGEST ME A THEME INSTEAD', textAlign: TextAlign.center),
-                              ),
-                            ),
-                          ],
-                        ),
-                        if (themeSuggestionNote.isNotEmpty) ...[
-                          const SizedBox(height: 8),
-                          Text(themeSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
-                        ],
-                        const SizedBox(height: 12),
-                        const Text(
-                          'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
-                          style: TextStyle(height: 1.35),
-                        ),
-                        const SizedBox(height: 10),
-                        const Text(
-                          'You may attach inspiration links or filenames later with your coordinator; photos of the venue (indoor/outdoor, ceiling height) help us propose realistic installs.',
-                          style: TextStyle(height: 1.35),
-                        ),
-                        const SizedBox(height: 10),
-                        const Text(
-                          'If you already have hired stylists or florists, note their contact windows here so we can align catering service timing with their setup and strike.',
-                          style: TextStyle(height: 1.35),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
               ],
             ),
           ),
@@ -3614,6 +6327,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         const SizedBox(height: 6),
                         Text('City: ${eventCity.text.trim()}'),
                         const SizedBox(height: 6),
+                        Text('When: ${_serializedEventDates()}'),
+                        const SizedBox(height: 6),
                         Text('Estimated: ₱${est.toStringAsFixed(2)}'),
                       ],
                     ),
@@ -3628,22 +6343,22 @@ class _InquiryScreenState extends State<InquiryScreen> {
               final guestsSaved = _guestCountForSubmit();
               final err = await state.submitInquiry({
                 'inquiry_type': inquiryType,
-                'event_title': inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : '',
+                'event_title': eventTitle.text.trim(),
                 'event_type': (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
                 'customer': contactPerson.text.trim(),
                 'contact_person': contactPerson.text.trim(),
                 'contact_number': contactNumber.text.trim(),
                 'inquiry_email': inquiryEmail.text.trim(),
-                'date_of_event': _serializedEventDates(),
+                'date_of_event': _scheduleSlotsJsonForSubmit(),
                 'note': note.text.trim(),
                 'curate_own_menu': curateOwn,
-                'selected_set_menu': selectedSetMenu,
-                'selected_dishes': selectedDishes.toList(),
+                'selected_set_menu': curateOwn ? selectedSetMenu : '',
+                'selected_dishes': curateOwn ? selectedDishes.toList() : <String>[],
                 'include_event_theme': inquiryType == 'CATERING AND EVENT',
                 'guest_count': guestsSaved,
                 'estimated_total': est,
-                'menu_suggestion_note': menuSuggestionNote,
-                'theme_suggestion_note': themeSuggestionNote,
+                'menu_suggestion_note': curateOwn ? '' : menuSuggestionNote,
+                'theme_suggestion_note': themeNotesController.text.trim(),
                 'event_city': eventCity.text.trim(),
                 'event_setting': eventSetting,
                 'service_included': serviceIncluded,
@@ -3679,7 +6394,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 2, vsync: this);
+    _tab = TabController(length: 3, vsync: this);
   }
 
   @override
@@ -3696,14 +6411,18 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
         );
 
     final lines = <Widget>[
-      line('Inquiry no.: ${r.inquiryNo}'),
+      line('Transaction no.: ${r.displayTransactionRef}'),
       line('Type: ${r.inquiryType}'),
-      line('Status: ${r.status}'),
     ];
+    if (r.isCompletedBooking && r.loyaltyPointsEarned > 0) {
+      lines.add(line('Catering loyalty: +${r.loyaltyPointsEarned} pts'));
+    }
 
+    if (r.eventType.trim().isNotEmpty) {
+      lines.add(line('Event type: ${r.eventType}'));
+    }
     if (isFullEvent) {
       if (r.eventTitle.trim().isNotEmpty) lines.add(line('Event title: ${r.eventTitle}'));
-      if (r.eventType.trim().isNotEmpty) lines.add(line('Event type: ${r.eventType}'));
       if (r.formalityLevel.trim().isNotEmpty) lines.add(line('Formality: ${r.formalityLevel}'));
       if (r.eventCity.trim().isNotEmpty) lines.add(line('City: ${r.eventCity}'));
       if (r.eventSetting.trim().isNotEmpty) lines.add(line('Setting: ${r.eventSetting}'));
@@ -3713,7 +6432,16 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     lines.add(line('Guests: ${r.guestCount}'));
     lines.add(line('Contact: ${r.contactPerson} / ${r.contactNumber}'));
     lines.add(line('Email: ${r.inquiryEmail}'));
-    if (r.dateOfEvent.trim().isNotEmpty) lines.add(line('Date/time: ${r.dateOfEvent}'));
+    if (r.dateOfEvent.trim().isNotEmpty) {
+      final formatted = formatScheduleSlotLine(r.dateOfEvent).trim();
+      if (formatted.isNotEmpty) {
+        lines.add(line('Date/Time of Event:'));
+        for (final ln in formatted.split('\n')) {
+          final t = ln.trim();
+          if (t.isNotEmpty) lines.add(line(t));
+        }
+      }
+    }
     if (r.serviceIncluded.trim().isNotEmpty) {
       lines.add(line('Service: ${r.serviceIncluded == 'yes' ? 'With service' : 'Without service'}'));
     }
@@ -3737,9 +6465,10 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
   }
 
   Future<void> _followUp(InquiryRecord r) async {
+    final ref = r.displayTransactionRef;
     final uri = Uri.parse(
-      'mailto:?subject=${Uri.encodeComponent('Follow up: ${r.inquiryNo}')}'
-      '&body=${Uri.encodeComponent('Inquiry: ${r.inquiryNo}\nType: ${r.inquiryType}\n')}',
+      'mailto:?subject=${Uri.encodeComponent('Follow up: $ref')}'
+      '&body=${Uri.encodeComponent('Transaction: $ref\nType: ${r.inquiryType}\n')}',
     );
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri);
@@ -3748,16 +6477,16 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     }
   }
 
-  void _showDetail(InquiryRecord r) {
+  void _showDetail(InquiryRecord r, {required bool allowFollowUp}) {
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(r.inquiryNo),
+        title: Text(r.displayTransactionRef),
         content: SingleChildScrollView(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: _inquiryDetailLines(r)),
         ),
         actions: [
-          TextButton(onPressed: () => _followUp(r), child: const Text('Follow up')),
+          if (allowFollowUp) TextButton(onPressed: () => _followUp(r), child: const Text('Follow up')),
           TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close')),
         ],
       ),
@@ -3768,9 +6497,10 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
   Widget build(BuildContext context) {
     final s = widget.state;
     final waiting = s.inquiries.where((r) => r.isWaiting).toList();
-    final responded = s.inquiries.where((r) => !r.isWaiting).toList();
+    final responded = s.inquiries.where((r) => !r.isWaiting && !r.isCompletedBooking).toList();
+    final completed = s.inquiries.where((r) => r.isCompletedBooking).toList();
 
-    Widget buildList(List<InquiryRecord> list) {
+    Widget buildList(List<InquiryRecord> list, {required bool allowFollowUp, bool showLoyaltyHint = false}) {
       return RefreshIndicator(
         onRefresh: s.loadInquiries,
         child: list.isEmpty
@@ -3790,14 +6520,22 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
                   return Card(
                     margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                     child: ListTile(
-                      title: Text(i.inquiryNo),
-                      subtitle: Text('${i.inquiryType} — ${i.eventTitle}\n${i.createdAt.toLocal()}'),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.reply_outlined),
-                        tooltip: 'Follow up',
-                        onPressed: () => _followUp(i),
+                      title: Text(i.displayTransactionRef),
+                      subtitle: Text(
+                        showLoyaltyHint && i.loyaltyPointsEarned > 0
+                            ? '${i.inquiryType} — ${i.eventTitle}\n'
+                                'Loyalty: +${i.loyaltyPointsEarned} pts\n'
+                                '${i.createdAt.toLocal()}'
+                            : '${i.inquiryType} — ${i.eventTitle}\n${i.createdAt.toLocal()}',
                       ),
-                      onTap: () => _showDetail(i),
+                      trailing: allowFollowUp
+                          ? IconButton(
+                              icon: const Icon(Icons.reply_outlined),
+                              tooltip: 'Follow up',
+                              onPressed: () => _followUp(i),
+                            )
+                          : null,
+                      onTap: () => _showDetail(i, allowFollowUp: allowFollowUp),
                     ),
                   );
                 },
@@ -3812,17 +6550,20 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
         children: [
           TabBar(
             controller: _tab,
+            isScrollable: true,
             tabs: const [
               Tab(text: 'WAITING FOR RESPONSE'),
               Tab(text: 'RESPONDED'),
+              Tab(text: 'COMPLETED CATERING ORDERS'),
             ],
           ),
           Expanded(
             child: TabBarView(
               controller: _tab,
               children: [
-                buildList(waiting),
-                buildList(responded),
+                buildList(waiting, allowFollowUp: true),
+                buildList(responded, allowFollowUp: false),
+                buildList(completed, allowFollowUp: false, showLoyaltyHint: true),
               ],
             ),
           ),
@@ -3866,11 +6607,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (ok == true && context.mounted) {
+      final nav = Navigator.of(context, rootNavigator: true);
+      while (nav.canPop()) {
+        nav.pop();
+      }
       widget.state.logout();
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute<void>(builder: (_) => AuthScreen(state: widget.state, cashierMode: kPosLoginBuild)),
-        (_) => false,
-      );
     }
   }
 
@@ -3939,9 +6680,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
           title: 'SETTINGS',
           body: Padding(
             padding: const EdgeInsets.all(14),
-            child: Column(
+            child: SingleChildScrollView(
+              child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                if (widget.state.isManagerOrSupervisor)
+                  const ListTile(
+                    leading: Icon(Icons.restaurant_menu),
+                    title: Text('Restaurant loyalty rewards'),
+                    subtitle: Text(
+                      'Customers earn loyalty points on confirmed restaurant orders (tracked separately from catering/event loyalty). '
+                      'Rates are applied automatically when orders complete.',
+                    ),
+                  ),
                 ListTile(
                   leading: Icon(widget.state.themeMode == ThemeMode.dark ? Icons.dark_mode_outlined : Icons.light_mode_outlined),
                   title: const Text('Appearance'),
@@ -3979,6 +6730,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onTap: _confirmLogout,
                 ),
               ],
+            ),
             ),
           ),
         );
@@ -4211,15 +6963,19 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => widget.state.loadCashierOrderHistory());
   }
 
-  Widget _historyProofImage(String? b64) {
+  Widget _historyProofImage(BuildContext context, String? b64, {String title = 'Payment proof'}) {
     if (b64 == null || b64.trim().isEmpty) return const SizedBox.shrink();
     try {
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: Image.memory(
-          Uint8List.fromList(base64Decode(b64.trim())),
-          height: 200,
-          fit: BoxFit.contain,
+      final bytes = Uint8List.fromList(base64Decode(b64.trim()));
+      return InkWell(
+        onTap: () => showProofFullScreen(context, bytes, title: title),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: Image.memory(
+            bytes,
+            height: 200,
+            fit: BoxFit.contain,
+          ),
         ),
       );
     } catch (_) {
@@ -4228,8 +6984,8 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
   }
 
   void _showOrderDetail(OrderData o) {
-    final p1 = _historyProofImage(o.paymentProofBase64);
-    final p2 = _historyProofImage(o.supplementalPaymentProofBase64);
+    final p1 = _historyProofImage(context, o.paymentProofBase64, title: 'Payment proof');
+    final p2 = _historyProofImage(context, o.supplementalPaymentProofBase64, title: 'Additional payment proof');
     final showP1 = o.paymentProofBase64 != null && o.paymentProofBase64!.trim().isNotEmpty;
     final showP2 = o.supplementalPaymentProofBase64 != null && o.supplementalPaymentProofBase64!.trim().isNotEmpty;
     showDialog<void>(
@@ -4243,7 +6999,7 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
             children: [
               Text('Placed: ${o.createdAt.toLocal()}'),
               Text('Source: ${o.orderSource}'),
-              Text('Status: ${o.status}'),
+              Text('Status: ${statusReadable(o.status)}'),
               Text('Fulfillment: ${o.fulfillmentStage}'),
               if ((o.userEmail ?? '').trim().isNotEmpty) Text('Customer email: ${o.userEmail}'),
               if (o.posCustomerLabel.trim().isNotEmpty) Text('Walk-in label: ${o.posCustomerLabel}'),
@@ -4253,6 +7009,10 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
                 Text('Amount received (recorded): ₱${o.cashierAmountReceived!.toStringAsFixed(2)}'),
               if (o.cashierSecondaryAmountReceived != null)
                 Text('Additional amount (recorded): ₱${o.cashierSecondaryAmountReceived!.toStringAsFixed(2)}'),
+              if (o.paymentMode.toUpperCase().contains('CASH') &&
+                  o.cashierChange != null &&
+                  o.cashierChange!.abs() > 0.005)
+                Text('Change given: ₱${o.cashierChange!.toStringAsFixed(2)}'),
               const SizedBox(height: 12),
               if (showP1) ...[
                 const Text('Payment proof', style: TextStyle(fontWeight: FontWeight.w800)),
@@ -4316,7 +7076,7 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
                         child: ListTile(
                           title: Text(o.orderNo),
                           subtitle: Text(
-                            '${o.orderSource} · ${o.status}\n${o.createdAt.toLocal()}',
+                            '${o.orderSource} · ${statusReadable(o.status)}\n${o.createdAt.toLocal()}',
                           ),
                           isThreeLine: true,
                           trailing: Text('₱${o.total.toStringAsFixed(2)}'),
@@ -4328,6 +7088,3984 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+// --- Manager/Supervisor Catering POS ---
+
+class ManagerCateringShellScreen extends StatefulWidget {
+  const ManagerCateringShellScreen({super.key, required this.state});
+  final AppState state;
+  @override
+  State<ManagerCateringShellScreen> createState() => _ManagerCateringShellScreenState();
+}
+
+class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen> with SingleTickerProviderStateMixin {
+  late TabController _tab;
+  static const _stages = [
+    'new_event',
+    'online_inquiries',
+    'for_processing',
+    'for_post_analysis',
+    'completed',
+    'cancelled',
+  ];
+  static const _labels = [
+    'New Event',
+    'Online Inquiries',
+    'For Processing',
+    'For Post-Analysis',
+    'Completed',
+    'Cancelled',
+  ];
+  @override
+  void initState() {
+    super.initState();
+    _tab = TabController(length: 6, vsync: this);
+    widget.state.loadManagerCateringByStage(_stages[0]);
+    _tab.addListener(() {
+      if (_tab.indexIsChanging) return;
+      widget.state.loadManagerCateringByStage(_stages[_tab.index]);
+    });
+  }
+
+  @override
+  void dispose() {
+    _tab.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final who = widget.state.cashierDisplayName.trim().isNotEmpty
+        ? widget.state.cashierDisplayName
+        : (widget.state.userEmail ?? 'User');
+    return AnimatedBuilder(
+      animation: widget.state,
+      builder: (context, _) {
+        return Scaffold(
+          appBar: AppBar(
+            backgroundColor: Colors.black87,
+            foregroundColor: Colors.white,
+            leading: Builder(
+              builder: (ctx) => IconButton(
+                icon: const Icon(Icons.menu, color: AppColors.brand),
+                onPressed: () => Scaffold.of(ctx).openDrawer(),
+              ),
+            ),
+            title: Text((_labels[_tab.index]).toUpperCase()),
+            bottom: TabBar(
+              controller: _tab,
+              isScrollable: true,
+              tabs: _labels.map((lab) => Tab(text: lab)).toList(),
+            ),
+          ),
+          drawer: Drawer(
+            child: ListView(
+              children: [
+                DrawerHeader(
+                  decoration: const BoxDecoration(color: AppColors.brand),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
+                      const SizedBox(height: 10),
+                      Text('Hi, $who!', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
+                    ],
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.settings),
+                  title: const Text('Settings'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: widget.state)));
+                  },
+                ),
+              ],
+            ),
+          ),
+          body: TabBarView(
+            controller: _tab,
+            children: [
+              _ManagerNewEventListTab(state: widget.state),
+              _ManagerStageListTab(state: widget.state, stage: 'online_inquiries', isReadOnly: false),
+              _ManagerStageListTab(state: widget.state, stage: 'for_processing', isReadOnly: false),
+              _ManagerStageListTab(state: widget.state, stage: 'for_post_analysis', isReadOnly: false),
+              _ManagerStageListTab(state: widget.state, stage: 'completed', isReadOnly: true),
+              _ManagerStageListTab(state: widget.state, stage: 'cancelled', isReadOnly: true),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _ManagerNewEventListTab extends StatelessWidget {
+  const _ManagerNewEventListTab({required this.state});
+  final AppState state;
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+          child: FilledButton.icon(
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (ctx) => ManagerNewEventCreateScreen(state: state),
+                ),
+              );
+            },
+            icon: const Icon(Icons.add_circle_outline),
+            label: const Text('NEW EVENT'),
+          ),
+        ),
+        Expanded(child: _ManagerStageListTab(state: state, stage: 'new_event', isReadOnly: false)),
+      ],
+    );
+  }
+}
+
+class ManagerNewEventCreateScreen extends StatefulWidget {
+  const ManagerNewEventCreateScreen({super.key, required this.state});
+  final AppState state;
+  @override
+  State<ManagerNewEventCreateScreen> createState() => _ManagerNewEventCreateScreenState();
+}
+
+class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScreen> {
+  String inquiryType = 'CATERING';
+  bool curateOwn = false;
+  String selectedSetMenu = 'All Dishes';
+  final selectedDishes = <String>{};
+  final guestCount = TextEditingController();
+  String menuSuggestionNote = '';
+  String themeSuggestionNote = '';
+  final eventTitle = TextEditingController();
+  final eventTypeOther = TextEditingController();
+  String eventTypeChoice = 'Birthday';
+  final contactPerson = TextEditingController();
+  final contactNumber = TextEditingController();
+  final inquiryEmail = TextEditingController();
+  final List<_InquiryEventWindow> _eventWindows = [_InquiryEventWindow()];
+  final eventCity = TextEditingController();
+  final note = TextEditingController();
+  String eventSetting = 'open';
+  String serviceIncluded = 'no';
+  String formalityLevel = 'casual';
+  bool foodTastingRequested = false;
+  final foodTastingDate = TextEditingController();
+  final foodTastingTime = TextEditingController();
+  final laborMaleController = TextEditingController(text: '0');
+  final laborFemaleController = TextEditingController(text: '0');
+  final laborManualLabelController = TextEditingController();
+  final laborManualAmountController = TextEditingController();
+  final travelCostController = TextEditingController(text: '0');
+  final themeCostController = TextEditingController(text: '0');
+  final additionalCostLabelController = TextEditingController();
+  final additionalCostAmountController = TextEditingController();
+  final menuSearchController = TextEditingController();
+  final List<Map<String, dynamic>> laborManualCosts = [];
+  final List<Map<String, dynamic>> additionalCosts = [];
+  final List<_InquiryEventWindow> _forProcessingWindows = [];
+  bool _forProcessingWindowsLoading = false;
+  bool _forProcessingWindowsLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _loadForProcessingWindowsIfNeeded();
+    });
+  }
+
+  @override
+  void dispose() {
+    guestCount.dispose();
+    eventTitle.dispose();
+    eventTypeOther.dispose();
+    contactPerson.dispose();
+    contactNumber.dispose();
+    inquiryEmail.dispose();
+    eventCity.dispose();
+    note.dispose();
+    foodTastingDate.dispose();
+    foodTastingTime.dispose();
+    laborMaleController.dispose();
+    laborFemaleController.dispose();
+    laborManualLabelController.dispose();
+    laborManualAmountController.dispose();
+    travelCostController.dispose();
+    themeCostController.dispose();
+    additionalCostLabelController.dispose();
+    additionalCostAmountController.dispose();
+    menuSearchController.dispose();
+    super.dispose();
+  }
+
+  int _minPaxForCurrentInquiry() =>
+      inquiryType == 'CATERING AND EVENT' ? kMinCateringEventPax : kMinCateringOnlyPax;
+
+  int _billableGuestCountForPricing() {
+    final raw = guestCount.text.trim();
+    if (raw.isEmpty) return 0;
+    final g = int.tryParse(raw) ?? 0;
+    if (g <= 0) return 0;
+    final min = _minPaxForCurrentInquiry();
+    return g < min ? min : g;
+  }
+
+  int _guestCountForSubmit() {
+    final raw = guestCount.text.trim();
+    final min = _minPaxForCurrentInquiry();
+    if (raw.isEmpty) return min;
+    final g = int.tryParse(raw) ?? 0;
+    if (g <= 0) return min;
+    return g < min ? min : g;
+  }
+
+  Future<void> _pickWindowDate(int index) async {
+    final ctx = context;
+    final w = _eventWindows[index];
+    final base = w.date ?? DateTime.now();
+    final d = await showDatePicker(
+      context: ctx,
+      initialDate: base,
+      firstDate: DateTime.now().subtract(const Duration(days: 1)),
+      lastDate: DateTime.now().add(const Duration(days: 365 * 3)),
+    );
+    if (!ctx.mounted || d == null) return;
+    setState(() => _eventWindows[index].date = DateTime(d.year, d.month, d.day));
+  }
+
+  Future<void> _pickWindowFrom(int index) async {
+    final ctx = context;
+    final w = _eventWindows[index];
+    final t = await showTimePicker(
+      context: ctx,
+      initialTime: w.from ?? const TimeOfDay(hour: 12, minute: 0),
+    );
+    if (!ctx.mounted || t == null) return;
+    setState(() => _eventWindows[index].from = t);
+  }
+
+  Future<void> _pickWindowTo(int index) async {
+    final ctx = context;
+    final w = _eventWindows[index];
+    final t = await showTimePicker(
+      context: ctx,
+      initialTime: w.to ?? const TimeOfDay(hour: 14, minute: 0),
+    );
+    if (!ctx.mounted || t == null) return;
+    setState(() => _eventWindows[index].to = t);
+  }
+
+  double _sumCostRows(List<Map<String, dynamic>> rows) {
+    double sum = 0;
+    for (final e in rows) {
+      sum += jsonToDouble(e['amount']);
+    }
+    return sum;
+  }
+
+  double _laborCostComputed() {
+    final male = int.tryParse(laborMaleController.text.trim()) ?? 0;
+    final female = int.tryParse(laborFemaleController.text.trim()) ?? 0;
+    final maleCost = male < 0 ? 0 : male * 1000;
+    final femaleCost = female < 0 ? 0 : female * 500;
+    return maleCost + femaleCost + _sumCostRows(laborManualCosts);
+  }
+
+  double _travelCostComputed() => double.tryParse(travelCostController.text.trim()) ?? 0;
+
+  double _themeCostComputed() => double.tryParse(themeCostController.text.trim()) ?? 0;
+
+  double _estimatedCost() =>
+      (_billableGuestCountForPricing() * kPesosPerPax) +
+      _laborCostComputed() +
+      _travelCostComputed() +
+      _themeCostComputed() +
+      _sumCostRows(additionalCosts);
+
+  String _resolvedEventType() {
+    if (eventTypeChoice != 'Other') return eventTypeChoice;
+    return eventTypeOther.text.trim();
+  }
+
+  List<Map<String, String>> _scheduleSlotsPayload() {
+    final out = <Map<String, String>>[];
+    for (final w in _eventWindows) {
+      if (w.date == null || w.from == null || w.to == null) continue;
+      final d = w.date!;
+      final dateStr = '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+      final f = '${w.from!.hour.toString().padLeft(2, '0')}:${w.from!.minute.toString().padLeft(2, '0')}';
+      final t = '${w.to!.hour.toString().padLeft(2, '0')}:${w.to!.minute.toString().padLeft(2, '0')}';
+      out.add({'date': dateStr, 'from': f, 'to': t, 'label': '$dateStr from $f to $t'});
+    }
+    return out;
+  }
+
+  DateTime? _tryParseScheduleDate(dynamic v) {
+    final s = v == null ? '' : v.toString().trim();
+    if (s.isEmpty) return null;
+    try {
+      return DateTime.parse(s);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  TimeOfDay? _tryParseScheduleTime(dynamic v) {
+    final s = v == null ? '' : v.toString().trim();
+    if (s.isEmpty) return null;
+    final m = RegExp(r'^(\d{1,2}):(\d{2})').firstMatch(s);
+    if (m == null) return null;
+    final hh = int.tryParse(m.group(1) ?? '');
+    final mm = int.tryParse(m.group(2) ?? '');
+    if (hh == null || mm == null) return null;
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+    return TimeOfDay(hour: hh, minute: mm);
+  }
+
+  List<_InquiryEventWindow> _windowsFromScheduleSlots(dynamic raw) {
+    final out = <_InquiryEventWindow>[];
+    dynamic listLike = raw;
+    if (raw is Map) listLike = [raw];
+    if (raw is String) {
+      final t = raw.trim();
+      if (t.startsWith('[') || t.startsWith('{')) {
+        try {
+          listLike = jsonDecode(t);
+        } catch (_) {}
+      }
+    }
+    if (listLike is List) {
+      for (final s in listLike) {
+        if (s is Map) {
+          final date = _tryParseScheduleDate(s['date'] ?? s['label']);
+          final from = _tryParseScheduleTime(s['from']);
+          final to = _tryParseScheduleTime(s['to']);
+          if (date != null && from != null && to != null) {
+            out.add(_InquiryEventWindow()..date = date..from = from..to = to);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  bool _windowsOverlapOnSameDate(_InquiryEventWindow a, _InquiryEventWindow b) {
+    if (a.date == null || a.from == null || a.to == null) return false;
+    if (b.date == null || b.from == null || b.to == null) return false;
+    if (a.date!.year != b.date!.year || a.date!.month != b.date!.month || a.date!.day != b.date!.day) return false;
+    final aStart = a.from!.hour * 60 + a.from!.minute;
+    final aEnd = a.to!.hour * 60 + a.to!.minute;
+    final bStart = b.from!.hour * 60 + b.from!.minute;
+    final bEnd = b.to!.hour * 60 + b.to!.minute;
+    return aStart < bEnd && aEnd > bStart;
+  }
+
+  int _conflictCountWithForProcessing() {
+    if (!_forProcessingWindowsLoaded) return 0;
+    final processingWindows = _forProcessingWindows;
+    var conflicts = 0;
+    for (final w in _eventWindows) {
+      for (final pw in processingWindows) {
+        if (_windowsOverlapOnSameDate(w, pw)) conflicts++;
+      }
+    }
+    return conflicts;
+  }
+
+  Future<void> _loadForProcessingWindowsIfNeeded() async {
+    if (_forProcessingWindowsLoading || _forProcessingWindowsLoaded) return;
+    final email = widget.state.userEmail;
+    if (email == null || widget.state.loginPassword.isEmpty) return;
+
+    setState(() => _forProcessingWindowsLoading = true);
+    try {
+      final listUri = Uri.parse('${normalizeApiBase(widget.state.apiBase)}/api/mobile/pos/catering/list');
+      final res = await http
+          .post(
+            listUri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': email,
+              'cashier_password': widget.state.loginPassword,
+              'stage': 'for_processing',
+              'summary': true,
+            }),
+          )
+          .timeout(_managerCateringListTimeout);
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! List) return;
+
+      final windows = <_InquiryEventWindow>[];
+      for (final e in body) {
+        if (e is Map) {
+          windows.addAll(_windowsFromScheduleSlots(e['schedule_slots']));
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _forProcessingWindows
+          ..clear()
+          ..addAll(windows);
+        _forProcessingWindowsLoaded = true;
+        _forProcessingWindowsLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _forProcessingWindowsLoaded = false;
+        _forProcessingWindowsLoading = false;
+      });
+    }
+  }
+
+  String? _validateManagerNewEvent() {
+    if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
+    if (contactNumber.text.trim().isEmpty) return 'Enter contact number.';
+    if (inquiryEmail.text.trim().isEmpty) return 'Enter email address.';
+    if (eventCity.text.trim().isEmpty) return 'Enter city of event.';
+    for (final w in _eventWindows) {
+      final any = w.date != null || w.from != null || w.to != null;
+      final all = w.date != null && w.from != null && w.to != null;
+      if (any && !all) return 'Complete event date, start time, and end time for each row (or remove extra rows).';
+    }
+    final completeWindows = _eventWindows.where((w) => w.date != null && w.from != null && w.to != null).toList();
+    if (completeWindows.isEmpty) return 'Set at least one event day with start and end time.';
+    for (final w in completeWindows) {
+      final sm = w.from!.hour * 60 + w.from!.minute;
+      final em = w.to!.hour * 60 + w.to!.minute;
+      if (em <= sm) return 'End time must be after start time for each event.';
+    }
+    if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
+    if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
+    if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
+      return 'Describe the event type for Other.';
+    }
+    if (foodTastingRequested &&
+        (foodTastingDate.text.trim().isEmpty || foodTastingTime.text.trim().isEmpty)) {
+      return 'Enter date and time for food tasting.';
+    }
+    final rawGuests = guestCount.text.trim();
+    if (rawGuests.isEmpty) return 'Enter number of guests.';
+    final gNum = int.tryParse(rawGuests);
+    if (gNum == null || gNum < 1) return 'Enter a valid number of guests.';
+    final min = _minPaxForCurrentInquiry();
+    if (gNum < min) return 'Minimum guests for this inquiry type is $min.';
+    return null;
+  }
+
+  Widget _buildEventTypePicker() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        DropdownButtonFormField<String>(
+          value: kMobileEventTypeChoices.contains(eventTypeChoice) ? eventTypeChoice : 'Other',
+          decoration: const InputDecoration(labelText: 'Event type'),
+          items: kMobileEventTypeChoices.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+          onChanged: (v) => setState(() => eventTypeChoice = v ?? 'Other'),
+        ),
+        if (eventTypeChoice == 'Other') ...[
+          const SizedBox(height: 8),
+          TextField(
+            controller: eventTypeOther,
+            decoration: const InputDecoration(labelText: 'Describe event type'),
+            onChanged: (_) => setState(() {}),
+          ),
+        ],
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = widget.state;
+    final cateringMenu = state.menu.where((m) => m.isCateringDish).toList();
+    final setMenuNames = ['All Dishes', ...state.setMenus.map((m) => m.name)];
+    final effectiveSetMenu = setMenuNames.contains(selectedSetMenu) ? selectedSetMenu : 'All Dishes';
+    final q = menuSearchController.text.trim().toLowerCase();
+    final availableDishes = cateringMenu
+        .map((m) => m.name.trim())
+        .where((n) => n.isNotEmpty)
+        .toSet()
+        .where((n) => q.isEmpty || n.toLowerCase().contains(q))
+        .toList();
+    final estimate = _estimatedCost();
+    final scheduleConflictsForProcessing = _conflictCountWithForProcessing();
+    final orderKind = inquiryType == 'CATERING' ? 'catering' : 'event';
+
+    Future<void> createNewEvent() async {
+      final v = _validateManagerNewEvent();
+      if (v != null) {
+        appSnack(context, v);
+        return;
+      }
+      final est = _estimatedCost();
+      final guestsSaved = _guestCountForSubmit();
+      final menuPayload = selectedDishes.toList();
+      final themeDesign = <String, dynamic>{
+        'note': note.text.trim(),
+        'event_setting': eventSetting,
+        'service_included': serviceIncluded,
+        'food_tasting_requested': foodTastingRequested,
+        'food_tasting_date': foodTastingDate.text.trim(),
+        'food_tasting_time': foodTastingTime.text.trim(),
+        'theme_cost': _themeCostComputed(),
+        'additional_costs': additionalCosts,
+        'labor_manual_costs': laborManualCosts,
+        if (inquiryType == 'CATERING AND EVENT') 'theme_suggestion_note': themeSuggestionNote,
+      };
+      final costBreakdown = <Map<String, dynamic>>[
+        {'label': 'Base food cost', 'amount': _billableGuestCountForPricing() * kPesosPerPax},
+        {'label': 'Labor cost', 'amount': _laborCostComputed()},
+        {'label': 'Travel cost', 'amount': _travelCostComputed()},
+        {'label': 'Theme design cost', 'amount': _themeCostComputed()},
+        {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+      ];
+      final yes = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Create new event?'),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Type: $inquiryType'),
+                if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  Text('Event: ${eventTitle.text.trim()}'),
+                ],
+                const SizedBox(height: 6),
+                Text('Event type: ${_resolvedEventType()}'),
+                const SizedBox(height: 6),
+                Text('Guests: ${guestCount.text.trim()}'),
+                const SizedBox(height: 6),
+                Text('City: ${eventCity.text.trim()}'),
+                const SizedBox(height: 6),
+                Text('Estimated: ₱${est.toStringAsFixed(2)}'),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm')),
+          ],
+        ),
+      );
+      if (yes != true || !context.mounted) return;
+      final err = await widget.state.managerCreateNewEvent(
+        orderKind: orderKind,
+        eventTitle: inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : '',
+        eventType: (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
+        customerName: contactPerson.text.trim(),
+        contactPerson: contactPerson.text.trim(),
+        contactNumber: contactNumber.text.trim(),
+        emailAddress: inquiryEmail.text.trim(),
+        address: eventCity.text.trim(),
+        guestCount: guestsSaved,
+        paymentMethod: 'cash',
+        costBreakdown: costBreakdown,
+        laborMaleCount: int.tryParse(laborMaleController.text.trim()) ?? 0,
+        laborFemaleCount: int.tryParse(laborFemaleController.text.trim()) ?? 0,
+        laborManualException: _sumCostRows(laborManualCosts),
+        travelCost: _travelCostComputed(),
+        manualTotalCost: null,
+        scheduleSlots: _scheduleSlotsPayload(),
+        menu: menuPayload,
+        themeDesign: themeDesign,
+        formalityLevel: inquiryType == 'CATERING AND EVENT' ? formalityLevel : '',
+      );
+      if (!context.mounted) return;
+      if (err != null) {
+        appSnack(context, err);
+        return;
+      }
+      appSnack(context, 'New event created');
+      await widget.state.loadManagerCateringByStage('new_event');
+      if (context.mounted) Navigator.of(context).pop();
+    }
+
+    Future<void> generateOrderSummaryPdfForDraft() async {
+      final v = _validateManagerNewEvent();
+      if (v != null) {
+        appSnack(context, v);
+        return;
+      }
+      final doc = pw.Document();
+      final eventWhen = _scheduleSlotsPayload().map((e) => e['label'] ?? '').where((e) => e.trim().isNotEmpty).join(' ; ');
+      final menuLines = selectedDishes.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      final total = _estimatedCost();
+      final rows = <List<String>>[
+        ['Type', inquiryType, 'Event', inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : contactPerson.text.trim()],
+        ['Event type', _resolvedEventType(), 'Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen],
+        ['Contact Person', contactPerson.text.trim(), 'Contact Number', contactNumber.text.trim()],
+        ['Email Address', inquiryEmail.text.trim(), 'Address of Event', eventCity.text.trim()],
+        ['Guests', _guestCountForSubmit().toString(), 'Service', serviceIncluded == 'yes' ? 'With service' : 'Without service'],
+        ['Formality', inquiryType == 'CATERING AND EVENT' ? formalityLevel : '—', 'Setting', eventSetting],
+        ['Menu Dishes', menuLines.isEmpty ? '—' : menuLines.join(', '), 'Base Food Cost', '₱${(_billableGuestCountForPricing() * kPesosPerPax).toStringAsFixed(2)}'],
+        ['Labor Cost', '₱${_laborCostComputed().toStringAsFixed(2)}', 'Travel Cost', '₱${_travelCostComputed().toStringAsFixed(2)}'],
+        ['Theme Design Cost', '₱${_themeCostComputed().toStringAsFixed(2)}', 'Additional Costs', '₱${_sumCostRows(additionalCosts).toStringAsFixed(2)}'],
+        ['Estimated Total', '₱${total.toStringAsFixed(2)}', 'Note', note.text.trim().isEmpty ? '—' : note.text.trim()],
+      ];
+      doc.addPage(
+        pw.MultiPage(
+          build: (ctx) => [
+            pw.Text('Order Summary', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 8),
+            pw.TableHelper.fromTextArray(
+              headers: const ['Field', 'Value', 'Field', 'Value'],
+              data: rows,
+            ),
+          ],
+        ),
+      );
+      await Printing.layoutPdf(onLayout: (_) async => doc.save());
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('NEW EVENT')),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 220),
+        children: [
+        Text(
+          'Catering only: minimum $kMinCateringOnlyPax guests. Catering + Event: minimum $kMinCateringEventPax guests. Estimated cost uses ₱${kPesosPerPax.toStringAsFixed(0)} × billable guests.',
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 10),
+        ToggleSection(
+          title: 'Event Information',
+          expanded: true,
+          onToggle: () {},
+          hideToggleIcon: true,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              DropdownButtonFormField<String>(
+                value: inquiryType,
+                decoration: const InputDecoration(
+                  labelText: 'Inquiry type',
+                  helperText: 'Same as Online Inquiries — Catering Only vs Catering + Event.',
+                ),
+                items: const [
+                  DropdownMenuItem(value: 'CATERING', child: Text('CATERING')),
+                  DropdownMenuItem(value: 'CATERING AND EVENT', child: Text('CATERING AND EVENT')),
+                ],
+                onChanged: (v) => setState(() => inquiryType = v ?? 'CATERING'),
+              ),
+              const SizedBox(height: 8),
+              _buildEventTypePicker(),
+              const SizedBox(height: 8),
+              if (inquiryType == 'CATERING AND EVENT') ...[
+                Text('Formality level', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 6),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(value: 'casual', label: Text('Casual')),
+                    ButtonSegment(value: 'semiformal', label: Text('Semiformal')),
+                    ButtonSegment(value: 'formal', label: Text('Formal')),
+                  ],
+                  selected: {formalityLevel},
+                  onSelectionChanged: (s) => setState(() => formalityLevel = s.first),
+                ),
+                const SizedBox(height: 12),
+              ],
+              const Text('Event setting', style: TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: RadioListTile<String>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Open space'),
+                      value: 'open',
+                      groupValue: eventSetting,
+                      onChanged: (v) => setState(() => eventSetting = v ?? 'open'),
+                    ),
+                  ),
+                  Expanded(
+                    child: RadioListTile<String>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Closed space'),
+                      value: 'closed',
+                      groupValue: eventSetting,
+                      onChanged: (v) => setState(() => eventSetting = v ?? 'closed'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              TextField(controller: eventTitle, decoration: const InputDecoration(labelText: 'Event title')),
+              const SizedBox(height: 8),
+              TextField(controller: contactPerson, decoration: const InputDecoration(labelText: 'Contact person')),
+              const SizedBox(height: 8),
+              TextField(controller: contactNumber, decoration: const InputDecoration(labelText: 'Contact number')),
+              const SizedBox(height: 8),
+              TextField(controller: inquiryEmail, decoration: const InputDecoration(labelText: 'Email address')),
+              const SizedBox(height: 8),
+              TextField(controller: eventCity, decoration: const InputDecoration(labelText: 'City of event')),
+              const SizedBox(height: 8),
+              const Text('Date & time of event', style: TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 6),
+              ...List.generate(_eventWindows.length, (index) {
+                final w = _eventWindows[index];
+                final dateLabel = w.date == null
+                    ? 'Pick date'
+                    : '${w.date!.month}/${w.date!.day}/${w.date!.year}';
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: () => _pickWindowDate(index),
+                              child: Text(dateLabel, overflow: TextOverflow.ellipsis),
+                            ),
+                          ),
+                          if (_eventWindows.length > 1)
+                            IconButton(
+                              tooltip: 'Remove window',
+                              icon: const Icon(Icons.remove_circle_outline, color: AppColors.accent),
+                              onPressed: () => setState(() {
+                                if (_eventWindows.length > 1) _eventWindows.removeAt(index);
+                              }),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: () => _pickWindowFrom(index),
+                              child: Text(w.from == null ? 'From' : w.from!.format(context)),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: () => _pickWindowTo(index),
+                              child: Text(w.to == null ? 'To' : w.to!.format(context)),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              }),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () => setState(() => _eventWindows.add(_InquiryEventWindow())),
+                  icon: const Icon(Icons.add),
+                  label: const Text('Add another window'),
+                ),
+              ),
+              if (scheduleConflictsForProcessing > 0)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    'Schedule overlaps another order already in For Processing — adjust date/time or confirm capacity.',
+                    style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700),
+                  ),
+                ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: guestCount,
+                decoration: const InputDecoration(labelText: 'Number of guests'),
+                keyboardType: TextInputType.number,
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 8),
+              TextField(controller: note, decoration: const InputDecoration(labelText: 'Note'), maxLines: 3),
+              const SizedBox(height: 8),
+              Text('Service', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+              Row(
+                children: [
+                  Expanded(
+                    child: RadioListTile<String>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('With service'),
+                      value: 'yes',
+                      groupValue: serviceIncluded,
+                      onChanged: (v) => setState(() => serviceIncluded = v ?? 'yes'),
+                    ),
+                  ),
+                  Expanded(
+                    child: RadioListTile<String>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Without service'),
+                      value: 'no',
+                      groupValue: serviceIncluded,
+                      onChanged: (v) => setState(() => serviceIncluded = v ?? 'no'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        ToggleSection(
+          title: 'Menu',
+          expanded: true,
+          onToggle: () {},
+          hideToggleIcon: true,
+          child: Column(
+            children: [
+              const Text('Build or modify menu by selecting dishes below.'),
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('With food tasting'),
+                value: foodTastingRequested,
+                onChanged: (v) => setState(() => foodTastingRequested = v ?? false),
+              ),
+              if (foodTastingRequested) ...[
+                const SizedBox(height: 8),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('Food Tasting Schedule', style: TextStyle(fontWeight: FontWeight.w700)),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: foodTastingDate,
+                        readOnly: true,
+                        decoration: const InputDecoration(hintText: 'date'),
+                        onTap: () async {
+                          final d = await showDatePicker(
+                            context: context,
+                            initialDate: DateTime.now(),
+                            firstDate: DateTime.now().subtract(const Duration(days: 1)),
+                            lastDate: DateTime.now().add(const Duration(days: 365 * 2)),
+                          );
+                          if (d == null) return;
+                          setState(() {
+                            foodTastingDate.text =
+                                '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+                          });
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: foodTastingTime,
+                        readOnly: true,
+                        decoration: const InputDecoration(hintText: 'time'),
+                        onTap: () async {
+                          final t = await showTimePicker(context: context, initialTime: const TimeOfDay(hour: 13, minute: 0));
+                          if (t == null) return;
+                          setState(() {
+                            foodTastingTime.text =
+                                '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 10),
+              TextField(
+                controller: menuSearchController,
+                decoration: const InputDecoration(
+                  labelText: 'Search dishes',
+                  prefixIcon: Icon(Icons.search),
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                value: effectiveSetMenu,
+                items: setMenuNames.map((name) => DropdownMenuItem(value: name, child: Text(name))).toList(),
+                onChanged: (v) {
+                  final next = v ?? 'All Dishes';
+                  setState(() {
+                    selectedSetMenu = next;
+                    selectedDishes.clear();
+                    if (next != 'All Dishes') {
+                      final rows = state.setMenus.where((m) => m.name == next).toList();
+                      if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
+                    }
+                  });
+                },
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: math.min(420, MediaQuery.sizeOf(context).height * 0.42),
+                child: ListView(
+                  padding: EdgeInsets.zero,
+                  children: [
+                    ...(() {
+                      final dishes = availableDishes.toList()
+                        ..sort((a, b) {
+                          final aSel = selectedDishes.contains(a) ? 0 : 1;
+                          final bSel = selectedDishes.contains(b) ? 0 : 1;
+                          if (aSel != bSel) return aSel - bSel;
+                          return a.toLowerCase().compareTo(b.toLowerCase());
+                        });
+                      return dishes;
+                    }()).map((dishName) {
+                      MenuItemData? dish;
+                      for (final c in cateringMenu) {
+                        if (c.name == dishName) {
+                          dish = c;
+                          break;
+                        }
+                      }
+                      final sel = selectedDishes.contains(dishName);
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 6),
+                        child: Material(
+                          color: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
+                          borderRadius: BorderRadius.circular(10),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: () => setState(() {
+                              if (sel) {
+                                selectedDishes.remove(dishName);
+                              } else {
+                                selectedDishes.add(dishName);
+                              }
+                            }),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              child: Row(
+                                children: [
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(6),
+                                    child: SizedBox(
+                                      width: 40,
+                                      height: 40,
+                                      child: dish != null ? _MenuThumb(item: dish, compact: true) : const Icon(Icons.fastfood, size: 22),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(child: Text(dishName, style: const TextStyle(fontSize: 13))),
+                                  Icon(
+                                    sel ? Icons.check_circle : Icons.circle_outlined,
+                                    size: 22,
+                                    color: sel ? AppColors.success : Colors.grey.shade500,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (inquiryType == 'CATERING AND EVENT') ...[
+          const SizedBox(height: 10),
+          ToggleSection(
+            title: 'Event Theme Design',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (themeSuggestionNote.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(themeSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
+                ],
+                const SizedBox(height: 12),
+                const Text(
+                  'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
+                  style: TextStyle(height: 1.35),
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'You may attach inspiration links or filenames later with your coordinator; photos of the venue (indoor/outdoor, ceiling height) help us propose realistic installs.',
+                  style: TextStyle(height: 1.35),
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'If you already have hired stylists or florists, note their contact windows here so we can align catering service timing with their setup and strike.',
+                  style: TextStyle(height: 1.35),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: themeCostController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Theme design cost (estimate)',
+                    helperText: 'Included in estimated total — matches Online Inquiries + manager costing.',
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ],
+            ),
+          ),
+        ],
+        const SizedBox(height: 10),
+        ToggleSection(
+          title: 'Labor costing & travel',
+          expanded: true,
+          onToggle: () {},
+          hideToggleIcon: true,
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: laborMaleController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Male workers (₱1000 each)'),
+                      onChanged: (_) => setState(() {}),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: laborFemaleController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Female workers (₱500 each)'),
+                      onChanged: (_) => setState(() {}),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: laborManualLabelController,
+                      decoration: const InputDecoration(labelText: 'Labor item'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: laborManualAmountController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Cost'),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () {
+                      final l = laborManualLabelController.text.trim();
+                      final a = double.tryParse(laborManualAmountController.text.trim());
+                      if (l.isEmpty || a == null) return;
+                      setState(() {
+                        laborManualCosts.add({'label': l, 'amount': a});
+                        laborManualLabelController.clear();
+                        laborManualAmountController.clear();
+                      });
+                    },
+                    icon: const Icon(Icons.add),
+                  ),
+                ],
+              ),
+              ...laborManualCosts.map((e) => ListTile(
+                    dense: true,
+                    title: Text('${e['label']}'),
+                    trailing: Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                  )),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text('Computed labor cost: ₱${_laborCostComputed().toStringAsFixed(2)}'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: travelCostController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'Travel cost'),
+                onChanged: (_) => setState(() {}),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        ToggleSection(
+          title: 'Additional costs',
+          expanded: true,
+          onToggle: () {},
+          hideToggleIcon: true,
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: additionalCostLabelController,
+                      decoration: const InputDecoration(labelText: 'Label'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: additionalCostAmountController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Amount'),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () {
+                      final l = additionalCostLabelController.text.trim();
+                      final a = double.tryParse(additionalCostAmountController.text.trim());
+                      if (l.isEmpty || a == null) return;
+                      setState(() {
+                        additionalCosts.add({'label': l, 'amount': a});
+                        additionalCostLabelController.clear();
+                        additionalCostAmountController.clear();
+                      });
+                    },
+                    icon: const Icon(Icons.add),
+                  ),
+                ],
+              ),
+              ...additionalCosts.map((e) => ListTile(
+                    dense: true,
+                    title: Text('${e['label']}'),
+                    trailing: Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                  )),
+            ],
+          ),
+        ),
+        if (!widget.state.isManager) ...[
+          const SizedBox(height: 8),
+          const Text('Supervisor has limited access: viewing and processing only.'),
+        ],
+        ],
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Container(
+          decoration: BoxDecoration(
+            color: Theme.of(context).scaffoldBackgroundColor,
+            border: Border(top: BorderSide(color: Colors.grey.shade300)),
+          ),
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Column(
+                  children: [
+                    const Text('Estimated Cost', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 2),
+                    Text(
+                      '₱${estimate.toStringAsFixed(2)}',
+                      style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton(
+                onPressed: generateOrderSummaryPdfForDraft,
+                child: const Text('Generate Order Summary PDF'),
+              ),
+              const SizedBox(height: 8),
+              FilledButton(
+                onPressed: !widget.state.isManager ? null : createNewEvent,
+                child: const Text('Save'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ManagerStageListTab extends StatelessWidget {
+  const _ManagerStageListTab({required this.state, required this.stage, required this.isReadOnly});
+  final AppState state;
+  final String stage;
+  final bool isReadOnly;
+  String _next(String s) {
+    if (s == 'new_event' || s == 'online_inquiries') return 'for_processing';
+    if (s == 'for_processing') return 'for_post_analysis';
+    if (s == 'for_post_analysis') return 'completed';
+    return 'completed';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = state.managerCateringRows.where((e) => e.status == stage).toList();
+    return RefreshIndicator(
+      onRefresh: () => state.loadManagerCateringByStage(stage),
+      child: rows.isEmpty
+          ? ListView(children: const [SizedBox(height: 140), Center(child: Text('No records in this stage.'))])
+          : ListView.builder(
+              padding: const EdgeInsets.all(10),
+              itemCount: rows.length,
+              itemBuilder: (context, i) {
+                final r = rows[i];
+                final entered = r.stageEnteredAt ?? r.updatedAt;
+                final whenStr = formatDateTimeLocal(entered);
+                final scheduleLine =
+                    r.schedulePreview.trim().isNotEmpty ? 'Event date/time: ${r.schedulePreview}' : '';
+                final settingLabel = managerEventSettingDisplayLabel(r.eventSetting);
+                final settingLine = settingLabel.isNotEmpty ? 'Setting: $settingLabel' : '';
+                final conflictLine = stage == 'for_processing' && r.processingScheduleOverlaps > 0
+                    ? 'Schedule overlap: crosses ${r.processingScheduleOverlaps} other active order(s) — open for details.'
+                    : '';
+                final subtitleLines = <String>[
+                  r.contactPerson,
+                  '${managerStageListTimestampLabel(stage)}: $whenStr',
+                  if (scheduleLine.isNotEmpty) scheduleLine,
+                  if (settingLine.isNotEmpty) settingLine,
+                  if (conflictLine.isNotEmpty) conflictLine,
+                ];
+                return Card(
+                  child: ListTile(
+                    leading: stage == 'for_processing' && r.processingScheduleOverlaps > 0
+                        ? Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800)
+                        : (r.status == 'new_event' || r.status == 'online_inquiries')
+                            ? Icon(Icons.notifications_active, color: Colors.red.shade700)
+                            : null,
+                    title: Text(r.eventTitle.isEmpty ? r.customerName : r.eventTitle),
+                    subtitle: Text(subtitleLines.join('\n')),
+                    isThreeLine: subtitleLines.length > 2,
+                    trailing: isReadOnly
+                        ? const Icon(Icons.lock_outline)
+                        : Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (stage == 'new_event' || stage == 'online_inquiries')
+                                TextButton(
+                                  onPressed: () async {
+                                    final ok = await showDialog<bool>(
+                                      context: context,
+                                      builder: (ctx) => AlertDialog(
+                                        title: const Text('Cancel this inquiry?'),
+                                        content: const Text(
+                                          'It will move to the Cancelled tab. This cannot be undone from the app.',
+                                        ),
+                                        actions: [
+                                          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+                                          FilledButton(
+                                            onPressed: () => Navigator.pop(ctx, true),
+                                            child: const Text('Yes, cancel'),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                    if (ok != true || !context.mounted) return;
+                                    final err = await state.managerAdvanceCateringStage(
+                                      id: r.id,
+                                      orderKind: r.orderKind,
+                                      status: 'cancelled',
+                                    );
+                                    if (!context.mounted) return;
+                                    if (err != null) {
+                                      appSnack(context, err);
+                                      return;
+                                    }
+                                    appSnack(context, 'Cancelled');
+                                    await state.loadManagerCateringByStage(stage);
+                                  },
+                                  child: Text('Cancel', style: TextStyle(color: Colors.red.shade800)),
+                                ),
+                              FilledButton(
+                                onPressed: () async {
+                                  final target = _next(stage);
+                                  if (!state.isManager && target == 'completed') {
+                                    appSnack(context, 'Supervisor cannot complete orders.');
+                                    return;
+                                  }
+                                  if (target == 'completed') {
+                                    final double tc = r.totalCost > 0 ? r.totalCost : 1.0;
+                                    if (!cateringFullPaymentConfirmed(r, tc)) {
+                                      appSnack(context, 'Full payment confirmation is required before completing this order.');
+                                      return;
+                                    }
+                                  }
+                                  final err = await state.managerAdvanceCateringStage(
+                                    id: r.id,
+                                    orderKind: r.orderKind,
+                                    status: target,
+                                    downPaymentAmount: stage == 'for_processing' ? (r.totalCost * 0.5) : null,
+                                    fullPaymentAmount: null,
+                                    postAnalysis: stage == 'for_post_analysis' ? {'completed_by': state.userEmail} : null,
+                                  );
+                                  if (!context.mounted) return;
+                                  if (err != null) {
+                                    appSnack(context, err);
+                                    return;
+                                  }
+                                  appSnack(context, 'Moved to next stage');
+                                  await state.loadManagerCateringByStage(stage);
+                                },
+                                child: const Text('Next'),
+                              ),
+                            ],
+                          ),
+                    onTap: () {
+                      Navigator.of(context).push<void>(
+                        MaterialPageRoute<void>(
+                          builder: (_) => ManagerCateringDetailScreen(state: state, row: r, stage: stage),
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
+
+class ManagerCateringDetailScreen extends StatefulWidget {
+  const ManagerCateringDetailScreen({super.key, required this.state, required this.row, required this.stage});
+  final AppState state;
+  final CateringEventRecord row;
+  final String stage;
+  @override
+  State<ManagerCateringDetailScreen> createState() => _ManagerCateringDetailScreenState();
+}
+
+class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScreen> {
+  CateringEventRecord? _loadedDetailRow;
+  bool _detailReady = false;
+
+  CateringEventRecord get d => _loadedDetailRow ?? widget.row;
+
+  final downPaymentController = TextEditingController();
+  final downPaymentPaidController = TextEditingController();
+  final fullPaymentController = TextEditingController();
+  final analysisController = TextEditingController();
+  final checklistController = TextEditingController();
+  final taskAssignmentController = TextEditingController();
+  final businessCardsController = TextEditingController();
+  final spotInquiriesController = TextEditingController();
+  final complaintsController = TextEditingController();
+  final popularDishController = TextEditingController();
+  final popularDrinkController = TextEditingController();
+  final popularDessertController = TextEditingController();
+  final laborMaleController = TextEditingController(text: '0');
+  final laborFemaleController = TextEditingController(text: '0');
+  final laborManualLabelController = TextEditingController();
+  final laborManualAmountController = TextEditingController();
+  final travelCostController = TextEditingController(text: '0');
+  final additionalCostLabelController = TextEditingController();
+  final additionalCostAmountController = TextEditingController();
+  final themeCostLabelController = TextEditingController();
+  final themeCostAmountController = TextEditingController();
+  final menuSearchController = TextEditingController();
+  final managerEventTypeOtherController = TextEditingController();
+  final managerDraftEventTitleController = TextEditingController();
+  final managerGuestCountController = TextEditingController();
+  final managerInquiryNoteController = TextEditingController();
+  String managerEventTypeChoice = 'Birthday';
+  String managerServiceIncluded = 'no';
+  String managerFormalityLevel = 'casual';
+  String managerEventSetting = 'open';
+  /// Draft-stage inquiry kind (`catering` vs `event`); may differ from [d] until saved / migrated.
+  String _draftOrderKind = 'event';
+  final List<_InquiryEventWindow> _eventWindows = [_InquiryEventWindow()];
+  final List<_InquiryEventWindow> _forProcessingWindows = [];
+  bool _forProcessingWindowsLoading = false;
+  bool _forProcessingWindowsLoaded = false;
+  String selectedSetMenu = 'All Dishes';
+  final selectedDishes = <String>{};
+  final List<Map<String, dynamic>> laborManualCosts = [];
+  final List<Map<String, dynamic>> additionalCosts = [];
+  final List<Map<String, dynamic>> themeDesignCosts = [];
+  // Post-Analysis requirement: keep the initial order summary PDF (#1)
+  // and generate a second one (#2) when additional costs are added/changed.
+  Uint8List? _postAnalysisPdf1Bytes;
+  Uint8List? _postAnalysisPdf2Bytes;
+  String _postAnalysisPdf1Signature = '';
+  String _postAnalysisPdf2Signature = '';
+  bool _postAnalysisPdfGenerating = false;
+  final List<Map<String, dynamic>> checklistRows = [];
+  final List<Map<String, dynamic>> checklistRowsOriginal = [];
+  final List<Map<String, dynamic>> taskRows = [];
+  final List<Map<String, dynamic>> taskRowsOriginal = [];
+  final List<String> actualEventImages = [];
+  Uint8List? _managerDownPaymentProofBytes;
+  Uint8List? _managerFullPaymentProofBytes;
+
+  double _sumCostRows(List<Map<String, dynamic>> rows) {
+    double sum = 0;
+    for (final e in rows) {
+      sum += jsonToDouble(e['amount']);
+    }
+    return sum;
+  }
+
+  double _baseFoodCost() {
+    final g = d.guestCount;
+    final minGuests = d.orderKind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
+    final billable = g < minGuests ? minGuests : g;
+    return billable * kPesosPerPax;
+  }
+
+  DateTime? _parseScheduleDate(dynamic v) {
+    final s = v == null ? '' : v.toString().trim();
+    if (s.isEmpty) return null;
+    try {
+      return DateTime.parse(s);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  TimeOfDay? _parseScheduleTime(dynamic v) {
+    final s = v == null ? '' : v.toString().trim();
+    if (s.isEmpty) return null;
+    // Supports "HH:MM" (optionally with seconds).
+    final m = RegExp(r'^(\d{1,2}):(\d{2})').firstMatch(s);
+    if (m == null) return null;
+    final hh = int.tryParse(m.group(1) ?? '');
+    final mm = int.tryParse(m.group(2) ?? '');
+    if (hh == null || mm == null) return null;
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+    return TimeOfDay(hour: hh, minute: mm);
+  }
+
+  List<_InquiryEventWindow> _windowsFromScheduleSlots(dynamic raw) {
+    final out = <_InquiryEventWindow>[];
+    dynamic listLike = raw;
+    if (raw is Map) listLike = [raw];
+    if (raw is String) {
+      final t = raw.trim();
+      if (t.startsWith('[') || t.startsWith('{')) {
+        try {
+          listLike = jsonDecode(t);
+        } catch (_) {}
+      }
+    }
+    if (listLike is List) {
+      for (final s in listLike) {
+        if (s is Map) {
+          final date = _parseScheduleDate(s['date'] ?? s['label']);
+          final from = _parseScheduleTime(s['from']);
+          final to = _parseScheduleTime(s['to']);
+          if (date != null && from != null && to != null) {
+            out.add(_InquiryEventWindow()..date = date..from = from..to = to);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  List<Map<String, String>> _scheduleSlotsPayload() {
+    final out = <Map<String, String>>[];
+    for (final w in _eventWindows) {
+      if (w.date == null || w.from == null || w.to == null) continue;
+      final d = w.date!;
+      final dateStr = '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+      final f = '${w.from!.hour.toString().padLeft(2, '0')}:${w.from!.minute.toString().padLeft(2, '0')}';
+      final t = '${w.to!.hour.toString().padLeft(2, '0')}:${w.to!.minute.toString().padLeft(2, '0')}';
+      out.add({'date': dateStr, 'from': f, 'to': t, 'label': '$dateStr from $f to $t'});
+    }
+    return out;
+  }
+
+  bool _windowsOverlapOnSameDate(_InquiryEventWindow a, _InquiryEventWindow b) {
+    if (a.date == null || a.from == null || a.to == null) return false;
+    if (b.date == null || b.from == null || b.to == null) return false;
+    if (a.date!.year != b.date!.year || a.date!.month != b.date!.month || a.date!.day != b.date!.day) return false;
+    final aStart = a.from!.hour * 60 + a.from!.minute;
+    final aEnd = a.to!.hour * 60 + a.to!.minute;
+    final bStart = b.from!.hour * 60 + b.from!.minute;
+    final bEnd = b.to!.hour * 60 + b.to!.minute;
+    return aStart < bEnd && aEnd > bStart;
+  }
+
+  Future<void> _loadForProcessingWindowsIfNeeded() async {
+    if (_forProcessingWindowsLoading || _forProcessingWindowsLoaded) return;
+    final email = widget.state.userEmail;
+    if (email == null || widget.state.loginPassword.isEmpty) return;
+
+    setState(() => _forProcessingWindowsLoading = true);
+    try {
+      final listUri = Uri.parse('${normalizeApiBase(widget.state.apiBase)}/api/mobile/pos/catering/list');
+      final res = await http
+          .post(
+            listUri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': email,
+              'cashier_password': widget.state.loginPassword,
+              'stage': 'for_processing',
+              'summary': true,
+            }),
+          )
+          .timeout(_managerCateringListTimeout);
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! List) return;
+
+      final windows = <_InquiryEventWindow>[];
+      for (final e in body) {
+        if (e is Map) {
+          windows.addAll(_windowsFromScheduleSlots(e['schedule_slots']));
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _forProcessingWindows
+          ..clear()
+          ..addAll(windows);
+        _forProcessingWindowsLoaded = true;
+        _forProcessingWindowsLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _forProcessingWindowsLoaded = false;
+        _forProcessingWindowsLoading = false;
+      });
+    }
+  }
+
+  int _conflictCountWithForProcessing() {
+    final draftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+    if (!draftStage) return 0;
+    if (!_forProcessingWindowsLoaded) return 0;
+    final processingWindows = _forProcessingWindows;
+    var conflicts = 0;
+    for (final w in _eventWindows) {
+      for (final pw in processingWindows) {
+        if (_windowsOverlapOnSameDate(w, pw)) conflicts++;
+      }
+    }
+    return conflicts;
+  }
+
+  Future<void> _pickWindowDate(int idx) async {
+    if (idx < 0 || idx >= _eventWindows.length) return;
+    final initial = _eventWindows[idx].date ?? DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+    );
+    if (picked == null) return;
+    setState(() {
+      _eventWindows[idx].date = picked;
+    });
+  }
+
+  Future<void> _pickWindowFromTime(int idx) async {
+    if (idx < 0 || idx >= _eventWindows.length) return;
+    final initial = _eventWindows[idx].from ?? const TimeOfDay(hour: 9, minute: 0);
+    final picked = await showTimePicker(context: context, initialTime: initial);
+    if (picked == null) return;
+    setState(() {
+      _eventWindows[idx].from = picked;
+    });
+  }
+
+  Future<void> _pickWindowToTime(int idx) async {
+    if (idx < 0 || idx >= _eventWindows.length) return;
+    final initial = _eventWindows[idx].to ?? const TimeOfDay(hour: 10, minute: 0);
+    final picked = await showTimePicker(context: context, initialTime: initial);
+    if (picked == null) return;
+    setState(() {
+      _eventWindows[idx].to = picked;
+    });
+  }
+
+  void _addAnotherWindow() {
+    setState(() {
+      _eventWindows.add(_InquiryEventWindow());
+    });
+  }
+
+  void _removeWindowAt(int idx) {
+    setState(() {
+      if (_eventWindows.length <= 1) {
+        _eventWindows[0] = _InquiryEventWindow();
+      } else {
+        _eventWindows.removeAt(idx);
+      }
+    });
+  }
+
+  List<Widget> _buildLabeledScheduleRows(List<dynamic> scheduleSlots) {
+    final out = <Widget>[];
+    for (final s in scheduleSlots) {
+      if (s is Map) {
+        final dateRaw = s['date'] ?? s['label'] ?? '';
+        final fromRaw = s['from'] ?? '';
+        final toRaw = s['to'] ?? '';
+        final dateStr = '$dateRaw'.trim();
+        final fromStr = '$fromRaw'.trim();
+        final toStr = '$toRaw'.trim();
+        if (dateStr.isNotEmpty && fromStr.isNotEmpty && toStr.isNotEmpty) {
+          out.add(
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                children: [
+                  Text('Date: $dateStr'),
+                  const SizedBox(width: 12),
+                  Text('Time: $fromStr - $toStr'),
+                ],
+              ),
+            ),
+          );
+          continue;
+        }
+      }
+      out.add(
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Text(formatScheduleSlotLine(s).trim()),
+        ),
+      );
+    }
+    return out;
+  }
+
+  double _laborCostComputed() {
+    final male = int.tryParse(laborMaleController.text.trim()) ?? 0;
+    final female = int.tryParse(laborFemaleController.text.trim()) ?? 0;
+    final maleCost = male < 0 ? 0 : male * 1000;
+    final femaleCost = female < 0 ? 0 : female * 500;
+    return maleCost + femaleCost + _sumCostRows(laborManualCosts);
+  }
+
+  double _travelCostComputed() => double.tryParse(travelCostController.text.trim()) ?? 0;
+
+  double _grandTotalComputed() =>
+      _baseFoodCost() + _laborCostComputed() + _travelCostComputed() + _sumCostRows(additionalCosts) + _sumCostRows(themeDesignCosts);
+
+  String _additionalCostsSignature(List<Map<String, dynamic>> costs) {
+    final normalized = costs.map((e) => {
+          'label': '${e['label'] ?? ''}'.trim(),
+          'amount': jsonToDouble(e['amount']).toStringAsFixed(2),
+        });
+    return jsonEncode(normalized.toList());
+  }
+
+  String _eventDateTimeJoinedFromRowScheduleSlots(List<dynamic> slots) {
+    final lines = <String>[];
+    for (final s in slots) {
+      final f = formatScheduleSlotLine(s).trim();
+      if (f.isNotEmpty) lines.add(f.replaceAll('\n', ' | '));
+    }
+    return lines.join(' ; ');
+  }
+
+  List<String> _menuDishNamesFromRowMenu() {
+    final names = <String>{};
+    final entries = normalizeCateringMenuList(d.menu);
+    for (final e in entries) {
+      final n = dishNameFromCateringMenuEntry(e).trim();
+      if (n.isNotEmpty) names.add(n);
+    }
+    return names.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+  }
+
+  Future<Uint8List> _buildOrderSummaryPdfBytes({
+    required List<Map<String, dynamic>> additionalCostsForPdf,
+    bool postAnalysis2Only = false,
+  }) async {
+    final doc = pw.Document();
+    final labelBg = pdf.PdfColor.fromInt(0xFFCFCFCF);
+    final themeCost = _sumCostRows(themeDesignCosts);
+    final additionalCostTotal = _sumCostRows(additionalCostsForPdf);
+    final processingAt = formatDateTimeLocal(d.stageEnteredAt ?? d.updatedAt);
+    final eventWhen = _eventDateTimeJoinedFromRowScheduleSlots(d.scheduleSlots);
+    final settingLabel = managerEventSetting == 'closed' ? 'Closed space' : 'Open space';
+
+    pw.Widget labelValueRow(String k, String v) => pw.Padding(
+          padding: const pw.EdgeInsets.only(bottom: 5),
+          child: pw.Row(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: [
+              pw.Expanded(
+                flex: 2,
+                child: pw.Container(
+                  color: labelBg,
+                  padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                  child: pw.Text(k, style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
+                ),
+              ),
+              pw.SizedBox(width: 6),
+              pw.Expanded(
+                flex: 3,
+                child: pw.Padding(
+                  padding: const pw.EdgeInsets.symmetric(vertical: 5),
+                  child: pw.Text(v.isEmpty ? '—' : v, style: const pw.TextStyle(fontSize: 10)),
+                ),
+              ),
+            ],
+          ),
+        );
+
+    if (postAnalysis2Only) {
+      final addRows = <pw.Widget>[
+        labelValueRow('Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen),
+        labelValueRow('Event setting', settingLabel),
+      ];
+      for (final e in additionalCostsForPdf) {
+        final label = '${e['label'] ?? ''}'.trim();
+        final amount = jsonToDouble(e['amount']);
+        if (label.isEmpty && amount <= 0) continue;
+        addRows.add(labelValueRow(label.isEmpty ? 'Additional item' : label, 'PHP ${amount.toStringAsFixed(2)}'));
+      }
+      addRows.add(labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'));
+      doc.addPage(
+        pw.MultiPage(
+          build: (ctx) => [
+            pw.Text('Order Summary', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            pw.Text('Macrina\'s Kitchen and Catering', style: pw.TextStyle(fontSize: 10, color: pdf.PdfColors.grey700)),
+            pw.SizedBox(height: 12),
+            pw.Text('Event information', style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 6),
+            labelValueRow('Transaction No.', d.transactionNo.isEmpty ? '—' : d.transactionNo),
+            labelValueRow('Event', d.eventTitle.isEmpty ? d.customerName : d.eventTitle),
+            labelValueRow('Customer', d.customerName),
+            labelValueRow('Contact person', d.contactPerson),
+            labelValueRow('Address', d.address),
+            ...addRows,
+          ],
+        ),
+      );
+      return doc.save();
+    }
+
+    final omitLaborTravel = widget.stage == 'for_processing';
+    final laborLine = omitLaborTravel ? 0.0 : _laborCostComputed();
+    final travelLine = omitLaborTravel ? 0.0 : _travelCostComputed();
+    final totalComputed = _baseFoodCost() + laborLine + travelLine + themeCost + additionalCostTotal;
+    final noPaxAmount = d.guestCount * kPesosPerPax;
+    final downPaymentDue = totalComputed * 0.5;
+    final totalDueNow = totalComputed - downPaymentDue;
+    final menuLines = _menuDishNamesFromRowMenu();
+    final cateringType = d.orderKind == 'catering' ? 'Catering' : 'Catering and Event';
+
+    doc.addPage(
+      pw.MultiPage(
+        build: (ctx) => [
+          pw.Text('Order Summary', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+          pw.Text('Macrina\'s Kitchen and Catering', style: pw.TextStyle(fontSize: 10, color: pdf.PdfColors.grey700)),
+          pw.SizedBox(height: 12),
+          labelValueRow('Transaction No.', d.transactionNo.isEmpty ? '—' : d.transactionNo),
+          labelValueRow('Date/Time processed', processingAt),
+          labelValueRow('Event', d.eventTitle.isEmpty ? d.customerName : d.eventTitle),
+          labelValueRow('Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen),
+          labelValueRow('Customer', d.customerName),
+          labelValueRow('Contact person', d.contactPerson),
+          labelValueRow('Catering type', cateringType),
+          labelValueRow('Address of event', d.address),
+          labelValueRow('Menu dishes', menuLines.isEmpty ? '—' : menuLines.join(', ')),
+          labelValueRow(
+            'No. of PAX and cost',
+            '${d.guestCount} x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${noPaxAmount.toStringAsFixed(2)}',
+          ),
+          labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
+          if (!omitLaborTravel) labelValueRow('Labor cost', 'PHP ${laborLine.toStringAsFixed(2)}'),
+          if (!omitLaborTravel) labelValueRow('Travel cost', 'PHP ${travelLine.toStringAsFixed(2)}'),
+          labelValueRow(
+            'Additional costs',
+            additionalCostsForPdf.isEmpty
+                ? '—'
+                : additionalCostsForPdf
+                    .map((e) {
+                      final lb = '${e['label'] ?? ''}'.trim();
+                      final am = jsonToDouble(e['amount']);
+                      if (lb.isEmpty && am <= 0) return '';
+                      return '${lb.isEmpty ? 'Item' : lb}: PHP ${am.toStringAsFixed(2)}';
+                    })
+                    .where((x) => x.isNotEmpty)
+                    .join(' · '),
+          ),
+          labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Down payment (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
+          labelValueRow('Total amount due (after down payment)', 'PHP ${totalDueNow.toStringAsFixed(2)}'),
+        ],
+      ),
+    );
+
+    return doc.save();
+  }
+
+  Future<void> _openOrderSummaryPdfBytes(Uint8List bytes) async {
+    await Printing.layoutPdf(onLayout: (_) async => bytes);
+  }
+
+  Future<void> _capturePostAnalysisPdf1IfNeeded() async {
+    if (widget.stage != 'for_post_analysis') return;
+    if (_postAnalysisPdf1Bytes != null) return;
+
+    final snapshot = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
+    final sig = _additionalCostsSignature(snapshot);
+    final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: snapshot);
+    if (!mounted) return;
+    setState(() {
+      _postAnalysisPdf1Bytes = bytes;
+      _postAnalysisPdf1Signature = sig;
+      _postAnalysisPdf2Bytes = null;
+      _postAnalysisPdf2Signature = '';
+    });
+  }
+
+  Future<void> _maybeGeneratePostAnalysisPdf2IfNeeded() async {
+    if (widget.stage != 'for_post_analysis') return;
+    if (_postAnalysisPdf1Bytes == null) {
+      await _capturePostAnalysisPdf1IfNeeded();
+      if (_postAnalysisPdf1Bytes == null) return;
+    }
+    if (_postAnalysisPdf1Signature.isEmpty) return;
+
+    final snapshot = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
+    final sig = _additionalCostsSignature(snapshot);
+    if (sig == _postAnalysisPdf1Signature) {
+      // Back to initial state: hide #2.
+      if (_postAnalysisPdf2Bytes != null) {
+        if (!mounted) return;
+        setState(() {
+          _postAnalysisPdf2Bytes = null;
+          _postAnalysisPdf2Signature = '';
+        });
+      }
+      return;
+    }
+    if (_postAnalysisPdf2Bytes != null && sig == _postAnalysisPdf2Signature) return;
+    if (_postAnalysisPdfGenerating) return;
+
+    setState(() => _postAnalysisPdfGenerating = true);
+    try {
+      final bytes = await _buildOrderSummaryPdfBytes(
+        additionalCostsForPdf: snapshot,
+        postAnalysis2Only: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _postAnalysisPdf2Bytes = bytes;
+        _postAnalysisPdf2Signature = sig;
+      });
+    } finally {
+      if (mounted) setState(() => _postAnalysisPdfGenerating = false);
+    }
+  }
+
+  void _refreshDueAndDefaults() {
+    final total = widget.stage == 'for_processing'
+        ? _baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts)
+        : _grandTotalComputed();
+    downPaymentController.text = (total * 0.5).toStringAsFixed(2);
+    if (fullPaymentController.text.trim().isEmpty || jsonToDouble(fullPaymentController.text) <= 0) {
+      fullPaymentController.text = total.toStringAsFixed(2);
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_bootstrapDetail);
+  }
+
+  Future<void> _bootstrapDetail() async {
+    final full = await widget.state.loadManagerCateringItem(
+      id: widget.row.id,
+      orderKind: widget.row.orderKind,
+    );
+    if (!mounted) return;
+    _loadedDetailRow = full ?? widget.row;
+    _initControllersFromRow(_loadedDetailRow!);
+    setState(() => _detailReady = true);
+  }
+
+  void _initControllersFromRow(CateringEventRecord row) {
+    final tdInit = row.themeDesign;
+    final existingEventType =
+        '${row.postAnalysis['event_type'] ?? tdInit['event_type'] ?? row.eventType}'.trim();
+    if (existingEventType.isNotEmpty) {
+      if (kMobileEventTypeChoices.contains(existingEventType)) {
+        managerEventTypeChoice = existingEventType;
+      } else {
+        managerEventTypeChoice = 'Other';
+        managerEventTypeOtherController.text = existingEventType;
+      }
+    }
+    managerServiceIncluded = '${tdInit['service_included'] ?? row.serviceIncluded ?? 'no'}' == 'yes' ? 'yes' : 'no';
+    managerFormalityLevel =
+        row.formalityLevel.trim().isEmpty ? '${tdInit['formality_level'] ?? 'casual'}'.trim() : row.formalityLevel.trim();
+    if (!{'casual', 'semiformal', 'formal'}.contains(managerFormalityLevel)) managerFormalityLevel = 'casual';
+    managerDraftEventTitleController.text =
+        row.eventTitle.trim().isNotEmpty ? row.eventTitle.trim() : '${tdInit['event_title'] ?? ''}'.trim();
+    managerGuestCountController.text = '${row.guestCount <= 0 ? '' : row.guestCount}';
+    managerInquiryNoteController.text = '${tdInit['note'] ?? ''}';
+    managerEventSetting = '${tdInit['event_setting'] ?? 'open'}'.trim().isEmpty ? 'open' : tdInit['event_setting'].toString().trim();
+    _draftOrderKind = row.orderKind;
+    if (widget.stage == 'new_event' || widget.stage == 'online_inquiries') {
+      _eventWindows
+        ..clear()
+        ..addAll(_windowsFromScheduleSlots(row.scheduleSlots));
+      if (_eventWindows.isEmpty) _eventWindows.add(_InquiryEventWindow());
+    }
+    if (widget.stage == 'new_event' || widget.stage == 'online_inquiries') {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _loadForProcessingWindowsIfNeeded();
+      });
+    }
+    downPaymentPaidController.text = row.downPaymentAmount > 0 ? row.downPaymentAmount.toStringAsFixed(2) : '';
+    fullPaymentController.text = row.fullPaymentAmount > 0 ? row.fullPaymentAmount.toStringAsFixed(2) : '';
+    analysisController.text = '${row.postAnalysis['notes'] ?? ''}';
+    checklistController.text = row.checklist.map((e) => '$e').join('\n');
+    taskAssignmentController.text = '${row.postAnalysis['task_assignment'] ?? ''}';
+    businessCardsController.text = '${row.postAnalysis['business_cards_given'] ?? ''}';
+    spotInquiriesController.text = '${row.postAnalysis['on_the_spot_inquiries'] ?? ''}';
+    complaintsController.text = '${row.postAnalysis['complaints'] ?? ''}';
+    popularDishController.text = '${row.postAnalysis['most_popular_dish'] ?? ''}';
+    popularDrinkController.text = '${row.postAnalysis['most_popular_drink'] ?? ''}';
+    popularDessertController.text = '${row.postAnalysis['most_popular_dessert'] ?? ''}';
+    travelCostController.text = row.travelCost.toStringAsFixed(2);
+    if (row.laborCost > 0) {
+      laborManualCosts.add({'label': 'Existing labor amount', 'amount': row.laborCost});
+    }
+    laborMaleController.text = '${row.postAnalysis['labor_male_count'] ?? 0}';
+    laborFemaleController.text = '${row.postAnalysis['labor_female_count'] ?? 0}';
+    for (final c in row.additionalCosts) {
+      if (c is Map<String, dynamic>) additionalCosts.add(c);
+    }
+    final td = tdInit;
+    final tc = td['cost_items'];
+    if (tc is List) {
+      for (final e in tc) {
+        if (e is Map<String, dynamic>) themeDesignCosts.add(e);
+      }
+    }
+    final rowMenu = normalizeCateringMenuList(row.menu);
+    for (final m in rowMenu) {
+      final n = dishNameFromCateringMenuEntry(m).trim();
+      if (n.isNotEmpty) selectedDishes.add(n);
+    }
+    for (final c in row.checklist) {
+      if (c is Map<String, dynamic>) {
+        checklistRows.add({
+          'item': '${c['item'] ?? ''}',
+          'description': '${c['description'] ?? ''}',
+          'quantity': '${c['quantity'] ?? ''}',
+          'cost': '${c['cost'] ?? ''}',
+          'status': '${c['status'] ?? 'not done'}',
+        });
+      } else if ('$c'.trim().isNotEmpty) {
+        checklistRows.add({'item': '$c', 'description': '', 'quantity': '', 'cost': '', 'status': 'not done'});
+      }
+    }
+    if (checklistRows.isEmpty) {
+      checklistRows.add({'item': '', 'description': '', 'quantity': '', 'cost': '', 'status': 'not done'});
+    }
+    checklistRowsOriginal
+      ..clear()
+      ..addAll(checklistRows.map((e) => Map<String, dynamic>.from(e)));
+    final existingTaskRows = row.postAnalysis['task_assignment_rows'];
+    if (existingTaskRows is List && existingTaskRows.isNotEmpty) {
+      for (final t in existingTaskRows) {
+        if (t is Map) {
+          taskRows.add({
+            'employee': '${t['employee'] ?? ''}',
+            'tasks': '${t['tasks'] ?? ''}',
+            'schedule_of_tasks': '${t['schedule_of_tasks'] ?? ''}',
+            'budget': '${t['budget'] ?? ''}',
+            'status': '${t['status'] ?? 'not done'}',
+          });
+        }
+      }
+    }
+    if (taskRows.isEmpty) {
+      for (var i = 0; i < 5; i++) {
+        taskRows.add({
+          'employee': '',
+          'tasks': '',
+          'schedule_of_tasks': '',
+          'budget': '',
+          'status': 'not done',
+        });
+      }
+    }
+    taskRowsOriginal
+      ..clear()
+      ..addAll(taskRows.map((e) => Map<String, dynamic>.from(e)));
+    _managerDownPaymentProofBytes = null;
+    _managerFullPaymentProofBytes = null;
+    final dpb = row.postAnalysis['manager_down_payment_proof_b64'];
+    if (dpb is String && dpb.trim().isNotEmpty) {
+      try {
+        _managerDownPaymentProofBytes = Uint8List.fromList(base64Decode(dpb.trim()));
+      } catch (_) {}
+    }
+    final fpb = row.postAnalysis['manager_full_payment_proof_b64'];
+    if (fpb is String && fpb.trim().isNotEmpty) {
+      try {
+        _managerFullPaymentProofBytes = Uint8List.fromList(base64Decode(fpb.trim()));
+      } catch (_) {}
+    }
+    if (widget.stage == 'for_post_analysis') {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        await _capturePostAnalysisPdf1IfNeeded();
+      });
+    }
+    _refreshDueAndDefaults();
+  }
+
+  @override
+  void dispose() {
+    downPaymentController.dispose();
+    downPaymentPaidController.dispose();
+    fullPaymentController.dispose();
+    analysisController.dispose();
+    checklistController.dispose();
+    taskAssignmentController.dispose();
+    businessCardsController.dispose();
+    spotInquiriesController.dispose();
+    complaintsController.dispose();
+    popularDishController.dispose();
+    popularDrinkController.dispose();
+    popularDessertController.dispose();
+    laborMaleController.dispose();
+    laborFemaleController.dispose();
+    laborManualLabelController.dispose();
+    laborManualAmountController.dispose();
+    travelCostController.dispose();
+    additionalCostLabelController.dispose();
+    additionalCostAmountController.dispose();
+    themeCostLabelController.dispose();
+    themeCostAmountController.dispose();
+    menuSearchController.dispose();
+    managerEventTypeOtherController.dispose();
+    managerDraftEventTitleController.dispose();
+    managerGuestCountController.dispose();
+    managerInquiryNoteController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_detailReady) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Loading…')),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+    final row = d;
+    final isProcessing = widget.stage == 'for_processing';
+    final isPost = widget.stage == 'for_post_analysis';
+    final isCompleted = widget.stage == 'completed';
+    final isOnlineInquiry = widget.stage == 'online_inquiries';
+    final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+    final isThemeReadOnly = isProcessing || isPost || isCompleted;
+    final canEditStage = !isCompleted;
+    final canComplete = widget.state.isManager;
+    final totalComputed = _grandTotalComputed();
+    final displayInvoiceTotal = isProcessing
+        ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts))
+        : totalComputed;
+    final scheduleConflictsForProcessing = _conflictCountWithForProcessing();
+    final downPaymentDue = displayInvoiceTotal * 0.5;
+    final isFullPaymentConfirmed = cateringFullPaymentConfirmed(row, totalComputed);
+    final laborCostComputed = _laborCostComputed();
+    final rowMenu = normalizeCateringMenuList(row.menu);
+    Future<void> _generateChecklistPdf() async {
+      final baseFont = await PdfGoogleFonts.notoSansRegular();
+      final boldFont = await PdfGoogleFonts.notoSansBold();
+      final doc = pw.Document(
+        theme: pw.ThemeData.withFont(base: baseFont, bold: boldFont),
+      );
+      final stageLabel = widget.stage.replaceAll('_', ' ').toUpperCase();
+      final generatedAt = DateTime.now().toLocal().toString();
+      String enrichChecklistItem(String item) {
+        final n = item.trim();
+        if (n.isEmpty) return item;
+        for (final m in widget.state.menu) {
+          if (m.name.trim() == n && m.ingredients.isNotEmpty) {
+            return '$n (${m.ingredients.join(', ')})';
+          }
+        }
+        return item;
+      }
+
+      final rows = checklistRows
+          .map(
+            (r) => [
+              enrichChecklistItem('${r['item'] ?? ''}'),
+              '${r['description'] ?? ''}',
+              '${r['quantity'] ?? ''}',
+              '${r['cost'] ?? ''}',
+              '${r['status'] ?? 'not done'}',
+            ],
+          )
+          .toList();
+      doc.addPage(
+        pw.MultiPage(
+          build: (ctx) => [
+            pw.Text('Checklist', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 6),
+            pw.Text('Event: ${row.eventTitle.isEmpty ? row.customerName : row.eventTitle}'),
+            pw.Text('Customer: ${row.customerName}'),
+            pw.Text('Stage: $stageLabel'),
+            pw.Text('Generated: $generatedAt'),
+            pw.SizedBox(height: 10),
+            pw.TableHelper.fromTextArray(
+              headers: const ['Item', 'Description', 'Quantity', 'Cost', 'Status'],
+              data: rows.isEmpty ? const [['', 'No checklist items.', '', '', '']] : rows,
+            ),
+          ],
+        ),
+      );
+      await Printing.layoutPdf(onLayout: (format) async => doc.save());
+    }
+    Future<void> _generateTaskPdf() async {
+      final doc = pw.Document();
+      final stageLabel = widget.stage.replaceAll('_', ' ').toUpperCase();
+      final generatedAt = DateTime.now().toLocal().toString();
+      final rows = taskRows
+          .map(
+            (r) => [
+              '${r['employee'] ?? ''}',
+              '${r['tasks'] ?? ''}',
+              '${r['schedule_of_tasks'] ?? ''}',
+              '${r['budget'] ?? ''}',
+              '${r['status'] ?? 'not done'}',
+            ],
+          )
+          .toList();
+      doc.addPage(
+        pw.MultiPage(
+          build: (ctx) => [
+            pw.Text('Task Assignment', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 6),
+            pw.Text('Event: ${row.eventTitle.isEmpty ? row.customerName : row.eventTitle}'),
+            pw.Text('Customer: ${row.customerName}'),
+            pw.Text('Stage: $stageLabel'),
+            pw.Text('Generated: $generatedAt'),
+            pw.SizedBox(height: 10),
+            pw.TableHelper.fromTextArray(
+              headers: const ['Employee', 'Tasks', 'Schedule of Tasks', 'Budget', 'Status'],
+              data: rows.isEmpty ? const [['', 'No task assignment rows.', '', '', '']] : rows,
+            ),
+          ],
+        ),
+      );
+      await Printing.layoutPdf(onLayout: (format) async => doc.save());
+    }
+    Future<void> _generateInvoicePdf() async {
+      final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: additionalCosts);
+      await Printing.layoutPdf(onLayout: (_) async => bytes);
+    }
+    Future<void> _openChecklistEditor() async {
+      final draft = checklistRows.map((e) => Map<String, dynamic>.from(e)).toList();
+      final saved = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: const Text('Checklist Editor'),
+            content: SizedBox(
+              width: 760,
+              child: SingleChildScrollView(
+                child: Column(
+                  children: [
+                    ...draft.asMap().entries.map((entry) {
+                      final i = entry.key;
+                      final r = entry.value;
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: Column(
+                            children: [
+                              TextField(
+                                controller: TextEditingController(text: '${r['item'] ?? ''}'),
+                                decoration: const InputDecoration(labelText: 'Item'),
+                                onChanged: (v) => r['item'] = v,
+                              ),
+                              const SizedBox(height: 6),
+                              TextField(
+                                controller: TextEditingController(text: '${r['description'] ?? ''}'),
+                                decoration: const InputDecoration(labelText: 'Description'),
+                                onChanged: (v) => r['description'] = v,
+                              ),
+                              const SizedBox(height: 6),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: TextField(
+                                      controller: TextEditingController(text: '${r['quantity'] ?? ''}'),
+                                      decoration: const InputDecoration(labelText: 'Quantity'),
+                                      onChanged: (v) => r['quantity'] = v,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: TextField(
+                                      controller: TextEditingController(text: '${r['cost'] ?? ''}'),
+                                      decoration: const InputDecoration(labelText: 'Cost'),
+                                      onChanged: (v) => r['cost'] = v,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              DropdownButtonFormField<String>(
+                                value: ('${r['status'] ?? 'not done'}' == 'completed') ? 'completed' : 'not done',
+                                items: const [
+                                  DropdownMenuItem(value: 'not done', child: Text('not done')),
+                                  DropdownMenuItem(value: 'completed', child: Text('completed')),
+                                ],
+                                onChanged: (v) => r['status'] = v ?? 'not done',
+                              ),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: IconButton(
+                                  onPressed: () => setDialogState(() => draft.removeAt(i)),
+                                  icon: const Icon(Icons.delete_outline),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => setDialogState(() {
+                          draft.add({'item': '', 'description': '', 'quantity': '', 'cost': '', 'status': 'not done'});
+                        }),
+                        icon: const Icon(Icons.add),
+                        label: const Text('Add row'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+            ],
+          ),
+        ),
+      );
+      if (saved == true) {
+        setState(() {
+          checklistRows
+            ..clear()
+            ..addAll(draft);
+          checklistRowsOriginal
+            ..clear()
+            ..addAll(draft.map((e) => Map<String, dynamic>.from(e)));
+        });
+      }
+    }
+    Future<void> _openTaskEditor() async {
+      final draft = taskRows.map((e) => Map<String, dynamic>.from(e)).toList();
+      final saved = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: const Text('Task Assignment Editor'),
+            content: SizedBox(
+              width: 760,
+              child: SingleChildScrollView(
+                child: Column(
+                  children: [
+                    ...draft.asMap().entries.map((entry) {
+                      final i = entry.key;
+                      final r = entry.value;
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: Column(
+                            children: [
+                              TextField(
+                                controller: TextEditingController(text: '${r['employee'] ?? ''}'),
+                                decoration: const InputDecoration(labelText: 'Employee'),
+                                onChanged: (v) => r['employee'] = v,
+                              ),
+                              const SizedBox(height: 6),
+                              TextField(
+                                controller: TextEditingController(text: '${r['tasks'] ?? ''}'),
+                                decoration: const InputDecoration(labelText: 'Tasks'),
+                                onChanged: (v) => r['tasks'] = v,
+                              ),
+                              const SizedBox(height: 6),
+                              TextField(
+                                controller: TextEditingController(text: '${r['schedule_of_tasks'] ?? ''}'),
+                                decoration: const InputDecoration(labelText: 'Schedule of tasks'),
+                                onChanged: (v) => r['schedule_of_tasks'] = v,
+                              ),
+                              const SizedBox(height: 6),
+                              TextField(
+                                controller: TextEditingController(text: '${r['budget'] ?? ''}'),
+                                decoration: const InputDecoration(labelText: 'Budget'),
+                                onChanged: (v) => r['budget'] = v,
+                              ),
+                              const SizedBox(height: 6),
+                              DropdownButtonFormField<String>(
+                                value: ('${r['status'] ?? 'not done'}' == 'completed') ? 'completed' : 'not done',
+                                items: const [
+                                  DropdownMenuItem(value: 'not done', child: Text('not done')),
+                                  DropdownMenuItem(value: 'completed', child: Text('completed')),
+                                ],
+                                onChanged: (v) => r['status'] = v ?? 'not done',
+                              ),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: IconButton(
+                                  onPressed: () => setDialogState(() => draft.removeAt(i)),
+                                  icon: const Icon(Icons.delete_outline),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => setDialogState(() {
+                          draft.add({
+                            'employee': '',
+                            'tasks': '',
+                            'schedule_of_tasks': '',
+                            'budget': '',
+                            'status': 'not done',
+                          });
+                        }),
+                        icon: const Icon(Icons.add),
+                        label: const Text('Add row'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+            ],
+          ),
+        ),
+      );
+      if (saved == true) {
+        setState(() {
+          taskRows
+            ..clear()
+            ..addAll(draft);
+          taskRowsOriginal
+            ..clear()
+            ..addAll(draft.map((e) => Map<String, dynamic>.from(e)));
+        });
+      }
+    }
+    String? _validateDraftScheduleCoherence() {
+      if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
+      for (final w in _eventWindows) {
+        final any = w.date != null || w.from != null || w.to != null;
+        final all = w.date != null && w.from != null && w.to != null;
+        if (any && !all) {
+          return 'Complete date, start time, and end time for each schedule row (or remove the row).';
+        }
+      }
+      final filled = _eventWindows.where((x) => x.date != null && x.from != null && x.to != null).toList();
+      for (final w in filled) {
+        final sm = w.from!.hour * 60 + w.from!.minute;
+        final em = w.to!.hour * 60 + w.to!.minute;
+        if (em <= sm) return 'End time must be after start time for each event window.';
+      }
+      return null;
+    }
+
+    String? _validateDraftReadyForNextStage() {
+      final sch = _validateDraftScheduleCoherence();
+      if (sch != null) return sch;
+      if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
+      final kind = d.orderKind;
+      final et =
+          managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
+      if (et.trim().isEmpty) return 'Choose or describe the event type.';
+      if (managerEventTypeChoice == 'Other' && managerEventTypeOtherController.text.trim().isEmpty) {
+        return 'Describe the event type for Other.';
+      }
+      if (kind == 'event' && managerDraftEventTitleController.text.trim().isEmpty) {
+        return 'Enter an event title for Catering + Event.';
+      }
+      final gc = int.tryParse(managerGuestCountController.text.trim());
+      if (gc == null || gc < 1) return 'Enter a valid number of guests.';
+      final minPax = kind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
+      if (gc < minPax) return 'Minimum guests for this inquiry type is $minPax.';
+      final complete = _eventWindows.where((x) => x.date != null && x.from != null && x.to != null).toList();
+      if (complete.isEmpty) return 'Add at least one event date with start and end time.';
+      if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
+      return null;
+    }
+
+    Future<void> submitNext() async {
+      final target = widget.stage == 'online_inquiries'
+          ? 'for_processing'
+          : widget.stage == 'new_event'
+              ? 'for_processing'
+          : widget.stage == 'for_processing'
+          ? 'for_post_analysis'
+          : widget.stage == 'for_post_analysis'
+              ? 'completed'
+              : '';
+      if (target.isEmpty) return;
+      if (!canComplete && target == 'completed') {
+        appSnack(context, 'Supervisor cannot complete orders.');
+        return;
+      }
+      final isDraftAdvance = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+      if (isDraftAdvance) {
+        final verr = _validateDraftReadyForNextStage();
+        if (verr != null) {
+          appSnack(context, verr);
+          return;
+        }
+      }
+      if (isDraftAdvance && _draftOrderKind != d.orderKind) {
+        final errSwitch = await widget.state.managerSwitchCateringOrderKind(
+          id: d.id,
+          fromKind: d.orderKind,
+          toKind: _draftOrderKind,
+        );
+        if (!mounted) return;
+        if (errSwitch != null) {
+          appSnack(context, errSwitch);
+          return;
+        }
+        final migrated = await widget.state.loadManagerCateringItem(
+          id: d.id,
+          orderKind: _draftOrderKind,
+        );
+        if (!mounted) return;
+        if (migrated != null) {
+          setState(() => _loadedDetailRow = migrated);
+        }
+      }
+      final rowSubmit = d;
+      final downPayment = double.tryParse(downPaymentController.text.trim());
+      final downPaymentPaid = double.tryParse(downPaymentPaidController.text.trim());
+      final fullPayment = double.tryParse(fullPaymentController.text.trim());
+      final postAnalysis = <String, dynamic>{
+        'notes': analysisController.text.trim(),
+        'task_assignment': taskAssignmentController.text.trim(),
+        'task_assignment_rows': taskRows,
+        'business_cards_given': businessCardsController.text.trim(),
+        'on_the_spot_inquiries': spotInquiriesController.text.trim(),
+        'complaints': complaintsController.text.trim(),
+        'most_popular_dish': popularDishController.text.trim(),
+        'most_popular_drink': popularDrinkController.text.trim(),
+        'most_popular_dessert': popularDessertController.text.trim(),
+        'labor_male_count': int.tryParse(laborMaleController.text.trim()) ?? 0,
+        'labor_female_count': int.tryParse(laborFemaleController.text.trim()) ?? 0,
+        'labor_manual_costs': laborManualCosts,
+        if (rowSubmit.postAnalysis['manager_full_payment_confirmed'] == true) 'manager_full_payment_confirmed': true,
+        if (rowSubmit.postAnalysis['additional_costs_payment_confirmed'] == true)
+          'additional_costs_payment_confirmed': true,
+        if (isOnlineInquiry || widget.stage == 'new_event')
+          'event_type': managerEventTypeChoice == 'Other'
+              ? managerEventTypeOtherController.text.trim()
+              : managerEventTypeChoice,
+      };
+      if (_managerDownPaymentProofBytes != null) {
+        postAnalysis['manager_down_payment_proof_b64'] = base64Encode(_managerDownPaymentProofBytes!);
+      }
+      if (_managerFullPaymentProofBytes != null) {
+        postAnalysis['manager_full_payment_proof_b64'] = base64Encode(_managerFullPaymentProofBytes!);
+      }
+      final laborForSubmit = isProcessing ? 0.0 : laborCostComputed;
+      final travelForSubmit = isProcessing ? 0.0 : _travelCostComputed();
+      final invoiceTotalSubmit = isProcessing
+          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts))
+          : totalComputed;
+      final themeDesign = <String, dynamic>{
+        ...rowSubmit.themeDesign,
+        'cost_items': themeDesignCosts,
+        'service_included': managerServiceIncluded,
+        'note': managerInquiryNoteController.text.trim(),
+        'event_title': managerDraftEventTitleController.text.trim(),
+        'event_type':
+            managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice,
+        'event_setting': managerEventSetting,
+        'formality_level': managerFormalityLevel,
+      };
+      final costBreakdown = <Map<String, dynamic>>[
+        {'label': 'Base food cost', 'amount': _baseFoodCost()},
+        {'label': 'Labor cost', 'amount': laborForSubmit},
+        {'label': 'Travel cost', 'amount': travelForSubmit},
+        {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+        {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+      ];
+      final confirm = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Confirm submission'),
+          content: Text('Proceed to ${target == 'completed' ? 'Completed' : 'next stage'}?'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm')),
+          ],
+        ),
+      );
+      if (confirm != true) return;
+      if (target == 'completed') {
+        if (!cateringFullPaymentConfirmed(rowSubmit, totalComputed)) {
+          appSnack(context, 'Full payment confirmation is required before completing this order.');
+          return;
+        }
+      }
+      final err = await widget.state.managerAdvanceCateringStage(
+        id: rowSubmit.id,
+        orderKind: rowSubmit.orderKind,
+        status: target,
+        downPaymentAmount: isProcessing
+            ? (downPaymentPaid ?? downPayment ?? (invoiceTotalSubmit * 0.5))
+            : null,
+        fullPaymentAmount: (isPost && target != 'completed') ? (fullPayment ?? totalComputed) : null,
+        postAnalysis:
+            (isProcessing || isPost || isOnlineInquiry || widget.stage == 'new_event') ? postAnalysis : null,
+        checklist: checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
+        actualEventImages: actualEventImages.isEmpty ? null : actualEventImages,
+        additionalCosts: additionalCosts,
+        laborCost: laborForSubmit,
+        travelCost: travelForSubmit,
+        totalCost: invoiceTotalSubmit,
+        costBreakdown: costBreakdown,
+        themeDesign: themeDesign,
+        menu: selectedDishes.isEmpty ? rowSubmit.menu : selectedDishes.toList(),
+      );
+      if (!mounted) return;
+      if (err != null) {
+        appSnack(context, err);
+        return;
+      }
+      appSnack(context, target == 'completed' ? 'Order completed' : 'Moved to next stage');
+      await widget.state.loadManagerCateringByStage(widget.stage);
+      if (mounted) Navigator.of(context).pop();
+    }
+    Future<void> saveCurrentStage() async {
+      final isProcessingHere = widget.stage == 'for_processing';
+      final laborCostComputedNow = isProcessingHere ? 0.0 : _laborCostComputed();
+      final travelNow = isProcessingHere ? 0.0 : _travelCostComputed();
+      final totalNow = isProcessingHere
+          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts))
+          : _grandTotalComputed();
+      final et =
+          managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
+
+      final isDraftStageHere = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+      if (isDraftStageHere) {
+        final verr = _validateDraftScheduleCoherence();
+        if (verr != null) {
+          appSnack(context, verr);
+          return;
+        }
+      }
+      if (isDraftStageHere && _draftOrderKind != d.orderKind) {
+        final errSwitch = await widget.state.managerSwitchCateringOrderKind(
+          id: d.id,
+          fromKind: d.orderKind,
+          toKind: _draftOrderKind,
+        );
+        if (!mounted) return;
+        if (errSwitch != null) {
+          appSnack(context, errSwitch);
+          return;
+        }
+        final migrated = await widget.state.loadManagerCateringItem(
+          id: d.id,
+          orderKind: _draftOrderKind,
+        );
+        if (!mounted) return;
+        if (migrated != null) {
+          setState(() => _loadedDetailRow = migrated);
+        }
+      }
+
+      final rowBase = d;
+      final postAnalysis = <String, dynamic>{
+        'notes': analysisController.text.trim(),
+        'task_assignment': taskAssignmentController.text.trim(),
+        'task_assignment_rows': taskRows,
+        'business_cards_given': businessCardsController.text.trim(),
+        'on_the_spot_inquiries': spotInquiriesController.text.trim(),
+        'complaints': complaintsController.text.trim(),
+        'most_popular_dish': popularDishController.text.trim(),
+        'most_popular_drink': popularDrinkController.text.trim(),
+        'most_popular_dessert': popularDessertController.text.trim(),
+        'labor_male_count': int.tryParse(laborMaleController.text.trim()) ?? 0,
+        'labor_female_count': int.tryParse(laborFemaleController.text.trim()) ?? 0,
+        'labor_manual_costs': laborManualCosts,
+        if (rowBase.postAnalysis['manager_full_payment_confirmed'] == true) 'manager_full_payment_confirmed': true,
+        if (rowBase.postAnalysis['additional_costs_payment_confirmed'] == true)
+          'additional_costs_payment_confirmed': true,
+        if (isOnlineInquiry || widget.stage == 'new_event') 'event_type': et,
+      };
+      if (_managerDownPaymentProofBytes != null) {
+        postAnalysis['manager_down_payment_proof_b64'] = base64Encode(_managerDownPaymentProofBytes!);
+      }
+      if (_managerFullPaymentProofBytes != null) {
+        postAnalysis['manager_full_payment_proof_b64'] = base64Encode(_managerFullPaymentProofBytes!);
+      }
+      final themeDesign = <String, dynamic>{
+        ...rowBase.themeDesign,
+        'cost_items': themeDesignCosts,
+        'service_included': managerServiceIncluded,
+        'note': managerInquiryNoteController.text.trim(),
+        'event_title': managerDraftEventTitleController.text.trim(),
+        'event_type': et,
+        'event_setting': managerEventSetting,
+        'formality_level': managerFormalityLevel,
+      };
+
+      if (isDraftStageHere) {
+        final gc = int.tryParse(managerGuestCountController.text.trim());
+        final err = await widget.state.managerSaveCateringDraft(
+          id: rowBase.id,
+          orderKind: rowBase.orderKind,
+          draft: {
+            'post_analysis': postAnalysis,
+            'checklist': checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
+            'theme_design': themeDesign,
+            'schedule_slots': _scheduleSlotsPayload(),
+            // Needed for event_orders so the list endpoint can populate columns for later stages.
+            'event_title': managerDraftEventTitleController.text.trim(),
+            'event_type': et,
+            'formality_level': managerFormalityLevel,
+            'menu': selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
+            'additional_costs': additionalCosts,
+            'labor_cost': laborCostComputedNow,
+            'travel_cost': travelNow,
+            'total_cost': totalNow,
+            'cost_breakdown': [
+              {'label': 'Base food cost', 'amount': _baseFoodCost()},
+              {'label': 'Labor cost', 'amount': laborCostComputedNow},
+              {'label': 'Travel cost', 'amount': travelNow},
+              {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+              {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+            ],
+            if (gc != null && gc >= 0) 'guest_count': gc,
+          },
+        );
+        if (!mounted) return;
+        if (err != null) {
+          appSnack(context, err);
+          return;
+        }
+        appSnack(context, 'Draft saved');
+        await widget.state.loadManagerCateringByStage(widget.stage);
+        return;
+      }
+
+      final err = await widget.state.managerAdvanceCateringStage(
+        id: rowBase.id,
+        orderKind: rowBase.orderKind,
+        status: widget.stage,
+        downPaymentAmount: isProcessing ? (double.tryParse(downPaymentPaidController.text.trim()) ?? downPaymentDue) : null,
+        // Post-analysis full payment is confirmed via [managerPatchCateringPostAnalysis] (manager only), not by setting amounts here.
+        fullPaymentAmount: null,
+        postAnalysis: (isProcessing || isPost || isOnlineInquiry) ? postAnalysis : null,
+        checklist: checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
+        additionalCosts: additionalCosts,
+        laborCost: laborCostComputedNow,
+        travelCost: travelNow,
+        totalCost: totalNow,
+        costBreakdown: [
+          {'label': 'Base food cost', 'amount': _baseFoodCost()},
+          {'label': 'Labor cost', 'amount': laborCostComputedNow},
+          {'label': 'Travel cost', 'amount': travelNow},
+          {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+          {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+        ],
+        themeDesign: themeDesign,
+        menu: selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
+      );
+      if (!mounted) return;
+      appSnack(context, err ?? 'Changes saved');
+      if (err == null) {
+        await widget.state.loadManagerCateringByStage(widget.stage);
+      }
+    }
+    return Scaffold(
+      appBar: AppBar(title: Text(row.eventTitle.isEmpty ? row.customerName : row.eventTitle)),
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          if (isProcessing)
+            Card(
+              color: Colors.orange.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      isOnlineInquiry ? 'Costing and Payment' : 'Down Payment',
+                      style: const TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 8),
+                    Text('Amount due (50% of total): ₱${downPaymentDue.toStringAsFixed(2)}'),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: downPaymentController,
+                      keyboardType: TextInputType.number,
+                      readOnly: true,
+                      decoration: const InputDecoration(labelText: 'Downpayment amount due'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: downPaymentPaidController,
+                      keyboardType: TextInputType.number,
+                      readOnly: !isProcessing,
+                      decoration: const InputDecoration(labelText: 'Downpayment amount paid (manual input)'),
+                    ),
+                    const SizedBox(height: 10),
+                    const Text('Proof of down payment (GCash)', style: TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: !isProcessing
+                                ? null
+                                : () async {
+                                    final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+                                    if (x == null || !mounted) return;
+                                    final b = await x.readAsBytes();
+                                    setState(() => _managerDownPaymentProofBytes = b);
+                                  },
+                            icon: const Icon(Icons.upload_file, size: 18),
+                            label: const Text('Upload'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: !isProcessing
+                                ? null
+                                : () async {
+                                    final x = await ImagePicker().pickImage(source: ImageSource.camera);
+                                    if (x == null || !mounted) return;
+                                    final b = await x.readAsBytes();
+                                    setState(() => _managerDownPaymentProofBytes = b);
+                                  },
+                            icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                            label: const Text('Camera'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_managerDownPaymentProofBytes != null) ...[
+                      const SizedBox(height: 8),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.memory(_managerDownPaymentProofBytes!, height: 120, fit: BoxFit.contain),
+                      ),
+                    ],
+                    const SizedBox(height: 10),
+                    FilledButton(
+                      onPressed: !isProcessing
+                          ? null
+                          : () async {
+                              setState(() {
+                                downPaymentPaidController.text = downPaymentDue.toStringAsFixed(2);
+                              });
+                              await saveCurrentStage();
+                              if (mounted) appSnack(context, 'Down payment amount saved');
+                            },
+                      child: const Text('Confirm down payment'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (isPost || isCompleted)
+            Card(
+              color: Colors.green.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Full Payment', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: downPaymentPaidController,
+                      readOnly: true,
+                      decoration: const InputDecoration(labelText: 'Down payment paid'),
+                    ),
+                    const SizedBox(height: 8),
+                    Builder(
+                      builder: (ctx) {
+                        final balanceDue =
+                            totalComputed - (double.tryParse(downPaymentPaidController.text.trim()) ?? 0);
+                        return Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: isFullPaymentConfirmed ? Colors.green.shade50 : Colors.red.shade50,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: isFullPaymentConfirmed ? Colors.green.shade700 : Colors.red.shade700,
+                              width: 1.5,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text('Balance amount due', style: TextStyle(fontWeight: FontWeight.w600)),
+                              Text(
+                                'PHP ${balanceDue.toStringAsFixed(2)}',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 16,
+                                  color: isFullPaymentConfirmed ? Colors.green.shade900 : Colors.red.shade900,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: fullPaymentController,
+                      keyboardType: TextInputType.number,
+                      readOnly: true,
+                      decoration: const InputDecoration(labelText: 'Full payment amount'),
+                    ),
+                    const SizedBox(height: 10),
+                    const Text('Proof of full payment (GCash)', style: TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: !isPost
+                                ? null
+                                : () async {
+                                    final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+                                    if (x == null || !mounted) return;
+                                    final b = await x.readAsBytes();
+                                    setState(() => _managerFullPaymentProofBytes = b);
+                                  },
+                            icon: const Icon(Icons.upload_file, size: 18),
+                            label: const Text('Upload'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: !isPost
+                                ? null
+                                : () async {
+                                    final x = await ImagePicker().pickImage(source: ImageSource.camera);
+                                    if (x == null || !mounted) return;
+                                    final b = await x.readAsBytes();
+                                    setState(() => _managerFullPaymentProofBytes = b);
+                                  },
+                            icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                            label: const Text('Camera'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_managerFullPaymentProofBytes != null) ...[
+                      const SizedBox(height: 8),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.memory(_managerFullPaymentProofBytes!, height: 120, fit: BoxFit.contain),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    FilledButton(
+                      onPressed: (!widget.state.isManager || !isPost || isFullPaymentConfirmed)
+                          ? null
+                          : () async {
+                              final balanceDue =
+                                  totalComputed - (double.tryParse(downPaymentPaidController.text.trim()) ?? 0);
+                              final ok = await showDialog<bool>(
+                                context: context,
+                                builder: (dlgCtx) => AlertDialog(
+                                  title: const Text('Confirm full payment'),
+                                  content: Text(
+                                    'Confirm that full payment of PHP ${balanceDue.toStringAsFixed(2)} has been received?',
+                                  ),
+                                  actions: [
+                                    TextButton(onPressed: () => Navigator.pop(dlgCtx, false), child: const Text('Cancel')),
+                                    FilledButton(
+                                      onPressed: () => Navigator.pop(dlgCtx, true),
+                                      child: const Text('Confirm'),
+                                    ),
+                                  ],
+                                ),
+                              );
+                              if (ok != true || !mounted) return;
+                              final err = await widget.state.managerPatchCateringPostAnalysis(
+                                id: row.id,
+                                orderKind: row.orderKind,
+                                patch: {'manager_full_payment_confirmed': true},
+                              );
+                              if (!mounted) return;
+                              if (err != null) {
+                                appSnack(context, err);
+                                return;
+                              }
+                              final full = await widget.state.loadManagerCateringItem(
+                                id: row.id,
+                                orderKind: row.orderKind,
+                              );
+                              if (!mounted) return;
+                              if (full != null) setState(() => _loadedDetailRow = full);
+                              appSnack(context, 'Full payment confirmed');
+                            },
+                      child: Text(isFullPaymentConfirmed ? 'FULLY PAID' : 'Confirm Full Payment'),
+                    ),
+                    const SizedBox(height: 12),
+                    const Text('Post Analysis', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: businessCardsController,
+                      keyboardType: TextInputType.number,
+                      readOnly: !isPost,
+                      decoration: const InputDecoration(labelText: 'Business cards given away'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: spotInquiriesController,
+                      keyboardType: TextInputType.number,
+                      readOnly: !isPost,
+                      decoration: const InputDecoration(labelText: 'On the spot inquiries'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: complaintsController,
+                      maxLines: 3,
+                      readOnly: !isPost,
+                      decoration: const InputDecoration(
+                        labelText: 'Complaints',
+                        helperText: 'Add multiple entries by writing one complaint per line.',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: popularDishController,
+                      maxLines: 3,
+                      readOnly: !isPost,
+                      decoration: const InputDecoration(
+                        labelText: 'Most popular dish',
+                        helperText: 'Add multiple entries by writing one dish per line.',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: popularDrinkController,
+                      maxLines: 3,
+                      readOnly: !isPost,
+                      decoration: const InputDecoration(
+                        labelText: 'Most popular drink',
+                        helperText: 'Add multiple entries by writing one drink per line.',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: popularDessertController,
+                      maxLines: 3,
+                      readOnly: !isPost,
+                      decoration: const InputDecoration(
+                        labelText: 'Most popular dessert',
+                        helperText: 'Add multiple entries by writing one dessert per line.',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: analysisController,
+                      maxLines: 4,
+                      readOnly: !isPost,
+                      decoration: const InputDecoration(labelText: 'Post-analysis notes'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (isProcessing || isPost || isCompleted)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Checklist and Task Assignment', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    Text(
+                      isProcessing
+                          ? 'Open each section in a separate window for easier card-based editing.'
+                          : 'PDF generation is available in this stage. Editing is disabled.',
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        if (isProcessing) ...[
+                          OutlinedButton(onPressed: _openChecklistEditor, child: const Text('Open Checklist Editor')),
+                          OutlinedButton(onPressed: _openTaskEditor, child: const Text('Open Task Assignment Editor')),
+                        ],
+                        OutlinedButton(onPressed: _generateChecklistPdf, child: const Text('Generate Checklist PDF')),
+                        OutlinedButton(onPressed: _generateTaskPdf, child: const Text('Generate Task Assignment PDF')),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Event Information', style: TextStyle(fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 8),
+                  if (!isDraftStage) ...[
+                    Text('Order type: ${row.orderKind == 'catering' ? 'Catering Only' : 'Catering + Event'}'),
+                    if (row.transactionNo.trim().isNotEmpty) Text('Transaction No.: ${row.transactionNo}'),
+                    Text('Event: ${row.eventTitle.trim().isEmpty ? row.customerName : row.eventTitle}'),
+                    Text('Customer: ${row.customerName}'),
+                    Text('Contact person: ${row.contactPerson}'),
+                    Text('Contact number: ${row.contactNumber}'),
+                    Text('Email: ${row.emailAddress}'),
+                    Text('Address: ${row.address}'),
+                    Text('Guests: ${row.guestCount}'),
+                    Text('Payment method: ${row.paymentMethod}'),
+                    Text('Labor cost: ₱${laborCostComputed.toStringAsFixed(2)}'),
+                    Text('Travel cost: ₱${_travelCostComputed().toStringAsFixed(2)}'),
+                    if (row.formalityLevel.trim().isNotEmpty) Text('Formality: ${row.formalityLevel}'),
+                    if (row.scheduleSlots.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      if (isProcessing || isPost) ...[
+                        Text(
+                          'Date & time of event',
+                          style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 6),
+                        ..._buildLabeledScheduleRows(row.scheduleSlots),
+                        if (isProcessing && row.processingScheduleOverlaps > 0) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'This date and time conflicts with another event in For Processing.',
+                            style: TextStyle(color: Colors.red.shade800, fontWeight: FontWeight.w600),
+                          ),
+                        ],
+                      ] else ...[
+                        for (final s in row.scheduleSlots)
+                          for (final line in formatScheduleSlotLine(s).split('\n'))
+                            if (line.trim().isNotEmpty) Text(line.trim()),
+                      ],
+                    ],
+                  ] else ...[
+                    DropdownButtonFormField<String>(
+                      value: _draftOrderKind == 'catering' ? 'CATERING' : 'CATERING AND EVENT',
+                      decoration: const InputDecoration(
+                        labelText: 'Inquiry type',
+                        helperText: 'Changing type moves this record between catering-only and full event tables when you save.',
+                      ),
+                      items: const [
+                        DropdownMenuItem(value: 'CATERING', child: Text('CATERING')),
+                        DropdownMenuItem(value: 'CATERING AND EVENT', child: Text('CATERING AND EVENT')),
+                      ],
+                      onChanged: canEditStage
+                          ? (v) => setState(() {
+                                _draftOrderKind = v == 'CATERING' ? 'catering' : 'event';
+                              })
+                          : null,
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: kMobileEventTypeChoices.contains(managerEventTypeChoice) ? managerEventTypeChoice : 'Other',
+                      decoration: const InputDecoration(labelText: 'Event type'),
+                      items: kMobileEventTypeChoices.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+                      onChanged: canEditStage ? (v) => setState(() => managerEventTypeChoice = v ?? 'Other') : null,
+                    ),
+                    if (managerEventTypeChoice == 'Other') ...[
+                      const SizedBox(height: 8),
+                      TextFormField(
+                        controller: managerEventTypeOtherController,
+                        readOnly: !canEditStage,
+                        decoration: const InputDecoration(labelText: 'Describe event type'),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    const Text('Event setting', style: TextStyle(fontWeight: FontWeight.w600)),
+                    RadioListTile<String>(
+                      value: 'open',
+                      groupValue: managerEventSetting,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Open space'),
+                      onChanged: canEditStage ? (v) => setState(() => managerEventSetting = v ?? 'open') : null,
+                    ),
+                    RadioListTile<String>(
+                      value: 'closed',
+                      groupValue: managerEventSetting,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Closed space'),
+                      onChanged: canEditStage ? (v) => setState(() => managerEventSetting = v ?? 'open') : null,
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: managerDraftEventTitleController,
+                      readOnly: !canEditStage,
+                      decoration: const InputDecoration(labelText: 'Event title'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextFormField(
+                      readOnly: !canEditStage,
+                      initialValue: row.contactPerson,
+                      decoration: const InputDecoration(labelText: 'Contact person'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextFormField(
+                      readOnly: !canEditStage,
+                      initialValue: row.contactNumber,
+                      decoration: const InputDecoration(labelText: 'Contact number'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextFormField(
+                      readOnly: !canEditStage,
+                      initialValue: row.emailAddress,
+                      decoration: const InputDecoration(labelText: 'Email address'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextFormField(
+                      readOnly: !canEditStage,
+                      initialValue: row.address,
+                      decoration: const InputDecoration(labelText: 'City of event'),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text('Date & time of event', style: TextStyle(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 4),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (int i = 0; i < _eventWindows.length; i++)
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: OutlinedButton(
+                                      onPressed: canEditStage ? () => _pickWindowDate(i) : null,
+                                      child: Text(
+                                        _eventWindows[i].date == null
+                                            ? 'Pick date'
+                                            : '${_eventWindows[i].date!.month}/${_eventWindows[i].date!.day}/${_eventWindows[i].date!.year}',
+                                      ),
+                                    ),
+                                  ),
+                                  if (canEditStage && _eventWindows.length > 1) ...[
+                                    const SizedBox(width: 8),
+                                    IconButton(
+                                      onPressed: () => _removeWindowAt(i),
+                                      icon: const Icon(Icons.delete_outline),
+                                      tooltip: 'Remove window',
+                                    ),
+                                  ],
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: OutlinedButton(
+                                      onPressed: canEditStage ? () => _pickWindowFromTime(i) : null,
+                                      child: Text(
+                                        _eventWindows[i].from == null ? 'From' : _eventWindows[i].from!.format(context),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: OutlinedButton(
+                                      onPressed: canEditStage ? () => _pickWindowToTime(i) : null,
+                                      child: Text(
+                                        _eventWindows[i].to == null ? 'To' : _eventWindows[i].to!.format(context),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                            ],
+                          ),
+                        if (canEditStage)
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: TextButton.icon(
+                              onPressed: _addAnotherWindow,
+                              icon: const Icon(Icons.add),
+                              label: const Text('Add another window'),
+                            ),
+                          ),
+                        if (scheduleConflictsForProcessing > 0)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 8),
+                            child: Text(
+                              'Conflicts detected with an existing event in For Processing.',
+                              style: TextStyle(
+                                color: Colors.red.shade700,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    const SizedBox(height: 6),
+                    const Text('Formality level', style: TextStyle(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 6),
+                    SegmentedButton<String>(
+                      segments: const [
+                        ButtonSegment(value: 'casual', label: Text('Casual')),
+                        ButtonSegment(value: 'semiformal', label: Text('Semiformal')),
+                        ButtonSegment(value: 'formal', label: Text('Formal')),
+                      ],
+                      selected: {managerFormalityLevel},
+                      onSelectionChanged: canEditStage ? (s) => setState(() => managerFormalityLevel = s.first) : null,
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: managerGuestCountController,
+                      keyboardType: TextInputType.number,
+                      readOnly: !canEditStage,
+                      decoration: const InputDecoration(labelText: 'Number of guests'),
+                    ),
+                    const SizedBox(height: 8),
+                    const SizedBox(height: 6),
+                    const Text('Service', style: TextStyle(fontWeight: FontWeight.w600)),
+                    RadioListTile<String>(
+                      value: 'yes',
+                      groupValue: managerServiceIncluded,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('With service'),
+                      onChanged: canEditStage ? (v) => setState(() => managerServiceIncluded = v ?? 'no') : null,
+                    ),
+                    RadioListTile<String>(
+                      value: 'no',
+                      groupValue: managerServiceIncluded,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Without service'),
+                      onChanged: canEditStage ? (v) => setState(() => managerServiceIncluded = v ?? 'no') : null,
+                    ),
+                    if (row.orderKind == 'catering') ...[
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: managerInquiryNoteController,
+                        readOnly: !canEditStage,
+                        decoration: const InputDecoration(labelText: 'Note'),
+                        maxLines: 3,
+                      ),
+                    ],
+                  ],
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Menu', style: TextStyle(fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 8),
+                  if (isDraftStage) ...[
+                    TextField(
+                      controller: menuSearchController,
+                      decoration: const InputDecoration(
+                        labelText: 'Search dishes',
+                        prefixIcon: Icon(Icons.search),
+                      ),
+                      onChanged: (_) => setState(() {}),
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: selectedSetMenu,
+                      items: ['All Dishes', ...widget.state.setMenus.map((m) => m.name)]
+                          .map((name) => DropdownMenuItem(value: name, child: Text(name)))
+                          .toList(),
+                      onChanged: !canEditStage
+                          ? null
+                          : (v) {
+                              final next = v ?? 'All Dishes';
+                              setState(() {
+                                selectedSetMenu = next;
+                                selectedDishes.clear();
+                                if (next != 'All Dishes') {
+                                  final rows = widget.state.setMenus.where((m) => m.name == next).toList();
+                                  if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
+                                }
+                              });
+                            },
+                    ),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      height: math.min(420, MediaQuery.sizeOf(context).height * 0.42),
+                      child: ListView(
+                        padding: EdgeInsets.zero,
+                        children: [
+                          ...(() {
+                            final seen = <String>{};
+                            final dishes = widget.state.menu.where((m) => m.isCateringDish).where((m) {
+                              final q = menuSearchController.text.trim().toLowerCase();
+                              final n = m.name.trim().toLowerCase();
+                              if (n.isEmpty || seen.contains(n)) return false;
+                              seen.add(n);
+                              return q.isEmpty || n.contains(q);
+                            }).toList();
+                            dishes.sort((a, b) {
+                              final sa = selectedDishes.contains(a.name) ? 0 : 1;
+                              final sb = selectedDishes.contains(b.name) ? 0 : 1;
+                              if (sa != sb) return sa - sb;
+                              return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+                            });
+                            return dishes;
+                          }()).map((dish) {
+                            final sel = selectedDishes.contains(dish.name);
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 6),
+                              child: Material(
+                                color: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
+                                borderRadius: BorderRadius.circular(10),
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(10),
+                                  onTap: !canEditStage
+                                      ? null
+                                      : () => setState(() {
+                                            if (sel) {
+                                              selectedDishes.remove(dish.name);
+                                            } else {
+                                              selectedDishes.add(dish.name);
+                                            }
+                                          }),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                    child: Row(
+                                      children: [
+                                        SizedBox(
+                                          width: 40,
+                                          height: 40,
+                                          child: ClipRRect(
+                                            borderRadius: BorderRadius.circular(8),
+                                            child: _MenuThumb(item: dish, compact: true),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(child: Text(dish.name)),
+                                        Icon(
+                                          sel ? Icons.check_circle : Icons.circle_outlined,
+                                          color: sel ? AppColors.success : Colors.grey.shade500,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          }),
+                        ],
+                      ),
+                    ),
+                  ] else ...[
+                    if (rowMenu.isEmpty)
+                      const Text('No menu selected.')
+                    else
+                      ...rowMenu.map((m) {
+                        final dishName = dishNameFromCateringMenuEntry(m);
+                        final dishImage = imageBase64FromCateringMenuEntry(m);
+                        MenuItemData? lookup;
+                        for (final dish in widget.state.menu) {
+                          if (dish.name.toLowerCase() == dishName.toLowerCase()) {
+                            lookup = dish;
+                            break;
+                          }
+                        }
+                        final thumbItem = MenuItemData(
+                          id: lookup?.id ?? dishName,
+                          name: dishName,
+                          description: lookup?.description ?? '',
+                          price: lookup?.price ?? 0,
+                          dips: const [],
+                          category: lookup?.category ?? '',
+                          dishType: lookup?.dishType ?? '',
+                          imageBase64: dishImage ?? lookup?.imageBase64,
+                        );
+                        return ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          leading: SizedBox(
+                            width: 42,
+                            height: 42,
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: _MenuThumb(item: thumbItem, compact: true),
+                            ),
+                          ),
+                          title: Text(dishName),
+                        );
+                      }),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (row.orderKind == 'event')
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Event Theme Design', style: TextStyle(fontWeight: FontWeight.w800)),
+                    if (isDraftStage) ...[
+                      const SizedBox(height: 8),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
+                        style: TextStyle(height: 1.35),
+                      ),
+                      const SizedBox(height: 10),
+                      const Text(
+                        'You may attach inspiration links or filenames later with your coordinator; photos of the venue (indoor/outdoor, ceiling height) help us propose realistic installs.',
+                        style: TextStyle(height: 1.35),
+                      ),
+                      const SizedBox(height: 10),
+                      const Text(
+                        'If you already have hired stylists or florists, note their contact windows here so we can align catering service timing with their setup and strike.',
+                        style: TextStyle(height: 1.35),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: managerInquiryNoteController,
+                        readOnly: isThemeReadOnly || !canEditStage,
+                        maxLines: 4,
+                        decoration: const InputDecoration(labelText: 'Theme notes'),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: themeCostAmountController,
+                        keyboardType: TextInputType.number,
+                        readOnly: isThemeReadOnly || !canEditStage,
+                        decoration: const InputDecoration(labelText: 'Theme design cost'),
+                      ),
+                    ] else ...[
+                      const SizedBox(height: 8),
+                      if (managerInquiryNoteController.text.trim().isNotEmpty ||
+                          '${row.themeDesign['note'] ?? ''}'.trim().isNotEmpty)
+                        Text(
+                          'Notes: ${managerInquiryNoteController.text.trim().isNotEmpty ? managerInquiryNoteController.text.trim() : '${row.themeDesign['note'] ?? ''}'}',
+                        ),
+                      if (themeDesignCosts.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        ...themeDesignCosts.map(
+                          (e) => ListTile(
+                            dense: true,
+                            contentPadding: EdgeInsets.zero,
+                            title: Text('${e['label'] ?? ''}'.trim().isEmpty ? 'Theme cost' : '${e['label']}'),
+                            trailing: Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                          ),
+                        ),
+                      ],
+                      if ('${row.themeDesign['note'] ?? ''}'.trim().isEmpty &&
+                          managerInquiryNoteController.text.trim().isEmpty &&
+                          themeDesignCosts.isEmpty)
+                        const SizedBox.shrink(),
+                    ],
+                    const SizedBox(height: 8),
+                  ],
+                ),
+              ),
+            ),
+          if (isDraftStage) ...[
+            Card(
+              color: Colors.orange.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Labor Cost', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: laborMaleController,
+                            keyboardType: TextInputType.number,
+                            readOnly: !canEditStage,
+                            decoration: const InputDecoration(labelText: 'Male workers (₱1000 each)'),
+                            onChanged: (_) => setState(_refreshDueAndDefaults),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: TextField(
+                            controller: laborFemaleController,
+                            keyboardType: TextInputType.number,
+                            readOnly: !canEditStage,
+                            decoration: const InputDecoration(labelText: 'Female workers (₱500 each)'),
+                            onChanged: (_) => setState(_refreshDueAndDefaults),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: laborManualLabelController,
+                            readOnly: !canEditStage,
+                            decoration: const InputDecoration(labelText: 'Labor item'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        SizedBox(
+                          width: 110,
+                          child: TextField(
+                            controller: laborManualAmountController,
+                            keyboardType: TextInputType.number,
+                            readOnly: !canEditStage,
+                            decoration: const InputDecoration(labelText: 'Amount'),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: !canEditStage
+                              ? null
+                              : () {
+                                  final l = laborManualLabelController.text.trim();
+                                  final a = double.tryParse(laborManualAmountController.text.trim());
+                                  if (l.isEmpty || a == null) return;
+                                  setState(() {
+                                    laborManualCosts.add({'label': l, 'amount': a});
+                                    laborManualLabelController.clear();
+                                    laborManualAmountController.clear();
+                                    _refreshDueAndDefaults();
+                                  });
+                                },
+                          icon: const Icon(Icons.add),
+                        ),
+                      ],
+                    ),
+                    ...laborManualCosts.asMap().entries.map((entry) {
+                      final idx = entry.key;
+                      final e = entry.value;
+                      return ListTile(
+                        dense: true,
+                        title: Text('${e['label']}'),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                            IconButton(
+                              onPressed: !canEditStage
+                                  ? null
+                                  : () => setState(() {
+                                      laborManualCosts.removeAt(idx);
+                                      _refreshDueAndDefaults();
+                                    }),
+                              icon: const Icon(Icons.delete_outline),
+                            ),
+                          ],
+                        ),
+                      );
+                    }),
+                    const SizedBox(height: 8),
+                    Text('Computed labor cost: ₱${laborCostComputed.toStringAsFixed(2)}'),
+                  ],
+                ),
+              ),
+            ),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Travel Cost', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: travelCostController,
+                      keyboardType: TextInputType.number,
+                      readOnly: !canEditStage,
+                      decoration: const InputDecoration(labelText: 'Travel cost'),
+                      onChanged: (_) => setState(_refreshDueAndDefaults),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Travel cost: ₱${_travelCostComputed().toStringAsFixed(2)}',
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+          if (isDraftStage || isPost || isProcessing) ...[
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Additional costs', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: additionalCostLabelController,
+                            readOnly: !(isDraftStage || isProcessing || isPost),
+                            decoration: const InputDecoration(labelText: 'Label'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        SizedBox(
+                          width: 110,
+                          child: TextField(
+                            controller: additionalCostAmountController,
+                            keyboardType: TextInputType.number,
+                            readOnly: !(isDraftStage || isProcessing || isPost),
+                            decoration: const InputDecoration(labelText: 'Amount'),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: !(isDraftStage || isProcessing || isPost)
+                              ? null
+                              : () {
+                                  final l = additionalCostLabelController.text.trim();
+                                  final a = double.tryParse(additionalCostAmountController.text.trim());
+                                  if (l.isEmpty || a == null) return;
+                                  setState(() {
+                                    additionalCosts.add({'label': l, 'amount': a});
+                                    additionalCostLabelController.clear();
+                                    additionalCostAmountController.clear();
+                                    _refreshDueAndDefaults();
+                                  });
+                                  if (isPost) {
+                                    _maybeGeneratePostAnalysisPdf2IfNeeded();
+                                  }
+                                },
+                          icon: const Icon(Icons.add),
+                        ),
+                      ],
+                    ),
+                    ...additionalCosts.asMap().entries.map(
+                      (entry) {
+                        final idx = entry.key;
+                        final e = entry.value;
+                        return ListTile(
+                          title: Text('${e['label']}'),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                              IconButton(
+                                onPressed: !(isDraftStage || isProcessing || isPost)
+                                    ? null
+                                    : () => setState(() {
+                                          additionalCosts.removeAt(idx);
+                                          _refreshDueAndDefaults();
+                                          if (isPost) {
+                                            // Trigger second summary generation after additional costs change.
+                                            _maybeGeneratePostAnalysisPdf2IfNeeded();
+                                          }
+                                        }),
+                                icon: const Icon(Icons.delete_outline),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                    if (isPost && _postAnalysisPdf2Bytes != null) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade50,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: Colors.red.shade700, width: 1.5),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Text(
+                              'Additional Costs Payment',
+                              style: TextStyle(fontWeight: FontWeight.w800, color: Colors.red.shade900),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              'PHP ${_sumCostRows(additionalCosts).toStringAsFixed(2)}',
+                              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18, color: Colors.red.shade900),
+                            ),
+                            const SizedBox(height: 8),
+                            FilledButton(
+                              style: FilledButton.styleFrom(backgroundColor: Colors.red.shade800),
+                              onPressed: !widget.state.isManager ||
+                                      (d.postAnalysis['additional_costs_payment_confirmed'] == true)
+                                  ? null
+                                  : () async {
+                                      final ok = await showDialog<bool>(
+                                        context: context,
+                                        builder: (dlgCtx) => AlertDialog(
+                                          title: const Text('Confirm additional costs payment'),
+                                          content: Text(
+                                            'Confirm payment of PHP ${_sumCostRows(additionalCosts).toStringAsFixed(2)} for additional costs?',
+                                          ),
+                                          actions: [
+                                            TextButton(
+                                              onPressed: () => Navigator.pop(dlgCtx, false),
+                                              child: const Text('Cancel'),
+                                            ),
+                                            FilledButton(
+                                              onPressed: () => Navigator.pop(dlgCtx, true),
+                                              child: const Text('Confirm'),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+                                      if (ok != true || !mounted) return;
+                                      final err = await widget.state.managerPatchCateringPostAnalysis(
+                                        id: d.id,
+                                        orderKind: d.orderKind,
+                                        patch: {'additional_costs_payment_confirmed': true},
+                                      );
+                                      if (!mounted) return;
+                                      if (err != null) {
+                                        appSnack(context, err);
+                                        return;
+                                      }
+                                      final full = await widget.state.loadManagerCateringItem(
+                                        id: d.id,
+                                        orderKind: d.orderKind,
+                                      );
+                                      if (!mounted) return;
+                                      if (full != null) setState(() => _loadedDetailRow = full);
+                                      appSnack(context, 'Additional costs payment confirmed');
+                                    },
+                              child: Text(
+                                d.postAnalysis['additional_costs_payment_confirmed'] == true
+                                    ? 'PAID'
+                                    : 'Confirm payment',
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    if (isPost) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        'Order Summary PDFs',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton(
+                            onPressed: _postAnalysisPdf1Bytes == null
+                                ? null
+                                : () => _openOrderSummaryPdfBytes(_postAnalysisPdf1Bytes!),
+                            child: const Text('Order Summary #1'),
+                          ),
+                          OutlinedButton(
+                            onPressed: _postAnalysisPdf2Bytes == null
+                                ? null
+                                : () => _openOrderSummaryPdfBytes(_postAnalysisPdf2Bytes!),
+                            child: _postAnalysisPdf2Bytes == null
+                                ? (_postAnalysisPdfGenerating
+                                    ? const SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                      )
+                                    : const Text('Order Summary #2'))
+                                : const Text('Order Summary #2'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Summary #1 reflects the initial quoted costs. Summary #2 includes event information and additional costs entered in this stage.',
+                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.black.withValues(alpha: 0.72)),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ],
+          if (isCompleted)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text(
+                'Completed records are locked and cannot be edited.',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+          if (false && (isProcessing || isPost || isOnlineInquiry || isDraftStage)) ...[
+            Padding(
+              padding: const EdgeInsets.only(top: 12, bottom: 10),
+              child: Center(
+                child: Column(
+                  children: [
+                    const Text('Estimated Cost', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 4),
+                    Text(
+                      '₱${totalComputed.toStringAsFixed(2)}',
+                      style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w800),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (isOnlineInquiry || isProcessing || isPost)
+              FilledButton(
+                onPressed: (isOnlineInquiry || isProcessing || isPost) ? submitNext : null,
+                child: Text(
+                  isOnlineInquiry
+                      ? 'Save and Move to For Processing'
+                      : (isPost ? 'Complete Order' : 'Submit to Next Stage'),
+                ),
+              ),
+            if (isDraftStage || isProcessing || isPost) ...[
+              if (isOnlineInquiry || isProcessing || isPost) const SizedBox(height: 8),
+              OutlinedButton(
+                onPressed: saveCurrentStage,
+                child: Text(isDraftStage ? 'Save draft' : 'Save'),
+              ),
+            ],
+          ],
+        ],
+      ),
+      bottomNavigationBar: (!isCompleted && (isProcessing || isPost || isOnlineInquiry || isDraftStage))
+          ? SafeArea(
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Theme.of(context).scaffoldBackgroundColor,
+                  border: Border(top: BorderSide(color: Colors.grey.shade300)),
+                ),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Center(
+                      child: Column(
+                        children: [
+                          Text(
+                            isProcessing ? 'Final Cost' : 'Estimated Cost',
+                            style: const TextStyle(fontWeight: FontWeight.w800),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '₱${(isProcessing ? displayInvoiceTotal : totalComputed).toStringAsFixed(2)}',
+                            style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton(
+                      onPressed: () async {
+                        if (isPost) {
+                          if (_postAnalysisPdf2Bytes != null) {
+                            await _openOrderSummaryPdfBytes(_postAnalysisPdf2Bytes!);
+                            return;
+                          }
+                            if (_postAnalysisPdfGenerating) {
+                              // If #2 is still being generated, fall back to generating the latest view.
+                              await _generateInvoicePdf();
+                              return;
+                            }
+                          if (_postAnalysisPdf1Bytes != null) {
+                            await _openOrderSummaryPdfBytes(_postAnalysisPdf1Bytes!);
+                            return;
+                          }
+                        }
+                        await _generateInvoicePdf();
+                      },
+                      child: const Text('Generate Order Summary PDF'),
+                    ),
+                    if (isDraftStage || isProcessing || isPost) ...[
+                      const SizedBox(height: 8),
+                      FilledButton(
+                        onPressed: submitNext,
+                        child: Text(
+                          isDraftStage
+                              ? 'Save and Move to For Processing'
+                              : (isPost ? 'Complete Order' : 'Submit to Next Stage'),
+                        ),
+                      ),
+                    ],
+                    if (isDraftStage || isProcessing || isPost) ...[
+                      const SizedBox(height: 8),
+                      OutlinedButton(
+                        onPressed: saveCurrentStage,
+                        child: Text(isDraftStage ? 'Save draft' : 'Save'),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            )
+          : null,
     );
   }
 }
@@ -4378,9 +11116,26 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
             backgroundColor: Colors.black87,
             foregroundColor: Colors.white,
             leading: Builder(
-              builder: (ctx) => IconButton(
-                icon: const Icon(Icons.menu, color: AppColors.brand),
-                onPressed: () => Scaffold.of(ctx).openDrawer(),
+              builder: (ctx) => Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.menu, color: AppColors.brand),
+                    onPressed: () => Scaffold.of(ctx).openDrawer(),
+                  ),
+                  if (widget.state.hasCashierAttentionBadge)
+                    const Positioned(
+                      right: 9,
+                      top: 9,
+                      child: SizedBox(
+                        width: 10,
+                        height: 10,
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
             title: Text(name, style: const TextStyle(fontWeight: FontWeight.w700, letterSpacing: 0.5)),
@@ -4409,10 +11164,17 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
               labelColor: AppColors.brand,
               unselectedLabelColor: Colors.white70,
               onTap: (_) => setState(() {}),
-              tabs: const [
-                Tab(text: 'New Order'),
-                Tab(text: 'Online Orders'),
-                Tab(text: 'Walk-in ongoing'),
+              tabs: [
+                const Tab(text: 'New Order'),
+                Tab(
+                  child: Badge(
+                    isLabelVisible: widget.state.hasCashierAttentionBadge,
+                    backgroundColor: Colors.red,
+                    smallSize: 10,
+                    child: const Text('Online Orders'),
+                  ),
+                ),
+                const Tab(text: 'Walk-in ongoing'),
               ],
             ),
           ),
@@ -4425,10 +11187,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
-                      const Text(
-                        "Macrina's Kitchen and Catering",
-                        style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
-                      ),
+                      Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
                       const SizedBox(height: 10),
                       Text(
                         'Hi, ${widget.state.cashierDisplayName.isNotEmpty ? widget.state.cashierDisplayName : 'Cashier'}',
@@ -4505,6 +11264,167 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
   String search = '';
   String sectionFilter = 'ALL';
 
+  Widget _posDishCard(MenuItemData item) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: ClipRRect(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
+              child: _MenuThumb(item: item),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(item.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
+                if (item.dips.isNotEmpty)
+                  Text(
+                    item.dips.join(', ').toUpperCase(),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 9, color: Colors.grey.shade700),
+                  ),
+                Row(
+                  children: [
+                    Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                    const Spacer(),
+                    IconButton(
+                      onPressed: () {
+                        widget.state.addToTray(item, dip: item.dips.isNotEmpty ? item.dips.first : '');
+                      },
+                      icon: const Icon(Icons.add_box_outlined),
+                      color: AppColors.ink,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _traySidebar(BuildContext context, double subtotal) {
+    return Container(
+      width: 300,
+      decoration: BoxDecoration(
+        color: Colors.grey.shade50,
+        border: Border(left: BorderSide(color: Colors.grey.shade300)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+            child: Text('TRAY', style: TextStyle(fontWeight: FontWeight.w900, color: Colors.grey.shade900)),
+          ),
+          Expanded(
+            child: widget.state.tray.isEmpty
+                ? Center(child: Text('No dishes yet.', style: TextStyle(color: Colors.grey.shade600)))
+                : ListView.builder(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    itemCount: widget.state.tray.length,
+                    itemBuilder: (context, i) {
+                      final e = widget.state.tray[i];
+                      return Card(
+                        child: ListTile(
+                          dense: true,
+                          title: Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+                          subtitle: Text(e.dip.isEmpty ? '—' : e.dip, maxLines: 1),
+                          trailing: SizedBox(
+                            width: 108,
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                  icon: const Icon(Icons.remove_circle_outline, size: 22),
+                                  onPressed: () => widget.state.changeQty(e, -1),
+                                ),
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                                  child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                ),
+                                IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                  icon: const Icon(Icons.add_circle_outline, size: 22),
+                                  onPressed: () => widget.state.changeQty(e, 1),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('Subtotal ₱${subtotal.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                        child: FilledButton(
+                        style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
+                        onPressed: () async {
+                          final ok = await showDialog<bool>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              title: const Text('Clear tray?'),
+                              content: const Text('Remove all items from the tray?'),
+                              actions: [
+                                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+                                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes')),
+                              ],
+                            ),
+                          );
+                          if (ok == true) widget.state.clearTray();
+                        },
+                        child: const Text('CANCEL'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FilledButton(
+                        style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                        onPressed: widget.state.tray.isEmpty
+                            ? null
+                            : () {
+                                Navigator.of(context).push<void>(
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal),
+                                  ),
+                                );
+                              },
+                        child: const Text('NEXT'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
@@ -4519,7 +11439,14 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
           return okSection && okSearch;
         }).toList();
         final subtotal = widget.state.tray.fold<double>(0, (s, e) => s + e.qty * e.menu.price);
-        return Column(
+        final cw = restaurantGridCrossAxisCount(MediaQuery.sizeOf(context).width);
+        final gridDelegate = SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: cw,
+          crossAxisSpacing: 10,
+          mainAxisSpacing: 10,
+          childAspectRatio: cw >= 4 ? 0.78 : 0.72,
+        );
+        final menuBody = Column(
           children: [
             Padding(
               padding: const EdgeInsets.all(12),
@@ -4552,97 +11479,77 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                   ? const Center(child: Text('No menu items (tag dishes as category "restaurant").'))
                   : GridView.builder(
                       padding: const EdgeInsets.all(12),
-                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 2,
-                        crossAxisSpacing: 10,
-                        mainAxisSpacing: 10,
-                        childAspectRatio: 0.72,
-                      ),
+                      gridDelegate: gridDelegate,
                       itemCount: filtered.length,
-                      itemBuilder: (context, i) {
-                        final item = filtered[i];
-                        return Container(
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: AppColors.border),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Expanded(
-                                child: ClipRRect(
-                                  borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
-                                  child: _MenuThumb(item: item),
-                                ),
-                              ),
-                              Padding(
-                                padding: const EdgeInsets.all(8),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(item.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
-                                    if (item.dips.isNotEmpty)
-                                      Text(
-                                        item.dips.join(', ').toUpperCase(),
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(fontSize: 9, color: Colors.grey.shade700),
-                                      ),
-                                    Row(
-                                      children: [
-                                        Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                        const Spacer(),
-                                        IconButton(
-                                          onPressed: () {
-                                            widget.state.addToTray(item, dip: item.dips.isNotEmpty ? item.dips.first : '');
-                                          },
-                                          icon: const Icon(Icons.add_box_outlined),
-                                          color: AppColors.ink,
-                                        ),
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
+                      itemBuilder: (context, i) => _posDishCard(filtered[i]),
                     ),
-            ),
-            Container(
-              decoration: const BoxDecoration(color: Colors.white, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: FilledButton(
-                      style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
-                      onPressed: () => widget.state.clearTray(),
-                      child: const Text('CANCEL'),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: FilledButton(
-                      style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                      onPressed: widget.state.tray.isEmpty
-                          ? null
-                          : () {
-                              Navigator.of(context).push<void>(
-                                MaterialPageRoute<void>(
-                                  builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal),
-                                ),
-                              );
-                            },
-                      child: const Text('NEXT'),
-                    ),
-                  ),
-                ],
-              ),
             ),
           ],
+        );
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final mq = MediaQuery.sizeOf(context);
+            final tabletLike = mq.shortestSide >= 600;
+            final wide = constraints.maxWidth >= 900 || (tabletLike && constraints.maxWidth >= 700);
+            if (wide) {
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(child: menuBody),
+                  _traySidebar(context, subtotal),
+                ],
+              );
+            }
+            return Column(
+              children: [
+                Expanded(child: menuBody),
+                Container(
+                  decoration: const BoxDecoration(color: Colors.white, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton(
+                          style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
+                          onPressed: () async {
+                            final ok = await showDialog<bool>(
+                              context: context,
+                              builder: (ctx) => AlertDialog(
+                                title: const Text('Clear tray?'),
+                                content: const Text('Remove all items from the tray?'),
+                                actions: [
+                                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+                                  FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes')),
+                                ],
+                              ),
+                            );
+                            if (ok == true) widget.state.clearTray();
+                          },
+                          child: const Text('CANCEL'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: FilledButton(
+                          style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                          onPressed: widget.state.tray.isEmpty
+                              ? null
+                              : () {
+                                  Navigator.of(context).push<void>(
+                                    MaterialPageRoute<void>(
+                                      builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal),
+                                    ),
+                                  );
+                                },
+                          child: const Text('NEXT'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
         );
       },
     );
@@ -4665,6 +11572,37 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
   final customerLabel = TextEditingController();
   Uint8List? gcashProofBytes;
 
+  void _showGcashProofFullscreen() {
+    final b = gcashProofBytes;
+    if (b == null) return;
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.black87,
+      builder: (ctx) => Dialog(
+        insetPadding: EdgeInsets.zero,
+        backgroundColor: Colors.black,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            InteractiveViewer(
+              minScale: 0.5,
+              maxScale: 4,
+              child: Center(child: Image.memory(b, fit: BoxFit.contain)),
+            ),
+            Positioned(
+              top: 8,
+              right: 8,
+              child: IconButton(
+                icon: const Icon(Icons.close, color: Colors.white),
+                onPressed: () => Navigator.pop(ctx),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     amountReceived.dispose();
@@ -4673,8 +11611,8 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
     super.dispose();
   }
 
-  Future<void> _pickGcashProof() async {
-    final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+  Future<void> _pickGcashProof(ImageSource source) async {
+    final x = await ImagePicker().pickImage(source: source);
     if (x == null) return;
     final b = await x.readAsBytes();
     setState(() => gcashProofBytes = b);
@@ -4703,6 +11641,71 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
             child: ListView(
               padding: const EdgeInsets.all(12),
               children: [
+                DropdownButtonFormField<String>(
+                  value: paymentMethod,
+                  decoration: const InputDecoration(labelText: 'PAYMENT METHOD'),
+                  items: const [
+                    DropdownMenuItem(value: 'CASH', child: Text('CASH')),
+                    DropdownMenuItem(value: 'GCASH', child: Text('GCASH')),
+                  ],
+                  onChanged: (v) => setState(() => paymentMethod = v ?? 'CASH'),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: amountReceived,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'AMOUNT RECEIVED'),
+                  onChanged: (_) => setState(() {}),
+                ),
+                Text('Amount due: ₱${widget.subtotal.toStringAsFixed(2)}'),
+                if (!isGcash)
+                  Text('Change: ₱${change.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w700)),
+                if (isGcash) ...[
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () => _pickGcashProof(ImageSource.gallery),
+                          icon: const Icon(Icons.upload_file),
+                          label: const Text('UPLOAD PROOF'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () => _pickGcashProof(ImageSource.camera),
+                          icon: const Icon(Icons.photo_camera_outlined),
+                          label: const Text('CAMERA'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (gcashProofBytes != null) ...[
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => _pickGcashProof(ImageSource.camera),
+                        icon: const Icon(Icons.refresh, size: 18),
+                        label: const Text('Retake / replace photo'),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10),
+                      child: GestureDetector(
+                        onTap: _showGcashProofFullscreen,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(10),
+                          child: Image.memory(gcashProofBytes!, height: 140, fit: BoxFit.contain),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+                const SizedBox(height: 12),
+                TextField(controller: customerLabel, decoration: const InputDecoration(labelText: 'Customer name / reference (optional)')),
+                TextField(controller: note, decoration: const InputDecoration(labelText: 'NOTE'), maxLines: 2),
+                const Divider(height: 28),
                 const Align(
                   alignment: Alignment.centerLeft,
                   child: Text('YOUR TRAY', style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 0.8)),
@@ -4728,45 +11731,6 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                     ),
                   ),
                 ),
-                const Divider(height: 28),
-                DropdownButtonFormField<String>(
-                  value: paymentMethod,
-                  decoration: const InputDecoration(labelText: 'PAYMENT METHOD'),
-                  items: const [
-                    DropdownMenuItem(value: 'CASH', child: Text('CASH')),
-                    DropdownMenuItem(value: 'GCASH', child: Text('GCASH')),
-                  ],
-                  onChanged: (v) => setState(() => paymentMethod = v ?? 'CASH'),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: amountReceived,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: 'AMOUNT RECEIVED'),
-                  onChanged: (_) => setState(() {}),
-                ),
-                Text('Amount due: ₱${widget.subtotal.toStringAsFixed(2)}'),
-                if (!isGcash)
-                  Text('Change: ₱${change.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w700)),
-                if (isGcash) ...[
-                  const SizedBox(height: 12),
-                  OutlinedButton.icon(
-                    onPressed: _pickGcashProof,
-                    icon: const Icon(Icons.upload_file),
-                    label: const Text('UPLOAD PROOF OF PAYMENT'),
-                  ),
-                  if (gcashProofBytes != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 10),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(10),
-                        child: Image.memory(gcashProofBytes!, height: 140, fit: BoxFit.contain),
-                      ),
-                    ),
-                ],
-                const SizedBox(height: 12),
-                TextField(controller: customerLabel, decoration: const InputDecoration(labelText: 'Customer name / reference (optional)')),
-                TextField(controller: note, decoration: const InputDecoration(labelText: 'NOTE'), maxLines: 2),
               ],
             ),
           ),
@@ -4777,19 +11741,19 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
             actionLabel: 'CONFIRM',
             onAction: () async {
               if (amountReceived.text.trim().isEmpty) {
-                appSnack(context, 'Enter amount received.');
+                await showStaffPosNotification('Checkout', 'Enter amount received.');
                 return;
               }
               if (parsed == null) {
-                appSnack(context, 'Enter a valid amount.');
+                await showStaffPosNotification('Checkout', 'Enter a valid amount.');
                 return;
               }
               if (arNum < widget.subtotal) {
-                appSnack(context, 'Amount received is less than the total.');
+                await showStaffPosNotification('Checkout', 'Amount received is less than the total.');
                 return;
               }
               if (isGcash && gcashProofBytes == null) {
-                appSnack(context, 'Upload proof of payment for GCash.');
+                await showStaffPosNotification('Checkout', 'Upload proof of payment for GCash.');
                 return;
               }
               final ok = await showDialog<bool>(
@@ -4813,10 +11777,10 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
               );
               if (!context.mounted) return;
               if (err != null) {
-                appSnack(context, err);
+                await showStaffPosNotification('Checkout', err);
                 return;
               }
-              appSnack(context, 'Walk-in order saved');
+              await showStaffPosNotification('Checkout', 'Walk-in order saved.');
               Navigator.of(context).popUntil((r) => r.isFirst);
             },
           ),
@@ -4861,7 +11825,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
             mainAxisSize: MainAxisSize.min,
             children: [
               Text('Total: ₱${o.total.toStringAsFixed(2)}'),
-              Text('Status: ${o.status}'),
+              Text('Status: ${statusReadable(o.status)}'),
               Text('Placed: ${o.createdAt.toLocal()}'),
               Text('Payment: ${o.paymentMode.trim().isEmpty ? '—' : o.paymentMode}'),
               if (o.cashierAmountReceived != null)
@@ -4956,16 +11920,21 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
       itemCount: rows.length,
       itemBuilder: (context, i) {
         final o = rows[i];
+        final submitted = formatDateTimeLocal(o.createdAt);
+        final completed =
+            o.updatedAt != null ? formatDateTimeLocal(o.updatedAt!) : '';
         return Card(
           child: ListTile(
             title: Text(o.orderNo),
             subtitle: Text(
               [
+                'Submitted: $submitted',
+                if (!showClaim && completed.isNotEmpty) 'Completed: $completed',
                 if (o.posCustomerLabel.trim().isNotEmpty) o.posCustomerLabel.trim(),
                 if (o.paymentMode.trim().isNotEmpty) o.paymentMode.toUpperCase(),
-              ].where((s) => s.isNotEmpty).join(' · '),
+              ].where((s) => s.isNotEmpty).join('\n'),
             ),
-            isThreeLine: false,
+            isThreeLine: true,
             trailing: showClaim
                 ? FilledButton(
                     onPressed: () async {
@@ -5007,17 +11976,40 @@ class PosOnlineOrdersTab extends StatefulWidget {
 
 class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTickerProviderStateMixin {
   late TabController _fulTab;
+  String _search = '';
+  Timer? _pendingReminderTimer;
+  final Map<int, int> _pendingAlertStage = {};
 
   @override
   void initState() {
     super.initState();
     _fulTab = TabController(length: 4, vsync: this);
+    _pendingReminderTimer = Timer.periodic(const Duration(seconds: 25), (_) => _tickPendingAlerts());
   }
 
   @override
   void dispose() {
+    _pendingReminderTimer?.cancel();
     _fulTab.dispose();
     super.dispose();
+  }
+
+  void _tickPendingAlerts() {
+    if (!mounted) return;
+    final pending =
+        widget.state.cashierOnlineOrders.where((o) => o.fulfillmentStage.toUpperCase() == 'PENDING_CASHIER');
+    final now = DateTime.now();
+    for (final o in pending) {
+      final mins = now.difference(o.createdAt).inMinutes;
+      final st = _pendingAlertStage[o.id] ?? 0;
+      if (mins >= 10 && st < 2) {
+        _pendingAlertStage[o.id] = 2;
+        showStaffPosNotification('Online orders', '${o.orderNo} is still awaiting cashier action.');
+      } else if (mins >= 5 && st < 1) {
+        _pendingAlertStage[o.id] = 1;
+        showStaffPosNotification('Online orders', '${o.orderNo} — please review when ready.');
+      }
+    }
   }
 
   static const _stages = [
@@ -5031,6 +12023,14 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
     final want = _stages[i];
     return widget.state.cashierOnlineOrders
         .where((o) => o.fulfillmentStage.toUpperCase() == want)
+        .where((o) {
+          final q = _search.trim().toLowerCase();
+          if (q.isEmpty) return true;
+          return o.orderNo.toLowerCase().contains(q) ||
+              (o.userEmail ?? '').toLowerCase().contains(q) ||
+              cashierCustomerLabel(o).toLowerCase().contains(q) ||
+              statusReadable(o.status).toLowerCase().contains(q);
+        })
         .toList();
   }
 
@@ -5041,6 +12041,13 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
       builder: (context, _) {
         return Column(
           children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: TextField(
+                decoration: const InputDecoration(hintText: 'SEARCH ORDER NO / EMAIL / STATUS'),
+                onChanged: (v) => setState(() => _search = v),
+              ),
+            ),
             Material(
               color: Theme.of(context).colorScheme.surface,
               child: TabBar(
@@ -5082,7 +12089,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                       ? Icon(Icons.notifications_active, color: Colors.deepOrange.shade700)
                                       : null,
                                   title: Text(o.orderNo),
-                                  subtitle: Text('${o.status}\n${o.userEmail ?? ''}'),
+                                  subtitle: Text('${statusReadable(o.status)}\n${cashierCustomerLabel(o)}'),
                                   isThreeLine: true,
                                   trailing: Text('₱${o.total.toStringAsFixed(2)}'),
                                   onTap: () async {
@@ -5186,6 +12193,15 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         final hasSupProof = o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false;
         final pendingBalReview = o.balanceProofPendingReview && hasSupProof;
         final waitingCustomerBalance = insufficientStatus && !hasSupProof && stage == 'PENDING_CASHIER';
+        final entered = parsed;
+        final amountClassified = entered != null;
+        final exactAmount = amountClassified && (entered - o.total).abs() <= 0.009;
+        final insufficientAmount = amountClassified && entered + 0.009 < o.total;
+        final overAmount = amountClassified && entered - o.total > 0.009;
+
+        final paymentAtTop = stage == 'PENDING_CASHIER';
+        final forDeliveryAtTop = stage == 'IN_PREPARATION';
+        final trackingAtTop = stage == 'OUT_FOR_DELIVERY';
 
         return Scaffold(
       appBar: AppBar(
@@ -5204,223 +12220,177 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
             child: ListView(
               padding: const EdgeInsets.all(12),
               children: [
-                _OrderNoCard(displayNo: o.orderNo),
-                const SizedBox(height: 10),
-                ToggleSection(
-                  title: 'ORDER SUMMARY',
-                  expanded: true,
-                  onToggle: () {},
-                  hideToggleIcon: true,
-                  child: Column(
-                    children: [
-                      LockedField(label: 'CUSTOMER EMAIL', value: o.userEmail?.trim().isNotEmpty == true ? o.userEmail! : '—'),
-                      LockedField(label: 'ORDER STATUS', value: o.status),
-                      LockedField(label: 'FULFILLMENT STAGE', value: o.fulfillmentStage),
-                      LockedField(label: 'ORDERED AT', value: o.createdAt.toLocal().toString()),
-                      LockedField(label: 'SUBTOTAL / TOTAL', value: '₱${o.total.toStringAsFixed(2)}'),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                ToggleSection(
-                  title: 'DELIVERY INFORMATION',
-                  expanded: showDelivery,
-                  onToggle: () => setState(() => showDelivery = !showDelivery),
-                  child: Column(
-                    children: [
-                      LockedField(label: 'NAME', value: o.deliveryName.isEmpty ? '—' : o.deliveryName),
-                      LockedField(label: 'CONTACT NUMBER', value: o.deliveryContact.isEmpty ? '—' : o.deliveryContact),
-                      LockedField(label: 'DELIVERY ADDRESS', value: o.deliveryAddress.isEmpty ? '—' : o.deliveryAddress),
-                      LockedField(label: 'TIME OF DELIVERY', value: o.deliveryTime.isEmpty ? 'NOW' : o.deliveryTime),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                ToggleSection(
-                  title: 'PAYMENT',
-                  titleColor: proofOk ? AppColors.brand : AppColors.accent,
-                  expanded: showPayment,
-                  onToggle: () => setState(() => showPayment = !showPayment),
+                if (paymentAtTop) ...[
+                  ToggleSection(
+                    title: 'PAYMENT',
+                    titleColor: proofOk ? AppColors.brand : AppColors.accent,
+                    expanded: showPayment,
+                    onToggle: () => setState(() => showPayment = !showPayment),
                     child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      LockedField(label: 'PAYMENT METHOD', value: pm),
-                      const SizedBox(height: 8),
-                      if (paymentLocked) ...[
-                        Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          child: Text(
-                            'PAYMENT IS COMPLETE!',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              fontWeight: FontWeight.w900,
-                              fontSize: 17,
-                              color: AppColors.success,
-                              letterSpacing: 0.5,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        LockedField(label: 'PAYMENT METHOD', value: pm),
+                        const SizedBox(height: 8),
+                        if (paymentLocked) ...[
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            child: Text(
+                              'PAYMENT IS COMPLETE!',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w900,
+                                fontSize: 17,
+                                color: AppColors.success,
+                                letterSpacing: 0.5,
+                              ),
                             ),
                           ),
-                        ),
-                        LockedField(
-                          label: 'AMOUNT RECEIVED',
-                          value: (amountLocked ?? parsed ?? 0).toStringAsFixed(2),
-                        ),
-                      ] else if (pendingBalReview) ...[
-                        Card(
-                          color: Colors.deepOrange.shade50,
-                          child: const ListTile(
-                            leading: Icon(Icons.mark_email_unread, color: Colors.deepOrange),
-                            title: Text('Customer uploaded balance payment proof'),
-                            subtitle: Text('Verify the supplemental proof and enter how much they paid for the balance.'),
+                          LockedField(
+                            label: 'AMOUNT RECEIVED',
+                            value: (amountLocked ?? parsed ?? 0).toStringAsFixed(2),
                           ),
-                        ),
+                        ] else if (pendingBalReview) ...[
+                          Card(
+                            color: Colors.deepOrange.shade50,
+                            child: const ListTile(
+                              leading: Icon(Icons.mark_email_unread, color: Colors.deepOrange),
+                              title: Text('Customer uploaded balance payment proof'),
+                              subtitle: Text('Verify the supplemental proof and enter how much they paid for the balance.'),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          LockedField(
+                            label: 'FIRST PAYMENT RECORDED',
+                            value: (o.cashierAmountReceived ?? 0).toStringAsFixed(2),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: supplementalAmount,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'ADDITIONAL AMOUNT RECEIVED (balance)',
+                            ),
+                            onChanged: (_) => setState(() {}),
+                          ),
+                        ] else ...[
+                          TextField(
+                            controller: amountReceived,
+                            keyboardType: TextInputType.number,
+                            readOnly: insufficientStatus && (o.cashierAmountReceived != null),
+                            decoration: InputDecoration(
+                              labelText: 'AMOUNT RECEIVED',
+                              helperText:
+                                  insufficientStatus ? 'Recorded when payment was marked insufficient.' : null,
+                            ),
+                            onChanged: (_) => setState(() {}),
+                          ),
+                        ],
+                        LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
+                        if (waitingCustomerBalance)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 10),
+                            child: Text(
+                              'Waiting for the customer to upload balance payment proof in the app.',
+                              style: TextStyle(color: Colors.deepOrange.shade900, fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                        if (!isGcash && !paymentLocked && !pendingBalReview)
+                          Text(
+                            'CHANGE: ₱${((ar ?? 0) - o.total).toStringAsFixed(2)}',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
                         const SizedBox(height: 10),
-                        LockedField(
-                          label: 'FIRST PAYMENT RECORDED',
-                          value: (o.cashierAmountReceived ?? 0).toStringAsFixed(2),
-                        ),
-                        const SizedBox(height: 10),
-                        TextField(
-                          controller: supplementalAmount,
-                          keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
-                            labelText: 'ADDITIONAL AMOUNT RECEIVED (balance)',
-                          ),
-                          onChanged: (_) => setState(() {}),
-                        ),
-                      ] else ...[
-                        TextField(
-                          controller: amountReceived,
-                          keyboardType: TextInputType.number,
-                          readOnly: insufficientStatus && (o.cashierAmountReceived != null),
-                          decoration: InputDecoration(
-                            labelText: 'AMOUNT RECEIVED',
-                            helperText:
-                                insufficientStatus ? 'Recorded when payment was marked insufficient.' : null,
-                          ),
-                          onChanged: (_) => setState(() {}),
-                        ),
-                      ],
-                      LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
-                      if (waitingCustomerBalance)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 10),
-                          child: Text(
-                            'Waiting for the customer to upload balance payment proof in the app.',
-                            style: TextStyle(color: Colors.deepOrange.shade900, fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                      if (!isGcash && !paymentLocked && !pendingBalReview)
-                        Text(
-                          'CHANGE: ₱${((ar ?? 0) - o.total).toStringAsFixed(2)}',
-                          style: const TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                      const SizedBox(height: 10),
-                      OutlinedButton(
-                        onPressed: o.paymentProofBase64 == null || o.paymentProofBase64!.isEmpty
-                            ? null
-                            : () {
-                                try {
-                                  final bytes = base64Decode(o.paymentProofBase64!);
-                                  showDialog<void>(
-                                    context: context,
-                                    builder: (ctx) => AlertDialog(
-                                      title: const Text('Proof of payment'),
-                                      content: Image.memory(Uint8List.fromList(bytes)),
-                                      actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
-                                    ),
-                                  );
-                                } catch (_) {
-                                  appSnack(context, 'Could not display image');
-                                }
-                              },
-                        child: const Text('VIEW PROOF OF PAYMENT'),
-                      ),
-                      if (hasSupProof) ...[
-                        const SizedBox(height: 8),
                         OutlinedButton(
-                          onPressed: () {
-                            try {
-                              final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
-                              showDialog<void>(
-                                context: context,
-                                builder: (ctx) => AlertDialog(
-                                  title: const Text('Balance payment proof'),
-                                  content: SingleChildScrollView(
-                                    child: Image.memory(Uint8List.fromList(bytes)),
+                          onPressed: o.paymentProofBase64 == null || o.paymentProofBase64!.isEmpty
+                              ? null
+                              : () {
+                                  try {
+                                    final bytes = base64Decode(o.paymentProofBase64!);
+                                    showDialog<void>(
+                                      context: context,
+                                      builder: (ctx) => AlertDialog(
+                                        title: const Text('Proof of payment'),
+                                        content: Image.memory(Uint8List.fromList(bytes)),
+                                        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+                                      ),
+                                    );
+                                  } catch (_) {
+                                    appSnack(context, 'Could not display image');
+                                  }
+                                },
+                          child: const Text('VIEW PROOF OF PAYMENT'),
+                        ),
+                        if (hasSupProof) ...[
+                          const SizedBox(height: 8),
+                          OutlinedButton(
+                            onPressed: () {
+                              try {
+                                final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+                                showDialog<void>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text('Balance payment proof'),
+                                    content: SingleChildScrollView(
+                                      child: Image.memory(Uint8List.fromList(bytes)),
+                                    ),
+                                    actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
                                   ),
-                                  actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
-                                ),
+                                );
+                              } catch (_) {
+                                appSnack(context, 'Could not display image');
+                              }
+                            },
+                            child: const Text('VIEW BALANCE PAYMENT PROOF'),
+                          ),
+                        ],
+                        if (!paymentLocked && !insufficientStatus && !pendingBalReview) ...[
+                          const SizedBox(height: 8),
+                          FilledButton(
+                            style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
+                            onPressed: insufficientAmount ? () async {
+                              if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
+                              final err = await widget.state.cashierReviewOrder(
+                                orderId: o.id,
+                                action: 'insufficient',
+                                amountReceived: ar,
                               );
-                            } catch (_) {
-                              appSnack(context, 'Could not display image');
-                            }
-                          },
-                          child: const Text('VIEW BALANCE PAYMENT PROOF'),
-                        ),
+                              if (!context.mounted) return;
+                              if (err != null) {
+                                appSnack(context, err);
+                                return;
+                              }
+                              appSnack(context, 'Customer notified (insufficient payment)');
+                              Navigator.pop(context);
+                            } : null,
+                            child: const Text('INSUFFICIENT PAYMENT'),
+                          ),
+                          const SizedBox(height: 8),
+                          FilledButton(
+                            style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                            onPressed: overAmount ? () async {
+                              if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
+                              final err = await widget.state.cashierReviewOrder(
+                                orderId: o.id,
+                                action: 'overpayment',
+                                amountReceived: ar,
+                              );
+                              if (!context.mounted) return;
+                              if (err != null) {
+                                appSnack(context, err);
+                                return;
+                              }
+                              appSnack(context, 'Customer notified (overpayment)');
+                              Navigator.pop(context);
+                            } : null,
+                            child: const Text('OVERPAYMENT'),
+                          ),
+                        ],
                       ],
-                      if (!paymentLocked && !insufficientStatus && !pendingBalReview) ...[
-                        const SizedBox(height: 8),
-                        FilledButton(
-                          style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
-                          onPressed: () async {
-                            if (amountReceived.text.trim().isEmpty || parsed == null) {
-                              appSnack(context, 'Enter amount received first.');
-                              return;
-                            }
-                            if ((ar ?? 0) >= o.total) {
-                              appSnack(context, 'Use Confirm order when payment is sufficient.');
-                              return;
-                            }
-                            if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
-                            final err = await widget.state.cashierReviewOrder(
-                              orderId: o.id,
-                              action: 'insufficient',
-                              amountReceived: ar,
-                            );
-                            if (!context.mounted) return;
-                            if (err != null) {
-                              appSnack(context, err);
-                              return;
-                            }
-                            appSnack(context, 'Customer notified (insufficient payment)');
-                            Navigator.pop(context);
-                          },
-                          child: const Text('INSUFFICIENT PAYMENT'),
-                        ),
-                        const SizedBox(height: 8),
-                        FilledButton(
-                          style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                          onPressed: () async {
-                            if (amountReceived.text.trim().isEmpty || parsed == null) {
-                              appSnack(context, 'Enter amount received first.');
-                              return;
-                            }
-                            if ((ar ?? 0) <= o.total) {
-                              appSnack(context, 'Amount is not over the total.');
-                              return;
-                            }
-                            if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
-                            final err = await widget.state.cashierReviewOrder(
-                              orderId: o.id,
-                              action: 'overpayment',
-                              amountReceived: ar,
-                            );
-                            if (!context.mounted) return;
-                            if (err != null) {
-                              appSnack(context, err);
-                              return;
-                            }
-                            appSnack(context, 'Customer notified (overpayment)');
-                            Navigator.pop(context);
-                          },
-                          child: const Text('OVERPAYMENT'),
-                        ),
-                      ],
-                    ],
+                    ),
                   ),
-                ),
-                const SizedBox(height: 10),
-                if (stage == 'IN_PREPARATION') ...[
+                  const SizedBox(height: 10),
+                ],
+                if (forDeliveryAtTop) ...[
                   Container(
                     width: double.infinity,
                     decoration: BoxDecoration(
@@ -5482,7 +12452,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   ),
                   const SizedBox(height: 10),
                 ],
-                if (stage == 'OUT_FOR_DELIVERY') ...[
+                if (trackingAtTop) ...[
                   ToggleSection(
                     title: 'TRACKING',
                     expanded: true,
@@ -5511,6 +12481,209 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           },
                           child: const Text('MARK DELIVERED'),
                         ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+                _OrderNoCard(displayNo: o.orderNo),
+                const SizedBox(height: 10),
+                ToggleSection(
+                  title: 'ORDER SUMMARY',
+                  expanded: true,
+                  onToggle: () {},
+                  hideToggleIcon: true,
+                  child: Column(
+                    children: [
+                      LockedField(label: 'CUSTOMER', value: cashierCustomerLabel(o)),
+                      LockedField(label: 'CUSTOMER EMAIL', value: o.userEmail?.trim().isNotEmpty == true ? o.userEmail! : '—'),
+                      LockedField(label: 'ORDER STATUS', value: statusReadable(o.status)),
+                      LockedField(label: 'FULFILLMENT STAGE', value: o.fulfillmentStage),
+                      LockedField(label: 'ORDERED AT', value: o.createdAt.toLocal().toString()),
+                      LockedField(label: 'SUBTOTAL / TOTAL', value: '₱${o.total.toStringAsFixed(2)}'),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                ToggleSection(
+                  title: 'DELIVERY INFORMATION',
+                  expanded: showDelivery,
+                  onToggle: () => setState(() => showDelivery = !showDelivery),
+                  child: Column(
+                    children: [
+                      LockedField(label: 'NAME', value: o.deliveryName.isEmpty ? '—' : o.deliveryName),
+                      LockedField(label: 'CONTACT NUMBER', value: o.deliveryContact.isEmpty ? '—' : o.deliveryContact),
+                      LockedField(label: 'DELIVERY ADDRESS', value: o.deliveryAddress.isEmpty ? '—' : o.deliveryAddress),
+                      LockedField(label: 'TIME OF DELIVERY', value: o.deliveryTime.isEmpty ? 'NOW' : o.deliveryTime),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                if (!paymentAtTop) ...[
+                  ToggleSection(
+                    title: 'PAYMENT',
+                    titleColor: proofOk ? AppColors.brand : AppColors.accent,
+                    expanded: showPayment,
+                    onToggle: () => setState(() => showPayment = !showPayment),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        LockedField(label: 'PAYMENT METHOD', value: pm),
+                        const SizedBox(height: 8),
+                        if (paymentLocked) ...[
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            child: Text(
+                              'PAYMENT IS COMPLETE!',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w900,
+                                fontSize: 17,
+                                color: AppColors.success,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ),
+                          LockedField(
+                            label: 'AMOUNT RECEIVED',
+                            value: (amountLocked ?? parsed ?? 0).toStringAsFixed(2),
+                          ),
+                        ] else if (pendingBalReview) ...[
+                          Card(
+                            color: Colors.deepOrange.shade50,
+                            child: const ListTile(
+                              leading: Icon(Icons.mark_email_unread, color: Colors.deepOrange),
+                              title: Text('Customer uploaded balance payment proof'),
+                              subtitle: Text('Verify the supplemental proof and enter how much they paid for the balance.'),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          LockedField(
+                            label: 'FIRST PAYMENT RECORDED',
+                            value: (o.cashierAmountReceived ?? 0).toStringAsFixed(2),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: supplementalAmount,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'ADDITIONAL AMOUNT RECEIVED (balance)',
+                            ),
+                            onChanged: (_) => setState(() {}),
+                          ),
+                        ] else ...[
+                          TextField(
+                            controller: amountReceived,
+                            keyboardType: TextInputType.number,
+                            readOnly: insufficientStatus && (o.cashierAmountReceived != null),
+                            decoration: InputDecoration(
+                              labelText: 'AMOUNT RECEIVED',
+                              helperText:
+                                  insufficientStatus ? 'Recorded when payment was marked insufficient.' : null,
+                            ),
+                            onChanged: (_) => setState(() {}),
+                          ),
+                        ],
+                        LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
+                        if (waitingCustomerBalance)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 10),
+                            child: Text(
+                              'Waiting for the customer to upload balance payment proof in the app.',
+                              style: TextStyle(color: Colors.deepOrange.shade900, fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                        if (!isGcash && !paymentLocked && !pendingBalReview)
+                          Text(
+                            'CHANGE: ₱${((ar ?? 0) - o.total).toStringAsFixed(2)}',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                        const SizedBox(height: 10),
+                        OutlinedButton(
+                          onPressed: o.paymentProofBase64 == null || o.paymentProofBase64!.isEmpty
+                              ? null
+                              : () {
+                                  try {
+                                    final bytes = base64Decode(o.paymentProofBase64!);
+                                    showDialog<void>(
+                                      context: context,
+                                      builder: (ctx) => AlertDialog(
+                                        title: const Text('Proof of payment'),
+                                        content: Image.memory(Uint8List.fromList(bytes)),
+                                        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+                                      ),
+                                    );
+                                  } catch (_) {
+                                    appSnack(context, 'Could not display image');
+                                  }
+                                },
+                          child: const Text('VIEW PROOF OF PAYMENT'),
+                        ),
+                        if (hasSupProof) ...[
+                          const SizedBox(height: 8),
+                          OutlinedButton(
+                            onPressed: () {
+                              try {
+                                final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+                                showDialog<void>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text('Balance payment proof'),
+                                    content: SingleChildScrollView(
+                                      child: Image.memory(Uint8List.fromList(bytes)),
+                                    ),
+                                    actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+                                  ),
+                                );
+                              } catch (_) {
+                                appSnack(context, 'Could not display image');
+                              }
+                            },
+                            child: const Text('VIEW BALANCE PAYMENT PROOF'),
+                          ),
+                        ],
+                        if (!paymentLocked && !insufficientStatus && !pendingBalReview) ...[
+                          const SizedBox(height: 8),
+                          FilledButton(
+                            style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
+                            onPressed: insufficientAmount ? () async {
+                              if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
+                              final err = await widget.state.cashierReviewOrder(
+                                orderId: o.id,
+                                action: 'insufficient',
+                                amountReceived: ar,
+                              );
+                              if (!context.mounted) return;
+                              if (err != null) {
+                                appSnack(context, err);
+                                return;
+                              }
+                              appSnack(context, 'Customer notified (insufficient payment)');
+                              Navigator.pop(context);
+                            } : null,
+                            child: const Text('INSUFFICIENT PAYMENT'),
+                          ),
+                          const SizedBox(height: 8),
+                          FilledButton(
+                            style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                            onPressed: overAmount ? () async {
+                              if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
+                              final err = await widget.state.cashierReviewOrder(
+                                orderId: o.id,
+                                action: 'overpayment',
+                                amountReceived: ar,
+                              );
+                              if (!context.mounted) return;
+                              if (err != null) {
+                                appSnack(context, err);
+                                return;
+                              }
+                              appSnack(context, 'Customer notified (overpayment)');
+                              Navigator.pop(context);
+                            } : null,
+                            child: const Text('OVERPAYMENT'),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -5553,10 +12726,24 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                 width: double.infinity,
                 color: Colors.orange.shade50,
                 padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 12),
-                child: Text(
-                  'Waiting for the customer to upload balance payment proof in the app. You can confirm once it appears above.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontWeight: FontWeight.w700, color: Colors.orange.shade900),
+                child: Column(
+                  children: [
+                    Text(
+                      'Waiting for the customer to upload balance payment proof in the app. You can confirm once it appears above.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontWeight: FontWeight.w700, color: Colors.orange.shade900),
+                    ),
+                    const SizedBox(height: 10),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        final err = await widget.state.cashierRemindInsufficientOrder(orderId: o.id);
+                        if (!context.mounted) return;
+                        appSnack(context, err ?? 'Follow-up sent to customer');
+                      },
+                      icon: const Icon(Icons.notifications_active_outlined),
+                      label: const Text('Follow up customer'),
+                    ),
+                  ],
                 ),
               )
             else if (pendingBalReview)
@@ -5604,7 +12791,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   SummaryLine('TOTAL', '₱${o.total.toStringAsFixed(2)}', isTotal: true),
                 ],
                 actionLabel: 'CONFIRM ORDER',
-                onAction: () async {
+                onAction: exactAmount ? () async {
                   if (amountReceived.text.trim().isEmpty) {
                     appSnack(context, 'Enter amount received.');
                     return;
@@ -5613,10 +12800,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                     appSnack(context, 'Enter a valid amount.');
                     return;
                   }
-                  if ((ar ?? 0) < o.total) {
-                    appSnack(context, 'Amount received is less than the total.');
-                    return;
-                  }
+                  if ((ar ?? 0) < o.total) return;
                   if (isGcash && !proofOk) {
                     appSnack(context, 'Customer payment proof must be received before confirming.');
                     return;
@@ -5639,7 +12823,12 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   }
                   appSnack(context, 'Order confirmed — customer notified');
                   Navigator.pop(context);
-                },
+                } : (amountClassified ? () {
+                  final kind = insufficientAmount
+                      ? 'insufficient'
+                      : (overAmount ? 'overpayment' : 'different');
+                  appSnack(context, 'The amount received is $kind, not exact. Please use the matching action button.');
+                } : null),
               ),
           ],
         ],

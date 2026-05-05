@@ -8,7 +8,7 @@
  *   public.menu_dishes + public.set_menus (see DEFAULT_PUBLIC_* below).
  *
  * Expected column aliases from menu query:
- *   id (text uuid ok), name, description, price, dips (JSON text array)
+ *   id (text uuid ok), name, description, price, dips (JSON text array), dish_type (optional)
  *
  * Set menus query expected columns:
  *   name, description, dishes (JSON text array of dish names)
@@ -19,10 +19,16 @@ export const DEFAULT_PUBLIC_MENU_SQL = `
   SELECT
     md.id::text AS id,
     md.name::text AS name,
-    TRIM(CONCAT_WS(' • ', NULLIF(TRIM(md.type), ''), NULLIF(TRIM(md.category), ''))) AS description,
+    CASE
+      WHEN LOWER(TRIM(COALESCE(md.type, ''))) = 'restaurant'
+        THEN NULLIF(TRIM(md.category), '')
+      ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(md.type), ''), NULLIF(TRIM(md.category), '')))
+    END AS description,
     COALESCE(NULLIF(TRIM(md.price), '')::numeric, 0) AS price,
     COALESCE(md.sauces::text, '[]') AS dips,
+    COALESCE(md.ingredients::text, '[]') AS ingredients,
     COALESCE(TRIM(md.category), '')::text AS category,
+    COALESCE(NULLIF(TRIM(md.type), ''), '')::text AS dish_type,
     md.image_base64::text AS image_base64
   FROM public.menu_dishes md
   WHERE NOT md.archived
@@ -82,11 +88,17 @@ export function resolveMenuSql(): string | null {
     : `'[]'::text`;
 
   const categoryCol = process.env.WEB_MENU_CATEGORY_COL?.trim();
+  const typeCol = process.env.WEB_MENU_TYPE_COL?.trim();
   const imageCol = process.env.WEB_MENU_IMAGE_COL?.trim();
+  const ingredientsCol = process.env.WEB_MENU_INGREDIENTS_COL?.trim();
   const categoryExpr = categoryCol
     ? `COALESCE(${escapeIdent(categoryCol)}::text, '')`
     : `''::text`;
+  const dishTypeExpr = typeCol ? `COALESCE(${escapeIdent(typeCol)}::text, '')` : `''::text`;
   const imageExpr = imageCol ? `${escapeIdent(imageCol)}::text` : `NULL::text`;
+  const ingredientsExpr = ingredientsCol
+    ? `COALESCE(${escapeIdent(ingredientsCol)}::text, '[]')`
+    : `'[]'::text`;
 
   const where = process.env.WEB_MENU_WHERE?.trim();
 
@@ -97,7 +109,9 @@ export function resolveMenuSql(): string | null {
       COALESCE(${escapeIdent(descCol)}::text, '') AS description,
       ${escapeIdent(priceCol)}::numeric AS price,
       ${dipsExpr} AS dips,
+      ${ingredientsExpr} AS ingredients,
       ${categoryExpr} AS category,
+      ${dishTypeExpr} AS dish_type,
       ${imageExpr} AS image_base64
     FROM ${qualified}
     ${where ? `WHERE ${where}` : ""}
