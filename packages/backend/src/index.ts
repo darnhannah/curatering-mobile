@@ -60,6 +60,263 @@ function parseJsonTextArray(raw: unknown): string[] {
   }
 }
 
+const fallbackThemeSuggestions: Array<Record<string, string>> = [
+  {
+    title: "Elegant Event Tablescape",
+    source: "fallback",
+    imageUrl: "https://images.unsplash.com/photo-1519225421980-715cb0215aed",
+    thumbnailUrl: "https://images.unsplash.com/photo-1519225421980-715cb0215aed",
+  },
+  {
+    title: "Floral Centerpiece Inspiration",
+    source: "fallback",
+    imageUrl: "https://images.unsplash.com/photo-1478146059778-26028b07395a",
+    thumbnailUrl: "https://images.unsplash.com/photo-1478146059778-26028b07395a",
+  },
+  {
+    title: "Modern Reception Setup",
+    source: "fallback",
+    imageUrl: "https://images.unsplash.com/photo-1469371670807-013ccf25f16a",
+    thumbnailUrl: "https://images.unsplash.com/photo-1469371670807-013ccf25f16a",
+  },
+  {
+    title: "Garden Party Decor",
+    source: "fallback",
+    imageUrl: "https://images.unsplash.com/photo-1522673607200-164d1b6ce486",
+    thumbnailUrl: "https://images.unsplash.com/photo-1522673607200-164d1b6ce486",
+  },
+  {
+    title: "Romantic Wedding Setup",
+    source: "fallback",
+    imageUrl: "https://images.unsplash.com/photo-1511285560929-80b456fea0bc",
+    thumbnailUrl: "https://images.unsplash.com/photo-1511285560929-80b456fea0bc",
+  },
+];
+
+function buildPexelsQuery(params: {
+  eventTitle?: unknown;
+  eventType?: unknown;
+  formalityLevel?: unknown;
+  prompt?: unknown;
+  baseImageUrl?: unknown;
+  forceNoPeople?: boolean;
+}): string {
+  const {
+    eventTitle,
+    eventType,
+    formalityLevel,
+    prompt,
+    baseImageUrl,
+    forceNoPeople = true,
+  } = params;
+  return [
+    String(eventType ?? "").trim(),
+    String(formalityLevel ?? "").trim(),
+    String(eventTitle ?? "").trim(),
+    String(prompt ?? "").trim(),
+    baseImageUrl ? "matching style composition" : "",
+    "event decor background",
+    forceNoPeople ? "-people -person -human -portrait -face -model -selfie" : "",
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sanitizeThemeSuggestions(rows: unknown): Array<Record<string, string>> {
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .filter((row) => row && typeof row === "object")
+    .map((row) => row as Record<string, unknown>)
+    .filter((row) => {
+      const text = [
+        row.title,
+        row.description,
+        row.imageUrl,
+        row.thumbnailUrl,
+        row.pexelsUrl,
+      ]
+        .map((v) => String(v ?? "").toLowerCase())
+        .join(" ");
+      const looksPeople = /\b(person|people|human|portrait|selfie|face|man|woman|model|boy|girl|bride|groom|crowd|group)\b/.test(text);
+      const looksDecor = /\b(decor|decoration|event|venue|hall|setup|tablescape|table|centerpiece|balloon|floral|flower|banquet|reception|aisle|stage|backdrop|dinner|wedding|birthday|celebration)\b/.test(
+        text,
+      );
+      return !looksPeople && looksDecor;
+    })
+    .map((row) => ({
+      title: String(row.title ?? "Theme suggestion"),
+      source: String(row.source ?? "fallback"),
+      imageUrl: String(row.imageUrl ?? ""),
+      thumbnailUrl: String(row.thumbnailUrl ?? row.imageUrl ?? ""),
+      photographer: String(row.photographer ?? ""),
+      pexelsUrl: String(row.pexelsUrl ?? ""),
+    }))
+    .filter((row) => row.imageUrl.trim().length > 0);
+}
+
+async function fetchPexelsImages(params: {
+  query: string;
+  perPage?: number;
+  page?: number;
+}): Promise<{ images: Array<Record<string, string>>; error: string; rateLimited: boolean }> {
+  const pexelsKey = String(process.env.PEXELS_API_KEY ?? "").trim();
+  const { query, perPage = 20, page = 1 } = params;
+  if (!pexelsKey) {
+    return { images: [], error: "PEXELS_API_KEY is not configured", rateLimited: false };
+  }
+  if (!query.trim()) {
+    return { images: [], error: "search query is empty", rateLimited: false };
+  }
+  const url = new URL("https://api.pexels.com/v1/search");
+  url.searchParams.set("query", query);
+  url.searchParams.set("per_page", String(Math.max(1, Math.min(perPage, 30))));
+  url.searchParams.set("page", String(Math.max(1, page)));
+  url.searchParams.set("orientation", "landscape");
+
+  try {
+    const upstream = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: pexelsKey },
+    });
+    if (upstream.status === 429) {
+      return { images: [], error: "Pexels rate limit reached. Please wait and try again.", rateLimited: true };
+    }
+    if (!upstream.ok) {
+      const t = await upstream.text().catch(() => "");
+      return {
+        images: [],
+        error: `Pexels request failed (${upstream.status})${t ? `: ${t.slice(0, 160)}` : ""}`,
+        rateLimited: false,
+      };
+    }
+    const json = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
+    const rows = Array.isArray(json.photos) ? json.photos : [];
+    const images = rows
+      .filter((row: unknown) => row && typeof row === "object")
+      .map((row: unknown) => {
+        const r = row as Record<string, unknown>;
+        const src = (r.src ?? {}) as Record<string, unknown>;
+        return {
+          title: String(r.alt ?? "Pexels theme suggestion"),
+          source: "pexels",
+          thumbnailUrl: String(src.medium ?? src.small ?? ""),
+          imageUrl: String(src.large2x ?? src.large ?? src.original ?? ""),
+          photographer: String(r.photographer ?? ""),
+          pexelsUrl: String(r.url ?? ""),
+        };
+      })
+      .filter((row) => row.imageUrl.trim().length > 0);
+    return { images: sanitizeThemeSuggestions(images), error: "", rateLimited: false };
+  } catch (err) {
+    return {
+      images: [],
+      error: `Pexels request failed: ${err instanceof Error ? err.message : String(err)}`,
+      rateLimited: false,
+    };
+  }
+}
+
+const AI_SERVICE_BASE_URL = String(process.env.AI_SERVICE_BASE_URL ?? process.env.FASTAPI_INTERNAL_URL ?? "").replace(
+  /\/+$/,
+  "",
+);
+const AI_SERVICE_TIMEOUT_SEGMENT_MS = Number(process.env.AI_SERVICE_TIMEOUT_SEGMENT_MS ?? 20000);
+const AI_SERVICE_TIMEOUT_RECOLOR_MS = Number(process.env.AI_SERVICE_TIMEOUT_RECOLOR_MS ?? 8000);
+const AI_SERVICE_TIMEOUT_COMPOSE_MS = Number(process.env.AI_SERVICE_TIMEOUT_COMPOSE_MS ?? 12000);
+const AI_SERVICE_TIMEOUT_ADD_BY_PROMPT_MS = Number(process.env.AI_SERVICE_TIMEOUT_ADD_BY_PROMPT_MS ?? 180000);
+const AI_SERVICE_SEGMENT_TIMEOUT_RETRIES = Math.max(0, Number(process.env.AI_SERVICE_SEGMENT_TIMEOUT_RETRIES ?? 1));
+const AI_SERVICE_TOKEN = String(process.env.AI_SERVICE_TOKEN ?? "").trim();
+const AI_SERVICE_MAX_IMAGE_BYTES = Number(process.env.AI_SERVICE_MAX_IMAGE_BYTES ?? 8_000_000);
+
+function ensureHexColor(rawValue: unknown, fallback = "#f4511e"): string {
+  const value = String(rawValue ?? "").trim();
+  const match = value.match(/^#?([0-9a-f]{6})$/i);
+  if (!match) return String(fallback).toLowerCase();
+  return `#${match[1].toLowerCase()}`;
+}
+
+function sanitizeBase64Image(input: unknown): string {
+  if (typeof input !== "string" || !input.trim()) {
+    throw new Error("imageBase64 is required");
+  }
+  const value = input.trim();
+  const cleaned = value.includes(",") ? value.split(",").pop() : value;
+  if (!cleaned || !/^[A-Za-z0-9+/=\s]+$/.test(cleaned)) {
+    throw new Error("imageBase64 must be valid base64");
+  }
+  const sizeBytes = Buffer.byteLength(cleaned, "base64");
+  if (sizeBytes <= 0 || sizeBytes > AI_SERVICE_MAX_IMAGE_BYTES) {
+    throw new Error(`imageBase64 exceeds size limit (${AI_SERVICE_MAX_IMAGE_BYTES} bytes)`);
+  }
+  return cleaned;
+}
+
+function normalizePolygonPoints(raw: unknown): Array<{ x: number; y: number }> {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((p: unknown) => {
+      if (!p || typeof p !== "object") return null;
+      const o = p as Record<string, unknown>;
+      const x = Number(o.x ?? o.left ?? 0);
+      const y = Number(o.y ?? o.top ?? 0);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return { x, y };
+    })
+    .filter((p): p is { x: number; y: number } => p != null);
+}
+
+async function callAiService(routePath: string, payload: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  if (!AI_SERVICE_BASE_URL) {
+    throw new Error("AI service is not configured (AI_SERVICE_BASE_URL missing)");
+  }
+  let lastErr: unknown;
+  const maxAttempts = 1 + AI_SERVICE_SEGMENT_TIMEOUT_RETRIES;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.max(1000, timeoutMs));
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (AI_SERVICE_TOKEN) {
+        headers.Authorization = `Bearer ${AI_SERVICE_TOKEN}`;
+        headers["X-AI-Service-Token"] = AI_SERVICE_TOKEN;
+      }
+      const response = await fetch(`${AI_SERVICE_BASE_URL}${routePath}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+      const json = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!response.ok) {
+        const msg = String(json.error ?? json.message ?? `AI service error (${response.status})`);
+        if (response.status >= 500 && attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 300 * attempt));
+          continue;
+        }
+        throw new Error(msg);
+      }
+      return json;
+    } catch (err) {
+      lastErr = err;
+      const message = err instanceof Error ? err.message : String(err);
+      const transient =
+        message.includes("ECONNRESET") ||
+        message.includes("UND_ERR_SOCKET") ||
+        message.includes("fetch failed") ||
+        message.includes("aborted");
+      if (!transient || attempt >= maxAttempts) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 300 * attempt));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw (lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? "AI service request failed")));
+}
+
 function toNum(v: unknown, fallback = 0): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -1760,6 +2017,499 @@ app.post("/api/mobile/catering/schedule-conflicts", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
+  }
+});
+
+app.post("/api/public/events/theme-design/theme-search", async (req, res) => {
+  try {
+    const query = String(req.body?.prompt ?? "").trim();
+    const eventTitle = String(req.body?.eventTitle ?? "").trim();
+    const eventType = String(req.body?.eventType ?? "").trim();
+    const formalityLevel = String(req.body?.formalityLevel ?? "").trim();
+    const pageNum = Math.max(1, Number(req.body?.page ?? 1));
+    const perPage = Math.max(1, Math.min(24, Number(req.body?.perPage ?? 12)));
+    const pexelsQuery = buildPexelsQuery({
+      eventTitle,
+      eventType,
+      formalityLevel,
+      prompt: query,
+      forceNoPeople: true,
+    });
+    const pex = await fetchPexelsImages({ query: pexelsQuery, perPage: 30, page: pageNum });
+    const source = pex.images.length > 0 ? pex.images : sanitizeThemeSuggestions(fallbackThemeSuggestions);
+    const start = 0;
+    const total = source.length;
+    const images = source.slice(start, start + perPage);
+    res.json({
+      ok: true,
+      query,
+      usedFallback: pex.images.length === 0,
+      error: pex.images.length === 0 ? pex.error || undefined : undefined,
+      images,
+      page: pageNum,
+      perPage,
+      total,
+      hasMore: images.length < total,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "theme search failed" });
+  }
+});
+
+app.post("/api/public/events/theme-design/yolo-sam-infer", async (req, res) => {
+  try {
+    const cleanedImageBase64 = sanitizeBase64Image(req.body?.imageBase64);
+    const fast = await callAiService(
+      "/v1/infer/yolo-sam",
+      {
+        image_base64: cleanedImageBase64,
+        confidence_threshold: Number.isFinite(Number(req.body?.confidenceThreshold))
+          ? Number(req.body?.confidenceThreshold)
+          : 0.25,
+        max_detections: Number.isFinite(Number(req.body?.maxDetections)) ? Number(req.body?.maxDetections) : 30,
+        mask_format: ["polygon", "rle", "alpha_png"].includes(String(req.body?.maskFormat))
+          ? String(req.body?.maskFormat)
+          : "polygon",
+      },
+      AI_SERVICE_TIMEOUT_SEGMENT_MS,
+    );
+    const objects = Array.isArray(fast.objects) ? fast.objects : [];
+    res.json({
+      ok: true,
+      imageWidth: Number(fast.image_width ?? fast.imageWidth ?? 0),
+      imageHeight: Number(fast.image_height ?? fast.imageHeight ?? 0),
+      detections: Array.isArray(fast.detections) ? fast.detections : [],
+      objects,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to run YOLO+SAM inference" });
+  }
+});
+
+app.post("/api/public/events/theme-design/swap-colors", async (req, res) => {
+  try {
+    const cleanedImageBase64 = sanitizeBase64Image(req.body?.imageBase64);
+    const masks = Array.isArray(req.body?.masks) ? req.body.masks : [];
+    const edits = Array.isArray(req.body?.edits) ? req.body.edits : [];
+    const normalizedMasks = masks
+      .filter((m: unknown) => m && typeof m === "object")
+      .map((m: unknown) => {
+        const o = m as Record<string, unknown>;
+        return {
+          object_id: String(o.objectId ?? o.object_id ?? ""),
+          polygon_points: Array.isArray(o.polygonPoints) ? o.polygonPoints : Array.isArray(o.polygon_points) ? o.polygon_points : undefined,
+          mask_rle: o.maskRle ?? o.mask_rle ?? undefined,
+          mask_base64: o.maskBase64 ?? o.mask_base64 ?? undefined,
+        };
+      })
+      .filter((m: { object_id: string }) => Boolean(m.object_id));
+    const normalizedEdits = edits
+      .filter((e: unknown) => e && typeof e === "object")
+      .map((e: unknown) => {
+        const o = e as Record<string, unknown>;
+        return {
+          object_id: String(o.objectId ?? o.object_id ?? ""),
+          target_hex: ensureHexColor(o.targetHex ?? o.target_hex ?? req.body?.currentTintColorHex),
+          intensity: Number(o.intensity ?? 1),
+        };
+      })
+      .filter((e: { object_id: string }) => Boolean(e.object_id));
+    const fast = await callAiService(
+      "/v1/edit/recolor",
+      {
+        image_base64: cleanedImageBase64,
+        masks: normalizedMasks,
+        edits: normalizedEdits,
+      },
+      AI_SERVICE_TIMEOUT_RECOLOR_MS,
+    );
+    res.json({
+      ok: true,
+      imageBase64: String(fast.image_base64 ?? fast.imageBase64 ?? ""),
+      applied: Array.isArray(fast.applied) ? fast.applied : [],
+      skipped: Array.isArray(fast.skipped) ? fast.skipped : [],
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to recolor theme objects" });
+  }
+});
+
+app.post("/api/public/events/theme-design/extract-objects", async (req, res) => {
+  try {
+    const imagesBase64 = Array.isArray(req.body?.imagesBase64) ? req.body.imagesBase64 : [];
+    const results: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < imagesBase64.length; i++) {
+      try {
+        const cleaned = sanitizeBase64Image(imagesBase64[i]);
+        const fast = await callAiService(
+          "/v1/infer/yolo-sam-extract",
+          {
+            image_base64: cleaned,
+            confidence_threshold: Number.isFinite(Number(req.body?.confidenceThreshold))
+              ? Number(req.body?.confidenceThreshold)
+              : 0.35,
+            max_detections: Number.isFinite(Number(req.body?.maxDetections)) ? Number(req.body?.maxDetections) : 20,
+            mask_format: "alpha_png",
+          },
+          AI_SERVICE_TIMEOUT_SEGMENT_MS,
+        );
+        const objects = Array.isArray(fast.objects)
+          ? fast.objects.map((obj: unknown, idx: number) => {
+              const o = obj as Record<string, unknown>;
+              return {
+                id: String(o.id ?? o.object_id ?? `obj_${i}_${idx}`),
+                label: String(o.label ?? "Object"),
+                score: Number(o.score ?? 0),
+                sourceImageIndex: i,
+                boundingBox: {
+                  left: Number((o.box as Record<string, unknown> | undefined)?.x ?? (o.box as Record<string, unknown> | undefined)?.left ?? 0),
+                  top: Number((o.box as Record<string, unknown> | undefined)?.y ?? (o.box as Record<string, unknown> | undefined)?.top ?? 0),
+                  width: Number((o.box as Record<string, unknown> | undefined)?.width ?? 0),
+                  height: Number((o.box as Record<string, unknown> | undefined)?.height ?? 0),
+                },
+                polygonPoints: normalizePolygonPoints(o.polygon_points ?? o.polygonPoints ?? []),
+                maskBase64: String(o.mask_base64 ?? o.maskBase64 ?? ""),
+                objectImageBase64: String(o.object_image_base64 ?? o.objectImageBase64 ?? ""),
+              };
+            })
+          : [];
+        results.push({
+          imageIndex: i,
+          imageWidth: Number(fast.image_width ?? fast.imageWidth ?? 0),
+          imageHeight: Number(fast.image_height ?? fast.imageHeight ?? 0),
+          objects,
+        });
+      } catch {
+        results.push({ imageIndex: i, imageWidth: 0, imageHeight: 0, objects: [] });
+      }
+    }
+    res.json({ ok: true, images: results });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to extract theme objects" });
+  }
+});
+
+app.post("/api/public/events/theme-design/analyze-base", async (req, res) => {
+  try {
+    const cleaned = sanitizeBase64Image(req.body?.baseImageBase64);
+    let objects: Array<Record<string, unknown>> = [];
+    try {
+      const fast = await callAiService(
+        "/v1/infer/yolo-sam",
+        {
+          image_base64: cleaned,
+          confidence_threshold: 0.25,
+          max_detections: 20,
+          mask_format: "polygon",
+        },
+        AI_SERVICE_TIMEOUT_SEGMENT_MS,
+      );
+      objects = Array.isArray(fast.objects) ? (fast.objects as Array<Record<string, unknown>>) : [];
+    } catch {
+      objects = [];
+    }
+    const occupied = objects.map((obj) => {
+      const box = (obj.box ?? {}) as Record<string, unknown>;
+      return {
+        left: Number(box.x ?? box.left ?? 0),
+        top: Number(box.y ?? box.top ?? 0),
+        width: Number(box.width ?? 0),
+        height: Number(box.height ?? 0),
+        label: String(obj.label ?? "Object"),
+      };
+    });
+    const freeSpaces: Array<Record<string, number>> = [];
+    const grid = 3;
+    for (let row = 0; row < grid; row++) {
+      for (let col = 0; col < grid; col++) {
+        const left = col / grid;
+        const top = row / grid;
+        const width = 1 / grid;
+        const height = 1 / grid;
+        const overlaps = occupied.some((box) => {
+          const xOverlap = Math.max(0, Math.min(left + width, box.left + box.width) - Math.max(left, box.left));
+          const yOverlap = Math.max(0, Math.min(top + height, box.top + box.height) - Math.max(top, box.top));
+          return xOverlap * yOverlap > 0.02;
+        });
+        if (!overlaps) freeSpaces.push({ left, top, width, height });
+      }
+    }
+    res.json({
+      ok: true,
+      freeSpaces,
+      recommendations: occupied.some((o) => /table|desk|counter|buffet/i.test(String(o.label)))
+        ? ["flowers", "fruit platter", "plates", "napkins"]
+        : ["flowers", "lights", "decorative elements", "table setup"],
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to analyze base image" });
+  }
+});
+
+app.post("/api/public/events/theme-design/auto-place", async (req, res) => {
+  try {
+    const freeSpaces = Array.isArray(req.body?.freeSpaces) ? req.body.freeSpaces : [];
+    const objects = Array.isArray(req.body?.objects) ? req.body.objects : [];
+    const placements = objects.map((obj: unknown, idx: number) => {
+      const slot = (freeSpaces[idx % Math.max(1, freeSpaces.length)] as Record<string, unknown> | undefined) ?? {
+        left: 0.1 + ((idx % 3) * 0.25),
+        top: 0.2 + ((idx % 2) * 0.25),
+        width: 0.25,
+        height: 0.25,
+      };
+      const o = obj as Record<string, unknown>;
+      return {
+        objectId: String(o.id ?? `obj_${idx}`),
+        x: Number(slot.left ?? 0),
+        y: Number(slot.top ?? 0),
+        width: Number(slot.width ?? 0.25),
+        height: Number(slot.height ?? 0.25),
+        rotation: 0,
+        zIndex: idx,
+        confidence: 0.72,
+        reason: "Placed in low-occupancy region",
+      };
+    });
+    res.json({ ok: true, placements });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to auto-place objects" });
+  }
+});
+
+app.post("/api/public/events/theme-design/render-composite", async (req, res) => {
+  try {
+    const cleanedBase = sanitizeBase64Image(req.body?.baseImageBase64);
+    const objectsRaw = Array.isArray(req.body?.objects) ? req.body.objects : [];
+    const objects = objectsRaw
+      .filter((obj: unknown) => obj && typeof obj === "object")
+      .map((obj: unknown, idx: number) => {
+        const o = obj as Record<string, unknown>;
+        return {
+          object_image_base64: String(o.objectImageBase64 ?? o.object_image_base64 ?? ""),
+          x: Number(o.x ?? 0),
+          y: Number(o.y ?? 0),
+          width: Number(o.width ?? 120),
+          height: Number(o.height ?? 120),
+          rotation: Number(o.rotation ?? 0),
+          z_index: Number(o.zIndex ?? o.z_index ?? idx),
+          target_hex: o.targetHex ? ensureHexColor(o.targetHex) : null,
+          intensity: Number(o.intensity ?? 1),
+        };
+      })
+      .filter((o: { object_image_base64: string }) => Boolean(o.object_image_base64));
+    const fast = await callAiService(
+      "/v1/edit/compose",
+      { base_image_base64: cleanedBase, objects },
+      AI_SERVICE_TIMEOUT_COMPOSE_MS,
+    );
+    res.json({ ok: true, imageBase64: String(fast.image_base64 ?? fast.imageBase64 ?? "") });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to render composite" });
+  }
+});
+
+app.post("/api/public/events/theme-design/add-by-prompt", async (req, res) => {
+  try {
+    const cleanedBase = sanitizeBase64Image(req.body?.baseImageBase64);
+    const prompt = String(req.body?.prompt ?? "").trim();
+    if (!prompt) {
+      res.status(400).json({ error: "prompt is required" });
+      return;
+    }
+    const sourceQuery = buildPexelsQuery({
+      eventTitle: req.body?.eventTitle,
+      eventType: req.body?.eventType,
+      formalityLevel: req.body?.formalityLevel,
+      prompt,
+      baseImageUrl: req.body?.baseImageUrl,
+      forceNoPeople: true,
+    });
+    const pex = await fetchPexelsImages({ query: sourceQuery, perPage: 30, page: 1 });
+    const sourceImages = (pex.images.length > 0 ? pex.images : sanitizeThemeSuggestions(fallbackThemeSuggestions)).slice(0, 10);
+    const imageDownloads = await Promise.all(
+      sourceImages.map(async (row) => {
+        const url = String(row.imageUrl ?? "").trim();
+        if (!url) return "";
+        try {
+          const dl = await fetch(url, { method: "GET" });
+          if (!dl.ok) return "";
+          const buf = Buffer.from(await dl.arrayBuffer());
+          return buf.toString("base64");
+        } catch {
+          return "";
+        }
+      }),
+    );
+    const imagesBase64 = imageDownloads.filter((b) => b);
+    if (imagesBase64.length === 0) {
+      res.json({
+        ok: true,
+        usedFallback: true,
+        error: pex.error || "No prompt images found.",
+        imageBase64: cleanedBase,
+        placements: [],
+      });
+      return;
+    }
+
+    let occupied: Array<{ left: number; top: number; width: number; height: number; label: string }> = [];
+    try {
+      const baseInfo = await callAiService(
+        "/v1/infer/yolo-sam",
+        {
+          image_base64: cleanedBase,
+          confidence_threshold: 0.35,
+          max_detections: 20,
+          mask_format: "polygon",
+        },
+        AI_SERVICE_TIMEOUT_ADD_BY_PROMPT_MS,
+      );
+      occupied = (Array.isArray(baseInfo.objects) ? baseInfo.objects : []).map((obj: unknown) => {
+        const o = obj as Record<string, unknown>;
+        const box = (o.box ?? {}) as Record<string, unknown>;
+        return {
+          left: Number(box.x ?? box.left ?? 0),
+          top: Number(box.y ?? box.top ?? 0),
+          width: Number(box.width ?? 0),
+          height: Number(box.height ?? 0),
+          label: String(o.label ?? "Object"),
+        };
+      });
+    } catch {
+      occupied = [];
+    }
+
+    const freeSpaces: Array<{ left: number; top: number; width: number; height: number }> = [];
+    const grid = 3;
+    for (let row = 0; row < grid; row++) {
+      for (let col = 0; col < grid; col++) {
+        const left = col / grid;
+        const top = row / grid;
+        const width = 1 / grid;
+        const height = 1 / grid;
+        const overlaps = occupied.some((box) => {
+          const xOverlap = Math.max(0, Math.min(left + width, box.left + box.width) - Math.max(left, box.left));
+          const yOverlap = Math.max(0, Math.min(top + height, box.top + box.height) - Math.max(top, box.top));
+          return xOverlap * yOverlap > 0.02;
+        });
+        if (!overlaps) freeSpaces.push({ left, top, width, height });
+      }
+    }
+
+    const extractedGroups: Array<{ id: string; label: string; objectImageBase64: string }> = [];
+    for (let i = 0; i < imagesBase64.length; i++) {
+      try {
+        const fast = await callAiService(
+          "/v1/infer/yolo-sam-extract",
+          {
+            image_base64: imagesBase64[i],
+            confidence_threshold: 0.35,
+            max_detections: 20,
+            mask_format: "alpha_png",
+          },
+          AI_SERVICE_TIMEOUT_ADD_BY_PROMPT_MS,
+        );
+        const objects = Array.isArray(fast.objects)
+          ? fast.objects.map((obj: unknown, idx: number) => {
+              const o = obj as Record<string, unknown>;
+              return {
+                id: String(o.id ?? o.object_id ?? `obj_${i}_${idx}`),
+                label: String(o.label ?? "Object"),
+                objectImageBase64: String(o.object_image_base64 ?? o.objectImageBase64 ?? ""),
+              };
+            })
+          : [];
+        extractedGroups.push(...objects.filter((o) => o.objectImageBase64));
+      } catch {
+        // Skip failed source and continue.
+      }
+    }
+
+    let usedSourceImageFallback = false;
+    if (extractedGroups.length === 0) {
+      usedSourceImageFallback = true;
+      for (let i = 0; i < Math.min(imagesBase64.length, 6); i++) {
+        extractedGroups.push({
+          id: `fallback_source_${i}`,
+          label: "Source image",
+          objectImageBase64: String(imagesBase64[i] ?? ""),
+        });
+      }
+    }
+    if (extractedGroups.length === 0) {
+      res.status(422).json({ error: "No objects extracted from prompt sources" });
+      return;
+    }
+
+    const placements = extractedGroups.map((obj, idx) => {
+      const slot = freeSpaces[idx % Math.max(1, freeSpaces.length)] ?? {
+        left: 0.1 + ((idx % 3) * 0.25),
+        top: 0.2 + ((idx % 2) * 0.25),
+        width: 0.25,
+        height: 0.25,
+      };
+      return {
+        objectImageBase64: obj.objectImageBase64,
+        x: Number(slot.left ?? 0),
+        y: Number(slot.top ?? 0),
+        width: Number(slot.width ?? 0.25),
+        height: Number(slot.height ?? 0.25),
+        rotation: 0,
+        zIndex: idx,
+        intensity: 1.0,
+        targetHex: null,
+      };
+    });
+
+    const composeResp = await callAiService(
+      "/v1/edit/compose",
+      {
+        base_image_base64: cleanedBase,
+        objects: placements.map((o) => ({
+          object_image_base64: o.objectImageBase64,
+          x: o.x,
+          y: o.y,
+          width: o.width,
+          height: o.height,
+          rotation: o.rotation,
+          z_index: o.zIndex,
+          intensity: o.intensity,
+          target_hex: o.targetHex,
+        })),
+      },
+      AI_SERVICE_TIMEOUT_COMPOSE_MS,
+    );
+
+    res.json({
+      ok: true,
+      imageBase64: String(composeResp.image_base64 ?? composeResp.imageBase64 ?? ""),
+      placements,
+      images: sourceImages,
+      usedSourceImageFallback,
+    });
+  } catch (err) {
+    console.error(err);
+    let safeBase = "";
+    try {
+      safeBase = sanitizeBase64Image(req.body?.baseImageBase64);
+    } catch {
+      safeBase = "";
+    }
+    res.json({
+      ok: true,
+      usedFallback: true,
+      error: err instanceof Error ? err.message : "Failed to add objects by prompt",
+      imageBase64: safeBase,
+      placements: [],
+      images: fallbackThemeSuggestions.slice(0, 6),
+    });
   }
 });
 

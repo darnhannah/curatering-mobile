@@ -2188,7 +2188,15 @@ class AppState extends ChangeNotifier {
             }),
           )
           .timeout(_apiTimeout);
-      if (res.statusCode != 201) return 'Could not create event';
+      if (res.statusCode != 201) {
+        try {
+          final body = jsonDecode(res.body);
+          if (body is Map && body['error'] != null) {
+            return '${body['error']}';
+          }
+        } catch (_) {}
+        return 'Could not create event (${res.statusCode})';
+      }
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -3698,6 +3706,1191 @@ class _MenuThumb extends StatelessWidget {
       } catch (_) {}
     }
     return Icon(Icons.fastfood, size: iconSize);
+  }
+}
+
+class AiThemeStudioResult {
+  const AiThemeStudioResult({
+    required this.baseImageUrl,
+    required this.selectedElements,
+    required this.generatedNotes,
+    required this.generatedImageBase64,
+  });
+  final String baseImageUrl;
+  final List<String> selectedElements;
+  final String generatedNotes;
+  final String generatedImageBase64;
+}
+
+class AiThemeStudioPage extends StatefulWidget {
+  const AiThemeStudioPage({
+    super.key,
+    required this.apiBase,
+    required this.eventTitle,
+    required this.eventType,
+    required this.formalityLevel,
+    required this.initialNotes,
+  });
+  final String apiBase;
+  final String eventTitle;
+  final String eventType;
+  final String formalityLevel;
+  final String initialNotes;
+
+  @override
+  State<AiThemeStudioPage> createState() => _AiThemeStudioPageState();
+}
+
+class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
+  static const List<Map<String, String>> _fallback = [
+    {'title': 'Elegant Event Tablescape', 'url': 'https://images.unsplash.com/photo-1519225421980-715cb0215aed'},
+    {'title': 'Floral Centerpiece Inspiration', 'url': 'https://images.unsplash.com/photo-1478146059778-26028b07395a'},
+    {'title': 'Modern Reception Setup', 'url': 'https://images.unsplash.com/photo-1469371670807-013ccf25f16a'},
+    {'title': 'Garden Party Decor', 'url': 'https://images.unsplash.com/photo-1522673607200-164d1b6ce486'},
+    {'title': 'Romantic Wedding Setup', 'url': 'https://images.unsplash.com/photo-1511285560929-80b456fea0bc'},
+  ];
+  int _step = 0;
+  int? _baseIdx;
+  final Set<int> _elementIdx = <int>{};
+  final Set<String> _selectedElementUrls = <String>{};
+  late final TextEditingController _notesCtrl;
+  late final TextEditingController _searchCtrl;
+  late final TextEditingController _promptCtrl;
+  late final TextEditingController _linkedBaseUrlCtrl;
+  bool _searching = false;
+  List<Map<String, String>> _templateSuggestions = List<Map<String, String>>.from(_fallback);
+  List<Map<String, String>> _elementSuggestions = <Map<String, String>>[];
+  bool _busy = false;
+  String? _baseImageB64;
+  List<Map<String, dynamic>> _extractedObjects = [];
+  List<Map<String, dynamic>> _placements = [];
+  List<Map<String, dynamic>> _freeSpaces = [];
+  String _renderedB64 = '';
+  bool _placementSaved = false;
+  String _statusHint = 'Pick a base template, then tap Analyze Base.';
+  int _lastTemplateSearchCount = 0;
+  int _lastElementSearchCount = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _notesCtrl = TextEditingController(text: widget.initialNotes);
+    _searchCtrl = TextEditingController(
+      text: '${widget.eventType} ${widget.formalityLevel} ${widget.eventTitle}'.trim(),
+    );
+    _promptCtrl = TextEditingController();
+    _linkedBaseUrlCtrl = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _notesCtrl.dispose();
+    _searchCtrl.dispose();
+    _promptCtrl.dispose();
+    _linkedBaseUrlCtrl.dispose();
+    super.dispose();
+  }
+
+  void _snack(String message, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: error ? Colors.red.shade700 : Colors.green.shade700,
+      ),
+    );
+  }
+
+  Future<void> _searchSuggestions() async {
+    setState(() => _searching = true);
+    try {
+      final url = Uri.parse('${normalizeApiBase(widget.apiBase)}/api/public/events/theme-design/theme-search');
+      final res = await http
+          .post(
+            url,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'eventTitle': widget.eventTitle,
+              'eventType': widget.eventType,
+              'formalityLevel': widget.formalityLevel,
+              'prompt': _searchCtrl.text.trim(),
+              'page': 1,
+              'perPage': 12,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body);
+        if (body is Map && body['images'] is List) {
+          final images = (body['images'] as List)
+              .whereType<Map>()
+              .map((e) => {
+                    'title': '${e['title'] ?? 'Theme suggestion'}',
+                    'url': '${e['imageUrl'] ?? e['thumbnailUrl'] ?? ''}',
+                  })
+              .where((e) => (e['url'] ?? '').trim().isNotEmpty)
+              .toList();
+          if (images.isNotEmpty && mounted) {
+            final usedFallback = body['usedFallback'] == true;
+            final backendNote = '${body['error'] ?? ''}'.trim();
+            setState(() {
+              if (_step == 0) {
+                _templateSuggestions = images;
+                _baseIdx = null;
+                _lastTemplateSearchCount = images.length;
+              } else {
+                _elementSuggestions = images;
+                _elementIdx
+                  ..clear()
+                  ..addAll(
+                    images.asMap().entries.where((e) => _selectedElementUrls.contains((e.value['url'] ?? '').trim())).map((e) => e.key),
+                  );
+                _lastElementSearchCount = images.length;
+              }
+              _statusHint = _step == 0
+                  ? 'Search loaded ${images.length} template(s). Select one as your base.'
+                  : 'Search loaded ${images.length} element candidate(s). Select items to extract.';
+            });
+            _snack(
+              usedFallback
+                  ? 'Loaded ${images.length} fallback template(s).${backendNote.isEmpty ? '' : ' $backendNote'}'
+                  : 'Loaded ${images.length} template(s).',
+              error: false,
+            );
+          } else {
+            setState(() {
+              if (_step == 0) {
+                _lastTemplateSearchCount = 0;
+                _statusHint = 'No template results. Try a different search phrase.';
+              } else {
+                _lastElementSearchCount = 0;
+                _statusHint = 'No element results. Try a different search phrase.';
+              }
+            });
+            _snack(_step == 0 ? 'No theme templates found for that search.' : 'No elements found for that search.', error: true);
+          }
+        }
+      } else {
+        _snack('Search failed (${res.statusCode}).', error: true);
+      }
+    } catch (_) {
+      // Keep fallback suggestions.
+      _snack('Could not reach AI search. Using fallback suggestions.', error: true);
+    } finally {
+      if (mounted) setState(() => _searching = false);
+    }
+  }
+
+  void _addLinkedBaseImage() {
+    final input = _linkedBaseUrlCtrl.text.trim();
+    final uri = Uri.tryParse(input);
+    if (input.isEmpty || uri == null || !(uri.hasScheme && (uri.scheme == 'http' || uri.scheme == 'https'))) {
+      _snack('Please enter a valid image URL (http/https).', error: true);
+      return;
+    }
+    setState(() {
+      _templateSuggestions.insert(0, {
+        'title': 'Linked base image',
+        'url': input,
+      });
+      _baseIdx = 0;
+      _step = 0;
+      _statusHint = 'Linked image added. You can now use it as your main photo.';
+    });
+    _linkedBaseUrlCtrl.clear();
+  }
+
+  Future<String> _urlToBase64(String url) async {
+    final uri = Uri.parse(url);
+    final res = await http.get(uri).timeout(_apiTimeout);
+    if (res.statusCode != 200) return '';
+    return base64Encode(res.bodyBytes);
+  }
+
+  Future<void> _prepareBaseAndAnalyze() async {
+    if (_baseIdx == null) return;
+    setState(() => _busy = true);
+    try {
+      _baseImageB64 = await _urlToBase64(_templateSuggestions[_baseIdx!]['url']!);
+      if ((_baseImageB64 ?? '').isEmpty) {
+        _snack('Could not load the selected base image.', error: true);
+        return;
+      }
+      final uri = Uri.parse('${normalizeApiBase(widget.apiBase)}/api/public/events/theme-design/analyze-base');
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'baseImageBase64': _baseImageB64}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body);
+        if (body is Map && body['freeSpaces'] is List) {
+          _freeSpaces = (body['freeSpaces'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+          _statusHint = 'Base analyzed. Go to Step 2 and extract objects.';
+          _snack('Base analyzed. Ready for object placement.');
+          if (_step == 0) {
+            setState(() => _step = 1);
+          }
+        }
+      }
+    } catch (_) {
+      _snack('Analyze base failed.', error: true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _extractObjectsFromSelected() async {
+    if (_elementIdx.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final list = <String>[];
+      for (final i in _elementIdx) {
+        if (i < 0 || i >= _elementSuggestions.length) continue;
+        final b64 = await _urlToBase64(_elementSuggestions[i]['url']!);
+        if (b64.isNotEmpty) list.add(b64);
+      }
+      if (list.isEmpty) {
+        _snack('Could not load selected template images.', error: true);
+        return;
+      }
+      final uri = Uri.parse('${normalizeApiBase(widget.apiBase)}/api/public/events/theme-design/extract-objects');
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'imagesBase64': list}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body);
+        if (body is Map && body['images'] is List) {
+          final imgs = (body['images'] as List).whereType<Map>();
+          final out = <Map<String, dynamic>>[];
+          for (final im in imgs) {
+            final objs = im['objects'];
+            if (objs is List) {
+              out.addAll(objs.whereType<Map>().map((e) => Map<String, dynamic>.from(e)));
+            }
+          }
+          // Keep only true extracted objects (no full-image fallback proxies).
+          final sourceB64 = list.map((e) => e.trim()).where((e) => e.isNotEmpty).toSet();
+          final clean = out.where((o) {
+            final id = '${o['id'] ?? ''}'.trim();
+            final label = '${o['label'] ?? ''}'.trim().toLowerCase();
+            final objB64 = '${o['objectImageBase64'] ?? ''}'.trim();
+            if (id.startsWith('fallback_source_')) return false;
+            if (label == 'source image') return false;
+            if (objB64.isNotEmpty && sourceB64.contains(objB64)) return false;
+            return true;
+          }).toList();
+          if (clean.isEmpty) {
+            _extractedObjects = [];
+            _placements = [];
+            _placementSaved = false;
+            _statusHint = 'No isolated objects detected. Try different element images.';
+            _snack('No isolated objects found. Please search/select other element images.', error: true);
+            return;
+          }
+          _extractedObjects = clean;
+          _statusHint = 'Extracted ${clean.length} object(s). You can drag/drop in Step 2.';
+          _snack('Extracted ${clean.length} object(s).');
+        }
+      }
+    } catch (_) {
+      _snack('Extract objects failed.', error: true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _autoPlace() async {
+    if (_extractedObjects.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final uri = Uri.parse('${normalizeApiBase(widget.apiBase)}/api/public/events/theme-design/auto-place');
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'freeSpaces': _freeSpaces, 'objects': _extractedObjects}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body);
+        if (body is Map && body['placements'] is List) {
+          _placements = (body['placements'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+          _placementSaved = false;
+          _statusHint = 'Placement created. Go to Step 3 to render or add prompt objects.';
+          _snack('Auto-placement generated (${_placements.length}).');
+          if (_placements.isNotEmpty) {
+            setState(() => _step = 2);
+            // Auto-generate preview so users can immediately see changes.
+            await _renderComposite();
+          }
+        }
+      }
+    } catch (_) {
+      _snack('Auto place failed.', error: true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _advanceToCompose() async {
+    if (_elementIdx.isEmpty || _busy || _searching) return;
+    await _extractObjectsFromSelected();
+    if (_extractedObjects.isNotEmpty && _freeSpaces.isNotEmpty) {
+      await _autoPlace();
+    }
+    if (mounted) {
+      setState(() => _step = 2);
+    }
+  }
+
+  Future<void> _renderComposite() async {
+    if ((_baseImageB64 ?? '').isEmpty || _placements.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final objectById = <String, Map<String, dynamic>>{};
+      for (final o in _extractedObjects) {
+        objectById['${o['id'] ?? ''}'] = o;
+      }
+      final renderObjs = _placements
+          .map((p) {
+            final id = '${p['objectId'] ?? ''}';
+            final src = objectById[id];
+            final directObjectImage = '${p['objectImageBase64'] ?? ''}';
+            if (src == null && directObjectImage.trim().isEmpty) return null;
+            return {
+              'objectImageBase64': src?['objectImageBase64'] ?? directObjectImage,
+              'x': p['x'] ?? 0,
+              'y': p['y'] ?? 0,
+              'width': p['width'] ?? 0.25,
+              'height': p['height'] ?? 0.25,
+              'rotation': p['rotation'] ?? 0,
+              'zIndex': p['zIndex'] ?? 0,
+              'intensity': 1,
+            };
+          })
+          .whereType<Map<String, dynamic>>()
+          .toList();
+      if (renderObjs.isEmpty) {
+        _snack('No visible objects to preview yet. Try "Find Decor Items" first.', error: true);
+        return;
+      }
+      final uri = Uri.parse('${normalizeApiBase(widget.apiBase)}/api/public/events/theme-design/render-composite');
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'baseImageBase64': _baseImageB64,
+              'objects': renderObjs,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body);
+        if (body is Map) {
+          _renderedB64 = '${body['imageBase64'] ?? ''}';
+          if (_renderedB64.trim().isNotEmpty) {
+            _statusHint = 'Composite rendered. You can still add prompt objects.';
+            _snack('Composite rendered successfully.');
+          } else {
+            _snack('Preview returned empty image.', error: true);
+          }
+        }
+      }
+    } catch (_) {
+      _snack('Render failed.', error: true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _addByPrompt() async {
+    final prompt = _promptCtrl.text.trim();
+    if ((_baseImageB64 ?? '').isEmpty || prompt.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final uri = Uri.parse('${normalizeApiBase(widget.apiBase)}/api/public/events/theme-design/add-by-prompt');
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'baseImageBase64': _baseImageB64,
+              'eventTitle': widget.eventTitle,
+              'eventType': widget.eventType,
+              'formalityLevel': widget.formalityLevel,
+              'prompt': prompt,
+            }),
+          )
+          .timeout(const Duration(seconds: 180));
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body);
+        if (body is Map) {
+          final b64 = '${body['imageBase64'] ?? ''}';
+          if (b64.isNotEmpty) {
+            _renderedB64 = b64;
+            final fallbackUsed = body['usedSourceImageFallback'] == true || body['usedFallback'] == true;
+            _statusHint = fallbackUsed
+                ? 'Prompt applied with fallback sources.'
+                : 'Prompt objects added to your composition.';
+            _snack('Prompt objects added.');
+          } else {
+            final msg = '${body['error'] ?? 'No composed image returned.'}';
+            _snack('Add-by-prompt: $msg', error: true);
+          }
+        }
+      } else {
+        String details = '';
+        try {
+          final errBody = jsonDecode(res.body);
+          if (errBody is Map && errBody['error'] != null) details = ' ${errBody['error']}';
+        } catch (_) {}
+        _snack('Add-by-prompt failed.${details.isEmpty ? '' : details}', error: true);
+      }
+    } catch (_) {
+      _snack('Add-by-prompt failed.', error: true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _recolorFirstObject() async {
+    if (_extractedObjects.isEmpty) return;
+    final selection = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (ctx) {
+        String? selectedObjectId = '${_extractedObjects.first['id'] ?? ''}';
+        String selectedHex = '#F4511E';
+        double selectedAlpha = 1.0;
+        const palette = <String>['#F4511E', '#1DB954', '#1976D2', '#E91E63', '#6A1B9A', '#FFC107', '#FFFFFF', '#212121'];
+        return StatefulBuilder(
+          builder: (context, setLocalState) => AlertDialog(
+            title: const Text('Recolor Extracted Objects'),
+            content: SizedBox(
+              width: 520,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: _extractedObjects.map((obj) {
+                      final id = '${obj['id'] ?? ''}';
+                      final label = '${obj['label'] ?? 'Object'}';
+                      return FilterChip(
+                        label: Text(label),
+                        selected: selectedObjectId == id,
+                        onSelected: (_) => setLocalState(() => selectedObjectId = id),
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: palette.map((hex) {
+                      final selected = selectedHex == hex;
+                      return GestureDetector(
+                        onTap: () => setLocalState(() => selectedHex = hex),
+                        child: Container(
+                          width: 30,
+                          height: 30,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Color(int.parse(hex.substring(1), radix: 16) + 0xFF000000),
+                            border: Border.all(color: selected ? Colors.black : Colors.black26, width: selected ? 2 : 1),
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 8),
+                  Text('Intensity: ${(selectedAlpha * 100).round()}%'),
+                  Slider(value: selectedAlpha, min: 0, max: 1, divisions: 20, onChanged: (v) => setLocalState(() => selectedAlpha = v)),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+              FilledButton(
+                onPressed: selectedObjectId == null
+                    ? null
+                    : () => Navigator.pop(ctx, {'objectId': selectedObjectId, 'targetHex': selectedHex, 'intensity': selectedAlpha}),
+                child: const Text('Apply Color'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    if (selection == null) return;
+    final objectId = '${selection['objectId'] ?? ''}';
+    final targetHex = '${selection['targetHex'] ?? '#F4511E'}';
+    final intensity = (selection['intensity'] as num?)?.toDouble() ?? 1.0;
+    final target = _extractedObjects.firstWhere((obj) => '${obj['id'] ?? ''}' == objectId, orElse: () => <String, dynamic>{});
+    if (target.isEmpty) return;
+    final objectImageB64 = '${target['objectImageBase64'] ?? ''}'.trim();
+    if (objectImageB64.isEmpty || objectId.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final uri = Uri.parse('${normalizeApiBase(widget.apiBase)}/api/public/events/theme-design/swap-colors');
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'imageBase64': objectImageB64,
+              'masks': [
+                {
+                  'objectId': objectId,
+                  if ('${target['maskBase64'] ?? ''}'.trim().isNotEmpty) 'maskBase64': target['maskBase64'],
+                  if (target['polygonPoints'] is List) 'polygonPoints': target['polygonPoints'],
+                }
+              ],
+              'edits': [
+                {
+                  'objectId': objectId,
+                  'targetHex': targetHex,
+                  'intensity': intensity,
+                }
+              ],
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body);
+        if (body is Map && '${body['imageBase64'] ?? ''}'.trim().isNotEmpty) {
+          final recolored = '${body['imageBase64']}';
+          final idx = _extractedObjects.indexWhere((obj) => '${obj['id'] ?? ''}' == objectId);
+          if (idx >= 0) {
+            _extractedObjects[idx] = {..._extractedObjects[idx], 'objectImageBase64': recolored};
+          }
+          _placementSaved = false;
+          _snack('Object recolored successfully.');
+        }
+      } else {
+        _snack('Recolor failed.', error: true);
+      }
+    } catch (_) {
+      _snack('Recolor failed.', error: true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  String _placementImageBase64(Map<String, dynamic> placement) {
+    final direct = '${placement['objectImageBase64'] ?? ''}'.trim();
+    if (direct.isNotEmpty) return direct;
+    final id = '${placement['objectId'] ?? ''}';
+    for (final o in _extractedObjects) {
+      if ('${o['id'] ?? ''}' == id) {
+        return '${o['objectImageBase64'] ?? ''}'.trim();
+      }
+    }
+    return '';
+  }
+
+  void _addPlacementFromObject(Map<String, dynamic> object, Size canvasSize, Offset localPos) {
+    final width = 0.22;
+    final height = 0.22;
+    final nx = (localPos.dx / canvasSize.width) - (width / 2);
+    final ny = (localPos.dy / canvasSize.height) - (height / 2);
+    setState(() {
+      _placements.add({
+        'objectId': '${object['id'] ?? ''}',
+        'objectImageBase64': '${object['objectImageBase64'] ?? ''}',
+        'x': nx.clamp(0.0, 1.0 - width),
+        'y': ny.clamp(0.0, 1.0 - height),
+        'width': width,
+        'height': height,
+        'rotation': 0,
+        'zIndex': _placements.length,
+      });
+      _placementSaved = false;
+      _statusHint = 'Object placed. Drag it on the preview to fine-tune.';
+    });
+  }
+
+  Widget _buildStep2Canvas(String previewUrl) {
+    if ((_baseImageB64 ?? '').trim().isEmpty && previewUrl.trim().isEmpty) {
+      return Center(child: Text('Select and analyze a base image first.', style: TextStyle(color: Colors.grey.shade600)));
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final canvas = Size(constraints.maxWidth, constraints.maxHeight);
+        return DragTarget<int>(
+          onAcceptWithDetails: (details) {
+            final i = details.data;
+            if (i < 0 || i >= _extractedObjects.length) return;
+            _addPlacementFromObject(_extractedObjects[i], canvas, details.offset - (context.findRenderObject() as RenderBox).localToGlobal(Offset.zero));
+          },
+          builder: (context, candidateData, rejectedData) {
+            return ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  ((_baseImageB64 ?? '').trim().isNotEmpty)
+                      ? Image.memory(
+                          base64Decode(_baseImageB64!),
+                          fit: BoxFit.cover,
+                          errorBuilder: (context, error, stackTrace) => Container(color: Colors.grey.shade200),
+                        )
+                      : Image.network(
+                          previewUrl,
+                          fit: BoxFit.cover,
+                          errorBuilder: (context, error, stackTrace) => Container(color: Colors.grey.shade200),
+                        ),
+                  if (candidateData.isNotEmpty) Container(color: Colors.black.withValues(alpha: 0.08)),
+                  ..._placements.asMap().entries.map((entry) {
+                    final idx = entry.key;
+                    final p = entry.value;
+                    final x = ((p['x'] as num?)?.toDouble() ?? 0).clamp(0.0, 1.0);
+                    final y = ((p['y'] as num?)?.toDouble() ?? 0).clamp(0.0, 1.0);
+                    final w = (((p['width'] as num?)?.toDouble() ?? 0.22).clamp(0.08, 0.7));
+                    final h = (((p['height'] as num?)?.toDouble() ?? 0.22).clamp(0.08, 0.7));
+                    final img = _placementImageBase64(p);
+                    if (img.isEmpty) return const SizedBox.shrink();
+                    return Positioned(
+                      left: x * canvas.width,
+                      top: y * canvas.height,
+                      width: w * canvas.width,
+                      height: h * canvas.height,
+                      child: GestureDetector(
+                        onPanUpdate: (d) {
+                          final dx = d.delta.dx / canvas.width;
+                          final dy = d.delta.dy / canvas.height;
+                          setState(() {
+                            final nx = (((p['x'] as num?)?.toDouble() ?? 0) + dx).clamp(0.0, 1.0 - w);
+                            final ny = (((p['y'] as num?)?.toDouble() ?? 0) + dy).clamp(0.0, 1.0 - h);
+                            p['x'] = nx;
+                            p['y'] = ny;
+                            _placementSaved = false;
+                          });
+                        },
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.white.withValues(alpha: 0.95), width: 1.2),
+                            borderRadius: BorderRadius.circular(6),
+                            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 3)],
+                          ),
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              Image.memory(base64Decode(img), fit: BoxFit.cover),
+                              Positioned(
+                                right: 0,
+                                top: 0,
+                                child: InkWell(
+                                  onTap: () => setState(() {
+                                    _placements.removeAt(idx);
+                                    _placementSaved = false;
+                                  }),
+                                  child: Container(
+                                    color: Colors.black54,
+                                    padding: const EdgeInsets.all(2),
+                                    child: const Icon(Icons.close, color: Colors.white, size: 14),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  }),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  String _autoNotes() {
+    final title = widget.eventTitle.trim().isEmpty ? 'the event' : widget.eventTitle.trim();
+    final elements = _elementIdx
+        .where((i) => i >= 0 && i < _elementSuggestions.length)
+        .map((i) => _elementSuggestions[i]['title']!)
+        .join(', ');
+    final base = _baseIdx != null ? _templateSuggestions[_baseIdx!]['title'] : 'selected inspiration';
+    return 'Use $base as primary visual direction for $title. '
+        'Blend accents from: ${elements.isEmpty ? 'floral and table styling motifs' : elements}. '
+        'Event type: ${widget.eventType}. Formality: ${widget.formalityLevel}.';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isWide = MediaQuery.sizeOf(context).width >= 900;
+    final isPhone = !isWide;
+    Widget cards({required bool selectingBase}) {
+      final options = selectingBase ? _templateSuggestions : _elementSuggestions;
+      if (options.isEmpty) {
+        return Center(
+          child: Text(
+            selectingBase
+                ? 'No templates yet. Use Search to load design ideas.'
+                : 'No element ideas yet. Search in Step 2 to load decor items.',
+          ),
+        );
+      }
+      return ListView.builder(
+        itemCount: options.length,
+        itemBuilder: (context, i) {
+          final active = selectingBase ? _baseIdx == i : _elementIdx.contains(i);
+          return Card(
+            child: ListTile(
+              leading: ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Image.network(
+                  options[i]['url']!,
+                  width: 46,
+                  height: 46,
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) => Container(
+                    width: 46,
+                    height: 46,
+                    color: Colors.grey.shade200,
+                    child: const Icon(Icons.image_not_supported),
+                  ),
+                ),
+              ),
+              title: Text(options[i]['title']!),
+              trailing: Icon(active ? Icons.check_box : Icons.check_box_outline_blank),
+              onTap: () => setState(() {
+                if (selectingBase) {
+                  _baseIdx = i;
+                } else if (_elementIdx.contains(i)) {
+                  _elementIdx.remove(i);
+                  _selectedElementUrls.remove((options[i]['url'] ?? '').trim());
+                } else {
+                  _elementIdx.add(i);
+                  _selectedElementUrls.add((options[i]['url'] ?? '').trim());
+                }
+              }),
+            ),
+          );
+        },
+      );
+    }
+
+    final leftPane = Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Event Details', style: TextStyle(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            Text('Event: ${widget.eventTitle.isEmpty ? "(not set)" : widget.eventTitle}'),
+            Text('Type: ${widget.eventType}'),
+            Text('Formality: ${widget.formalityLevel}'),
+            const SizedBox(height: 12),
+            Text(_step == 0 ? 'Step 1: Choose Template' : 'Step 2: Add Elements', style: const TextStyle(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _searchCtrl,
+              decoration: InputDecoration(
+                labelText: _step == 0 ? 'Search templates' : 'Search elements',
+                isDense: true,
+                border: const OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            FilledButton.icon(
+              onPressed: _searching ? null : _searchSuggestions,
+              icon: _searching
+                  ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.search, size: 16),
+              label: Text(_searching ? 'Searching...' : _step == 0 ? 'Search Templates' : 'Search Elements'),
+            ),
+            if (_step == 0) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _linkedBaseUrlCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'Or paste image URL',
+                        hintText: 'https://...',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(onPressed: _addLinkedBaseImage, child: const Text('Add URL')),
+                ],
+              ),
+            ],
+            const SizedBox(height: 8),
+            if (isWide)
+              Expanded(child: cards(selectingBase: _step == 0))
+            else
+              SizedBox(height: 240, child: cards(selectingBase: _step == 0)),
+          ],
+        ),
+      ),
+    );
+    final previewUrl = _step == 0
+        ? (_baseIdx != null && _baseIdx! >= 0 && _baseIdx! < _templateSuggestions.length
+            ? _templateSuggestions[_baseIdx!]['url'] ?? ''
+            : '')
+        : (_renderedB64.trim().isNotEmpty
+            ? ''
+            : ((_baseIdx != null && _baseIdx! >= 0 && _baseIdx! < _templateSuggestions.length)
+                ? _templateSuggestions[_baseIdx!]['url'] ?? ''
+                : ''));
+    final centerPane = Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(_step == 2 ? 'Step 3: Compose your design on canvas' : 'Preview', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+            const SizedBox(height: 8),
+            Expanded(
+              child: (_step == 1)
+                  ? _buildStep2Canvas(previewUrl)
+                  : (_renderedB64.trim().isNotEmpty)
+                  ? InteractiveViewer(
+                      minScale: 0.5,
+                      maxScale: 3,
+                      child: Center(
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.memory(base64Decode(_renderedB64), fit: BoxFit.contain),
+                        ),
+                      ),
+                    )
+                  : (previewUrl.trim().isEmpty
+                      ? Center(child: Text('Select an image to preview.', style: TextStyle(color: Colors.grey.shade600)))
+                      : InteractiveViewer(
+                          minScale: 0.5,
+                          maxScale: 3,
+                          child: Center(
+                            child: Image.network(
+                              previewUrl,
+                              fit: BoxFit.contain,
+                              errorBuilder: (context, error, stackTrace) => const Text('Preview not available for this image.'),
+                            ),
+                          ),
+                        )),
+            ),
+            if (_step == 2) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 110,
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Before', style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 4),
+                          Expanded(
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: ((_baseImageB64 ?? '').trim().isNotEmpty)
+                                  ? Image.memory(
+                                      base64Decode(_baseImageB64!),
+                                      fit: BoxFit.cover,
+                                      width: double.infinity,
+                                      errorBuilder: (context, error, stackTrace) => Container(
+                                        color: Colors.grey.shade200,
+                                        alignment: Alignment.center,
+                                        child: const Icon(Icons.broken_image),
+                                      ),
+                                    )
+                                  : Container(
+                                      color: Colors.grey.shade200,
+                                      alignment: Alignment.center,
+                                      child: const Text('No base'),
+                                    ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('After', style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 4),
+                          Expanded(
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: (_renderedB64.trim().isNotEmpty)
+                                  ? Image.memory(
+                                      base64Decode(_renderedB64),
+                                      fit: BoxFit.cover,
+                                      width: double.infinity,
+                                      errorBuilder: (context, error, stackTrace) => Container(
+                                        color: Colors.grey.shade200,
+                                        alignment: Alignment.center,
+                                        child: const Icon(Icons.broken_image),
+                                      ),
+                                    )
+                                  : Container(
+                                      color: Colors.grey.shade200,
+                                      alignment: Alignment.center,
+                                      child: const Text('No preview yet'),
+                                    ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text('Theme Notes', style: TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              FilledButton.tonal(
+                onPressed: () => setState(() => _notesCtrl.text = _autoNotes()),
+                child: const Text('Generate Notes'),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 150,
+                child: TextField(
+                  controller: _notesCtrl,
+                  maxLines: null,
+                  expands: true,
+                  decoration: const InputDecoration(border: OutlineInputBorder()),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+    final rightPane = Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+            Text(
+              _step == 0
+                  ? 'Mark one base image, then proceed.'
+                  : _step == 1
+                      ? 'Check one or more images (not the base) to use as extraction sources.'
+                      : 'Compose your design on canvas.',
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _statusHint,
+              style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade700, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Selected: ${_elementIdx.length}  |  Found: ${_extractedObjects.length}  |  Arranged: ${_placements.length}  |  Preview: ${_renderedB64.trim().isEmpty ? 'No' : 'Yes'}',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+            ),
+            const SizedBox(height: 8),
+            if (_step == 0)
+              Text(
+                _lastTemplateSearchCount > 0
+                    ? 'Showing $_lastTemplateSearchCount template(s).'
+                    : 'Showing ${_templateSuggestions.length} template(s).',
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+              ),
+            if (_step > 0)
+              Text(
+                _lastElementSearchCount > 0
+                    ? 'Showing $_lastElementSearchCount element candidate(s).'
+                    : 'Showing ${_elementSuggestions.length} element candidate(s).',
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+              ),
+            if (_step == 0) const SizedBox(height: 8),
+            if (_step == 0)
+              OutlinedButton(
+                onPressed: (_baseIdx == null || _busy) ? null : _prepareBaseAndAnalyze,
+                child: Text(_busy ? 'Preparing...' : 'Lock Base and Continue'),
+              ),
+            if (_step == 1) ...[
+              OutlinedButton(
+                onPressed: (_elementIdx.isEmpty || _busy) ? null : _extractObjectsFromSelected,
+                child: Text(_busy ? 'Finding items...' : 'Extract Source Objects'),
+              ),
+              if (_extractedObjects.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(
+                  'Drag object chips into the preview to place them.',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                ),
+                const SizedBox(height: 6),
+                SizedBox(
+                  height: 66,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: _extractedObjects.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 6),
+                    itemBuilder: (context, i) {
+                      final b64 = '${_extractedObjects[i]['objectImageBase64'] ?? ''}'.trim();
+                      return Draggable<int>(
+                        data: i,
+                        feedback: Material(
+                          elevation: 4,
+                          borderRadius: BorderRadius.circular(8),
+                          child: Container(
+                            width: 62,
+                            height: 62,
+                            color: Colors.white,
+                            child: b64.isNotEmpty ? Image.memory(base64Decode(b64), fit: BoxFit.cover) : const Icon(Icons.image),
+                          ),
+                        ),
+                        childWhenDragging: Opacity(
+                          opacity: 0.35,
+                          child: Container(
+                            width: 62,
+                            height: 62,
+                            color: Colors.grey.shade300,
+                            child: b64.isNotEmpty ? Image.memory(base64Decode(b64), fit: BoxFit.cover) : const Icon(Icons.image),
+                          ),
+                        ),
+                        child: Container(
+                          width: 62,
+                          height: 62,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.grey.shade300),
+                          ),
+                          child: b64.isNotEmpty ? Image.memory(base64Decode(b64), fit: BoxFit.cover) : const Icon(Icons.image),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+              OutlinedButton(
+                onPressed: (_extractedObjects.isEmpty || _busy) ? null : _autoPlace,
+                child: Text(_busy ? 'Arranging...' : 'Auto Place'),
+              ),
+            ],
+            if (_step == 2) ...[
+              OutlinedButton(
+                onPressed: (_elementIdx.isEmpty || _busy) ? null : _extractObjectsFromSelected,
+                child: Text(_busy ? 'Segmenting...' : 'Extract'),
+              ),
+              OutlinedButton(
+                onPressed: ((_extractedObjects.isEmpty && _placements.isEmpty) || _busy) ? null : _autoPlace,
+                child: const Text('Auto Place'),
+              ),
+              OutlinedButton(
+                onPressed: (_extractedObjects.isEmpty || _busy) ? null : _recolorFirstObject,
+                child: Text(_busy ? 'Changing color...' : 'Recolor Objects'),
+              ),
+              OutlinedButton(
+                onPressed: (_placements.isEmpty || _busy)
+                    ? null
+                    : () => setState(() {
+                          _placementSaved = true;
+                          _statusHint = 'Placement saved. You can now render and apply.';
+                        }),
+                child: Text(_placementSaved ? 'Placement Saved' : 'Save Placement'),
+              ),
+              OutlinedButton(
+                onPressed: (_placements.isEmpty || !_placementSaved || _busy) ? null : _renderComposite,
+                child: Text(_busy ? 'Rendering...' : 'Render'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _promptCtrl,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(labelText: 'Add by prompt', hintText: 'e.g. add more flowers on table', isDense: true),
+              ),
+              OutlinedButton(
+                onPressed: ((_baseImageB64 ?? '').isEmpty || _promptCtrl.text.trim().isEmpty || _busy)
+                    ? null
+                    : _addByPrompt,
+                child: Text(_busy ? 'Adding...' : 'Add by Prompt'),
+              ),
+            ],
+            SizedBox(height: isPhone ? 10 : 120),
+            if (_step > 0)
+              OutlinedButton(
+                onPressed: () => setState(() => _step--),
+                child: const Text('Back'),
+              ),
+            if (_step < 2)
+              FilledButton(
+                onPressed: (_step == 0 && _baseIdx == null) || (_step == 1 && _elementIdx.isEmpty)
+                    ? null
+                    : (_step == 1 ? _advanceToCompose : () => setState(() => _step++)),
+                child: Text(_step == 1 ? 'Next: Compose' : 'Next'),
+              ),
+            if (_step == 2 && _renderedB64.trim().isNotEmpty)
+              FilledButton(
+                onPressed: () {
+                  final base = _baseIdx == null ? '' : _templateSuggestions[_baseIdx!]['url']!;
+                  final picks = _elementIdx
+                      .where((i) => i >= 0 && i < _elementSuggestions.length)
+                      .map((i) => _elementSuggestions[i]['url']!)
+                      .toList();
+                  Navigator.pop(
+                    context,
+                    AiThemeStudioResult(
+                      baseImageUrl: base,
+                      selectedElements: picks,
+                      generatedNotes: _notesCtrl.text.trim(),
+                      generatedImageBase64: _renderedB64.trim(),
+                    ),
+                  );
+                },
+                child: const Text('Apply and Return'),
+              ),
+            OutlinedButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Back to Online Inquiry'),
+            ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Event Theme Design Studio')),
+      body: Padding(
+        padding: const EdgeInsets.all(12),
+        child: isWide
+            ? Row(
+                children: [
+                  SizedBox(width: 280, child: leftPane),
+                  const SizedBox(width: 8),
+                  Expanded(child: centerPane),
+                  const SizedBox(width: 8),
+                  SizedBox(width: 260, child: rightPane),
+                ],
+              )
+            : Column(
+                children: [
+                  leftPane,
+                  const SizedBox(height: 8),
+                  Expanded(child: centerPane),
+                  const SizedBox(height: 8),
+                  SizedBox(height: 300, child: rightPane),
+                ],
+              ),
+      ),
+    );
   }
 }
 
@@ -5577,6 +6770,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
   String menuSuggestionNote = '';
   String themeSuggestionNote = '';
   final themeNotesController = TextEditingController();
+  String _themePreviewB64 = '';
+  String _themeDesignInputMode = 'suggest';
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
@@ -5590,6 +6785,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
   Timer? _scheduleConflictDebounce;
   int _publicScheduleConflictCount = 0;
   final eventCity = TextEditingController();
+  final List<String> _venueSuggestions = [];
+  Timer? _venueDebounce;
   final note = TextEditingController();
   String eventSetting = 'open';
   String serviceIncluded = 'no';
@@ -5606,12 +6803,15 @@ class _InquiryScreenState extends State<InquiryScreen> {
     contactPerson.text = p.fullName;
     contactNumber.text = p.contactNumber;
     inquiryEmail.text = widget.state.userEmail ?? '';
+    eventCity.addListener(_onVenueChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleConflictRefresh());
   }
 
   @override
   void dispose() {
     _scheduleConflictDebounce?.cancel();
+    _venueDebounce?.cancel();
+    eventCity.removeListener(_onVenueChanged);
     guestCount.dispose();
     eventTitle.dispose();
     eventTypeOther.dispose();
@@ -5741,6 +6941,50 @@ class _InquiryScreenState extends State<InquiryScreen> {
     _scheduleConflictRefresh();
   }
 
+  void _onVenueChanged() {
+    _venueDebounce?.cancel();
+    final q = eventCity.text.trim();
+    if (q.length < 3) {
+      if (_venueSuggestions.isNotEmpty && mounted) setState(() => _venueSuggestions.clear());
+      return;
+    }
+    _venueDebounce = Timer(const Duration(milliseconds: 300), () async {
+      try {
+        final uri = Uri.parse(
+          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=5',
+        );
+        final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+        if (res.statusCode != 200 || !mounted) return;
+        final body = jsonDecode(res.body);
+        if (body is! List) return;
+        final next = body
+            .whereType<Map>()
+            .map((e) => '${e['display_name'] ?? ''}'.trim())
+            .where((s) => s.isNotEmpty)
+            .take(5)
+            .toList();
+        if (mounted) setState(() {
+          _venueSuggestions
+            ..clear()
+            ..addAll(next);
+        });
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _pickVenueOnMap() async {
+    final res = await Navigator.of(context).push<MapPinResult>(
+      MaterialPageRoute(
+        builder: (_) => _MapPinPickerDialog(initialSearchQuery: eventCity.text.trim()),
+      ),
+    );
+    if (res == null || !mounted) return;
+    setState(() {
+      eventCity.text = res.address.trim();
+      _venueSuggestions.clear();
+    });
+  }
+
   double _estimatedCost() => _billableGuestCountForPricing() * kPesosPerPax;
 
   String _resolvedEventType() {
@@ -5748,12 +6992,34 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return eventTypeOther.text.trim();
   }
 
+  Future<void> _openAiThemeStudio() async {
+    final res = await Navigator.of(context).push<AiThemeStudioResult>(
+      MaterialPageRoute(
+        builder: (_) => AiThemeStudioPage(
+          apiBase: widget.state.apiBase,
+          eventTitle: eventTitle.text.trim(),
+          eventType: _resolvedEventType(),
+          formalityLevel: formalityLevel,
+          initialNotes: themeNotesController.text.trim(),
+        ),
+      ),
+    );
+    if (res == null || !mounted) return;
+    setState(() {
+      themeNotesController.text = res.generatedNotes;
+      _themePreviewB64 = res.generatedImageBase64;
+      if (res.generatedNotes.isNotEmpty) {
+        themeSuggestionNote = 'AI theme draft prepared. You can still edit the notes below.';
+      }
+    });
+  }
+
   /// Returns null if valid; otherwise an error message for the user.
   String? _validateInquiry() {
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
     if (contactNumber.text.trim().isEmpty) return 'Enter contact number.';
     if (inquiryEmail.text.trim().isEmpty) return 'Enter email address.';
-    if (eventCity.text.trim().isEmpty) return 'Enter city of event.';
+    if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
     for (final w in _eventWindows) {
       final any = w.date != null || w.from != null || w.to != null;
       final all = w.date != null && w.from != null && w.to != null;
@@ -5958,7 +7224,39 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           ),
                         ),
                       const SizedBox(height: 8),
-                      TextField(controller: eventCity, decoration: const InputDecoration(labelText: 'City of event')),
+                      TextField(
+                        controller: eventCity,
+                        decoration: InputDecoration(
+                          labelText: 'Event venue',
+                          suffixIcon: IconButton(
+                            tooltip: 'Pin on map',
+                            onPressed: _pickVenueOnMap,
+                            icon: const Icon(Icons.place_outlined),
+                          ),
+                        ),
+                      ),
+                      if (_venueSuggestions.isNotEmpty)
+                        Container(
+                          margin: const EdgeInsets.only(top: 6),
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.grey.shade300),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Column(
+                            children: _venueSuggestions
+                                .map(
+                                  (s) => ListTile(
+                                    dense: true,
+                                    title: Text(s, maxLines: 2, overflow: TextOverflow.ellipsis),
+                                    onTap: () => setState(() {
+                                      eventCity.text = s;
+                                      _venueSuggestions.clear();
+                                    }),
+                                  ),
+                                )
+                                .toList(),
+                          ),
+                        ),
                       const SizedBox(height: 8),
                       Text('Setting of event', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
                       const SizedBox(height: 6),
@@ -6084,6 +7382,35 @@ class _InquiryScreenState extends State<InquiryScreen> {
                             labelText: 'Theme / styling notes',
                             hintText: 'Palette, decor, lighting, florals, signage, layout ideas (no cost field)',
                           ),
+                        ),
+                        const SizedBox(height: 10),
+                        if (_themePreviewB64.trim().isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 10),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: Image.memory(
+                                base64Decode(_themePreviewB64),
+                                height: 140,
+                                fit: BoxFit.contain,
+                                errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+                              ),
+                            ),
+                          ),
+                        const SizedBox(height: 6),
+                        Text('Design input', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 6),
+                        SegmentedButton<String>(
+                          segments: const [
+                            ButtonSegment(value: 'suggest', label: Text('Suggest Theme')),
+                            ButtonSegment(value: 'studio', label: Text('Open AI Studio')),
+                          ],
+                          selected: {_themeDesignInputMode},
+                          onSelectionChanged: (s) {
+                            final next = s.first;
+                            setState(() => _themeDesignInputMode = next);
+                            if (next == 'studio') _openAiThemeStudio();
+                          },
                         ),
                       ],
                     ),
@@ -6325,7 +7652,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         const SizedBox(height: 6),
                         Text('Guests: ${guestCount.text.trim()}'),
                         const SizedBox(height: 6),
-                        Text('City: ${eventCity.text.trim()}'),
+                        Text('Venue: ${eventCity.text.trim()}'),
                         const SizedBox(height: 6),
                         Text('When: ${_serializedEventDates()}'),
                         const SizedBox(height: 6),
@@ -7177,6 +8504,14 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
                   ),
                 ),
                 ListTile(
+                  leading: const Icon(Icons.dashboard_customize_outlined),
+                  title: const Text('Manage Events'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _tab.animateTo(0);
+                  },
+                ),
+                ListTile(
                   leading: const Icon(Icons.settings),
                   title: const Text('Settings'),
                   onTap: () {
@@ -7240,6 +8575,7 @@ class ManagerNewEventCreateScreen extends StatefulWidget {
 }
 
 class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScreen> {
+  static const String _managerNewEventDraftKey = 'manager_new_event_unsaved_draft_v1';
   String inquiryType = 'CATERING';
   bool curateOwn = false;
   String selectedSetMenu = 'All Dishes';
@@ -7255,6 +8591,8 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   final inquiryEmail = TextEditingController();
   final List<_InquiryEventWindow> _eventWindows = [_InquiryEventWindow()];
   final eventCity = TextEditingController();
+  final List<String> _venueSuggestions = [];
+  Timer? _venueDebounce;
   final note = TextEditingController();
   String eventSetting = 'open';
   String serviceIncluded = 'no';
@@ -7268,6 +8606,8 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   final laborManualAmountController = TextEditingController();
   final travelCostController = TextEditingController(text: '0');
   final themeCostController = TextEditingController(text: '0');
+  String _managerThemePreviewB64 = '';
+  String _managerThemeInputMode = 'suggest';
   final additionalCostLabelController = TextEditingController();
   final additionalCostAmountController = TextEditingController();
   final menuSearchController = TextEditingController();
@@ -7280,15 +8620,35 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   @override
   void initState() {
     super.initState();
+    _restoreLocalDraft();
+    for (final c in [
+      guestCount,
+      eventTitle,
+      eventTypeOther,
+      contactPerson,
+      contactNumber,
+      inquiryEmail,
+      eventCity,
+      note,
+      foodTastingDate,
+      foodTastingTime,
+      themeCostController,
+      menuSearchController,
+    ]) {
+      c.addListener(_saveLocalDraftDebounced);
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _loadForProcessingWindowsIfNeeded();
     });
+    eventCity.addListener(_onVenueChanged);
   }
 
   @override
   void dispose() {
     guestCount.dispose();
+    _venueDebounce?.cancel();
+    eventCity.removeListener(_onVenueChanged);
     eventTitle.dispose();
     eventTypeOther.dispose();
     contactPerson.dispose();
@@ -7307,7 +8667,72 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     additionalCostLabelController.dispose();
     additionalCostAmountController.dispose();
     menuSearchController.dispose();
+    _saveLocalDraftNow();
     super.dispose();
+  }
+
+  Timer? _localDraftDebounce;
+  void _saveLocalDraftDebounced() {
+    _localDraftDebounce?.cancel();
+    _localDraftDebounce = Timer(const Duration(milliseconds: 300), _saveLocalDraftNow);
+  }
+
+  Future<void> _saveLocalDraftNow() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final payload = <String, dynamic>{
+        'inquiryType': inquiryType,
+        'eventTitle': eventTitle.text.trim(),
+        'eventTypeChoice': eventTypeChoice,
+        'eventTypeOther': eventTypeOther.text.trim(),
+        'contactPerson': contactPerson.text.trim(),
+        'contactNumber': contactNumber.text.trim(),
+        'inquiryEmail': inquiryEmail.text.trim(),
+        'eventCity': eventCity.text.trim(),
+        'note': note.text.trim(),
+        'guestCount': guestCount.text.trim(),
+        'eventSetting': eventSetting,
+        'serviceIncluded': serviceIncluded,
+        'formalityLevel': formalityLevel,
+        'foodTastingRequested': foodTastingRequested,
+        'foodTastingDate': foodTastingDate.text.trim(),
+        'foodTastingTime': foodTastingTime.text.trim(),
+        'selectedDishes': selectedDishes.toList(),
+      };
+      await p.setString(_managerNewEventDraftKey, jsonEncode(payload));
+    } catch (_) {}
+  }
+
+  Future<void> _restoreLocalDraft() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final raw = p.getString(_managerNewEventDraftKey);
+      if (raw == null || raw.trim().isEmpty) return;
+      final m = jsonDecode(raw);
+      if (m is! Map) return;
+      inquiryType = '${m['inquiryType'] ?? inquiryType}';
+      eventTitle.text = '${m['eventTitle'] ?? ''}';
+      eventTypeChoice = '${m['eventTypeChoice'] ?? eventTypeChoice}';
+      eventTypeOther.text = '${m['eventTypeOther'] ?? ''}';
+      contactPerson.text = '${m['contactPerson'] ?? ''}';
+      contactNumber.text = '${m['contactNumber'] ?? ''}';
+      inquiryEmail.text = '${m['inquiryEmail'] ?? ''}';
+      eventCity.text = '${m['eventCity'] ?? ''}';
+      note.text = '${m['note'] ?? ''}';
+      guestCount.text = '${m['guestCount'] ?? ''}';
+      eventSetting = '${m['eventSetting'] ?? eventSetting}';
+      serviceIncluded = '${m['serviceIncluded'] ?? serviceIncluded}';
+      formalityLevel = '${m['formalityLevel'] ?? formalityLevel}';
+      foodTastingRequested = m['foodTastingRequested'] == true;
+      foodTastingDate.text = '${m['foodTastingDate'] ?? ''}';
+      foodTastingTime.text = '${m['foodTastingTime'] ?? ''}';
+      final dishes = m['selectedDishes'];
+      if (dishes is List) {
+        selectedDishes
+          ..clear()
+          ..addAll(dishes.map((e) => '$e'));
+      }
+    } catch (_) {}
   }
 
   int _minPaxForCurrentInquiry() =>
@@ -7397,6 +8822,27 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   String _resolvedEventType() {
     if (eventTypeChoice != 'Other') return eventTypeChoice;
     return eventTypeOther.text.trim();
+  }
+
+  Future<void> _openAiThemeStudioForManagerNewEvent() async {
+    final res = await Navigator.of(context).push<AiThemeStudioResult>(
+      MaterialPageRoute(
+        builder: (_) => AiThemeStudioPage(
+          apiBase: widget.state.apiBase,
+          eventTitle: eventTitle.text.trim(),
+          eventType: _resolvedEventType(),
+          formalityLevel: formalityLevel,
+          initialNotes: themeSuggestionNote,
+        ),
+      ),
+    );
+    if (res == null || !mounted) return;
+    setState(() {
+      if (res.generatedNotes.isNotEmpty) {
+        themeSuggestionNote = res.generatedNotes;
+      }
+      _managerThemePreviewB64 = res.generatedImageBase64;
+    });
   }
 
   List<Map<String, String>> _scheduleSlotsPayload() {
@@ -7536,7 +8982,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
     if (contactNumber.text.trim().isEmpty) return 'Enter contact number.';
     if (inquiryEmail.text.trim().isEmpty) return 'Enter email address.';
-    if (eventCity.text.trim().isEmpty) return 'Enter city of event.';
+    if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
     for (final w in _eventWindows) {
       final any = w.date != null || w.from != null || w.to != null;
       final all = w.date != null && w.from != null && w.to != null;
@@ -7587,6 +9033,50 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         ],
       ],
     );
+  }
+
+  void _onVenueChanged() {
+    _venueDebounce?.cancel();
+    final q = eventCity.text.trim();
+    if (q.length < 3) {
+      if (_venueSuggestions.isNotEmpty && mounted) setState(() => _venueSuggestions.clear());
+      return;
+    }
+    _venueDebounce = Timer(const Duration(milliseconds: 300), () async {
+      try {
+        final uri = Uri.parse(
+          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=5',
+        );
+        final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+        if (res.statusCode != 200 || !mounted) return;
+        final body = jsonDecode(res.body);
+        if (body is! List) return;
+        final next = body
+            .whereType<Map>()
+            .map((e) => '${e['display_name'] ?? ''}'.trim())
+            .where((s) => s.isNotEmpty)
+            .take(5)
+            .toList();
+        if (mounted) setState(() {
+          _venueSuggestions
+            ..clear()
+            ..addAll(next);
+        });
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _pickVenueOnMap() async {
+    final res = await Navigator.of(context).push<MapPinResult>(
+      MaterialPageRoute(
+        builder: (_) => _MapPinPickerDialog(initialSearchQuery: eventCity.text.trim()),
+      ),
+    );
+    if (res == null || !mounted) return;
+    setState(() {
+      eventCity.text = res.address.trim();
+      _venueSuggestions.clear();
+    });
   }
 
   @override
@@ -7653,7 +9143,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 const SizedBox(height: 6),
                 Text('Guests: ${guestCount.text.trim()}'),
                 const SizedBox(height: 6),
-                Text('City: ${eventCity.text.trim()}'),
+                Text('Venue: ${eventCity.text.trim()}'),
                 const SizedBox(height: 6),
                 Text('Estimated: ₱${est.toStringAsFixed(2)}'),
               ],
@@ -7694,6 +9184,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         return;
       }
       appSnack(context, 'New event created');
+      try {
+        final p = await SharedPreferences.getInstance();
+        await p.remove(_managerNewEventDraftKey);
+      } catch (_) {}
       await widget.state.loadManagerCateringByStage('new_event');
       if (context.mounted) Navigator.of(context).pop();
     }
@@ -7712,7 +9206,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         ['Type', inquiryType, 'Event', inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : contactPerson.text.trim()],
         ['Event type', _resolvedEventType(), 'Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen],
         ['Contact Person', contactPerson.text.trim(), 'Contact Number', contactNumber.text.trim()],
-        ['Email Address', inquiryEmail.text.trim(), 'Address of Event', eventCity.text.trim()],
+        ['Email Address', inquiryEmail.text.trim(), 'Event Venue', eventCity.text.trim()],
         ['Guests', _guestCountForSubmit().toString(), 'Service', serviceIncluded == 'yes' ? 'With service' : 'Without service'],
         ['Formality', inquiryType == 'CATERING AND EVENT' ? formalityLevel : '—', 'Setting', eventSetting],
         ['Menu Dishes', menuLines.isEmpty ? '—' : menuLines.join(', '), 'Base Food Cost', '₱${(_billableGuestCountForPricing() * kPesosPerPax).toStringAsFixed(2)}'],
@@ -7817,7 +9311,39 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               const SizedBox(height: 8),
               TextField(controller: inquiryEmail, decoration: const InputDecoration(labelText: 'Email address')),
               const SizedBox(height: 8),
-              TextField(controller: eventCity, decoration: const InputDecoration(labelText: 'City of event')),
+              TextField(
+                controller: eventCity,
+                decoration: InputDecoration(
+                  labelText: 'Event venue',
+                  suffixIcon: IconButton(
+                    tooltip: 'Pin on map',
+                    onPressed: _pickVenueOnMap,
+                    icon: const Icon(Icons.place_outlined),
+                  ),
+                ),
+              ),
+              if (_venueSuggestions.isNotEmpty)
+                Container(
+                  margin: const EdgeInsets.only(top: 6),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade300),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(
+                    children: _venueSuggestions
+                        .map(
+                          (s) => ListTile(
+                            dense: true,
+                            title: Text(s, maxLines: 2, overflow: TextOverflow.ellipsis),
+                            onTap: () => setState(() {
+                              eventCity.text = s;
+                              _venueSuggestions.clear();
+                            }),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ),
               const SizedBox(height: 8),
               const Text('Date & time of event', style: TextStyle(fontWeight: FontWeight.w600)),
               const SizedBox(height: 6),
@@ -8099,6 +9625,18 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   const SizedBox(height: 8),
                   Text(themeSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
                 ],
+                if (_managerThemePreviewB64.trim().isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.memory(
+                      base64Decode(_managerThemePreviewB64),
+                      height: 140,
+                      fit: BoxFit.contain,
+                      errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 12),
                 const Text(
                   'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
@@ -8115,6 +9653,19 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   style: TextStyle(height: 1.35),
                 ),
                 const SizedBox(height: 12),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(value: 'suggest', label: Text('Suggest Theme')),
+                    ButtonSegment(value: 'studio', label: Text('Open AI Studio')),
+                  ],
+                  selected: {_managerThemeInputMode},
+                  onSelectionChanged: (s) {
+                    final next = s.first;
+                    setState(() => _managerThemeInputMode = next);
+                    if (next == 'studio') _openAiThemeStudioForManagerNewEvent();
+                  },
+                ),
+                const SizedBox(height: 10),
                 TextField(
                   controller: themeCostController,
                   keyboardType: TextInputType.number,
@@ -8455,8 +10006,10 @@ class ManagerCateringDetailScreen extends StatefulWidget {
 }
 
 class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScreen> {
+  static const String _managerDraftDetailKeyPrefix = 'manager_draft_detail_unsaved_v1_';
   CateringEventRecord? _loadedDetailRow;
   bool _detailReady = false;
+  Timer? _localDraftDebounce;
 
   CateringEventRecord get d => _loadedDetailRow ?? widget.row;
 
@@ -8490,6 +10043,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   String managerServiceIncluded = 'no';
   String managerFormalityLevel = 'casual';
   String managerEventSetting = 'open';
+  String _detailThemePreviewB64 = '';
+  String _detailThemeInputMode = 'suggest';
   /// Draft-stage inquiry kind (`catering` vs `event`); may differ from [d] until saved / migrated.
   String _draftOrderKind = 'event';
   final List<_InquiryEventWindow> _eventWindows = [_InquiryEventWindow()];
@@ -8680,6 +10235,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     setState(() {
       _eventWindows[idx].date = picked;
     });
+    _saveLocalDraftDebounced();
   }
 
   Future<void> _pickWindowFromTime(int idx) async {
@@ -8690,6 +10246,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     setState(() {
       _eventWindows[idx].from = picked;
     });
+    _saveLocalDraftDebounced();
   }
 
   Future<void> _pickWindowToTime(int idx) async {
@@ -8700,12 +10257,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     setState(() {
       _eventWindows[idx].to = picked;
     });
+    _saveLocalDraftDebounced();
   }
 
   void _addAnotherWindow() {
     setState(() {
       _eventWindows.add(_InquiryEventWindow());
     });
+    _saveLocalDraftDebounced();
   }
 
   void _removeWindowAt(int idx) {
@@ -8716,6 +10275,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         _eventWindows.removeAt(idx);
       }
     });
+    _saveLocalDraftDebounced();
   }
 
   List<Widget> _buildLabeledScheduleRows(List<dynamic> scheduleSlots) {
@@ -8993,7 +10553,80 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   @override
   void initState() {
     super.initState();
+    for (final c in [
+      managerDraftEventTitleController,
+      managerEventTypeOtherController,
+      managerGuestCountController,
+      managerInquiryNoteController,
+    ]) {
+      c.addListener(_saveLocalDraftDebounced);
+    }
     Future.microtask(_bootstrapDetail);
+  }
+
+  String get _localDraftKey => '$_managerDraftDetailKeyPrefix${widget.row.id}_${widget.stage}';
+
+  void _saveLocalDraftDebounced() {
+    _localDraftDebounce?.cancel();
+    _localDraftDebounce = Timer(const Duration(milliseconds: 350), _saveLocalDraftNow);
+  }
+
+  Future<void> _saveLocalDraftNow() async {
+    final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+    if (!isDraftStage || !_detailReady) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString(
+        _localDraftKey,
+        jsonEncode({
+          'draft_order_kind': _draftOrderKind,
+          'event_title': managerDraftEventTitleController.text.trim(),
+          'event_type_choice': managerEventTypeChoice,
+          'event_type_other': managerEventTypeOtherController.text.trim(),
+          'guest_count': managerGuestCountController.text.trim(),
+          'inquiry_note': managerInquiryNoteController.text.trim(),
+          'event_setting': managerEventSetting,
+          'service_included': managerServiceIncluded,
+          'formality_level': managerFormalityLevel,
+          'selected_dishes': selectedDishes.toList(),
+          'schedule_slots': _scheduleSlotsPayload(),
+        }),
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _restoreLocalDraftIfAny() async {
+    final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+    if (!isDraftStage) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      final raw = p.getString(_localDraftKey);
+      if (raw == null || raw.trim().isEmpty) return;
+      final m = jsonDecode(raw);
+      if (m is! Map) return;
+      _draftOrderKind = '${m['draft_order_kind'] ?? _draftOrderKind}';
+      managerDraftEventTitleController.text = '${m['event_title'] ?? managerDraftEventTitleController.text}';
+      managerEventTypeChoice = '${m['event_type_choice'] ?? managerEventTypeChoice}';
+      managerEventTypeOtherController.text = '${m['event_type_other'] ?? managerEventTypeOtherController.text}';
+      managerGuestCountController.text = '${m['guest_count'] ?? managerGuestCountController.text}';
+      managerInquiryNoteController.text = '${m['inquiry_note'] ?? managerInquiryNoteController.text}';
+      managerEventSetting = '${m['event_setting'] ?? managerEventSetting}';
+      managerServiceIncluded = '${m['service_included'] ?? managerServiceIncluded}';
+      managerFormalityLevel = '${m['formality_level'] ?? managerFormalityLevel}';
+      final dishes = m['selected_dishes'];
+      if (dishes is List) {
+        selectedDishes
+          ..clear()
+          ..addAll(dishes.map((e) => '$e'));
+      }
+      final slots = m['schedule_slots'];
+      if (slots is List) {
+        _eventWindows
+          ..clear()
+          ..addAll(_windowsFromScheduleSlots(slots));
+        if (_eventWindows.isEmpty) _eventWindows.add(_InquiryEventWindow());
+      }
+    } catch (_) {}
   }
 
   Future<void> _bootstrapDetail() async {
@@ -9004,6 +10637,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     if (!mounted) return;
     _loadedDetailRow = full ?? widget.row;
     _initControllersFromRow(_loadedDetailRow!);
+    await _restoreLocalDraftIfAny();
     setState(() => _detailReady = true);
   }
 
@@ -9145,6 +10779,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   @override
   void dispose() {
+    _localDraftDebounce?.cancel();
+    _saveLocalDraftNow();
     downPaymentController.dispose();
     downPaymentPaidController.dispose();
     fullPaymentController.dispose();
@@ -9791,6 +11427,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           return;
         }
         appSnack(context, 'Draft saved');
+        try {
+          final p = await SharedPreferences.getInstance();
+          await p.remove(_localDraftKey);
+        } catch (_) {}
         await widget.state.loadManagerCateringByStage(widget.stage);
         return;
       }
@@ -10214,6 +11854,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onChanged: canEditStage
                           ? (v) => setState(() {
                                 _draftOrderKind = v == 'CATERING' ? 'catering' : 'event';
+                                _saveLocalDraftDebounced();
                               })
                           : null,
                     ),
@@ -10222,7 +11863,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       value: kMobileEventTypeChoices.contains(managerEventTypeChoice) ? managerEventTypeChoice : 'Other',
                       decoration: const InputDecoration(labelText: 'Event type'),
                       items: kMobileEventTypeChoices.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
-                      onChanged: canEditStage ? (v) => setState(() => managerEventTypeChoice = v ?? 'Other') : null,
+                      onChanged: canEditStage
+                          ? (v) => setState(() {
+                                managerEventTypeChoice = v ?? 'Other';
+                                _saveLocalDraftDebounced();
+                              })
+                          : null,
                     ),
                     if (managerEventTypeChoice == 'Other') ...[
                       const SizedBox(height: 8),
@@ -10240,7 +11886,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       dense: true,
                       contentPadding: EdgeInsets.zero,
                       title: const Text('Open space'),
-                      onChanged: canEditStage ? (v) => setState(() => managerEventSetting = v ?? 'open') : null,
+                      onChanged: canEditStage
+                          ? (v) => setState(() {
+                                managerEventSetting = v ?? 'open';
+                                _saveLocalDraftDebounced();
+                              })
+                          : null,
                     ),
                     RadioListTile<String>(
                       value: 'closed',
@@ -10248,7 +11899,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       dense: true,
                       contentPadding: EdgeInsets.zero,
                       title: const Text('Closed space'),
-                      onChanged: canEditStage ? (v) => setState(() => managerEventSetting = v ?? 'open') : null,
+                      onChanged: canEditStage
+                          ? (v) => setState(() {
+                                managerEventSetting = v ?? 'open';
+                                _saveLocalDraftDebounced();
+                              })
+                          : null,
                     ),
                     const SizedBox(height: 8),
                     TextField(
@@ -10370,7 +12026,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         ButtonSegment(value: 'formal', label: Text('Formal')),
                       ],
                       selected: {managerFormalityLevel},
-                      onSelectionChanged: canEditStage ? (s) => setState(() => managerFormalityLevel = s.first) : null,
+                      onSelectionChanged: canEditStage
+                          ? (s) => setState(() {
+                                managerFormalityLevel = s.first;
+                                _saveLocalDraftDebounced();
+                              })
+                          : null,
                     ),
                     const SizedBox(height: 8),
                     TextField(
@@ -10388,7 +12049,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       dense: true,
                       contentPadding: EdgeInsets.zero,
                       title: const Text('With service'),
-                      onChanged: canEditStage ? (v) => setState(() => managerServiceIncluded = v ?? 'no') : null,
+                      onChanged: canEditStage
+                          ? (v) => setState(() {
+                                managerServiceIncluded = v ?? 'no';
+                                _saveLocalDraftDebounced();
+                              })
+                          : null,
                     ),
                     RadioListTile<String>(
                       value: 'no',
@@ -10396,7 +12062,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       dense: true,
                       contentPadding: EdgeInsets.zero,
                       title: const Text('Without service'),
-                      onChanged: canEditStage ? (v) => setState(() => managerServiceIncluded = v ?? 'no') : null,
+                      onChanged: canEditStage
+                          ? (v) => setState(() {
+                                managerServiceIncluded = v ?? 'no';
+                                _saveLocalDraftDebounced();
+                              })
+                          : null,
                     ),
                     if (row.orderKind == 'catering') ...[
                       const SizedBox(height: 8),
@@ -10592,6 +12263,52 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         readOnly: isThemeReadOnly || !canEditStage,
                         maxLines: 4,
                         decoration: const InputDecoration(labelText: 'Theme notes'),
+                      ),
+                      const SizedBox(height: 10),
+                      if (_detailThemePreviewB64.trim().isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.memory(
+                              base64Decode(_detailThemePreviewB64),
+                              height: 140,
+                              fit: BoxFit.contain,
+                              errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+                            ),
+                          ),
+                        ),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(value: 'suggest', label: Text('Suggest Theme')),
+                          ButtonSegment(value: 'studio', label: Text('Open AI Studio')),
+                        ],
+                        selected: {_detailThemeInputMode},
+                        onSelectionChanged: (!canEditStage || isThemeReadOnly)
+                            ? null
+                            : (s) async {
+                                final next = s.first;
+                                setState(() => _detailThemeInputMode = next);
+                                if (next != 'studio') return;
+                                final res = await Navigator.of(context).push<AiThemeStudioResult>(
+                                  MaterialPageRoute(
+                                    builder: (_) => AiThemeStudioPage(
+                                      apiBase: widget.state.apiBase,
+                                      eventTitle: managerDraftEventTitleController.text.trim(),
+                                      eventType: managerEventTypeChoice == 'Other'
+                                          ? managerEventTypeOtherController.text.trim()
+                                          : managerEventTypeChoice,
+                                      formalityLevel: managerFormalityLevel,
+                                      initialNotes: managerInquiryNoteController.text.trim(),
+                                    ),
+                                  ),
+                                );
+                                if (res == null || !mounted) return;
+                                setState(() {
+                                  managerInquiryNoteController.text = res.generatedNotes;
+                                  _detailThemePreviewB64 = res.generatedImageBase64;
+                                });
+                              },
                       ),
                       const SizedBox(height: 8),
                       TextField(
@@ -11198,6 +12915,14 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
                   ),
                 ),
                 ListTile(
+                  leading: const Icon(Icons.dashboard_customize_outlined),
+                  title: const Text('Manage Orders'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _tab.animateTo(0);
+                  },
+                ),
+                ListTile(
                   leading: const Icon(Icons.history),
                   title: const Text('Order history'),
                   onTap: () {
@@ -11380,39 +13105,14 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                 Row(
                   children: [
                     Expanded(
-                        child: FilledButton(
-                        style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
-                        onPressed: () async {
-                          final ok = await showDialog<bool>(
-                            context: context,
-                            builder: (ctx) => AlertDialog(
-                              title: const Text('Clear tray?'),
-                              content: const Text('Remove all items from the tray?'),
-                              actions: [
-                                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
-                                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes')),
-                              ],
-                            ),
-                          );
-                          if (ok == true) widget.state.clearTray();
-                        },
-                        child: const Text('CANCEL'),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
                       child: FilledButton(
                         style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                        onPressed: widget.state.tray.isEmpty
-                            ? null
-                            : () {
-                                Navigator.of(context).push<void>(
-                                  MaterialPageRoute<void>(
-                                    builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal),
-                                  ),
-                                );
-                              },
-                        child: const Text('NEXT'),
+                        onPressed: () {
+                          Navigator.of(context).push<void>(
+                            MaterialPageRoute<void>(builder: (_) => PosYourTrayScreen(state: widget.state, subtotal: subtotal)),
+                          );
+                        },
+                        child: const Text('YOUR TRAY'),
                       ),
                     ),
                   ],
@@ -11510,38 +13210,13 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                     children: [
                       Expanded(
                         child: FilledButton(
-                          style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
-                          onPressed: () async {
-                            final ok = await showDialog<bool>(
-                              context: context,
-                              builder: (ctx) => AlertDialog(
-                                title: const Text('Clear tray?'),
-                                content: const Text('Remove all items from the tray?'),
-                                actions: [
-                                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
-                                  FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes')),
-                                ],
-                              ),
-                            );
-                            if (ok == true) widget.state.clearTray();
-                          },
-                          child: const Text('CANCEL'),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: FilledButton(
                           style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                          onPressed: widget.state.tray.isEmpty
-                              ? null
-                              : () {
-                                  Navigator.of(context).push<void>(
-                                    MaterialPageRoute<void>(
-                                      builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal),
-                                    ),
-                                  );
-                                },
-                          child: const Text('NEXT'),
+                          onPressed: () {
+                            Navigator.of(context).push<void>(
+                              MaterialPageRoute<void>(builder: (_) => PosYourTrayScreen(state: widget.state, subtotal: subtotal)),
+                            );
+                          },
+                          child: const Text('YOUR TRAY'),
                         ),
                       ),
                     ],
@@ -11563,6 +13238,95 @@ class PosWalkInCheckoutScreen extends StatefulWidget {
 
   @override
   State<PosWalkInCheckoutScreen> createState() => _PosWalkInCheckoutScreenState();
+}
+
+class PosYourTrayScreen extends StatelessWidget {
+  const PosYourTrayScreen({super.key, required this.state, required this.subtotal});
+  final AppState state;
+  final double subtotal;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.black87,
+        foregroundColor: Colors.white,
+        title: const Text('YOUR TRAY'),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: state.tray.isEmpty
+                ? const Center(child: Text('No dishes yet.'))
+                : ListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: state.tray.length,
+                    itemBuilder: (context, i) {
+                      final e = state.tray[i];
+                      return Card(
+                        child: ListTile(
+                          title: Text(e.menu.name),
+                          subtitle: Text(e.dip.isEmpty ? '—' : e.dip),
+                          trailing: Text('x${e.qty}  ₱${(e.qty * e.menu.price).toStringAsFixed(2)}'),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('Subtotal ₱${subtotal.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton(
+                        style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
+                        onPressed: () async {
+                          final ok = await showDialog<bool>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              title: const Text('Clear tray?'),
+                              content: const Text('Remove all items from the tray?'),
+                              actions: [
+                                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+                                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes')),
+                              ],
+                            ),
+                          );
+                          if (ok == true) state.clearTray();
+                        },
+                        child: const Text('CANCEL'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FilledButton(
+                        style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                        onPressed: state.tray.isEmpty
+                            ? null
+                            : () {
+                                Navigator.of(context).push<void>(
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => PosWalkInCheckoutScreen(state: state, subtotal: subtotal),
+                                  ),
+                                );
+                              },
+                        child: const Text('NEXT'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
