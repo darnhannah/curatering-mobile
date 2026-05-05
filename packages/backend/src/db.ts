@@ -265,6 +265,10 @@ export async function initDb(): Promise<void> {
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS full_payment_due_at TIMESTAMPTZ`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS points_earned INTEGER NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS points_earned INTEGER NOT NULL DEFAULT 0`);
   await p.query(
     `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS service_included TEXT NOT NULL DEFAULT ''`,
   );

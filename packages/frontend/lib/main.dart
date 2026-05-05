@@ -145,7 +145,6 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
   late final AppState appState;
   final GlobalKey<NavigatorState> _rootNavKey = GlobalKey<NavigatorState>();
   Timer? _backgroundLogoutTimer;
-  static const Duration _backgroundLogoutDelay = Duration(minutes: 3);
   /// Customer-only: prompt when payment confirmation still pending after 10 minutes.
   Timer? _paymentStallTimer;
   String? _paymentWatchEmail;
@@ -179,19 +178,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
       }
       return;
     }
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.detached) {
-      if (appState.userEmail == null) return;
-      _backgroundLogoutTimer?.cancel();
-      _backgroundLogoutTimer = Timer(_backgroundLogoutDelay, () {
-        if (!mounted || appState.userEmail == null) return;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted || appState.userEmail == null) return;
-          _showSessionExpiredOnRoot();
-        });
-      });
-    }
+    // Per latest requirement: switching apps / exiting should not auto-logout.
   }
 
   Future<void> _pollCustomerAttentionNotifications() async {
@@ -692,6 +679,9 @@ void appSnack(BuildContext context, String message) {
 const int kMinCateringOnlyPax = 10;
 const int kMinCateringEventPax = 50;
 const double kPesosPerPax = 500;
+/// Catering/event loyalty (matches backend `loyalty-calculation` thresholds).
+const double kCateringLoyaltyMinOrderTotal = 500;
+const int kCateringLoyaltyPointsAward = 8;
 
 class AppColors {
   static const brand = Color(0xFFFFC233);
@@ -1027,6 +1017,7 @@ bool customerOrderPendingTab(OrderData o) {
   if (orderLooksCompleted(o)) return false;
   final u = o.status.toUpperCase();
   return u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+      u.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION') ||
       u.contains('WAITING FOR ORDER CONFIRMATION') ||
       u.contains('WAITING FOR ORDER') ||
       u.contains('PAYMENT INSUFFICIENT') ||
@@ -1055,12 +1046,22 @@ String fulfillmentStageReadable(String stage) {
 
 String statusReadable(String status) {
   final up = status.toUpperCase();
+  if (up.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION')) return 'WAITING FOR BALANCE PAYMENT CONFIRMATION';
   if (up.contains('WAITING FOR ORDER CONFIRMATION')) return 'WAITING FOR PAYMENT CONFIRMATION';
   if (up.contains('ORDER CONFIRMED')) return status.replaceAll(RegExp('ORDER CONFIRMED', caseSensitive: false), 'PAYMENT CONFIRMED');
   if (up.contains('PAYMENT INSUFFICIENT')) {
     return 'PAYMENT INSUFFICIENT - PAY REMAINDER';
   }
   return status;
+}
+
+String statusReadableForOrder(OrderData o) {
+  final up = o.status.toUpperCase();
+  final hasBalanceProof = (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false) || o.balanceProofPendingReview;
+  if (hasBalanceProof && up.contains('WAITING FOR PAYMENT CONFIRMATION')) {
+    return 'WAITING FOR BALANCE PAYMENT CONFIRMATION';
+  }
+  return statusReadable(o.status);
 }
 
 void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
@@ -1229,6 +1230,7 @@ class CateringEventRecord {
     this.eventSetting = '',
     this.schedulePreview = '',
     this.processingScheduleOverlaps = 0,
+    this.cateringLoyaltyPointsEarned = 0,
   });
   final String id;
   final String orderKind;
@@ -1269,6 +1271,12 @@ class CateringEventRecord {
   final String schedulePreview;
   /// For `for_processing` list: how many *other* active orders overlap this event's schedule.
   final int processingScheduleOverlaps;
+
+  /// Points applied when this catering/event order is completed (from `points_earned` in DB).
+  final int cateringLoyaltyPointsEarned;
+
+  int get cateringLoyaltyEligiblePointsIfCompleted =>
+      totalCost >= kCateringLoyaltyMinOrderTotal ? kCateringLoyaltyPointsAward : 0;
 
   factory CateringEventRecord.fromApiMap(Map<String, dynamic> m) {
     return CateringEventRecord(
@@ -1355,6 +1363,7 @@ class CateringEventRecord {
       eventSetting: '${m['event_setting'] ?? ''}',
       schedulePreview: '${m['schedule_preview'] ?? ''}',
       processingScheduleOverlaps: jsonToInt(m['processing_schedule_overlaps']),
+      cateringLoyaltyPointsEarned: jsonToInt(m['points_earned']),
     );
   }
 }
@@ -4984,6 +4993,7 @@ class CheckoutScreen extends StatefulWidget {
 }
 
 class _CheckoutScreenState extends State<CheckoutScreen> {
+  /// Kept in [State] so expanding/collapsing sections survives pushing [PaymentScreen] and popping back.
   bool showDelivery = true;
   bool showTray = true;
   bool showNotes = true;
@@ -4998,11 +5008,9 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     final profile = widget.state.profile;
     final fromProfile = List<String>.from(profile.deliveryAddresses);
     final primary = profile.deliveryAddress.trim();
-    if (fromProfile.isNotEmpty) {
-      _deliveryAddresses.addAll(fromProfile);
-    } else if (primary.isNotEmpty) {
-      _deliveryAddresses.add(primary);
-    }
+    final merged = <String>{...fromProfile};
+    if (primary.isNotEmpty) merged.add(primary);
+    _deliveryAddresses.addAll(merged);
     final savedSel = widget.state.checkoutSelectedAddress?.trim();
     if (savedSel != null && savedSel.isNotEmpty && _deliveryAddresses.contains(savedSel)) {
       _selectedDeliveryAddress = savedSel;
@@ -5117,10 +5125,6 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 return;
               }
               s.profile.deliveryAddress = _selectedDeliveryAddress!.trim();
-              if (!s.profile.deliveryMapConfirmed) {
-                appSnack(context, 'Open the map from My Profile, pin your location, and confirm before ordering.');
-                return;
-              }
               final okCheckout = await showDialog<bool>(
                 context: context,
                 builder: (ctx) => AlertDialog(
@@ -5412,30 +5416,69 @@ class _PaymentScreenState extends State<PaymentScreen> {
                             ),
                           ),
                           const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  insufficient
-                                      ? 'After paying the remaining balance, upload proof here.'
-                                      : 'Once paid, upload proof of payment',
-                                ),
-                              ),
-                              OutlinedButton(
-                                onPressed: () => _pickAndUploadProof(insufficient: insufficient),
-                                child: Text(
-                                  insufficient
-                                      ? (proofDone ? 'CHANGE BALANCE PROOF' : 'UPLOAD BALANCE PROOF')
-                                      : (uploadedFile == null && !proofDone ? 'UPLOAD' : 'CHANGE PHOTO'),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              OutlinedButton.icon(
-                                onPressed: () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
-                                icon: const Icon(Icons.photo_camera_outlined, size: 18),
-                                label: const Text('CAMERA'),
-                              ),
-                            ],
+                          LayoutBuilder(
+                            builder: (context, c) {
+                              final narrow = c.maxWidth < 560;
+                              if (narrow) {
+                                return Column(
+                                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                                  children: [
+                                    Text(
+                                      insufficient
+                                          ? 'After paying the remaining balance, upload proof here.'
+                                          : 'Once paid, upload proof of payment',
+                                      maxLines: 3,
+                                    ),
+                                    const SizedBox(height: 8),
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: OutlinedButton(
+                                            onPressed: () => _pickAndUploadProof(insufficient: insufficient),
+                                            child: Text(
+                                              insufficient
+                                                  ? (proofDone ? 'CHANGE BALANCE PROOF' : 'UPLOAD BALANCE PROOF')
+                                                  : (uploadedFile == null && !proofDone ? 'UPLOAD' : 'CHANGE PHOTO'),
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        OutlinedButton.icon(
+                                          onPressed: () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
+                                          icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                                          label: const Text('CAMERA'),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                );
+                              }
+                              return Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      insufficient
+                                          ? 'After paying the remaining balance, upload proof here.'
+                                          : 'Once paid, upload proof of payment',
+                                    ),
+                                  ),
+                                  OutlinedButton(
+                                    onPressed: () => _pickAndUploadProof(insufficient: insufficient),
+                                    child: Text(
+                                      insufficient
+                                          ? (proofDone ? 'CHANGE BALANCE PROOF' : 'UPLOAD BALANCE PROOF')
+                                          : (uploadedFile == null && !proofDone ? 'UPLOAD' : 'CHANGE PHOTO'),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  OutlinedButton.icon(
+                                    onPressed: () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
+                                    icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                                    label: const Text('CAMERA'),
+                                  ),
+                                ],
+                              );
+                            },
                           ),
                           if (!insufficient) _paymentProofPreview(synced),
                           if (insufficient) ...[
@@ -5541,7 +5584,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                   SummaryLine('TOTAL', '₱${orderForUi.total.toStringAsFixed(2)}', isTotal: true),
                 ],
                 secondaryLabel: 'BACK',
-                actionLabel: 'SUBMIT ORDER',
+                actionLabel: insufficient ? 'SUBMIT BALANCE PAYMENT' : 'SUBMIT ORDER',
                 onSecondary: () => Navigator.of(context).pop(),
                 onAction: () {
                   final syncedNow = _syncedOrder(s);
@@ -5563,11 +5606,18 @@ class _PaymentScreenState extends State<PaymentScreen> {
                   showDialog<bool>(
                     context: context,
                     builder: (ctx) => AlertDialog(
-                      title: const Text('Submit order?'),
-                      content: const Text('Please confirm all details before submitting this order.'),
+                      title: Text(insNow ? 'Submit balance payment?' : 'Submit order?'),
+                      content: Text(
+                        insNow
+                            ? 'Please confirm your remaining balance payment proof before submitting.'
+                            : 'Please confirm all details before submitting this order.',
+                      ),
                       actions: [
                         TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Back')),
-                        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Submit order')),
+                        FilledButton(
+                          onPressed: () => Navigator.pop(ctx, true),
+                          child: Text(insNow ? 'Submit balance payment' : 'Submit order'),
+                        ),
                       ],
                     ),
                   ).then((okSubmit) {
@@ -5603,6 +5653,10 @@ class OrderStatusScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final track = order.deliveryTrackingUrl.trim();
+    final st = order.status.toUpperCase();
+    final canFollowUp = st.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+        st.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION') ||
+        st.contains('WAITING FOR ORDER CONFIRMATION');
     return AppScaffold(
       state: state,
       title: 'ORDER STATUS',
@@ -5622,6 +5676,22 @@ class OrderStatusScreen extends StatelessWidget {
                     Text('Status: ${statusReadable(order.status)}'),
                     Text('Total: ₱${order.total.toStringAsFixed(2)}'),
                     Text('Payment proof: ${paymentUploaded ? 'Received' : 'Not uploaded yet'}'),
+                    if (canFollowUp) ...[
+                      const SizedBox(height: 10),
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          final err = await state.submitHelpRequest(
+                            area: 'Order Follow-up',
+                            problem: 'Follow-up on pending order ${order.orderNo}',
+                            desiredOutcome: 'Please review this order and update the payment/order confirmation status.',
+                          );
+                          if (!context.mounted) return;
+                          appSnack(context, err ?? 'Follow-up sent');
+                        },
+                        icon: const Icon(Icons.reply_outlined),
+                        label: const Text('FOLLOW UP'),
+                      ),
+                    ],
                     if (track.isNotEmpty) ...[
                       const SizedBox(height: 12),
                       Text('Delivery tracking', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
@@ -5701,7 +5771,9 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
     final u = o.status.toUpperCase();
     if (u.contains('PAYMENT INSUFFICIENT') || u.contains('INSUFFICIENT')) return false;
     // Follow-up only when cashier confirmation is still needed (after the user paid the remainder).
-    return u.contains('WAITING FOR PAYMENT CONFIRMATION') || u.contains('WAITING FOR ORDER CONFIRMATION');
+    return u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+        u.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION') ||
+        u.contains('WAITING FOR ORDER CONFIRMATION');
   }
 
   bool _canCustomerCancelOrder(OrderData o) {
@@ -5834,7 +5906,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                     clipBehavior: Clip.none,
                     children: [
                       Card(
-                        color: alert ? Colors.red.shade50 : null,
+                          color: alert ? Colors.amber.shade50 : null,
                         child: ListTile(
                           dense: true,
                           visualDensity: VisualDensity.compact,
@@ -5854,8 +5926,8 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                               height: 1.2,
                             ),
                           ),
-                          TextSpan(text: '${statusReadable(o.status)}'),
-                          if (o.loyaltyPointsEarned > 0 && tabIndex == 1)
+                          TextSpan(text: '${statusReadableForOrder(o)}'),
+                          if (o.loyaltyPointsEarned > 0 && (tabIndex == 1 || tabIndex == 2))
                             TextSpan(text: '\nLoyalty: +${o.loyaltyPointsEarned} pts'),
                           TextSpan(text: '\n${o.createdAt.toLocal()}'),
                         ],
@@ -5914,7 +5986,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 _detailLine('Order no.', o.orderNo),
-                                _detailLine('Status', statusReadable(o.status)),
+                                _detailLine('Status', statusReadableForOrder(o)),
                                 _detailLine('Fulfillment stage', fulfillmentStageReadable(o.fulfillmentStage)),
                                 if (o.loyaltyPointsEarned > 0)
                                   _detailLine('Loyalty points from this order', '+${o.loyaltyPointsEarned} pts'),
@@ -6157,6 +6229,8 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
   double? mapLng;
   late List<String> _savedAddresses;
   final TextEditingController _newAddressManual = TextEditingController();
+  final List<String> _addrSuggestions = [];
+  Timer? _addrDebounce;
 
   @override
   void initState() {
@@ -6181,7 +6255,42 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
     contactController.dispose();
     addressController.dispose();
     _newAddressManual.dispose();
+    _addrDebounce?.cancel();
     super.dispose();
+  }
+
+  void _suggestAddress(String q) {
+    _addrDebounce?.cancel();
+    final query = q.trim();
+    if (query.length < 3) {
+      if (_addrSuggestions.isNotEmpty) setState(() => _addrSuggestions.clear());
+      return;
+    }
+    _addrDebounce = Timer(const Duration(milliseconds: 280), () async {
+      try {
+        final local = _savedAddresses.where((a) => a.toLowerCase().contains(query.toLowerCase())).take(5).toList();
+        final uri = Uri.parse(
+          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(query)}&format=json&limit=5',
+        );
+        final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+        if (res.statusCode != 200 || !mounted) return;
+        final body = jsonDecode(res.body);
+        if (body is! List) return;
+        final next = body
+            .whereType<Map>()
+            .map((e) => '${e['display_name'] ?? ''}'.trim())
+            .where((s) => s.isNotEmpty)
+            .take(5)
+            .toList();
+        if (!mounted) return;
+        setState(() {
+          _addrSuggestions
+            ..clear()
+            ..addAll(local)
+            ..addAll(next.where((s) => !local.contains(s)));
+        });
+      } catch (_) {}
+    });
   }
 
   Future<void> _openMapsDialog() async {
@@ -6227,9 +6336,15 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                   const SizedBox(height: 10),
                   TextField(
                     controller: addressController,
-                    decoration: const InputDecoration(
+                    onChanged: _suggestAddress,
+                    decoration: InputDecoration(
                       labelText: 'Primary delivery address',
                       hintText: 'Street, building, landmarks…',
+                      suffixIcon: IconButton(
+                        tooltip: 'Pin on map',
+                        onPressed: _openMapsDialog,
+                        icon: const Icon(Icons.place_outlined),
+                      ),
                     ),
                     minLines: 2,
                     maxLines: 4,
@@ -6237,13 +6352,45 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                   const SizedBox(height: 10),
                   TextField(
                     controller: _newAddressManual,
-                    decoration: const InputDecoration(
-                      labelText: 'Add another address (manual)',
+                    onChanged: _suggestAddress,
+                    decoration: InputDecoration(
+                      labelText: 'Add another address',
                       hintText: 'Type an address, then tap Add',
+                      suffixIcon: IconButton(
+                        tooltip: 'Pin on map',
+                        onPressed: _openMapsDialog,
+                        icon: const Icon(Icons.place_outlined),
+                      ),
                     ),
                     minLines: 1,
                     maxLines: 3,
                   ),
+                  if (_addrSuggestions.isNotEmpty)
+                    Container(
+                      margin: const EdgeInsets.only(top: 6),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.grey.shade300),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Column(
+                        children: _addrSuggestions
+                            .map(
+                              (s) => ListTile(
+                                dense: true,
+                                title: Text(s, maxLines: 2, overflow: TextOverflow.ellipsis),
+                                onTap: () => setState(() {
+                                  if (_newAddressManual.text.trim().isNotEmpty) {
+                                    _newAddressManual.text = s;
+                                  } else {
+                                    addressController.text = s;
+                                  }
+                                  _addrSuggestions.clear();
+                                }),
+                              ),
+                            )
+                            .toList(),
+                      ),
+                    ),
                   const SizedBox(height: 8),
                   Align(
                     alignment: Alignment.centerRight,
@@ -6277,60 +6424,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                       ),
                     ),
                   ],
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.tonalIcon(
-                      onPressed: _openMapsDialog,
-                      icon: const Icon(Icons.map_outlined),
-                      label: const Text('OPEN MAP TO PIN / SEARCH LOCATION'),
-                      style: FilledButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        foregroundColor: AppColors.ink,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Tap the map to drop a pin. We resolve the street address using OpenStreetMap (same coordinates you can verify in Google Maps).',
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade800),
-                  ),
                   const SizedBox(height: 16),
-                  if (mapLat != null && mapLng != null) ...[
-                    const Text('Map preview', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      height: 160,
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: FlutterMap(
-                          options: MapOptions(
-                            initialCenter: LatLng(mapLat!, mapLng!),
-                            initialZoom: 15,
-                            interactionOptions: const InteractionOptions(flags: InteractiveFlag.none),
-                          ),
-                          children: [
-                            TileLayer(
-                              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                              userAgentPackageName: 'com.curatering.mobile',
-                            ),
-                            MarkerLayer(
-                              markers: [
-                                Marker(
-                                  point: LatLng(mapLat!, mapLng!),
-                                  width: 40,
-                                  height: 40,
-                                  alignment: Alignment.center,
-                                  child: const Icon(Icons.location_on, color: AppColors.accent, size: 40),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                  ],
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
@@ -6770,8 +6864,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
   String menuSuggestionNote = '';
   String themeSuggestionNote = '';
   final themeNotesController = TextEditingController();
-  String _themePreviewB64 = '';
-  String _themeDesignInputMode = 'suggest';
+  final List<String> _themeReferenceImagesB64 = <String>[];
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
@@ -6950,6 +7043,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
     }
     _venueDebounce = Timer(const Duration(milliseconds: 300), () async {
       try {
+        final local = widget.state.profile.deliveryAddresses
+            .where((a) => a.toLowerCase().contains(q.toLowerCase()))
+            .take(5)
+            .toList();
         final uri = Uri.parse(
           'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=5',
         );
@@ -6966,6 +7063,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
         if (mounted) setState(() {
           _venueSuggestions
             ..clear()
+            ..addAll(local)
             ..addAll(next);
         });
       } catch (_) {}
@@ -6993,24 +7091,16 @@ class _InquiryScreenState extends State<InquiryScreen> {
   }
 
   Future<void> _openAiThemeStudio() async {
-    final res = await Navigator.of(context).push<AiThemeStudioResult>(
-      MaterialPageRoute(
-        builder: (_) => AiThemeStudioPage(
-          apiBase: widget.state.apiBase,
-          eventTitle: eventTitle.text.trim(),
-          eventType: _resolvedEventType(),
-          formalityLevel: formalityLevel,
-          initialNotes: themeNotesController.text.trim(),
-        ),
-      ),
-    );
-    if (res == null || !mounted) return;
+    // Event theme design editing is now web-only per product direction.
+  }
+
+  Future<void> _pickThemeReferenceImage() async {
+    final x = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 85);
+    if (x == null) return;
+    final bytes = await x.readAsBytes();
+    if (!mounted) return;
     setState(() {
-      themeNotesController.text = res.generatedNotes;
-      _themePreviewB64 = res.generatedImageBase64;
-      if (res.generatedNotes.isNotEmpty) {
-        themeSuggestionNote = 'AI theme draft prepared. You can still edit the notes below.';
-      }
+      _themeReferenceImagesB64.add(base64Encode(bytes));
     });
   }
 
@@ -7209,20 +7299,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         child: TextButton.icon(
                           onPressed: () {
                             setState(() => _eventWindows.add(_InquiryEventWindow()));
-                            _scheduleConflictRefresh();
                           },
                           icon: const Icon(Icons.add),
                           label: const Text('Add another day'),
                         ),
                       ),
-                      if (_publicScheduleConflictCount > 0)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 8),
-                          child: Text(
-                            'This date/time conflicts with an event already in For Processing.',
-                            style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700, fontSize: 13),
-                          ),
-                        ),
                       const SizedBox(height: 8),
                       TextField(
                         controller: eventCity,
@@ -7332,25 +7413,16 @@ class _InquiryScreenState extends State<InquiryScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        const Text('DO YOU ALREADY HAVE A THEME DIRECTION IN MIND?'),
+                        const Text('DO YOU ALREADY HAVE A DESIGN DIRECTION IN MIND?'),
                         const SizedBox(height: 8),
                         Row(
                           children: [
                             Expanded(
                               child: OutlinedButton(
                                 onPressed: () => setState(() {
-                                  themeSuggestionNote = '';
+                                  themeSuggestionNote = 'No, suggest me a design.';
                                 }),
-                                child: const Text('YES, I HAVE A THEME'),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: OutlinedButton(
-                                onPressed: () => setState(() {
-                                  themeSuggestionNote = 'No, please suggest a theme style for this event.';
-                                }),
-                                child: const Text('NO, SUGGEST A THEME'),
+                                child: const Text('NO, SUGGEST ME A DESIGN'),
                               ),
                             ),
                           ],
@@ -7360,58 +7432,62 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           Text(themeSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
                         ],
                         const SizedBox(height: 10),
-                        const Text(
-                          'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
-                          style: TextStyle(height: 1.35),
-                        ),
-                        const SizedBox(height: 10),
-                        const Text(
-                          'You may attach inspiration links or filenames later with your coordinator; photos of the venue (indoor/outdoor, ceiling height) help us propose realistic installs.',
-                          style: TextStyle(height: 1.35),
-                        ),
-                        const SizedBox(height: 10),
-                        const Text(
-                          'If you already have hired stylists or florists, note their contact windows here so we can align catering service timing with their setup and strike.',
-                          style: TextStyle(height: 1.35),
-                        ),
-                        const SizedBox(height: 10),
                         TextField(
                           controller: themeNotesController,
                           maxLines: 4,
                           decoration: const InputDecoration(
                             labelText: 'Theme / styling notes',
-                            hintText: 'Palette, decor, lighting, florals, signage, layout ideas (no cost field)',
+                            hintText: 'Describe preferred look, colors, motif, and styling notes',
                           ),
                         ),
                         const SizedBox(height: 10),
-                        if (_themePreviewB64.trim().isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: Image.memory(
-                                base64Decode(_themePreviewB64),
-                                height: 140,
-                                fit: BoxFit.contain,
-                                errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+                        Row(
+                          children: [
+                            OutlinedButton.icon(
+                              onPressed: _pickThemeReferenceImage,
+                              icon: const Icon(Icons.upload_file),
+                              label: const Text('Upload Reference Image'),
+                            ),
+                            const SizedBox(width: 8),
+                            Text('${_themeReferenceImagesB64.length} image(s) attached'),
+                          ],
+                        ),
+                        if (_themeReferenceImagesB64.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          SizedBox(
+                            height: 82,
+                            child: ListView.separated(
+                              scrollDirection: Axis.horizontal,
+                              itemCount: _themeReferenceImagesB64.length,
+                              separatorBuilder: (_, __) => const SizedBox(width: 8),
+                              itemBuilder: (context, i) => Stack(
+                                children: [
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Image.memory(
+                                      base64Decode(_themeReferenceImagesB64[i]),
+                                      width: 82,
+                                      height: 82,
+                                      fit: BoxFit.cover,
+                                    ),
+                                  ),
+                                  Positioned(
+                                    right: 0,
+                                    top: 0,
+                                    child: InkWell(
+                                      onTap: () => setState(() => _themeReferenceImagesB64.removeAt(i)),
+                                      child: Container(
+                                        color: Colors.black54,
+                                        padding: const EdgeInsets.all(2),
+                                        child: const Icon(Icons.close, size: 14, color: Colors.white),
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
-                        const SizedBox(height: 6),
-                        Text('Design input', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
-                        const SizedBox(height: 6),
-                        SegmentedButton<String>(
-                          segments: const [
-                            ButtonSegment(value: 'suggest', label: Text('Suggest Theme')),
-                            ButtonSegment(value: 'studio', label: Text('Open AI Studio')),
-                          ],
-                          selected: {_themeDesignInputMode},
-                          onSelectionChanged: (s) {
-                            final next = s.first;
-                            setState(() => _themeDesignInputMode = next);
-                            if (next == 'studio') _openAiThemeStudio();
-                          },
-                        ),
+                        ],
                       ],
                     ),
                   ),
@@ -7686,6 +7762,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'estimated_total': est,
                 'menu_suggestion_note': curateOwn ? '' : menuSuggestionNote,
                 'theme_suggestion_note': themeNotesController.text.trim(),
+                if (inquiryType == 'CATERING AND EVENT')
+                  'theme_design': {
+                    'note': themeNotesController.text.trim(),
+                    'reference_images': _themeReferenceImagesB64,
+                  },
                 'event_city': eventCity.text.trim(),
                 'event_setting': eventSetting,
                 'service_included': serviceIncluded,
@@ -7793,15 +7874,13 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
 
   Future<void> _followUp(InquiryRecord r) async {
     final ref = r.displayTransactionRef;
-    final uri = Uri.parse(
-      'mailto:?subject=${Uri.encodeComponent('Follow up: $ref')}'
-      '&body=${Uri.encodeComponent('Transaction: $ref\nType: ${r.inquiryType}\n')}',
+    final err = await widget.state.submitHelpRequest(
+      area: 'Catering Inquiry Follow-up',
+      problem: 'Customer follow-up on inquiry $ref',
+      desiredOutcome: 'Please review and respond to this inquiry as soon as possible.',
     );
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri);
-    } else if (mounted) {
-      appSnack(context, 'Could not open your email app');
-    }
+    if (!mounted) return;
+    appSnack(context, err ?? 'Follow-up sent to manager');
   }
 
   void _showDetail(InquiryRecord r, {required bool allowFollowUp}) {
@@ -8332,6 +8411,8 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
               if (o.posCustomerLabel.trim().isNotEmpty) Text('Walk-in label: ${o.posCustomerLabel}'),
               Text('Payment: ${o.paymentMode}'),
               Text('Total: ₱${o.total.toStringAsFixed(2)}'),
+              if (o.loyaltyPointsEarned > 0)
+                Text('Customer loyalty (this order): +${o.loyaltyPointsEarned} pts'),
               if (o.cashierAmountReceived != null)
                 Text('Amount received (recorded): ₱${o.cashierAmountReceived!.toStringAsFixed(2)}'),
               if (o.cashierSecondaryAmountReceived != null)
@@ -8403,7 +8484,8 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
                         child: ListTile(
                           title: Text(o.orderNo),
                           subtitle: Text(
-                            '${o.orderSource} · ${statusReadable(o.status)}\n${o.createdAt.toLocal()}',
+                            '${o.orderSource} · ${statusReadable(o.status)}\n${o.createdAt.toLocal()}'
+                            '${o.loyaltyPointsEarned > 0 ? '\nLoyalty: +${o.loyaltyPointsEarned} pts' : ''}',
                           ),
                           isThreeLine: true,
                           trailing: Text('₱${o.total.toStringAsFixed(2)}'),
@@ -9199,30 +9281,96 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         return;
       }
       final doc = pw.Document();
+      final labelBg = pdf.PdfColor.fromInt(0xFFCFCFCF);
       final eventWhen = _scheduleSlotsPayload().map((e) => e['label'] ?? '').where((e) => e.trim().isNotEmpty).join(' ; ');
       final menuLines = selectedDishes.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      final guestCountValue = _guestCountForSubmit();
+      final baseFoodCost = _billableGuestCountForPricing() * kPesosPerPax;
+      final laborCost = _laborCostComputed();
+      final travelCost = _travelCostComputed();
+      final themeCost = _themeCostComputed();
+      final additionalCostTotal = _sumCostRows(additionalCosts);
       final total = _estimatedCost();
-      final rows = <List<String>>[
-        ['Type', inquiryType, 'Event', inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : contactPerson.text.trim()],
-        ['Event type', _resolvedEventType(), 'Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen],
-        ['Contact Person', contactPerson.text.trim(), 'Contact Number', contactNumber.text.trim()],
-        ['Email Address', inquiryEmail.text.trim(), 'Event Venue', eventCity.text.trim()],
-        ['Guests', _guestCountForSubmit().toString(), 'Service', serviceIncluded == 'yes' ? 'With service' : 'Without service'],
-        ['Formality', inquiryType == 'CATERING AND EVENT' ? formalityLevel : '—', 'Setting', eventSetting],
-        ['Menu Dishes', menuLines.isEmpty ? '—' : menuLines.join(', '), 'Base Food Cost', '₱${(_billableGuestCountForPricing() * kPesosPerPax).toStringAsFixed(2)}'],
-        ['Labor Cost', '₱${_laborCostComputed().toStringAsFixed(2)}', 'Travel Cost', '₱${_travelCostComputed().toStringAsFixed(2)}'],
-        ['Theme Design Cost', '₱${_themeCostComputed().toStringAsFixed(2)}', 'Additional Costs', '₱${_sumCostRows(additionalCosts).toStringAsFixed(2)}'],
-        ['Estimated Total', '₱${total.toStringAsFixed(2)}', 'Note', note.text.trim().isEmpty ? '—' : note.text.trim()],
-      ];
+      final downPaymentDue = total * 0.5;
+      final totalDueNow = total - downPaymentDue;
+      final settingLabel = eventSetting == 'closed' ? 'Closed space' : 'Open space';
+      final cateringType = inquiryType == 'CATERING' ? 'Catering' : 'Catering and Event';
+
+      pw.Widget labelValueRow(String k, String v) => pw.Padding(
+            padding: const pw.EdgeInsets.only(bottom: 5),
+            child: pw.Row(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.Expanded(
+                  flex: 2,
+                  child: pw.Container(
+                    color: labelBg,
+                    padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                    child: pw.Text(k, style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
+                  ),
+                ),
+                pw.SizedBox(width: 6),
+                pw.Expanded(
+                  flex: 3,
+                  child: pw.Padding(
+                    padding: const pw.EdgeInsets.symmetric(vertical: 5),
+                    child: pw.Text(v.isEmpty ? '—' : v, style: const pw.TextStyle(fontSize: 10)),
+                  ),
+                ),
+              ],
+            ),
+          );
+
       doc.addPage(
         pw.MultiPage(
           build: (ctx) => [
             pw.Text('Order Summary', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
-            pw.SizedBox(height: 8),
-            pw.TableHelper.fromTextArray(
-              headers: const ['Field', 'Value', 'Field', 'Value'],
-              data: rows,
+            pw.Text('Macrina\'s Kitchen and Catering', style: pw.TextStyle(fontSize: 10, color: pdf.PdfColors.grey700)),
+            pw.SizedBox(height: 12),
+            labelValueRow('Transaction No.', '—'),
+            labelValueRow('Date/Time processed', formatDateTimeLocal(DateTime.now())),
+            labelValueRow(
+              'Event',
+              inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : contactPerson.text.trim(),
             ),
+            labelValueRow('Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen),
+            labelValueRow('Customer', contactPerson.text.trim()),
+            labelValueRow('Contact person', contactPerson.text.trim()),
+            labelValueRow('Contact number', contactNumber.text.trim()),
+            labelValueRow('Email address', inquiryEmail.text.trim()),
+            labelValueRow('Catering type', cateringType),
+            labelValueRow('Event type', _resolvedEventType()),
+            labelValueRow('Address of event', eventCity.text.trim()),
+            labelValueRow('Service', serviceIncluded == 'yes' ? 'With service' : 'Without service'),
+            labelValueRow('Event setting', settingLabel),
+            labelValueRow('Formality level', inquiryType == 'CATERING AND EVENT' ? formalityLevel : '—'),
+            labelValueRow('Menu dishes', menuLines.isEmpty ? '—' : menuLines.join(', ')),
+            labelValueRow(
+              'No. of PAX and cost',
+              '$guestCountValue x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${baseFoodCost.toStringAsFixed(2)}',
+            ),
+            labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
+            labelValueRow('Labor cost', 'PHP ${laborCost.toStringAsFixed(2)}'),
+            labelValueRow('Travel cost', 'PHP ${travelCost.toStringAsFixed(2)}'),
+            labelValueRow(
+              'Additional costs',
+              additionalCosts.isEmpty
+                  ? '—'
+                  : additionalCosts
+                      .map((e) {
+                        final lb = '${e['label'] ?? ''}'.trim();
+                        final am = jsonToDouble(e['amount']);
+                        if (lb.isEmpty && am <= 0) return '';
+                        return '${lb.isEmpty ? 'Item' : lb}: PHP ${am.toStringAsFixed(2)}';
+                      })
+                      .where((x) => x.isNotEmpty)
+                      .join(' · '),
+            ),
+            labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+            labelValueRow('Total invoice', 'PHP ${total.toStringAsFixed(2)}'),
+            labelValueRow('Down payment (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
+            labelValueRow('Total amount due (after down payment)', 'PHP ${totalDueNow.toStringAsFixed(2)}'),
+            labelValueRow('Note', note.text.trim().isEmpty ? '—' : note.text.trim()),
           ],
         ),
       );
@@ -9621,49 +9769,16 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (themeSuggestionNote.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Text(themeSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
-                ],
-                if (_managerThemePreviewB64.trim().isNotEmpty) ...[
-                  const SizedBox(height: 10),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.memory(
-                      base64Decode(_managerThemePreviewB64),
-                      height: 140,
-                      fit: BoxFit.contain,
-                      errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
-                    ),
-                  ),
-                ],
-                const SizedBox(height: 12),
-                const Text(
-                  'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
-                  style: TextStyle(height: 1.35),
+                const SizedBox(height: 8),
+                Text(
+                  'Customize event design in web only. Mobile manager view is notes-only.',
+                  style: TextStyle(color: Colors.blueGrey.shade700, fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 10),
-                const Text(
-                  'You may attach inspiration links or filenames later with your coordinator; photos of the venue (indoor/outdoor, ceiling height) help us propose realistic installs.',
-                  style: TextStyle(height: 1.35),
-                ),
-                const SizedBox(height: 10),
-                const Text(
-                  'If you already have hired stylists or florists, note their contact windows here so we can align catering service timing with their setup and strike.',
-                  style: TextStyle(height: 1.35),
-                ),
-                const SizedBox(height: 12),
-                SegmentedButton<String>(
-                  segments: const [
-                    ButtonSegment(value: 'suggest', label: Text('Suggest Theme')),
-                    ButtonSegment(value: 'studio', label: Text('Open AI Studio')),
-                  ],
-                  selected: {_managerThemeInputMode},
-                  onSelectionChanged: (s) {
-                    final next = s.first;
-                    setState(() => _managerThemeInputMode = next);
-                    if (next == 'studio') _openAiThemeStudioForManagerNewEvent();
-                  },
+                TextField(
+                  controller: note,
+                  maxLines: 4,
+                  decoration: const InputDecoration(labelText: 'Theme design notes'),
                 ),
                 const SizedBox(height: 10),
                 TextField(
@@ -9888,12 +10003,19 @@ class _ManagerStageListTab extends StatelessWidget {
                 final conflictLine = stage == 'for_processing' && r.processingScheduleOverlaps > 0
                     ? 'Schedule overlap: crosses ${r.processingScheduleOverlaps} other active order(s) — open for details.'
                     : '';
+                final stLower = r.status.trim().toLowerCase();
+                final loyaltyLine = r.cateringLoyaltyPointsEarned > 0 && stLower == 'completed'
+                    ? 'Catering loyalty applied: +${r.cateringLoyaltyPointsEarned} pts'
+                    : (stLower != 'completed' && r.cateringLoyaltyEligiblePointsIfCompleted > 0)
+                        ? 'If completed at this total: +${r.cateringLoyaltyEligiblePointsIfCompleted} pts (min ₱${kCateringLoyaltyMinOrderTotal.toStringAsFixed(0)} catering)'
+                        : '';
                 final subtitleLines = <String>[
                   r.contactPerson,
                   '${managerStageListTimestampLabel(stage)}: $whenStr',
                   if (scheduleLine.isNotEmpty) scheduleLine,
                   if (settingLine.isNotEmpty) settingLine,
                   if (conflictLine.isNotEmpty) conflictLine,
+                  if (loyaltyLine.isNotEmpty) loyaltyLine,
                 ];
                 return Card(
                   child: ListTile(
@@ -10423,9 +10545,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       return doc.save();
     }
 
-    final omitLaborTravel = widget.stage == 'for_processing';
-    final laborLine = omitLaborTravel ? 0.0 : _laborCostComputed();
-    final travelLine = omitLaborTravel ? 0.0 : _travelCostComputed();
+    final laborLine = _laborCostComputed();
+    final travelLine = _travelCostComputed();
     final totalComputed = _baseFoodCost() + laborLine + travelLine + themeCost + additionalCostTotal;
     final noPaxAmount = d.guestCount * kPesosPerPax;
     final downPaymentDue = totalComputed * 0.5;
@@ -10453,8 +10574,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             '${d.guestCount} x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${noPaxAmount.toStringAsFixed(2)}',
           ),
           labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
-          if (!omitLaborTravel) labelValueRow('Labor cost', 'PHP ${laborLine.toStringAsFixed(2)}'),
-          if (!omitLaborTravel) labelValueRow('Travel cost', 'PHP ${travelLine.toStringAsFixed(2)}'),
+          labelValueRow('Labor cost', 'PHP ${laborLine.toStringAsFixed(2)}'),
+          labelValueRow('Travel cost', 'PHP ${travelLine.toStringAsFixed(2)}'),
           labelValueRow(
             'Additional costs',
             additionalCostsForPdf.isEmpty
@@ -10482,6 +10603,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   Future<void> _openOrderSummaryPdfBytes(Uint8List bytes) async {
     await Printing.layoutPdf(onLayout: (_) async => bytes);
+  }
+
+  Future<void> _sendOrderSummaryPdfToCustomer() async {
+    final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: additionalCosts);
+    final d = _loadedDetailRow ?? widget.row;
+    final tx = d.transactionNo.trim().isEmpty ? d.id : d.transactionNo.trim();
+    await Printing.sharePdf(
+      bytes: bytes,
+      filename: 'order_summary_$tx.pdf',
+      subject: 'Order summary $tx',
+      body: 'Please see attached order summary for ${d.customerName}.',
+    );
   }
 
   Future<void> _capturePostAnalysisPdf1IfNeeded() async {
@@ -10911,7 +11044,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             pw.Text('Generated: $generatedAt'),
             pw.SizedBox(height: 10),
             pw.TableHelper.fromTextArray(
-              headers: const ['Employee', 'Tasks', 'Schedule of Tasks', 'Budget', 'Status'],
+              headers: const ['Employee', 'Task', 'Schedule of Task', 'Budget', 'Status'],
               data: rows.isEmpty ? const [['', 'No task assignment rows.', '', '', '']] : rows,
             ),
           ],
@@ -11057,14 +11190,40 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               const SizedBox(height: 6),
                               TextField(
                                 controller: TextEditingController(text: '${r['tasks'] ?? ''}'),
-                                decoration: const InputDecoration(labelText: 'Tasks'),
+                                decoration: const InputDecoration(labelText: 'Task'),
                                 onChanged: (v) => r['tasks'] = v,
                               ),
                               const SizedBox(height: 6),
-                              TextField(
-                                controller: TextEditingController(text: '${r['schedule_of_tasks'] ?? ''}'),
-                                decoration: const InputDecoration(labelText: 'Schedule of tasks'),
-                                onChanged: (v) => r['schedule_of_tasks'] = v,
+                              Builder(
+                                builder: (context) {
+                                  final scheduleCtrl = TextEditingController(text: '${r['schedule_of_tasks'] ?? ''}');
+                                  return TextField(
+                                    controller: scheduleCtrl,
+                                    readOnly: true,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Schedule of Task',
+                                      suffixIcon: Icon(Icons.calendar_month_outlined),
+                                    ),
+                                    onTap: () async {
+                                      DateTime initial = DateTime.now();
+                                      final existing = '${r['schedule_of_tasks'] ?? ''}'.trim();
+                                      final parsed = DateTime.tryParse(existing);
+                                      if (parsed != null) initial = parsed;
+                                      final d = await showDatePicker(
+                                        context: context,
+                                        initialDate: initial,
+                                        firstDate: DateTime(2020, 1, 1),
+                                        lastDate: DateTime(2100, 12, 31),
+                                      );
+                                      if (d == null) return;
+                                      final dateText =
+                                          '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+                                      setDialogState(() {
+                                        r['schedule_of_tasks'] = dateText;
+                                      });
+                                    },
+                                  );
+                                },
                               ),
                               const SizedBox(height: 6),
                               TextField(
@@ -11106,7 +11265,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           });
                         }),
                         icon: const Icon(Icons.add),
-                        label: const Text('Add row'),
+                        label: const Text('Add task and schedule'),
                       ),
                     ),
                   ],
@@ -11469,6 +11628,28 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
+          if (row.cateringLoyaltyPointsEarned > 0 && row.status.trim().toLowerCase() == 'completed')
+            Card(
+              color: Colors.amber.shade50,
+              child: ListTile(
+                leading: const Icon(Icons.card_giftcard_outlined),
+                title: Text(
+                  'Catering loyalty applied: +${row.cateringLoyaltyPointsEarned} pts',
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+            )
+          else if (row.status.trim().toLowerCase() != 'completed' &&
+              row.cateringLoyaltyEligiblePointsIfCompleted > 0)
+            Card(
+              child: ListTile(
+                leading: Icon(Icons.stars_outlined, color: Colors.blue.shade700),
+                title: const Text('Catering loyalty (if completed at this total)'),
+                subtitle: Text(
+                  '+${row.cateringLoyaltyEligiblePointsIfCompleted} pts — minimum order ₱${kCateringLoyaltyMinOrderTotal.toStringAsFixed(0)}',
+                ),
+              ),
+            ),
           if (isProcessing)
             Card(
               color: Colors.orange.shade50,
@@ -11934,7 +12115,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     TextFormField(
                       readOnly: !canEditStage,
                       initialValue: row.address,
-                      decoration: const InputDecoration(labelText: 'City of event'),
+                      decoration: const InputDecoration(labelText: 'Event venue'),
                     ),
                     const SizedBox(height: 8),
                     const Text('Date & time of event', style: TextStyle(fontWeight: FontWeight.w600)),
@@ -12242,20 +12423,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     const Text('Event Theme Design', style: TextStyle(fontWeight: FontWeight.w800)),
                     if (isDraftStage) ...[
                       const SizedBox(height: 8),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'Use this space to describe your preferred mood board: colour palette, linens and napery, florals and greenery, lighting (warm candlelight vs bright festoons), signage, stage or backdrop ideas, table layouts, and any motif or cultural elements you want reflected.',
-                        style: TextStyle(height: 1.35),
-                      ),
-                      const SizedBox(height: 10),
-                      const Text(
-                        'You may attach inspiration links or filenames later with your coordinator; photos of the venue (indoor/outdoor, ceiling height) help us propose realistic installs.',
-                        style: TextStyle(height: 1.35),
-                      ),
-                      const SizedBox(height: 10),
-                      const Text(
-                        'If you already have hired stylists or florists, note their contact windows here so we can align catering service timing with their setup and strike.',
-                        style: TextStyle(height: 1.35),
+                      Text(
+                        'Customize event design in web only. Mobile manager view is notes-only.',
+                        style: TextStyle(color: Colors.blueGrey.shade700, fontWeight: FontWeight.w600),
                       ),
                       const SizedBox(height: 10),
                       TextField(
@@ -12263,52 +12433,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         readOnly: isThemeReadOnly || !canEditStage,
                         maxLines: 4,
                         decoration: const InputDecoration(labelText: 'Theme notes'),
-                      ),
-                      const SizedBox(height: 10),
-                      if (_detailThemePreviewB64.trim().isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(8),
-                            child: Image.memory(
-                              base64Decode(_detailThemePreviewB64),
-                              height: 140,
-                              fit: BoxFit.contain,
-                              errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
-                            ),
-                          ),
-                        ),
-                      SegmentedButton<String>(
-                        segments: const [
-                          ButtonSegment(value: 'suggest', label: Text('Suggest Theme')),
-                          ButtonSegment(value: 'studio', label: Text('Open AI Studio')),
-                        ],
-                        selected: {_detailThemeInputMode},
-                        onSelectionChanged: (!canEditStage || isThemeReadOnly)
-                            ? null
-                            : (s) async {
-                                final next = s.first;
-                                setState(() => _detailThemeInputMode = next);
-                                if (next != 'studio') return;
-                                final res = await Navigator.of(context).push<AiThemeStudioResult>(
-                                  MaterialPageRoute(
-                                    builder: (_) => AiThemeStudioPage(
-                                      apiBase: widget.state.apiBase,
-                                      eventTitle: managerDraftEventTitleController.text.trim(),
-                                      eventType: managerEventTypeChoice == 'Other'
-                                          ? managerEventTypeOtherController.text.trim()
-                                          : managerEventTypeChoice,
-                                      formalityLevel: managerFormalityLevel,
-                                      initialNotes: managerInquiryNoteController.text.trim(),
-                                    ),
-                                  ),
-                                );
-                                if (res == null || !mounted) return;
-                                setState(() {
-                                  managerInquiryNoteController.text = res.generatedNotes;
-                                  _detailThemePreviewB64 = res.generatedImageBase64;
-                                });
-                              },
                       ),
                       const SizedBox(height: 8),
                       TextField(
@@ -12319,6 +12443,44 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       ),
                     ] else ...[
                       const SizedBox(height: 8),
+                      Builder(
+                        builder: (context) {
+                          final webImage = '${row.themeDesign['image'] ?? row.themeDesign['imageBase64'] ?? row.themeDesign['output'] ?? ''}'.trim();
+                          final webImageUrl = '${row.themeDesign['imageUrl'] ?? row.themeDesign['url'] ?? ''}'.trim();
+                          if (webImage.isNotEmpty) {
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.memory(
+                                  base64Decode(webImage),
+                                  height: 160,
+                                  fit: BoxFit.contain,
+                                  errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+                                ),
+                              ),
+                            );
+                          }
+                          if (webImageUrl.isNotEmpty) {
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.network(
+                                  webImageUrl,
+                                  height: 160,
+                                  fit: BoxFit.contain,
+                                  errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+                                ),
+                              ),
+                            );
+                          }
+                          return Text(
+                            'No web theme design output found in this order.',
+                            style: TextStyle(color: Colors.grey.shade700),
+                          );
+                        },
+                      ),
                       if (managerInquiryNoteController.text.trim().isNotEmpty ||
                           '${row.themeDesign['note'] ?? ''}'.trim().isNotEmpty)
                         Text(
@@ -12760,6 +12922,16 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       },
                       child: const Text('Generate Order Summary PDF'),
                     ),
+                    if (isProcessing) ...[
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          await _sendOrderSummaryPdfToCustomer();
+                        },
+                        icon: const Icon(Icons.send_outlined),
+                        label: const Text('Send Order Summary PDF to Customer'),
+                      ),
+                    ],
                     if (isDraftStage || isProcessing || isPost) ...[
                       const SizedBox(height: 8),
                       FilledButton(
@@ -13109,10 +13281,10 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                         style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                         onPressed: () {
                           Navigator.of(context).push<void>(
-                            MaterialPageRoute<void>(builder: (_) => PosYourTrayScreen(state: widget.state, subtotal: subtotal)),
+                            MaterialPageRoute<void>(builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal)),
                           );
                         },
-                        child: const Text('YOUR TRAY'),
+                        child: const Text('CHECKOUT'),
                       ),
                     ),
                   ],
@@ -13853,7 +14025,10 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                       ? Icon(Icons.notifications_active, color: Colors.deepOrange.shade700)
                                       : null,
                                   title: Text(o.orderNo),
-                                  subtitle: Text('${statusReadable(o.status)}\n${cashierCustomerLabel(o)}'),
+                                  subtitle: Text(
+                                    '${statusReadable(o.status)}\n${cashierCustomerLabel(o)}'
+                                    '${o.loyaltyPointsEarned > 0 && (o.status.toUpperCase().contains('ORDER CONFIRMED') || o.status.toUpperCase().contains('OVERPAYMENT')) ? '\nLoyalty: +${o.loyaltyPointsEarned} pts' : ''}',
+                                  ),
                                   isThreeLine: true,
                                   trailing: Text('₱${o.total.toStringAsFixed(2)}'),
                                   onTap: () async {
@@ -13984,6 +14159,18 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
             child: ListView(
               padding: const EdgeInsets.all(12),
               children: [
+                if ((statusUp.contains('ORDER CONFIRMED') || statusUp.contains('OVERPAYMENT')) &&
+                    o.loyaltyPointsEarned > 0)
+                  Card(
+                    color: Colors.amber.shade50,
+                    child: ListTile(
+                      leading: const Icon(Icons.card_giftcard_outlined),
+                      title: Text(
+                        'Customer loyalty this order: +${o.loyaltyPointsEarned} pts',
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  ),
                 if (paymentAtTop) ...[
                   ToggleSection(
                     title: 'PAYMENT',
