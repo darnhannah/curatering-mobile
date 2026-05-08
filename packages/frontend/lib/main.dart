@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -145,11 +146,14 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
   late final AppState appState;
   final GlobalKey<NavigatorState> _rootNavKey = GlobalKey<NavigatorState>();
   Timer? _backgroundLogoutTimer;
+  Timer? _inactivityLogoutTimer;
+  static const Duration _inactivityLogoutAfter = Duration(minutes: 10);
   /// Customer-only: prompt when payment confirmation still pending after 10 minutes.
   Timer? _paymentStallTimer;
   String? _paymentWatchEmail;
   final Set<String> _stallPromptedOrderNos = <String>{};
   Timer? _customerNotifPollTimer;
+  Timer? _realtimeSyncTimer;
   final Set<String> _lastAttentionOrderSnapshot = <String>{};
 
   @override
@@ -157,15 +161,34 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     appState = AppState(savedThemeMode: widget.savedThemeMode);
+    _armInactivityLogoutTimer();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _backgroundLogoutTimer?.cancel();
+    _inactivityLogoutTimer?.cancel();
     _paymentStallTimer?.cancel();
     _customerNotifPollTimer?.cancel();
+    _realtimeSyncTimer?.cancel();
     super.dispose();
+  }
+
+  void _armInactivityLogoutTimer() {
+    _inactivityLogoutTimer?.cancel();
+    _inactivityLogoutTimer = Timer(_inactivityLogoutAfter, _logoutForInactivity);
+  }
+
+  void _onUserActivity() {
+    if (appState.userEmail != null) {
+      _armInactivityLogoutTimer();
+    }
+  }
+
+  void _logoutForInactivity() {
+    if (!mounted || appState.userEmail == null) return;
+    _showSessionExpiredOnRoot();
   }
 
   @override
@@ -173,12 +196,18 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
     if (state == AppLifecycleState.resumed) {
       _backgroundLogoutTimer?.cancel();
       _backgroundLogoutTimer = null;
+      _onUserActivity();
       if (appState.userEmail != null && appState.userRole == 'customer') {
         _pollCustomerAttentionNotifications();
       }
       return;
     }
-    // Per latest requirement: switching apps / exiting should not auto-logout.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.detached) {
+      _backgroundLogoutTimer?.cancel();
+      _backgroundLogoutTimer = Timer(_inactivityLogoutAfter, _logoutForInactivity);
+    }
   }
 
   Future<void> _pollCustomerAttentionNotifications() async {
@@ -294,6 +323,9 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
         if (email == null) {
           _backgroundLogoutTimer?.cancel();
           _backgroundLogoutTimer = null;
+          _inactivityLogoutTimer?.cancel();
+        } else if (_inactivityLogoutTimer == null || !_inactivityLogoutTimer!.isActive) {
+          _armInactivityLogoutTimer();
         }
 
         if (email == null) {
@@ -303,6 +335,8 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           _stallPromptedOrderNos.clear();
           _customerNotifPollTimer?.cancel();
           _customerNotifPollTimer = null;
+          _realtimeSyncTimer?.cancel();
+          _realtimeSyncTimer = null;
           _lastAttentionOrderSnapshot.clear();
         } else if (appState.userRole == 'customer' && email != _paymentWatchEmail) {
           _paymentWatchEmail = email;
@@ -313,6 +347,10 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           _lastAttentionOrderSnapshot.clear();
           _customerNotifPollTimer = Timer.periodic(const Duration(seconds: 90), (_) => _pollCustomerAttentionNotifications());
           WidgetsBinding.instance.addPostFrameCallback((_) => _pollCustomerAttentionNotifications());
+        }
+        if (email != null && (_realtimeSyncTimer == null || !_realtimeSyncTimer!.isActive)) {
+          _realtimeSyncTimer?.cancel();
+          _realtimeSyncTimer = Timer.periodic(const Duration(seconds: 6), (_) => appState.pollRealtimeSync());
         }
 
         return MaterialApp(
@@ -325,7 +363,13 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           theme: buildAppLightTheme(),
           darkTheme: buildAppDarkTheme(),
           themeMode: appState.themeMode,
-          builder: (context, child) => child ?? const SizedBox.shrink(),
+          builder: (context, child) => Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: (_) => _onUserActivity(),
+            onPointerMove: (_) => _onUserActivity(),
+            onPointerSignal: (_) => _onUserActivity(),
+            child: child ?? const SizedBox.shrink(),
+          ),
           home: appState.userEmail == null
               ? AuthScreen(
                   key: ValueKey(appState.authSessionKey),
@@ -337,8 +381,8 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                   child: appState.isCashier
                       ? PosShellScreen(state: appState)
                       : appState.isManagerOrSupervisor
-                          ? ManagerCateringShellScreen(state: appState)
-                          : RestaurantMenuScreen(state: appState),
+                          ? ManagerDashboardScreen(state: appState)
+                          : CustomerDashboardScreen(state: appState),
                 ),
         );
       },
@@ -464,7 +508,7 @@ String managerStageListTimestampLabel(String stage) {
     case 'for_processing':
       return 'In For Processing since';
     case 'for_post_analysis':
-      return 'In Post-Analysis since';
+      return 'In For Full Payment since';
     case 'completed':
       return 'Last updated';
     default:
@@ -1394,6 +1438,8 @@ class AppState extends ChangeNotifier {
   String checkoutNote = '';
   /// Persists chosen delivery line for checkout when navigating away from [CheckoutScreen].
   String? checkoutSelectedAddress;
+  /// Delivery schedule chosen at checkout ("NOW" or formatted datetime).
+  String checkoutDeliveryTime = 'NOW';
   /// `customer`, `cashier`, `manager`, or `supervisor` from login API.
   String userRole = 'customer';
   String cashierDisplayName = '';
@@ -1408,6 +1454,9 @@ class AppState extends ChangeNotifier {
   int authSessionKey = 0;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
+  DateTime? _menuLoadedAt;
+  Map<String, String>? _lastRealtimeStamps;
+  bool _realtimePollInFlight = false;
   bool get hasCashierAttentionBadge => cashierOnlineOrders.any((o) => o.balanceProofPendingReview);
   bool get hasManagerAttentionBadge =>
       managerCateringRows.any((r) => r.status == 'new_event' || r.status == 'online_inquiries');
@@ -1471,6 +1520,7 @@ class AppState extends ChangeNotifier {
         await restoreCustomerDraftAfterLogin();
         await loadNotifications();
       }
+      await bootstrapRealtimeSync();
       showLoginWelcomeDialog = true;
       notifyListeners();
       return null;
@@ -1628,6 +1678,7 @@ class AppState extends ChangeNotifier {
     await p.remove('customer_tray_v1_$e');
     await p.remove('customer_checkout_note_v1_$e');
     await p.remove('customer_checkout_addr_v1_$e');
+    await p.remove('customer_checkout_time_v1_$e');
   }
 
   Future<void> restoreCustomerDraftAfterLogin() async {
@@ -1636,6 +1687,7 @@ class AppState extends ChangeNotifier {
     final k = userEmail!.toLowerCase();
     checkoutNote = prefs.getString('customer_checkout_note_v1_$k') ?? checkoutNote;
     checkoutSelectedAddress = prefs.getString('customer_checkout_addr_v1_$k');
+    checkoutDeliveryTime = prefs.getString('customer_checkout_time_v1_$k') ?? checkoutDeliveryTime;
     final raw = prefs.getString('customer_tray_v1_$k');
     tray.clear();
     if (raw != null && raw.isNotEmpty) {
@@ -1700,6 +1752,14 @@ class AppState extends ChangeNotifier {
     });
   }
 
+  void updateCheckoutDraftDeliveryTime(String v) {
+    checkoutDeliveryTime = v.trim().isEmpty ? 'NOW' : v.trim();
+    notifyListeners();
+    final em = userEmail?.toLowerCase();
+    if (userRole != 'customer' || em == null) return;
+    SharedPreferences.getInstance().then((p) => p.setString('customer_checkout_time_v1_$em', checkoutDeliveryTime));
+  }
+
   Future<String?> cancelOrderAsCustomer({required int orderId}) async {
     if (userEmail == null) return 'Not signed in';
     try {
@@ -1750,11 +1810,15 @@ class AppState extends ChangeNotifier {
     setMenus.clear();
     checkoutNote = '';
     checkoutSelectedAddress = null;
+    checkoutDeliveryTime = 'NOW';
+    _lastRealtimeStamps = null;
+    _realtimePollInFlight = false;
     if (persistedEmail != null) {
       SharedPreferences.getInstance().then((p) async {
         await p.remove('customer_tray_v1_$persistedEmail');
         await p.remove('customer_checkout_note_v1_$persistedEmail');
         await p.remove('customer_checkout_addr_v1_$persistedEmail');
+        await p.remove('customer_checkout_time_v1_$persistedEmail');
       });
     }
     clearCustomerNotificationDedupe();
@@ -1764,7 +1828,87 @@ class AppState extends ChangeNotifier {
   Uri _uri(String path, [Map<String, String>? query]) =>
       Uri.parse('${normalizeApiBase(apiBase)}$path').replace(queryParameters: query);
 
-  Future<void> loadMenu() async {
+  Future<Map<String, String>?> _fetchRealtimeStamps() async {
+    if (userEmail == null) return null;
+    try {
+      final res = await http
+          .get(_uri('/api/mobile/realtime/sync-stamps', {'user_email': userEmail!, 'role': userRole}))
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return null;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return null;
+      return <String, String>{
+        'menu': '${body['menu'] ?? ''}',
+        'restaurant_orders': '${body['restaurant_orders'] ?? ''}',
+        'profile': '${body['profile'] ?? ''}',
+        'notifications': '${body['notifications'] ?? ''}',
+        'inquiries': '${body['inquiries'] ?? ''}',
+        'manager_catering': '${body['manager_catering'] ?? ''}',
+        'loyalty': '${body['loyalty'] ?? ''}',
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> bootstrapRealtimeSync() async {
+    _lastRealtimeStamps = await _fetchRealtimeStamps();
+  }
+
+  bool _stampChanged(Map<String, String> previous, Map<String, String> next, String key) {
+    return (previous[key] ?? '') != (next[key] ?? '');
+  }
+
+  Future<void> pollRealtimeSync() async {
+    if (userEmail == null || _realtimePollInFlight) return;
+    _realtimePollInFlight = true;
+    try {
+      final next = await _fetchRealtimeStamps();
+      if (next == null) return;
+      final previous = _lastRealtimeStamps;
+      _lastRealtimeStamps = next;
+      if (previous == null) return;
+      final jobs = <Future<void>>[];
+      if (_stampChanged(previous, next, 'menu')) {
+        jobs.add(loadMenu(force: true));
+      }
+      if (isCashier) {
+        if (_stampChanged(previous, next, 'restaurant_orders')) {
+          jobs.add(loadCashierOnlineOrders());
+          jobs.add(loadCashierWalkInQueues());
+        }
+      } else if (isManagerOrSupervisor) {
+        if (_stampChanged(previous, next, 'manager_catering') ||
+            _stampChanged(previous, next, 'restaurant_orders')) {
+          jobs.add(loadManagerCateringByStage('new_event'));
+        }
+      } else {
+        if (_stampChanged(previous, next, 'restaurant_orders')) {
+          jobs.add(loadOrders());
+        }
+        if (_stampChanged(previous, next, 'inquiries')) {
+          jobs.add(loadInquiries());
+        }
+        if (_stampChanged(previous, next, 'profile') || _stampChanged(previous, next, 'loyalty')) {
+          jobs.add(loadProfile());
+        }
+        if (_stampChanged(previous, next, 'notifications')) {
+          jobs.add(loadNotifications());
+        }
+      }
+      if (jobs.isNotEmpty) {
+        await Future.wait(jobs);
+      }
+    } finally {
+      _realtimePollInFlight = false;
+    }
+  }
+
+  Future<void> loadMenu({bool force = false}) async {
+    if (!force && _menuLoadedAt != null) {
+      final age = DateTime.now().difference(_menuLoadedAt!);
+      if (age < const Duration(seconds: 20) && menu.isNotEmpty) return;
+    }
     final res = await http.get(_uri('/api/mobile/menu'));
     if (res.statusCode != 200) return;
     final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
@@ -1789,6 +1933,7 @@ class AppState extends ChangeNotifier {
           );
         }),
       );
+    _menuLoadedAt = DateTime.now();
     notifyListeners();
   }
 
@@ -1940,6 +2085,7 @@ class AppState extends ChangeNotifier {
               'delivery_name': profile.fullName,
               'delivery_contact': profile.contactNumber,
               'delivery_address': profile.deliveryAddress,
+              'delivery_time': checkoutDeliveryTime,
               'items': tray
                   .map(
                     (e) => {
@@ -1989,7 +2135,7 @@ class AppState extends ChangeNotifier {
         deliveryName: profile.fullName,
         deliveryContact: profile.contactNumber,
         deliveryAddress: profile.deliveryAddress,
-        deliveryTime: 'NOW',
+        deliveryTime: checkoutDeliveryTime,
         orderSource: 'MOBILE_APP',
         fulfillmentStage: 'PENDING_CASHIER',
         customerDisplayName: profile.fullName.trim().isNotEmpty ? profile.fullName.trim() : null,
@@ -2038,6 +2184,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> clearCheckoutAfterSuccessfulOrderAndPayment() async {
     checkoutNote = '';
+    checkoutDeliveryTime = 'NOW';
     tray.clear();
     notifyListeners();
     await clearPersistedCustomerDraft();
@@ -3125,6 +3272,7 @@ class AppScaffold extends StatelessWidget {
     this.showTrayShortcut = true,
     this.forceDrawerLeading = false,
     this.actions,
+    this.onBackPressed,
   });
 
   final AppState state;
@@ -3134,6 +3282,7 @@ class AppScaffold extends StatelessWidget {
   /// When true (e.g. restaurant menu root), always show the drawer menu icon instead of a back arrow.
   final bool forceDrawerLeading;
   final List<Widget>? actions;
+  final VoidCallback? onBackPressed;
 
   @override
   Widget build(BuildContext context) {
@@ -3175,6 +3324,10 @@ class AppScaffold extends StatelessWidget {
                 ? IconButton(
                     icon: const Icon(Icons.arrow_back),
                     onPressed: () async {
+                      if (onBackPressed != null) {
+                        onBackPressed!();
+                        return;
+                      }
                       final nav = Navigator.of(context);
                       await nav.maybePop();
                     },
@@ -3270,6 +3423,10 @@ class AppDrawer extends StatelessWidget {
               ],
             ),
           ),
+          ListTile(
+            title: const Text('Dashboard'),
+            onTap: () => open(context, CustomerDashboardScreen(state: state)),
+          ),
           ListTile(title: const Text('My Profile'), onTap: () => open(context, MyProfileScreen(state: state))),
           ListTile(
             title: const Text('My Orders'),
@@ -3295,6 +3452,140 @@ class AppDrawer extends StatelessWidget {
   }
 }
 
+class CustomerDashboardScreen extends StatelessWidget {
+  const CustomerDashboardScreen({super.key, required this.state});
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final items = <({String title, IconData icon, Widget screen})>[
+      (title: 'Restaurant Menu', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state)),
+      (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state)),
+      (title: 'My Orders', icon: Icons.receipt_long_outlined, screen: MyOrdersScreen(state: state)),
+      (title: 'Inquire Catering', icon: Icons.event_available_outlined, screen: InquiryScreen(state: state)),
+      (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state)),
+      (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state)),
+    ];
+    return AppScaffold(
+      state: state,
+      title: 'DASHBOARD',
+      showTrayShortcut: false,
+      forceDrawerLeading: true,
+      body: GridView.builder(
+        padding: const EdgeInsets.all(12),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+          crossAxisSpacing: 10,
+          mainAxisSpacing: 10,
+          childAspectRatio: 1.35,
+        ),
+        itemCount: items.length,
+        itemBuilder: (context, index) {
+          final item = items[index];
+          return Card(
+            child: InkWell(
+              borderRadius: BorderRadius.circular(12),
+              onTap: () {
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute<void>(builder: (_) => item.screen),
+                );
+              },
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(item.icon, color: AppColors.brand, size: 30),
+                    const Spacer(),
+                    Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class ManagerDashboardScreen extends StatelessWidget {
+  const ManagerDashboardScreen({super.key, required this.state});
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final cards = <({String title, IconData icon, int tabIdx})>[
+      (title: 'New Event', icon: Icons.add_box_outlined, tabIdx: 0),
+      (title: 'Online Inquiries', icon: Icons.inbox_outlined, tabIdx: 1),
+      (title: 'For Processing', icon: Icons.pending_actions_outlined, tabIdx: 2),
+      (title: 'For Full Payment', icon: Icons.payments_outlined, tabIdx: 3),
+      (title: 'Completed', icon: Icons.task_alt_outlined, tabIdx: 4),
+      (title: 'Cancelled', icon: Icons.cancel_outlined, tabIdx: 5),
+    ];
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.black87,
+        foregroundColor: Colors.white,
+        title: const Text('MANAGER DASHBOARD'),
+      ),
+      body: GridView.builder(
+        padding: const EdgeInsets.all(12),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+          crossAxisSpacing: 10,
+          mainAxisSpacing: 10,
+          childAspectRatio: 1.35,
+        ),
+        itemCount: cards.length + 1,
+        itemBuilder: (context, index) {
+          if (index == cards.length) {
+            return Card(
+              child: InkWell(
+                borderRadius: BorderRadius.circular(12),
+                onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state))),
+                child: const Padding(
+                  padding: EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(Icons.settings_outlined, color: AppColors.brand, size: 30),
+                      Spacer(),
+                      Text('Settings', style: TextStyle(fontWeight: FontWeight.w800)),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }
+          final item = cards[index];
+          return Card(
+            child: InkWell(
+              borderRadius: BorderRadius.circular(12),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => ManagerCateringShellScreen(state: state, initialTabIndex: item.tabIdx),
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(item.icon, color: AppColors.brand, size: 30),
+                    const Spacer(),
+                    Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
 class RestaurantMenuScreen extends StatefulWidget {
   const RestaurantMenuScreen({super.key, required this.state});
   final AppState state;
@@ -3306,6 +3597,26 @@ class RestaurantMenuScreen extends StatefulWidget {
 class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   String _search = '';
   String _sectionFilter = 'ALL';
+  Timer? _realtimeRefreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    // Lightweight polling so updates from other clients show up quickly.
+    _realtimeRefreshTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
+      if (!mounted) return;
+      await widget.state.loadMenu();
+      if (widget.state.userEmail != null) {
+        await widget.state.loadOrders();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _realtimeRefreshTimer?.cancel();
+    super.dispose();
+  }
 
   String _dishCardDescription(MenuItemData item) {
     final raw = item.description.trim();
@@ -3581,7 +3892,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
         return AppScaffold(
           state: widget.state,
           title: 'MENU',
-          showTrayShortcut: false,
+          showTrayShortcut: true,
           forceDrawerLeading: true,
           body: LayoutBuilder(
             builder: (context, constraints) {
@@ -4915,6 +5226,7 @@ class TrayScreen extends StatelessWidget {
         return AppScaffold(
           state: state,
           title: 'YOUR TRAY',
+          showTrayShortcut: false,
           body: Column(
             children: [
               Expanded(
@@ -5000,6 +5312,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   final noteController = TextEditingController();
   final List<String> _deliveryAddresses = [];
   String? _selectedDeliveryAddress;
+  String _selectedDeliveryTime = 'NOW';
 
   @override
   void initState() {
@@ -5017,6 +5330,24 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     } else if (_deliveryAddresses.isNotEmpty) {
       _selectedDeliveryAddress = _deliveryAddresses.first;
     }
+    _selectedDeliveryTime = widget.state.checkoutDeliveryTime.trim().isEmpty ? 'NOW' : widget.state.checkoutDeliveryTime.trim();
+  }
+
+  Future<void> _pickScheduledDelivery() async {
+    final now = DateTime.now();
+    final d = await showDatePicker(
+      context: context,
+      initialDate: now,
+      firstDate: now,
+      lastDate: now.add(const Duration(days: 60)),
+    );
+    if (d == null || !mounted) return;
+    final t = await showTimePicker(context: context, initialTime: TimeOfDay.now());
+    if (t == null || !mounted) return;
+    final dt = DateTime(d.year, d.month, d.day, t.hour, t.minute);
+    final label = DateFormat('yyyy-MM-dd HH:mm').format(dt);
+    setState(() => _selectedDeliveryTime = label);
+    widget.state.updateCheckoutDraftDeliveryTime(label);
   }
 
   @override
@@ -5074,7 +5405,27 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                             style: TextStyle(color: Colors.red.shade800, fontSize: 13),
                           ),
                         ),
-                      const LockedField(label: 'TIME OF DELIVERY', value: 'NOW'),
+                      LockedField(label: 'TIME OF DELIVERY', value: _selectedDeliveryTime),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: () {
+                              setState(() => _selectedDeliveryTime = 'NOW');
+                              widget.state.updateCheckoutDraftDeliveryTime('NOW');
+                            },
+                            icon: const Icon(Icons.flash_on_outlined, size: 18),
+                            label: const Text('ASAP'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: _pickScheduledDelivery,
+                            icon: const Icon(Icons.schedule_outlined, size: 18),
+                            label: const Text('SET SCHEDULE'),
+                          ),
+                        ],
+                      ),
                       const LockedField(label: 'MODE OF PAYMENT', value: 'GCASH ONLY'),
                     ],
                   ),
@@ -5124,7 +5475,12 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 appSnack(context, 'Select your delivery address.');
                 return;
               }
+              if (s.profile.fullName.trim().isEmpty || s.profile.contactNumber.trim().isEmpty) {
+                appSnack(context, 'Complete your name and contact number in My Profile first.');
+                return;
+              }
               s.profile.deliveryAddress = _selectedDeliveryAddress!.trim();
+              s.updateCheckoutDraftDeliveryTime(_selectedDeliveryTime);
               final okCheckout = await showDialog<bool>(
                 context: context,
                 builder: (ctx) => AlertDialog(
@@ -5226,7 +5582,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
       deliveryName: s.profile.fullName,
       deliveryContact: s.profile.contactNumber,
       deliveryAddress: s.profile.deliveryAddress,
-      deliveryTime: 'NOW',
+      deliveryTime: s.checkoutDeliveryTime,
     );
   }
 
@@ -5660,6 +6016,12 @@ class OrderStatusScreen extends StatelessWidget {
     return AppScaffold(
       state: state,
       title: 'ORDER STATUS',
+      onBackPressed: () {
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: state)),
+          (_) => false,
+        );
+      },
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -5765,6 +6127,7 @@ class MyOrdersScreen extends StatefulWidget {
 }
 
 class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProviderStateMixin {
+  Timer? _autoRefreshTimer;
   bool _isInsufficient(OrderData o) => o.status.toUpperCase().contains('INSUFFICIENT');
   bool _needsAttention(OrderData o) => widget.state.orderNosWithUnreadAttention.contains(o.orderNo);
   bool _canFollowUp(OrderData o) {
@@ -5830,10 +6193,15 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
   void initState() {
     super.initState();
     _tab = TabController(length: 4, vsync: this);
+    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 12), (_) {
+      if (!mounted) return;
+      widget.state.loadOrders();
+    });
   }
 
   @override
   void dispose() {
+    _autoRefreshTimer?.cancel();
     _tab.dispose();
     super.dispose();
   }
@@ -7107,8 +7475,16 @@ class _InquiryScreenState extends State<InquiryScreen> {
   /// Returns null if valid; otherwise an error message for the user.
   String? _validateInquiry() {
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
-    if (contactNumber.text.trim().isEmpty) return 'Enter contact number.';
-    if (inquiryEmail.text.trim().isEmpty) return 'Enter email address.';
+    final phone = contactNumber.text.trim();
+    if (phone.isEmpty) return 'Enter contact number.';
+    if (phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone)) {
+      return 'Enter a valid contact number.';
+    }
+    final email = inquiryEmail.text.trim();
+    if (email.isEmpty) return 'Enter email address.';
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      return 'Enter a valid email address.';
+    }
     if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
     for (final w in _eventWindows) {
       final any = w.date != null || w.from != null || w.to != null;
@@ -7883,6 +8259,37 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     appSnack(context, err ?? 'Follow-up sent to manager');
   }
 
+  Future<void> _sendFeedback(InquiryRecord r) async {
+    final ctl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Feedback · ${r.displayTransactionRef}'),
+        content: TextField(
+          controller: ctl,
+          maxLines: 4,
+          decoration: const InputDecoration(
+            labelText: 'Your feedback',
+            hintText: 'Share your feedback for this completed catering order',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Submit')),
+        ],
+      ),
+    );
+    final msg = ctl.text.trim();
+    if (ok != true || msg.isEmpty || !mounted) return;
+    final err = await widget.state.submitHelpRequest(
+      area: 'Catering Feedback',
+      problem: 'Customer feedback for ${r.displayTransactionRef}',
+      desiredOutcome: msg,
+    );
+    if (!mounted) return;
+    appSnack(context, err ?? 'Feedback submitted');
+  }
+
   void _showDetail(InquiryRecord r, {required bool allowFollowUp}) {
     showDialog<void>(
       context: context,
@@ -7906,7 +8313,12 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     final responded = s.inquiries.where((r) => !r.isWaiting && !r.isCompletedBooking).toList();
     final completed = s.inquiries.where((r) => r.isCompletedBooking).toList();
 
-    Widget buildList(List<InquiryRecord> list, {required bool allowFollowUp, bool showLoyaltyHint = false}) {
+    Widget buildList(
+      List<InquiryRecord> list, {
+      required bool allowFollowUp,
+      bool showLoyaltyHint = false,
+      bool allowFeedback = false,
+    }) {
       return RefreshIndicator(
         onRefresh: s.loadInquiries,
         child: list.isEmpty
@@ -7940,7 +8352,13 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
                               tooltip: 'Follow up',
                               onPressed: () => _followUp(i),
                             )
-                          : null,
+                          : allowFeedback
+                              ? IconButton(
+                                  icon: const Icon(Icons.rate_review_outlined),
+                                  tooltip: 'Feedback',
+                                  onPressed: () => _sendFeedback(i),
+                                )
+                              : null,
                       onTap: () => _showDetail(i, allowFollowUp: allowFollowUp),
                     ),
                   );
@@ -7969,7 +8387,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
               children: [
                 buildList(waiting, allowFollowUp: true),
                 buildList(responded, allowFollowUp: false),
-                buildList(completed, allowFollowUp: false, showLoyaltyHint: true),
+                buildList(completed, allowFollowUp: false, showLoyaltyHint: true, allowFeedback: true),
               ],
             ),
           ),
@@ -8504,14 +8922,16 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
 // --- Manager/Supervisor Catering POS ---
 
 class ManagerCateringShellScreen extends StatefulWidget {
-  const ManagerCateringShellScreen({super.key, required this.state});
+  const ManagerCateringShellScreen({super.key, required this.state, this.initialTabIndex = 0});
   final AppState state;
+  final int initialTabIndex;
   @override
   State<ManagerCateringShellScreen> createState() => _ManagerCateringShellScreenState();
 }
 
 class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen> with SingleTickerProviderStateMixin {
   late TabController _tab;
+  Timer? _realtimeManagerTimer;
   static const _stages = [
     'new_event',
     'online_inquiries',
@@ -8524,23 +8944,29 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
     'New Event',
     'Online Inquiries',
     'For Processing',
-    'For Post-Analysis',
+    'For Full Payment',
     'Completed',
     'Cancelled',
   ];
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 6, vsync: this);
-    widget.state.loadManagerCateringByStage(_stages[0]);
+    final idx = widget.initialTabIndex.clamp(0, 5);
+    _tab = TabController(length: 6, vsync: this, initialIndex: idx);
     _tab.addListener(() {
       if (_tab.indexIsChanging) return;
+      widget.state.loadManagerCateringByStage(_stages[_tab.index]);
+    });
+    widget.state.loadManagerCateringByStage(_stages[idx]);
+    _realtimeManagerTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (!mounted) return;
       widget.state.loadManagerCateringByStage(_stages[_tab.index]);
     });
   }
 
   @override
   void dispose() {
+    _realtimeManagerTimer?.cancel();
     _tab.dispose();
     super.dispose();
   }
@@ -8584,6 +9010,16 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
                       Text('Hi, $who!', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
                     ],
                   ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.dashboard_outlined),
+                  title: const Text('Dashboard'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.of(context).pushReplacement(
+                      MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
+                    );
+                  },
                 ),
                 ListTile(
                   leading: const Icon(Icons.dashboard_customize_outlined),
@@ -11880,67 +12316,16 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       child: Text(isFullPaymentConfirmed ? 'FULLY PAID' : 'Confirm Full Payment'),
                     ),
                     const SizedBox(height: 12),
-                    const Text('Post Analysis', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: businessCardsController,
-                      keyboardType: TextInputType.number,
-                      readOnly: !isPost,
-                      decoration: const InputDecoration(labelText: 'Business cards given away'),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: spotInquiriesController,
-                      keyboardType: TextInputType.number,
-                      readOnly: !isPost,
-                      decoration: const InputDecoration(labelText: 'On the spot inquiries'),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: complaintsController,
-                      maxLines: 3,
-                      readOnly: !isPost,
-                      decoration: const InputDecoration(
-                        labelText: 'Complaints',
-                        helperText: 'Add multiple entries by writing one complaint per line.',
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(8),
+                        color: Colors.blueGrey.shade50,
+                        border: Border.all(color: Colors.blueGrey.shade100),
                       ),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: popularDishController,
-                      maxLines: 3,
-                      readOnly: !isPost,
-                      decoration: const InputDecoration(
-                        labelText: 'Most popular dish',
-                        helperText: 'Add multiple entries by writing one dish per line.',
+                      child: const Text(
+                        'Post-analysis section has been removed. Use this stage for full payment confirmation only.',
                       ),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: popularDrinkController,
-                      maxLines: 3,
-                      readOnly: !isPost,
-                      decoration: const InputDecoration(
-                        labelText: 'Most popular drink',
-                        helperText: 'Add multiple entries by writing one drink per line.',
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: popularDessertController,
-                      maxLines: 3,
-                      readOnly: !isPost,
-                      decoration: const InputDecoration(
-                        labelText: 'Most popular dessert',
-                        helperText: 'Add multiple entries by writing one dessert per line.',
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: analysisController,
-                      maxLines: 4,
-                      readOnly: !isPost,
-                      decoration: const InputDecoration(labelText: 'Post-analysis notes'),
                     ),
                   ],
                 ),
@@ -13914,6 +14299,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
   late TabController _fulTab;
   String _search = '';
   Timer? _pendingReminderTimer;
+  Timer? _realtimeOrdersTimer;
   final Map<int, int> _pendingAlertStage = {};
 
   @override
@@ -13921,11 +14307,16 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
     super.initState();
     _fulTab = TabController(length: 4, vsync: this);
     _pendingReminderTimer = Timer.periodic(const Duration(seconds: 25), (_) => _tickPendingAlerts());
+    _realtimeOrdersTimer = Timer.periodic(const Duration(seconds: 12), (_) {
+      if (!mounted) return;
+      widget.state.loadCashierOnlineOrders();
+    });
   }
 
   @override
   void dispose() {
     _pendingReminderTimer?.cancel();
+    _realtimeOrdersTimer?.cancel();
     _fulTab.dispose();
     super.dispose();
   }

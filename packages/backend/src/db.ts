@@ -191,6 +191,152 @@ export async function initDb(): Promise<void> {
   await p.query(
     `ALTER TABLE mobile_orders ADD COLUMN IF NOT EXISTS balance_proof_pending_review BOOLEAN NOT NULL DEFAULT FALSE`,
   );
+  // Restaurant orders table now serves as the canonical table for mobile/POS restaurant flows.
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS mobile_id BIGINT`);
+  await p.query(`CREATE SEQUENCE IF NOT EXISTS restaurant_orders_mobile_id_seq`);
+  await p.query(`ALTER TABLE restaurant_orders ALTER COLUMN mobile_id SET DEFAULT nextval('restaurant_orders_mobile_id_seq')`);
+  await p.query(`UPDATE restaurant_orders SET mobile_id = nextval('restaurant_orders_mobile_id_seq') WHERE mobile_id IS NULL`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS user_email TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_no TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_mode TEXT NOT NULL DEFAULT 'GCASH ONLY'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_uploaded BOOLEAN NOT NULL DEFAULT FALSE`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_proof TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_name TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_contact TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_time TEXT NOT NULL DEFAULT 'NOW'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS total NUMERIC(12,2) NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_source TEXT NOT NULL DEFAULT 'MOBILE_APP'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_amount_received NUMERIC(12,2)`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_change NUMERIC(12,2)`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS fulfillment_stage TEXT NOT NULL DEFAULT 'PENDING_CASHIER'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_tracking_url TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_lines_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_claimed BOOLEAN NOT NULL DEFAULT FALSE`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS supplemental_payment_proof TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_secondary_amount_received NUMERIC(12,2)`);
+  await p.query(
+    `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS balance_proof_pending_review BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
+  try {
+    await p.query(`ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_status_check`);
+  } catch {
+    // Constraint may not exist in all environments.
+  }
+  await p.query(`ALTER TABLE restaurant_orders ALTER COLUMN status SET DEFAULT 'WAITING FOR ORDER CONFIRMATION'`);
+  // Some migrated datasets contain duplicate order numbers (ex: ORD-0001).
+  // Keep the newest row's value and clear older duplicates so unique index creation succeeds.
+  await p.query(`
+    UPDATE restaurant_orders
+    SET order_no = NULL
+    WHERE order_no IS NOT NULL
+      AND TRIM(order_no) = ''
+  `);
+  await p.query(`
+    WITH ranked AS (
+      SELECT
+        id,
+        ROW_NUMBER() OVER (
+          PARTITION BY order_no
+          ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+        ) AS rn
+      FROM restaurant_orders
+      WHERE order_no IS NOT NULL
+    )
+    UPDATE restaurant_orders ro
+    SET order_no = NULL
+    FROM ranked r
+    WHERE ro.id = r.id
+      AND r.rn > 1
+  `);
+  await p.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS restaurant_orders_mobile_id_uq ON restaurant_orders (mobile_id)`,
+  );
+  await p.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS restaurant_orders_order_no_uq ON restaurant_orders (order_no) WHERE order_no IS NOT NULL`,
+  );
+  await p.query(`
+    INSERT INTO restaurant_orders (
+      mobile_id, user_email, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
+      delivery_name, delivery_contact, delivery_address, delivery_time, total, total_amount,
+      order_source, pos_customer_label, cashier_amount_received, cashier_change, fulfillment_stage,
+      delivery_tracking_url, order_lines_snapshot, pos_claimed, supplemental_payment_proof,
+      cashier_secondary_amount_received, balance_proof_pending_review, created_at, updated_at, items
+    )
+    SELECT
+      mo.id, mo.user_email, mo.order_no, mo.status, mo.note, mo.payment_mode, mo.payment_uploaded, mo.payment_proof,
+      mo.delivery_name, mo.delivery_contact, mo.delivery_address, mo.delivery_time, COALESCE(mo.total, 0), COALESCE(mo.total, 0),
+      mo.order_source, mo.pos_customer_label, mo.cashier_amount_received, mo.cashier_change, mo.fulfillment_stage,
+      mo.delivery_tracking_url, COALESCE(mo.order_lines_snapshot, '[]'::jsonb), mo.pos_claimed, mo.supplemental_payment_proof,
+      mo.cashier_secondary_amount_received, COALESCE(mo.balance_proof_pending_review, FALSE), mo.created_at, mo.updated_at,
+      COALESCE(mo.order_lines_snapshot, '[]'::jsonb)
+    FROM mobile_orders mo
+    WHERE NOT EXISTS (
+      SELECT 1 FROM restaurant_orders ro
+      WHERE ro.mobile_id = mo.id OR (ro.order_no IS NOT NULL AND ro.order_no = mo.order_no)
+    )
+  `);
+  await p.query(`
+    CREATE OR REPLACE FUNCTION sync_mobile_orders_into_restaurant_orders() RETURNS trigger AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        DELETE FROM restaurant_orders WHERE mobile_id = OLD.id;
+        RETURN OLD;
+      END IF;
+      INSERT INTO restaurant_orders (
+        mobile_id, user_email, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
+        delivery_name, delivery_contact, delivery_address, delivery_time, total, total_amount,
+        order_source, pos_customer_label, cashier_amount_received, cashier_change, fulfillment_stage,
+        delivery_tracking_url, order_lines_snapshot, pos_claimed, supplemental_payment_proof,
+        cashier_secondary_amount_received, balance_proof_pending_review, created_at, updated_at, items
+      )
+      VALUES (
+        NEW.id, NEW.user_email, NEW.order_no, NEW.status, NEW.note, NEW.payment_mode, NEW.payment_uploaded, NEW.payment_proof,
+        NEW.delivery_name, NEW.delivery_contact, NEW.delivery_address, NEW.delivery_time, COALESCE(NEW.total, 0), COALESCE(NEW.total, 0),
+        NEW.order_source, NEW.pos_customer_label, NEW.cashier_amount_received, NEW.cashier_change, NEW.fulfillment_stage,
+        NEW.delivery_tracking_url, COALESCE(NEW.order_lines_snapshot, '[]'::jsonb), NEW.pos_claimed, NEW.supplemental_payment_proof,
+        NEW.cashier_secondary_amount_received, COALESCE(NEW.balance_proof_pending_review, FALSE), NEW.created_at, NEW.updated_at,
+        COALESCE(NEW.order_lines_snapshot, '[]'::jsonb)
+      )
+      ON CONFLICT (mobile_id) DO UPDATE SET
+        user_email = EXCLUDED.user_email,
+        order_no = EXCLUDED.order_no,
+        status = EXCLUDED.status,
+        note = EXCLUDED.note,
+        payment_mode = EXCLUDED.payment_mode,
+        payment_uploaded = EXCLUDED.payment_uploaded,
+        payment_proof = EXCLUDED.payment_proof,
+        delivery_name = EXCLUDED.delivery_name,
+        delivery_contact = EXCLUDED.delivery_contact,
+        delivery_address = EXCLUDED.delivery_address,
+        delivery_time = EXCLUDED.delivery_time,
+        total = EXCLUDED.total,
+        total_amount = EXCLUDED.total_amount,
+        order_source = EXCLUDED.order_source,
+        pos_customer_label = EXCLUDED.pos_customer_label,
+        cashier_amount_received = EXCLUDED.cashier_amount_received,
+        cashier_change = EXCLUDED.cashier_change,
+        fulfillment_stage = EXCLUDED.fulfillment_stage,
+        delivery_tracking_url = EXCLUDED.delivery_tracking_url,
+        order_lines_snapshot = EXCLUDED.order_lines_snapshot,
+        pos_claimed = EXCLUDED.pos_claimed,
+        supplemental_payment_proof = EXCLUDED.supplemental_payment_proof,
+        cashier_secondary_amount_received = EXCLUDED.cashier_secondary_amount_received,
+        balance_proof_pending_review = EXCLUDED.balance_proof_pending_review,
+        created_at = EXCLUDED.created_at,
+        updated_at = EXCLUDED.updated_at,
+        items = EXCLUDED.items;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+  `);
+  await p.query(`DROP TRIGGER IF EXISTS trg_sync_mobile_orders_into_restaurant_orders ON mobile_orders`);
+  await p.query(`
+    CREATE TRIGGER trg_sync_mobile_orders_into_restaurant_orders
+    AFTER INSERT OR UPDATE OR DELETE ON mobile_orders
+    FOR EACH ROW EXECUTE FUNCTION sync_mobile_orders_into_restaurant_orders()
+  `);
 
   await p.query(`
     UPDATE mobile_orders
