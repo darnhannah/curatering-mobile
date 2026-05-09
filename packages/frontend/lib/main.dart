@@ -9501,10 +9501,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (ok == true && context.mounted) {
       widget.state.logout();
       if (!mounted) return;
-      Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
-        MaterialPageRoute<void>(builder: (_) => AuthScreen(state: widget.state, cashierMode: kPosLoginBuild)),
-        (_) => false,
-      );
+      Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
     }
   }
 
