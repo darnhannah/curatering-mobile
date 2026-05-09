@@ -3599,7 +3599,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         children: [
                           SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.4)),
                           SizedBox(width: 12),
-                          Text('Loading...'),
+                          Text('Logging in...'),
                         ],
                       ),
                     ),
@@ -3688,7 +3688,7 @@ class AppScaffold extends StatelessWidget {
         : state.orders
             .where((o) => customerOrderPendingTab(o))
             .any((o) => state.orderNosWithUnreadAttention.contains(o.orderNo));
-    final showAttentionDot = state.unreadNotificationsCount > 0 || pendingAttentionExists;
+    final showAttentionDot = isCustomer ? pendingAttentionExists : (state.unreadNotificationsCount > 0 || pendingAttentionExists);
     return Scaffold(
       appBar: AppBar(
         foregroundColor: headerFg,
@@ -3801,7 +3801,7 @@ class AppDrawer extends StatelessWidget {
         : state.orders
             .where((o) => customerOrderPendingTab(o))
             .any((o) => state.orderNosWithUnreadAttention.contains(o.orderNo));
-    final showAttentionDot = state.unreadNotificationsCount > 0 || pendingAttentionExists;
+    final showAttentionDot = isCustomer ? pendingAttentionExists : (state.unreadNotificationsCount > 0 || pendingAttentionExists);
     return Drawer(
       child: ListView(
         children: [
@@ -5617,7 +5617,6 @@ class TrayScreen extends StatelessWidget {
                                     IconButton(
                                       onPressed: () {
                                         state.changeQty(item, 1);
-                                        appSnack(context, 'Updated quantity');
                                       },
                                       icon: const Icon(Icons.add_circle, color: AppColors.success),
                                     ),
@@ -5628,8 +5627,6 @@ class TrayScreen extends StatelessWidget {
                                         state.changeQty(item, -1);
                                         if (q <= 1) {
                                           appSnack(context, 'Removed ${item.menu.name} from tray');
-                                        } else {
-                                          appSnack(context, 'Updated quantity');
                                         }
                                       },
                                       icon: const Icon(Icons.remove_circle, color: AppColors.accent),
@@ -9501,7 +9498,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (ok == true && context.mounted) {
       widget.state.logout();
       if (!mounted) return;
-      Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
+      Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+        MaterialPageRoute<void>(builder: (_) => AuthScreen(state: widget.state, cashierMode: kPosLoginBuild)),
+        (_) => false,
+      );
     }
   }
 

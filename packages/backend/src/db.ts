@@ -196,6 +196,14 @@ export async function initDb(): Promise<void> {
   await p.query(`CREATE SEQUENCE IF NOT EXISTS restaurant_orders_mobile_id_seq`);
   await p.query(`ALTER TABLE restaurant_orders ALTER COLUMN mobile_id SET DEFAULT nextval('restaurant_orders_mobile_id_seq')`);
   await p.query(`UPDATE restaurant_orders SET mobile_id = nextval('restaurant_orders_mobile_id_seq') WHERE mobile_id IS NULL`);
+  // Keep sequence aligned with existing rows so inserts never reuse an existing mobile_id.
+  await p.query(`
+    SELECT setval(
+      'restaurant_orders_mobile_id_seq',
+      COALESCE((SELECT MAX(mobile_id) FROM restaurant_orders), 1),
+      COALESCE((SELECT MAX(mobile_id) FROM restaurant_orders), 0) > 0
+    )
+  `);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS user_email TEXT`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_no TEXT`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT ''`);
