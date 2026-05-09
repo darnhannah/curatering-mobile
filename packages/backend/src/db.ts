@@ -456,4 +456,12 @@ export async function initDb(): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS customer_tray_drafts (
+      user_email TEXT PRIMARY KEY,
+      tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 }

@@ -582,6 +582,8 @@ const RESTAURANT_LOYALTY_STEP_AMOUNT = 100;
 const RESTAURANT_LOYALTY_STEP_POINTS = 2;
 const CATERING_LOYALTY_STEP_AMOUNT = 500;
 const CATERING_LOYALTY_STEP_POINTS = 8;
+const CATERING_ONLY_MIN_GUESTS = 10;
+const CATERING_EVENT_MIN_GUESTS = 50;
 
 type LoyaltyEarnKind = "restaurant_mobile" | "catering_event";
 
@@ -613,7 +615,8 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
     await getPool().query(
       `UPDATE event_orders
        SET points_earned = CASE
-         WHEN LOWER(TRIM(status)) = 'completed' THEN FLOOR(COALESCE(total_cost, 0)::numeric / $1::numeric)::int * $2::int
+         WHEN LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+           THEN FLOOR(COALESCE(total_cost, 0)::numeric / $1::numeric)::int * $2::int
          ELSE 0
        END`,
       [CATERING_LOYALTY_STEP_AMOUNT, CATERING_LOYALTY_STEP_POINTS],
@@ -621,7 +624,8 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
     await getPool().query(
       `UPDATE catering_orders
        SET points_earned = CASE
-         WHEN LOWER(TRIM(status)) = 'completed' THEN FLOOR(COALESCE(total_cost, 0)::numeric / $1::numeric)::int * $2::int
+         WHEN LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+           THEN FLOOR(COALESCE(total_cost, 0)::numeric / $1::numeric)::int * $2::int
          ELSE 0
        END`,
       [CATERING_LOYALTY_STEP_AMOUNT, CATERING_LOYALTY_STEP_POINTS],
@@ -1393,6 +1397,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
           String(ord.user_email).toLowerCase(),
           `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
         ]);
+        await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
         res.json({ ok: true, status: newStatus });
         return;
       }
@@ -1459,6 +1464,10 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       inApp = `[${ord.order_no}] Payment update: please pay the remaining balance (total ₱${total.toFixed(2)}).`;
     }
     await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [ue, inApp]);
+    const stUp = newStatus.toUpperCase();
+    if (stUp.includes("ORDER CONFIRMED") && ord.user_email) {
+      await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
+    }
     res.json({ ok: true, status: newStatus });
   } catch (err) {
     console.error(err);
@@ -2040,7 +2049,7 @@ app.post("/api/mobile/orders", async (req, res) => {
       JSON.stringify(parsedItems),
     ]);
     await client.query("COMMIT");
-    void applyLoyaltyRewardsBestEffort(userEmail, orderNo, total);
+    // Loyalty is awarded when the cashier confirms the order (see online-orders review), not on submit.
     void logActionBestEffort("order.submit", userEmail, `Order submitted: ${orderNo}`, {
       order_no: orderNo,
       total,
@@ -2094,13 +2103,17 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
          WHERE mobile_id = $1`,
         [id, paymentProof],
       );
-      await getPool().query(
-        `INSERT INTO notifications (user_id, message)
-         SELECT email, $1
-         FROM users
-         WHERE role = 'cashier'`,
-        [`Balance payment proof uploaded for ${row.order_no}. Please review and confirm the order.`],
-      );
+      try {
+        await getPool().query(
+          `INSERT INTO notifications (user_id, message)
+           SELECT email, $1
+           FROM users
+           WHERE role = 'cashier'`,
+          [`Balance payment proof uploaded for ${row.order_no}. Please review and confirm the order.`],
+        );
+      } catch (notifyErr) {
+        console.warn("[payment] cashier inbox notify skipped:", notifyErr instanceof Error ? notifyErr.message : notifyErr);
+      }
       const notify = process.env.CASHIER_BALANCE_NOTIFY_EMAIL?.trim();
       if (notify) {
         void sendMailSafe(
@@ -2127,7 +2140,7 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
       }
     }
     const { rows } = await getPool().query(
-      `SELECT mobile_id AS id, order_no, payment_uploaded, balance_proof_pending_review FROM restaurant_orders WHERE mobile_id = $1`,
+      `SELECT mobile_id AS id, order_no, payment_uploaded FROM restaurant_orders WHERE mobile_id = $1`,
       [id],
     );
     const orderNo = String((rows[0] as { order_no?: string } | undefined)?.order_no ?? "");
@@ -2140,6 +2153,61 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
+  }
+});
+
+app.patch("/api/mobile/inquiries/:id/cancel-customer", async (req, res) => {
+  const id = String(req.params.id ?? "").trim();
+  const userEmail = String(req.body?.user_email ?? "").trim().toLowerCase();
+  if (!id || !userEmail) {
+    res.status(400).json({ error: "id and user_email are required" });
+    return;
+  }
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const tryCancel = async (table: "catering_orders" | "event_orders") => {
+      const { rows } = await client.query(
+        `SELECT id::text AS id, status, COALESCE(NULLIF(TRIM(transaction_no), ''), CONCAT('TRX-', id::text)) AS tx
+         FROM ${table}
+         WHERE id::text = $1 AND LOWER(TRIM(email_address)) = $2
+         FOR UPDATE`,
+        [id, userEmail],
+      );
+      const row = rows[0] as { id: string; status: string; tx: string } | undefined;
+      if (!row) return { found: false, cancelled: false, tx: "" };
+      const st = String(row.status ?? "").trim().toLowerCase();
+      if (st !== "new_event" && st !== "online_inquiries" && st !== "for_processing") {
+        return { found: true, cancelled: false, tx: row.tx };
+      }
+      await client.query(
+        `UPDATE ${table}
+         SET status = 'cancelled', updated_at = NOW(), updated_by = $3
+         WHERE id::text = $1 AND LOWER(TRIM(email_address)) = $2`,
+        [id, userEmail, userEmail],
+      );
+      return { found: true, cancelled: true, tx: row.tx };
+    };
+    const first = await tryCancel("catering_orders");
+    const second = first.found ? first : await tryCancel("event_orders");
+    if (!second.found) {
+      await client.query("ROLLBACK");
+      res.status(404).json({ error: "inquiry not found" });
+      return;
+    }
+    if (!second.cancelled) {
+      await client.query("ROLLBACK");
+      res.status(400).json({ error: "this inquiry can no longer be cancelled" });
+      return;
+    }
+    await client.query("COMMIT");
+    res.json({ ok: true, transaction_no: second.tx });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  } finally {
+    client.release();
   }
 });
 
@@ -2750,8 +2818,10 @@ app.get("/api/mobile/inquiries", async (req, res) => {
               '' AS menu_suggestion_note,
               '' AS theme_suggestion_note,
               COALESCE(total_cost, 0) AS estimated_total,
+              COALESCE(down_payment_amount, 0)::float8 AS down_payment_amount,
+              COALESCE(full_payment_amount, 0)::float8 AS full_payment_amount,
               CASE
-                WHEN LOWER(TRIM(status)) = 'completed'
+                WHEN LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
                   THEN FLOOR(COALESCE(total_cost, 0)::numeric / ${CATERING_LOYALTY_STEP_AMOUNT}::numeric)::int * ${CATERING_LOYALTY_STEP_POINTS}
                 ELSE 0
               END AS loyalty_points_earned,
@@ -2788,8 +2858,10 @@ app.get("/api/mobile/inquiries", async (req, res) => {
                 '' AS menu_suggestion_note,
                 '' AS theme_suggestion_note,
                 COALESCE(total_cost, 0) AS estimated_total,
+                COALESCE(down_payment_amount, 0)::float8 AS down_payment_amount,
+                COALESCE(full_payment_amount, 0)::float8 AS full_payment_amount,
                 CASE
-                  WHEN LOWER(TRIM(status)) = 'completed'
+                  WHEN LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
                     THEN FLOOR(COALESCE(total_cost, 0)::numeric / ${CATERING_LOYALTY_STEP_AMOUNT}::numeric)::int * ${CATERING_LOYALTY_STEP_POINTS}
                   ELSE 0
                 END AS loyalty_points_earned,
@@ -2818,23 +2890,74 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     res.status(400).json({ error: "user_email is required" });
     return;
   }
-  const inquiryType = String(req.body?.inquiry_type ?? "CATERING");
-  const eventTitle = String(req.body?.event_title ?? "");
-  const eventType = String(req.body?.event_type ?? "");
-  const customer = String(req.body?.customer ?? "");
-  const contactPerson = String(req.body?.contact_person ?? "");
-  const contactNumber = String(req.body?.contact_number ?? "");
-  const inquiryEmail = String(req.body?.inquiry_email ?? "");
+  const inquiryType = String(req.body?.inquiry_type ?? "CATERING").trim().toUpperCase();
+  if (!["CATERING", "CATERING AND EVENT"].includes(inquiryType)) {
+    res.status(400).json({ error: "inquiry_type must be CATERING or CATERING AND EVENT" });
+    return;
+  }
+  const eventTitle = String(req.body?.event_title ?? "").trim();
+  const eventType = String(req.body?.event_type ?? "").trim();
+  const customer = String(req.body?.customer ?? "").trim();
+  const contactPerson = String(req.body?.contact_person ?? "").trim();
+  const contactNumber = String(req.body?.contact_number ?? "").trim();
+  const inquiryEmail = String(req.body?.inquiry_email ?? "").trim().toLowerCase();
   const dateOfEvent = String(req.body?.date_of_event ?? "").trim();
-  const note = String(req.body?.note ?? "");
+  const note = String(req.body?.note ?? "").trim();
   const serviceIncluded =
     String(req.body?.service_included ?? "no").trim().toLowerCase() === "yes" ? "yes" : "no";
   const selectedDishes = Array.isArray(req.body?.selected_dishes) ? req.body.selected_dishes : [];
-  const guestCount = Math.max(0, Number(req.body?.guest_count ?? 0));
+  const guestCountRaw = Number(req.body?.guest_count ?? NaN);
+  const guestCount = Number.isFinite(guestCountRaw) ? Math.max(0, Math.floor(guestCountRaw)) : 0;
   const estimatedTotal = Number(req.body?.estimated_total ?? 0);
-  const eventCity = String(req.body?.event_city ?? "");
-  const formalityLevel = String(req.body?.formality_level ?? "");
+  const eventCity = String(req.body?.event_city ?? "").trim();
+  const formalityLevel = String(req.body?.formality_level ?? "").trim();
   const eventSetting = String(req.body?.event_setting ?? "").trim();
+  const curateOwnMenu = Boolean(req.body?.curate_own_menu);
+  const foodTastingRequested = Boolean(req.body?.food_tasting_requested);
+  const foodTastingDate = String(req.body?.food_tasting_date ?? "").trim();
+  const foodTastingTime = String(req.body?.food_tasting_time ?? "").trim();
+
+  if (!contactPerson) {
+    res.status(400).json({ error: "contact_person is required" });
+    return;
+  }
+  if (!contactNumber || contactNumber.length < 7 || !/^[0-9+\-\s()]+$/.test(contactNumber)) {
+    res.status(400).json({ error: "valid contact_number is required" });
+    return;
+  }
+  if (!inquiryEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(inquiryEmail)) {
+    res.status(400).json({ error: "valid inquiry_email is required" });
+    return;
+  }
+  if (!eventCity) {
+    res.status(400).json({ error: "event_city is required" });
+    return;
+  }
+  if (!note) {
+    res.status(400).json({ error: "note is required" });
+    return;
+  }
+  const minGuests = inquiryType === "CATERING AND EVENT" ? CATERING_EVENT_MIN_GUESTS : CATERING_ONLY_MIN_GUESTS;
+  if (guestCount < minGuests) {
+    res.status(400).json({ error: `minimum guests for ${inquiryType} is ${minGuests}` });
+    return;
+  }
+  if (curateOwnMenu && selectedDishes.length < 1) {
+    res.status(400).json({ error: "select at least one dish for curate_own_menu" });
+    return;
+  }
+  if (!eventType) {
+    res.status(400).json({ error: "event_type is required" });
+    return;
+  }
+  if (inquiryType === "CATERING AND EVENT" && !eventTitle) {
+    res.status(400).json({ error: "event_title is required for CATERING AND EVENT" });
+    return;
+  }
+  if (foodTastingRequested && (!foodTastingDate || !foodTastingTime)) {
+    res.status(400).json({ error: "food_tasting_date and food_tasting_time are required when food tasting is requested" });
+    return;
+  }
   let scheduleSlots: unknown[] = [];
   if (dateOfEvent.startsWith("[")) {
     try {
@@ -2846,6 +2969,36 @@ app.post("/api/mobile/inquiries", async (req, res) => {
   }
   if (scheduleSlots.length === 0 && dateOfEvent) {
     scheduleSlots = [{ label: dateOfEvent }];
+  }
+  if (scheduleSlots.length < 1) {
+    res.status(400).json({ error: "at least one schedule slot is required" });
+    return;
+  }
+  for (const rawSlot of scheduleSlots) {
+    const slot = rawSlot && typeof rawSlot === "object" ? (rawSlot as Record<string, unknown>) : null;
+    if (!slot) {
+      res.status(400).json({ error: "each schedule slot must be an object" });
+      return;
+    }
+    const date = String(slot.date ?? "").trim();
+    const from = String(slot.from ?? "").trim();
+    const to = String(slot.to ?? "").trim();
+    if (!date || !from || !to) {
+      res.status(400).json({ error: "each schedule slot must include date, from, and to" });
+      return;
+    }
+    const dateOk = /^\d{4}-\d{2}-\d{2}$/.test(date);
+    const timeOk = /^\d{2}:\d{2}$/.test(from) && /^\d{2}:\d{2}$/.test(to);
+    if (!dateOk || !timeOk) {
+      res.status(400).json({ error: "schedule slot date/time format is invalid" });
+      return;
+    }
+    const fromMinutes = Number(from.slice(0, 2)) * 60 + Number(from.slice(3, 5));
+    const toMinutes = Number(to.slice(0, 2)) * 60 + Number(to.slice(3, 5));
+    if (!Number.isFinite(fromMinutes) || !Number.isFinite(toMinutes) || toMinutes <= fromMinutes) {
+      res.status(400).json({ error: "schedule slot end time must be after start time" });
+      return;
+    }
   }
   try {
     const cateringOnly = inquiryType.trim().toUpperCase() == "CATERING";
@@ -3515,13 +3668,14 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
         dueMsg,
       );
     }
-    if (nextStatus === "completed") {
+    // Award catering loyalty when the order reaches For Full Payment (for_post_analysis), not on completed.
+    if (nextStatus === "for_post_analysis") {
       const loyaltyEmail = String(rows[0].email_address ?? before.email_address ?? "").trim().toLowerCase();
-      const loyaltyPoints = loyaltyPointsFor("catering_event", toNum(rows[0].total_cost ?? before.total_cost, 0));
+      const loyaltyPoints = loyaltyPointsFor("catering_event", orderTotal);
       await applyLoyaltyRewardsBestEffort(
         loyaltyEmail,
         String(rows[0].transaction_no ?? before.transaction_no ?? id),
-        toNum(rows[0].total_cost ?? before.total_cost, 0),
+        orderTotal,
         "catering_event",
       );
       await getPool().query(
@@ -3884,6 +4038,61 @@ app.get("/api/mobile/notifications", async (req, res) => {
   }
 });
 
+app.get("/api/mobile/customer/tray-draft", async (req, res) => {
+  const userEmail = String(req.query.user_email ?? "")
+    .trim()
+    .toLowerCase();
+  if (!userEmail) {
+    res.status(400).json({ error: "user_email is required" });
+    return;
+  }
+  try {
+    const { rows } = await getPool().query(
+      `SELECT tray_lines, updated_at
+       FROM customer_tray_drafts
+       WHERE LOWER(user_email) = $1
+       LIMIT 1`,
+      [userEmail],
+    );
+    const row = (rows[0] ?? null) as { tray_lines?: unknown; updated_at?: string } | null;
+    res.json({
+      tray_lines: Array.isArray(row?.tray_lines) ? row?.tray_lines : [],
+      updated_at: row?.updated_at ?? "",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
+app.put("/api/mobile/customer/tray-draft", async (req, res) => {
+  const userEmail = String(req.body?.user_email ?? "")
+    .trim()
+    .toLowerCase();
+  const trayLines = Array.isArray(req.body?.tray_lines) ? req.body.tray_lines : null;
+  if (!userEmail || trayLines == null) {
+    res.status(400).json({ error: "user_email and tray_lines are required" });
+    return;
+  }
+  try {
+    const { rows } = await getPool().query(
+      `INSERT INTO customer_tray_drafts (user_email, tray_lines, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (user_email)
+       DO UPDATE SET tray_lines = EXCLUDED.tray_lines, updated_at = NOW()
+       RETURNING updated_at`,
+      [userEmail, JSON.stringify(trayLines)],
+    );
+    res.json({
+      ok: true,
+      updated_at: String(rows[0]?.updated_at ?? ""),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
 app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
   const userEmail = String(req.query.user_email ?? "")
     .trim()
@@ -3900,13 +4109,14 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
       `SELECT
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM menu_dishes), '') AS menu_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM customer_profiles WHERE LOWER(email) = $1), '') AS profile_stamp,
+         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM customer_profiles), '') AS profile_stamp,
          COALESCE((SELECT MAX(created_at)::text FROM notifications WHERE user_id = $1), '') AS notifications_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM catering_orders WHERE LOWER(email_address) = $1), '') AS catering_inquiries_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM event_orders WHERE LOWER(email_address) = $1), '') AS event_inquiries_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM catering_orders), '') AS manager_catering_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM event_orders), '') AS manager_event_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM customer_accounts WHERE LOWER(email) = $1), '') AS loyalty_stamp`,
+         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM customer_accounts), '') AS loyalty_stamp,
+         COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(user_email) = $1), '') AS tray_stamp`,
       [userEmail],
     );
     const row = (rows[0] ?? {}) as Record<string, unknown>;
@@ -3920,6 +4130,164 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
       inquiries: `${String(row.catering_inquiries_stamp ?? "")}|${String(row.event_inquiries_stamp ?? "")}`,
       manager_catering: `${String(row.manager_catering_stamp ?? "")}|${String(row.manager_event_stamp ?? "")}`,
       loyalty: String(row.loyalty_stamp ?? ""),
+      tray: String(row.tray_stamp ?? ""),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
+app.get("/api/mobile/realtime/deltas", async (req, res) => {
+  const userEmail = String(req.query.user_email ?? "")
+    .trim()
+    .toLowerCase();
+  const role = String(req.query.role ?? "customer")
+    .trim()
+    .toLowerCase();
+  const sinceRaw = String(req.query.since ?? "").trim();
+  if (!userEmail) {
+    res.status(400).json({ error: "user_email is required" });
+    return;
+  }
+  const parsed = sinceRaw ? new Date(sinceRaw) : null;
+  const since = parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date(Date.now() - 5 * 60 * 1000);
+  try {
+    const menuChanged = (( 
+      await getPool().query(
+        `SELECT 1
+         FROM menu_dishes
+         WHERE COALESCE(updated_at, created_at) > $1
+         LIMIT 1`,
+        [since.toISOString()],
+      )
+    ).rowCount ?? 0) > 0;
+
+    const profileChanged = (( 
+      await getPool().query(
+        `SELECT 1
+         FROM customer_profiles
+         WHERE LOWER(TRIM(user_email)) = $1
+           AND COALESCE(updated_at, created_at) > $2
+         LIMIT 1`,
+        [userEmail, since.toISOString()],
+      )
+    ).rowCount ?? 0) > 0;
+
+    const loyaltyChanged = ((
+      await getPool().query(
+        `SELECT 1
+         FROM customer_accounts
+         WHERE LOWER(
+                 TRIM(
+                   COALESCE(
+                     to_jsonb(customer_accounts)->>'email',
+                     to_jsonb(customer_accounts)->>'user_email',
+                     ''
+                   )
+                 )
+               ) = $1
+           AND COALESCE(updated_at, created_at) > $2
+         LIMIT 1`,
+        [userEmail, since.toISOString()],
+      )
+    ).rowCount ?? 0) > 0;
+
+    const orderRows = await getPool().query(
+      role === "customer"
+        ? `SELECT mobile_id::text AS id
+           FROM restaurant_orders
+           WHERE LOWER(TRIM(user_email)) = $1
+             AND COALESCE(updated_at, created_at) > $2
+           ORDER BY COALESCE(updated_at, created_at) DESC
+           LIMIT 200`
+        : `SELECT mobile_id::text AS id
+           FROM restaurant_orders
+           WHERE COALESCE(updated_at, created_at) > $1
+           ORDER BY COALESCE(updated_at, created_at) DESC
+           LIMIT 200`,
+      role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
+    );
+
+    const inquiryRows = await getPool().query(
+      role === "customer"
+        ? `SELECT id::text AS id
+           FROM (
+             SELECT id, COALESCE(updated_at, created_at) AS ts
+             FROM catering_orders
+             WHERE LOWER(TRIM(email_address)) = $1
+             UNION ALL
+             SELECT id, COALESCE(updated_at, created_at) AS ts
+             FROM event_orders
+             WHERE LOWER(TRIM(email_address)) = $1
+           ) t
+           WHERE t.ts > $2
+           ORDER BY t.ts DESC
+           LIMIT 200`
+        : `SELECT id::text AS id
+           FROM (
+             SELECT id, COALESCE(updated_at, created_at) AS ts FROM catering_orders
+             UNION ALL
+             SELECT id, COALESCE(updated_at, created_at) AS ts FROM event_orders
+           ) t
+           WHERE t.ts > $1
+           ORDER BY t.ts DESC
+           LIMIT 200`,
+      role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
+    );
+    const cateringInquiryRows = await getPool().query(
+      role === "customer"
+        ? `SELECT id::text AS id
+           FROM catering_orders
+           WHERE LOWER(TRIM(email_address)) = $1
+             AND COALESCE(updated_at, created_at) > $2
+           ORDER BY COALESCE(updated_at, created_at) DESC
+           LIMIT 200`
+        : `SELECT id::text AS id
+           FROM catering_orders
+           WHERE COALESCE(updated_at, created_at) > $1
+           ORDER BY COALESCE(updated_at, created_at) DESC
+           LIMIT 200`,
+      role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
+    );
+    const eventInquiryRows = await getPool().query(
+      role === "customer"
+        ? `SELECT id::text AS id
+           FROM event_orders
+           WHERE LOWER(TRIM(email_address)) = $1
+             AND COALESCE(updated_at, created_at) > $2
+           ORDER BY COALESCE(updated_at, created_at) DESC
+           LIMIT 200`
+        : `SELECT id::text AS id
+           FROM event_orders
+           WHERE COALESCE(updated_at, created_at) > $1
+           ORDER BY COALESCE(updated_at, created_at) DESC
+           LIMIT 200`,
+      role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
+    );
+
+    const notificationRows = await getPool().query(
+      `SELECT id::text AS id
+       FROM notifications
+       WHERE user_id = $1
+         AND created_at > $2
+       ORDER BY created_at DESC
+       LIMIT 200`,
+      [userEmail, since.toISOString()],
+    );
+
+    res.json({
+      role,
+      since: since.toISOString(),
+      server_time: new Date().toISOString(),
+      menu_changed: menuChanged,
+      profile_changed: profileChanged,
+      loyalty_changed: loyaltyChanged,
+      restaurant_order_ids: orderRows.rows.map((r: { id: string }) => String(r.id)),
+      inquiry_ids: inquiryRows.rows.map((r: { id: string }) => String(r.id)),
+      catering_inquiry_ids: cateringInquiryRows.rows.map((r: { id: string }) => String(r.id)),
+      event_inquiry_ids: eventInquiryRows.rows.map((r: { id: string }) => String(r.id)),
+      notification_ids: notificationRows.rows.map((r: { id: string }) => String(r.id)),
     });
   } catch (err) {
     console.error(err);

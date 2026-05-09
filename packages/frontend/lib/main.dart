@@ -28,6 +28,7 @@ const bool kPosLoginBuild = bool.fromEnvironment('POS_LOGIN', defaultValue: fals
 class AppBrandAssets {
   AppBrandAssets._();
   static const String logo = 'assets/images/macrinasLogo.png';
+  static const String logoDashboard = 'assets/images/macrinasLogo3.png';
   /// Login / welcome hero (customer).
   static const String logoLogin = 'assets/images/macrinasLogo2.png';
   static const String qrCode = 'assets/images/QRCode_Curatering.jpg';
@@ -212,7 +213,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
 
   Future<void> _pollCustomerAttentionNotifications() async {
     if (appState.userEmail == null || appState.userRole != 'customer') return;
-    await appState.loadNotifications();
+    await appState.loadNotifications(force: true);
     if (!mounted) return;
     final next = appState.orderNosWithUnreadAttention;
     if (_lastAttentionOrderSnapshot.isEmpty) {
@@ -1108,6 +1109,29 @@ String statusReadableForOrder(OrderData o) {
   return statusReadable(o.status);
 }
 
+String inquiryStatusReadable(String status) {
+  final s = status.trim();
+  if (s.isEmpty) return s;
+  final low = s.toLowerCase();
+  switch (low) {
+    case 'new_event':
+      return 'New Event';
+    case 'online_inquiries':
+      return 'Online Inquiries';
+    case 'for_processing':
+      return 'For Processing';
+    case 'for_post_analysis':
+      return 'For Full Payment';
+    default:
+      return s
+          .replaceAll('_', ' ')
+          .split(' ')
+          .where((w) => w.trim().isNotEmpty)
+          .map((w) => '${w[0].toUpperCase()}${w.substring(1).toLowerCase()}')
+          .join(' ');
+  }
+}
+
 void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
   showDialog<void>(
     context: context,
@@ -1163,6 +1187,8 @@ class InquiryRecord {
     this.foodTastingRequested = false,
     this.loyaltyPointsEarned = 0,
     this.transactionNo = '',
+    this.downPaymentAmount = 0,
+    this.fullPaymentAmount = 0,
   });
 
   final int id;
@@ -1195,6 +1221,10 @@ class InquiryRecord {
   final bool foodTastingRequested;
   /// Estimated loyalty points for completed catering/event (matches backend floor of total cost).
   final int loyaltyPointsEarned;
+  /// From catering/event order row after down payment is recorded.
+  final double downPaymentAmount;
+  /// From catering/event order row (full payment toward balance).
+  final double fullPaymentAmount;
 
   bool get isCompletedBooking {
     final s = status.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '_').replaceAll('-', '_');
@@ -1454,9 +1484,34 @@ class AppState extends ChangeNotifier {
   int authSessionKey = 0;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
+  final Set<String> _readAttentionOrderNos = <String>{};
   DateTime? _menuLoadedAt;
   Map<String, String>? _lastRealtimeStamps;
   bool _realtimePollInFlight = false;
+  String _lastTrayServerStamp = '';
+  String _lastRealtimeServerTime = '';
+  DateTime? _ordersLoadedAt;
+  DateTime? _inquiriesLoadedAt;
+  DateTime? _profileLoadedAt;
+  DateTime? _notificationsLoadedAt;
+  final Set<String> _managerCateringInFlightStages = <String>{};
+  final Map<String, DateTime> _managerCateringLoadedAt = <String, DateTime>{};
+  String _managerActiveStage = 'new_event';
+  bool _loadOrdersInFlight = false;
+  bool _loadInquiriesInFlight = false;
+  bool _loadProfileInFlight = false;
+  bool _loadNotificationsInFlight = false;
+  bool _loadCashierOnlineOrdersInFlight = false;
+  bool _loadCashierWalkInQueuesInFlight = false;
+  bool _loadCashierOrderHistoryInFlight = false;
+  DateTime? _cashierOnlineOrdersLoadedAt;
+  DateTime? _cashierWalkInQueuesLoadedAt;
+  DateTime? _cashierOrderHistoryLoadedAt;
+  bool _loadSetMenusInFlight = false;
+  bool _loadLoyaltyHistoryInFlight = false;
+  bool _loadMenuInFlight = false;
+  DateTime? _setMenusLoadedAt;
+  DateTime? _loyaltyHistoryLoadedAt;
   bool get hasCashierAttentionBadge => cashierOnlineOrders.any((o) => o.balanceProofPendingReview);
   bool get hasManagerAttentionBadge =>
       managerCateringRows.any((r) => r.status == 'new_event' || r.status == 'online_inquiries');
@@ -1466,6 +1521,13 @@ class AppState extends ChangeNotifier {
   bool get isCashier => userRole == 'cashier';
   bool get isManager => userRole == 'manager';
   bool get isManagerOrSupervisor => userRole == 'manager' || userRole == 'supervisor';
+
+  String get managerActiveStage => _managerActiveStage;
+  void setManagerActiveStage(String stage) {
+    final next = stage.trim().toLowerCase();
+    if (next.isEmpty || next == _managerActiveStage) return;
+    _managerActiveStage = next;
+  }
 
   void setThemeMode(ThemeMode mode) {
     if (themeMode == mode) return;
@@ -1504,21 +1566,26 @@ class AppState extends ChangeNotifier {
       userRole = '${bodyMap['role'] ?? 'customer'}'.trim().toLowerCase();
       cashierDisplayName = '${bodyMap['display_name'] ?? ''}'.trim();
       if (isCashier) {
-        await loadMenu();
-        await loadCashierOnlineOrders();
-        await loadCashierWalkInQueues();
+        await loadMenu(force: true);
+        await loadCashierOnlineOrders(force: true);
+        await loadCashierWalkInQueues(force: true);
       } else if (isManagerOrSupervisor) {
-        await Future.wait([loadMenu(), loadSetMenus(), loadManagerCateringByStage('new_event')]);
+        await Future.wait([
+          loadMenu(force: true),
+          loadSetMenus(force: true),
+          loadManagerCateringByStage('new_event', force: true),
+        ]);
       } else {
         await Future.wait([
-          loadMenu(),
-          loadSetMenus(),
-          loadProfile(),
-          loadOrders(),
-          loadInquiries(),
+          loadMenu(force: true),
+          loadSetMenus(force: true),
+          loadProfile(force: true),
+          loadOrders(force: true),
+          loadInquiries(force: true),
         ]);
+        await _restoreReadAttentionOrderNos();
         await restoreCustomerDraftAfterLogin();
-        await loadNotifications();
+        await loadNotifications(force: true);
       }
       await bootstrapRealtimeSync();
       showLoginWelcomeDialog = true;
@@ -1689,28 +1756,15 @@ class AppState extends ChangeNotifier {
     checkoutSelectedAddress = prefs.getString('customer_checkout_addr_v1_$k');
     checkoutDeliveryTime = prefs.getString('customer_checkout_time_v1_$k') ?? checkoutDeliveryTime;
     final raw = prefs.getString('customer_tray_v1_$k');
-    tray.clear();
     if (raw != null && raw.isNotEmpty) {
       try {
         final list = jsonDecode(raw) as List<dynamic>;
-        for (final e in list) {
-          final m = e as Map<String, dynamic>;
-          final id = '${m['id']}';
-          final dip = '${m['dip'] ?? ''}';
-          final qty = jsonToInt(m['qty']);
-          MenuItemData? foundItem;
-          for (final x in menu) {
-            if (x.id == id) {
-              foundItem = x;
-              break;
-            }
-          }
-          if (foundItem != null && qty > 0) {
-            tray.add(CartItem(menu: foundItem, dip: dip, qty: qty));
-          }
-        }
+        _applyTrayLinesSnapshot(list);
       } catch (_) {}
+    } else {
+      tray.clear();
     }
+    await pullCustomerTrayDraftFromServer();
     notifyListeners();
   }
 
@@ -1728,6 +1782,89 @@ class AppState extends ChangeNotifier {
         )
         .toList();
     await prefs.setString('customer_tray_v1_$k', jsonEncode(lines));
+    unawaited(_pushCustomerTrayDraftToServer(lines));
+  }
+
+  Future<void> _restoreReadAttentionOrderNos() async {
+    if (userEmail == null || userRole != 'customer') return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = userEmail!.toLowerCase();
+      final saved = prefs.getStringList('customer_read_attention_orders_v1_$key') ?? const <String>[];
+      _readAttentionOrderNos
+        ..clear()
+        ..addAll(saved.map((e) => e.trim()).where((e) => e.isNotEmpty));
+    } catch (_) {}
+  }
+
+  Future<void> _persistReadAttentionOrderNos() async {
+    if (userEmail == null || userRole != 'customer') return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = userEmail!.toLowerCase();
+      final list = _readAttentionOrderNos.toList()..sort();
+      await prefs.setStringList('customer_read_attention_orders_v1_$key', list);
+    } catch (_) {}
+  }
+
+  void _applyTrayLinesSnapshot(List<dynamic> list) {
+    tray.clear();
+    for (final e in list) {
+      if (e is! Map) continue;
+      final id = '${e['id']}';
+      final dip = '${e['dip'] ?? ''}';
+      final qty = jsonToInt(e['qty']);
+      MenuItemData? foundItem;
+      for (final x in menu) {
+        if (x.id == id) {
+          foundItem = x;
+          break;
+        }
+      }
+      if (foundItem != null && qty > 0) {
+        tray.add(CartItem(menu: foundItem, dip: dip, qty: qty));
+      }
+    }
+  }
+
+  Future<void> _pushCustomerTrayDraftToServer(List<Map<String, dynamic>> lines) async {
+    final email = userEmail;
+    if (email == null || userRole != 'customer') return;
+    try {
+      final res = await http
+          .put(
+            _uri('/api/mobile/customer/tray-draft'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'user_email': email, 'tray_lines': lines}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is Map<String, dynamic>) {
+        _lastTrayServerStamp = '${body['updated_at'] ?? ''}';
+      }
+    } catch (_) {}
+  }
+
+  Future<void> pullCustomerTrayDraftFromServer() async {
+    final email = userEmail;
+    if (email == null || userRole != 'customer') return;
+    try {
+      final res =
+          await http.get(_uri('/api/mobile/customer/tray-draft', {'user_email': email})).timeout(_apiTimeout);
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return;
+      final trayLines = body['tray_lines'];
+      final updatedAt = '${body['updated_at'] ?? ''}';
+      if (trayLines is! List) return;
+      _applyTrayLinesSnapshot(trayLines);
+      final prefs = await SharedPreferences.getInstance();
+      final k = email.toLowerCase();
+      await prefs.setString('customer_tray_v1_$k', jsonEncode(trayLines));
+      _lastTrayServerStamp = updatedAt;
+      notifyListeners();
+    } catch (_) {}
   }
 
   void updateCheckoutDraftNote(String v) {
@@ -1778,11 +1915,48 @@ class AppState extends ChangeNotifier {
           return 'Could not cancel (${res.statusCode})';
         }
       }
-      await loadOrders();
+      await loadOrders(force: true);
       notifyListeners();
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  Future<String?> cancelInquiryAsCustomer({required int inquiryId}) async {
+    if (userEmail == null) return 'Not signed in';
+    try {
+      final res = await http
+          .patch(
+            _uri('/api/mobile/inquiries/$inquiryId/cancel-customer'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'user_email': userEmail}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not cancel inquiry'}';
+        } catch (_) {
+          return 'Could not cancel inquiry (${res.statusCode})';
+        }
+      }
+      await loadInquiries(force: true);
+      notifyListeners();
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  void markOrderAttentionRead(String orderNo) {
+    final key = orderNo.trim();
+    if (key.isEmpty) return;
+    _readAttentionOrderNos.add(key);
+    unawaited(_persistReadAttentionOrderNos());
+    if (orderNosWithUnreadAttention.remove(key)) {
+      if (unreadNotificationsCount > 0) unreadNotificationsCount--;
+      notifyListeners();
     }
   }
 
@@ -1813,6 +1987,31 @@ class AppState extends ChangeNotifier {
     checkoutDeliveryTime = 'NOW';
     _lastRealtimeStamps = null;
     _realtimePollInFlight = false;
+    _lastTrayServerStamp = '';
+    _lastRealtimeServerTime = '';
+    _ordersLoadedAt = null;
+    _inquiriesLoadedAt = null;
+    _profileLoadedAt = null;
+    _notificationsLoadedAt = null;
+    _managerCateringLoadedAt.clear();
+    _managerCateringInFlightStages.clear();
+    _managerActiveStage = 'new_event';
+    _loadOrdersInFlight = false;
+    _loadInquiriesInFlight = false;
+    _loadProfileInFlight = false;
+    _loadNotificationsInFlight = false;
+    _loadCashierOnlineOrdersInFlight = false;
+    _loadCashierWalkInQueuesInFlight = false;
+    _loadCashierOrderHistoryInFlight = false;
+    _cashierOnlineOrdersLoadedAt = null;
+    _cashierWalkInQueuesLoadedAt = null;
+    _cashierOrderHistoryLoadedAt = null;
+    _loadSetMenusInFlight = false;
+    _loadLoyaltyHistoryInFlight = false;
+    _loadMenuInFlight = false;
+    _readAttentionOrderNos.clear();
+    _setMenusLoadedAt = null;
+    _loyaltyHistoryLoadedAt = null;
     if (persistedEmail != null) {
       SharedPreferences.getInstance().then((p) async {
         await p.remove('customer_tray_v1_$persistedEmail');
@@ -1838,6 +2037,7 @@ class AppState extends ChangeNotifier {
       final body = jsonDecode(res.body);
       if (body is! Map<String, dynamic>) return null;
       return <String, String>{
+        'server_time': '${body['server_time'] ?? ''}',
         'menu': '${body['menu'] ?? ''}',
         'restaurant_orders': '${body['restaurant_orders'] ?? ''}',
         'profile': '${body['profile'] ?? ''}',
@@ -1845,7 +2045,23 @@ class AppState extends ChangeNotifier {
         'inquiries': '${body['inquiries'] ?? ''}',
         'manager_catering': '${body['manager_catering'] ?? ''}',
         'loyalty': '${body['loyalty'] ?? ''}',
+        'tray': '${body['tray'] ?? ''}',
       };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> _fetchRealtimeDeltas(String sinceIso) async {
+    if (userEmail == null || sinceIso.trim().isEmpty) return null;
+    try {
+      final res = await http
+          .get(_uri('/api/mobile/realtime/deltas', {'user_email': userEmail!, 'role': userRole, 'since': sinceIso}))
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return null;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return null;
+      return body;
     } catch (_) {
       return null;
     }
@@ -1853,6 +2069,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> bootstrapRealtimeSync() async {
     _lastRealtimeStamps = await _fetchRealtimeStamps();
+    _lastRealtimeServerTime = _lastRealtimeStamps?['server_time'] ?? '';
   }
 
   bool _stampChanged(Map<String, String> previous, Map<String, String> next, String key) {
@@ -1868,32 +2085,62 @@ class AppState extends ChangeNotifier {
       final previous = _lastRealtimeStamps;
       _lastRealtimeStamps = next;
       if (previous == null) return;
+      final delta = await _fetchRealtimeDeltas(_lastRealtimeServerTime);
+      _lastRealtimeServerTime = next['server_time'] ?? '';
       final jobs = <Future<void>>[];
       if (_stampChanged(previous, next, 'menu')) {
-        jobs.add(loadMenu(force: true));
+        final allow = delta == null || delta['menu_changed'] == true;
+        if (allow) jobs.add(loadMenu(force: true));
       }
       if (isCashier) {
         if (_stampChanged(previous, next, 'restaurant_orders')) {
-          jobs.add(loadCashierOnlineOrders());
-          jobs.add(loadCashierWalkInQueues());
+          final orderIds = delta?['restaurant_order_ids'];
+          final allow = delta == null || (orderIds is List && orderIds.isNotEmpty);
+          if (allow) {
+            jobs.add(loadCashierOnlineOrders(force: true));
+            jobs.add(loadCashierWalkInQueues(force: true));
+          }
         }
       } else if (isManagerOrSupervisor) {
         if (_stampChanged(previous, next, 'manager_catering') ||
             _stampChanged(previous, next, 'restaurant_orders')) {
-          jobs.add(loadManagerCateringByStage('new_event'));
+          final changedCateringInquiryIds = delta?['catering_inquiry_ids'];
+          final changedEventInquiryIds = delta?['event_inquiry_ids'];
+          final changedInquiryIds = delta?['inquiry_ids'];
+          final changedOrderIds = delta?['restaurant_order_ids'];
+          final allow = delta == null ||
+              (changedCateringInquiryIds is List && changedCateringInquiryIds.isNotEmpty) ||
+              (changedEventInquiryIds is List && changedEventInquiryIds.isNotEmpty) ||
+              (changedInquiryIds is List && changedInquiryIds.isNotEmpty) ||
+              (changedOrderIds is List && changedOrderIds.isNotEmpty);
+          if (allow) {
+            jobs.add(loadManagerCateringByStage(managerActiveStage, force: true));
+          }
         }
       } else {
         if (_stampChanged(previous, next, 'restaurant_orders')) {
-          jobs.add(loadOrders());
+          final orderIds = delta?['restaurant_order_ids'];
+          final allow = delta == null || (orderIds is List && orderIds.isNotEmpty);
+          if (allow) jobs.add(loadOrders(force: true));
         }
         if (_stampChanged(previous, next, 'inquiries')) {
-          jobs.add(loadInquiries());
+          final inquiryIds = delta?['inquiry_ids'];
+          final allow = delta == null || (inquiryIds is List && inquiryIds.isNotEmpty);
+          if (allow) jobs.add(loadInquiries(force: true));
+        }
+        if (_stampChanged(previous, next, 'tray') && next['tray'] != _lastTrayServerStamp) {
+          jobs.add(pullCustomerTrayDraftFromServer());
         }
         if (_stampChanged(previous, next, 'profile') || _stampChanged(previous, next, 'loyalty')) {
-          jobs.add(loadProfile());
+          final profileChanged = delta?['profile_changed'] == true;
+          final loyaltyChanged = delta?['loyalty_changed'] == true;
+          final allow = delta == null || profileChanged || loyaltyChanged;
+          if (allow) jobs.add(loadProfile(force: true));
         }
         if (_stampChanged(previous, next, 'notifications')) {
-          jobs.add(loadNotifications());
+          final notifIds = delta?['notification_ids'];
+          final allow = delta == null || (notifIds is List && notifIds.isNotEmpty);
+          if (allow) jobs.add(loadNotifications(force: true));
         }
       }
       if (jobs.isNotEmpty) {
@@ -1905,65 +2152,86 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> loadMenu({bool force = false}) async {
+    if (_loadMenuInFlight) return;
     if (!force && _menuLoadedAt != null) {
       final age = DateTime.now().difference(_menuLoadedAt!);
       if (age < const Duration(seconds: 20) && menu.isNotEmpty) return;
     }
-    final res = await http.get(_uri('/api/mobile/menu'));
-    if (res.statusCode != 200) return;
-    final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
-    menu
-      ..clear()
-      ..addAll(
-        body.map((e) {
-          final map = e as Map<String, dynamic>;
-          final dipValues = map['dips'] is List ? (map['dips'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
-          final ingValues =
-              map['ingredients'] is List ? (map['ingredients'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
-          return MenuItemData(
-            id: '${map['id']}',
-            name: '${map['name']}',
-            description: '${map['description']}',
-            price: jsonToDouble(map['price']),
-            dips: dipValues,
-            ingredients: ingValues,
-            category: '${map['category'] ?? ''}',
-            dishType: '${map['dish_type'] ?? ''}',
-            imageBase64: map['image_base64'] != null ? '${map['image_base64']}' : null,
-          );
-        }),
-      );
-    _menuLoadedAt = DateTime.now();
-    notifyListeners();
+    _loadMenuInFlight = true;
+    try {
+      final res = await http.get(_uri('/api/mobile/menu'));
+      if (res.statusCode != 200) return;
+      final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
+      menu
+        ..clear()
+        ..addAll(
+          body.map((e) {
+            final map = e as Map<String, dynamic>;
+            final dipValues = map['dips'] is List ? (map['dips'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
+            final ingValues =
+                map['ingredients'] is List ? (map['ingredients'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
+            return MenuItemData(
+              id: '${map['id']}',
+              name: '${map['name']}',
+              description: '${map['description']}',
+              price: jsonToDouble(map['price']),
+              dips: dipValues,
+              ingredients: ingValues,
+              category: '${map['category'] ?? ''}',
+              dishType: '${map['dish_type'] ?? ''}',
+              imageBase64: map['image_base64'] != null ? '${map['image_base64']}' : null,
+            );
+          }),
+        );
+      _menuLoadedAt = DateTime.now();
+      notifyListeners();
+    } finally {
+      _loadMenuInFlight = false;
+    }
   }
 
-  Future<void> loadSetMenus() async {
-    final res = await http.get(_uri('/api/mobile/set-menus'));
-    if (res.statusCode != 200) return;
-    final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
-    setMenus
-      ..clear()
-      ..addAll(
-        body.map((e) {
-          final map = e as Map<String, dynamic>;
-          final dishes = map['dishes'] is List
-              ? (map['dishes'] as List<dynamic>).map((d) => '$d').toList()
-              : <String>[];
-          return SetMenuData(
-            name: '${map['name']}',
-            description: '${map['description'] ?? ''}',
-            dishes: dishes,
-          );
-        }),
-      );
-    notifyListeners();
+  Future<void> loadSetMenus({bool force = false}) async {
+    if (_loadSetMenusInFlight) return;
+    if (!force && _setMenusLoadedAt != null && DateTime.now().difference(_setMenusLoadedAt!) < const Duration(seconds: 8)) {
+      return;
+    }
+    _loadSetMenusInFlight = true;
+    try {
+      final res = await http.get(_uri('/api/mobile/set-menus'));
+      if (res.statusCode != 200) return;
+      final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
+      setMenus
+        ..clear()
+        ..addAll(
+          body.map((e) {
+            final map = e as Map<String, dynamic>;
+            final dishes = map['dishes'] is List
+                ? (map['dishes'] as List<dynamic>).map((d) => '$d').toList()
+                : <String>[];
+            return SetMenuData(
+              name: '${map['name']}',
+              description: '${map['description'] ?? ''}',
+              dishes: dishes,
+            );
+          }),
+        );
+      _setMenusLoadedAt = DateTime.now();
+      notifyListeners();
+    } finally {
+      _loadSetMenusInFlight = false;
+    }
   }
 
-  Future<void> loadProfile() async {
-    if (userEmail == null) return;
-    final res = await http.get(_uri('/api/mobile/profile', {'user_email': userEmail!}));
-    if (res.statusCode != 200) return;
-    final map = jsonDecode(res.body) as Map<String, dynamic>;
+  Future<void> loadProfile({bool force = false}) async {
+    if (userEmail == null || _loadProfileInFlight) return;
+    if (!force && _profileLoadedAt != null && DateTime.now().difference(_profileLoadedAt!) < const Duration(seconds: 4)) {
+      return;
+    }
+    _loadProfileInFlight = true;
+    try {
+      final res = await http.get(_uri('/api/mobile/profile', {'user_email': userEmail!}));
+      if (res.statusCode != 200) return;
+      final map = jsonDecode(res.body) as Map<String, dynamic>;
     final addrList = <String>[];
     final rawAddrs = map['delivery_addresses'];
     if (rawAddrs is List) {
@@ -1972,7 +2240,7 @@ class AppState extends ChangeNotifier {
         if (s.isNotEmpty) addrList.add(s);
       }
     }
-    profile = ProfileData(
+      profile = ProfileData(
       fullName: '${map['full_name'] ?? ''}',
       contactNumber: '${map['contact_number'] ?? ''}',
       deliveryAddress: '${map['delivery_address'] ?? ''}',
@@ -1984,29 +2252,44 @@ class AppState extends ChangeNotifier {
       loyaltyPointsCatering: jsonToInt(map['loyalty_points_catering']),
       deliveryAddresses: addrList,
     );
-    await loadLoyaltyHistory();
-    notifyListeners();
+      _profileLoadedAt = DateTime.now();
+      await loadLoyaltyHistory(force: true);
+      notifyListeners();
+    } finally {
+      _loadProfileInFlight = false;
+    }
   }
 
-  Future<void> loadLoyaltyHistory() async {
-    if (userEmail == null) return;
-    final res = await http.get(_uri('/api/mobile/loyalty-history', {'user_email': userEmail!}));
-    if (res.statusCode != 200) return;
-    final body = jsonDecode(res.body);
-    if (body is! List) return;
-    loyaltyHistory
-      ..clear()
-      ..addAll(
-        body.whereType<Map<String, dynamic>>().map(
-          (m) => LoyaltyHistoryItem(
-            orderNo: '${m['order_no'] ?? ''}',
-            pointsDelta: jsonToInt(m['points_delta']),
-            createdAt: jsonToDateTime(m['created_at'], DateTime.now()),
-            source: '${m['source'] ?? 'restaurant'}'.toLowerCase().contains('catering') ? 'catering' : 'restaurant',
+  Future<void> loadLoyaltyHistory({bool force = false}) async {
+    if (userEmail == null || _loadLoyaltyHistoryInFlight) return;
+    if (!force &&
+        _loyaltyHistoryLoadedAt != null &&
+        DateTime.now().difference(_loyaltyHistoryLoadedAt!) < const Duration(seconds: 6)) {
+      return;
+    }
+    _loadLoyaltyHistoryInFlight = true;
+    try {
+      final res = await http.get(_uri('/api/mobile/loyalty-history', {'user_email': userEmail!}));
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! List) return;
+      loyaltyHistory
+        ..clear()
+        ..addAll(
+          body.whereType<Map<String, dynamic>>().map(
+            (m) => LoyaltyHistoryItem(
+              orderNo: '${m['order_no'] ?? ''}',
+              pointsDelta: jsonToInt(m['points_delta']),
+              createdAt: jsonToDateTime(m['created_at'], DateTime.now()),
+              source: '${m['source'] ?? 'restaurant'}'.toLowerCase().contains('catering') ? 'catering' : 'restaurant',
+            ),
           ),
-        ),
-      );
-    notifyListeners();
+        );
+      _loyaltyHistoryLoadedAt = DateTime.now();
+      notifyListeners();
+    } finally {
+      _loadLoyaltyHistoryInFlight = false;
+    }
   }
 
   Future<void> saveProfile(ProfileData updated) async {
@@ -2143,7 +2426,7 @@ class AppState extends ChangeNotifier {
       );
       if (!clearCheckoutDraft) {
         try {
-          await loadOrders();
+          await loadOrders(force: true);
         } catch (_) {
           orders.insert(0, order);
         }
@@ -2155,7 +2438,7 @@ class AppState extends ChangeNotifier {
       notifyListeners();
       await clearPersistedCustomerDraft();
       try {
-        await loadOrders();
+        await loadOrders(force: true);
       } catch (_) {
         orders.insert(0, order);
       }
@@ -2167,7 +2450,7 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<bool> uploadPaymentProof(int orderId, XFile file) async {
+  Future<String?> uploadPaymentProof(int orderId, XFile file) async {
     try {
       final encoded = base64Encode(await file.readAsBytes());
       final res = await http.patch(
@@ -2175,10 +2458,18 @@ class AppState extends ChangeNotifier {
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({'payment_proof': encoded}),
       );
-      await loadOrders();
-      return res.statusCode == 200;
-    } catch (_) {
-      return false;
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not upload payment proof'}';
+        } catch (_) {
+          return 'Could not upload payment proof (${res.statusCode})';
+        }
+      }
+      await loadOrders(force: true);
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
     }
   }
 
@@ -2190,11 +2481,16 @@ class AppState extends ChangeNotifier {
     await clearPersistedCustomerDraft();
   }
 
-  Future<void> loadOrders() async {
-    if (userEmail == null) return;
-    final res = await http.get(_uri('/api/mobile/orders', {'user_email': userEmail!}));
-    if (res.statusCode != 200) return;
-    final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
+  Future<void> loadOrders({bool force = false}) async {
+    if (userEmail == null || _loadOrdersInFlight) return;
+    if (!force && _ordersLoadedAt != null && DateTime.now().difference(_ordersLoadedAt!) < const Duration(seconds: 4)) {
+      return;
+    }
+    _loadOrdersInFlight = true;
+    try {
+      final res = await http.get(_uri('/api/mobile/orders', {'user_email': userEmail!}));
+      if (res.statusCode != 200) return;
+      final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
     final parsed = <OrderData>[];
     for (final e in body) {
       try {
@@ -2203,12 +2499,16 @@ class AppState extends ChangeNotifier {
         parsed.add(orderDataFromApiMap(map, lines));
       } catch (_) {}
     }
-    orders
-      ..clear()
-      ..addAll(parsed);
-    notifyListeners();
-    if (!isCashier && !isManagerOrSupervisor) {
-      await loadNotifications();
+      orders
+        ..clear()
+        ..addAll(parsed);
+      _ordersLoadedAt = DateTime.now();
+      notifyListeners();
+      if (!isCashier && !isManagerOrSupervisor) {
+        await loadNotifications(force: true);
+      }
+    } finally {
+      _loadOrdersInFlight = false;
     }
   }
 
@@ -2230,7 +2530,7 @@ class AppState extends ChangeNotifier {
           return 'Inquiry failed (${res.statusCode})';
         }
       }
-      await loadInquiries();
+      await loadInquiries(force: true);
       notifyListeners();
       return null;
     } catch (e) {
@@ -2238,8 +2538,14 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> loadManagerCateringByStage(String stage) async {
+  Future<void> loadManagerCateringByStage(String stage, {bool force = false}) async {
     if (userEmail == null || !isManagerOrSupervisor) return;
+    if (_managerCateringInFlightStages.contains(stage)) return;
+    final loadedAt = _managerCateringLoadedAt[stage];
+    if (!force && loadedAt != null && DateTime.now().difference(loadedAt) < const Duration(seconds: 5)) {
+      return;
+    }
+    _managerCateringInFlightStages.add(stage);
     try {
       final res = await http
           .post(
@@ -2261,8 +2567,12 @@ class AppState extends ChangeNotifier {
         ..addAll(
           body.whereType<Map<String, dynamic>>().map(CateringEventRecord.fromApiMap),
         );
+      _managerCateringLoadedAt[stage] = DateTime.now();
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _managerCateringInFlightStages.remove(stage);
+    }
   }
 
   /// Full catering/event row for manager detail (list uses [loadManagerCateringByStage] with summary strips).
@@ -2522,8 +2832,14 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> loadNotifications() async {
-    if (userEmail == null || isCashier || isManagerOrSupervisor) return;
+  Future<void> loadNotifications({bool force = false}) async {
+    if (userEmail == null || isCashier || isManagerOrSupervisor || _loadNotificationsInFlight) return;
+    if (!force &&
+        _notificationsLoadedAt != null &&
+        DateTime.now().difference(_notificationsLoadedAt!) < const Duration(seconds: 4)) {
+      return;
+    }
+    _loadNotificationsInFlight = true;
     try {
       final res = await http.get(_uri('/api/mobile/notifications', {'user_email': userEmail!})).timeout(_apiTimeout);
       if (res.statusCode != 200) return;
@@ -2540,11 +2856,19 @@ class AppState extends ChangeNotifier {
           final msg = '${e['message'] ?? ''}';
           final m = re.firstMatch(msg);
           final id = m?.group(1)?.trim();
-          if (id != null && id.isNotEmpty) orderNosWithUnreadAttention.add(id);
+          if (id != null &&
+              id.isNotEmpty &&
+              !_readAttentionOrderNos.contains(id)) {
+            orderNosWithUnreadAttention.add(id);
+          }
         }
       }
+      _notificationsLoadedAt = DateTime.now();
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _loadNotificationsInFlight = false;
+    }
   }
 
   Future<void> markAllNotificationsRead() async {
@@ -2557,7 +2881,7 @@ class AppState extends ChangeNotifier {
             body: jsonEncode({'user_email': userEmail}),
           )
           .timeout(_apiTimeout);
-      await loadNotifications();
+      await loadNotifications(force: true);
     } catch (_) {}
   }
 
@@ -2594,11 +2918,16 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> loadInquiries() async {
-    if (userEmail == null) return;
-    final res = await http.get(_uri('/api/mobile/inquiries', {'user_email': userEmail!}));
-    if (res.statusCode != 200) return;
-    final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
+  Future<void> loadInquiries({bool force = false}) async {
+    if (userEmail == null || _loadInquiriesInFlight) return;
+    if (!force && _inquiriesLoadedAt != null && DateTime.now().difference(_inquiriesLoadedAt!) < const Duration(seconds: 4)) {
+      return;
+    }
+    _loadInquiriesInFlight = true;
+    try {
+      final res = await http.get(_uri('/api/mobile/inquiries', {'user_email': userEmail!}));
+      if (res.statusCode != 200) return;
+      final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
     final parsed = <InquiryRecord>[];
     for (final e in body) {
       try {
@@ -2634,18 +2963,30 @@ class AppState extends ChangeNotifier {
             foodTastingRequested: jsonToBool(map['food_tasting_requested']),
             loyaltyPointsEarned: jsonToInt(map['loyalty_points_earned']),
             transactionNo: '${map['transaction_no'] ?? ''}',
+            downPaymentAmount: jsonToDouble(map['down_payment_amount']),
+            fullPaymentAmount: jsonToDouble(map['full_payment_amount']),
           ),
         );
       } catch (_) {}
     }
-    inquiries
-      ..clear()
-      ..addAll(parsed);
-    notifyListeners();
+      inquiries
+        ..clear()
+        ..addAll(parsed);
+      _inquiriesLoadedAt = DateTime.now();
+      notifyListeners();
+    } finally {
+      _loadInquiriesInFlight = false;
+    }
   }
 
-  Future<void> loadCashierOnlineOrders() async {
-    if (userEmail == null || !isCashier) return;
+  Future<void> loadCashierOnlineOrders({bool force = false}) async {
+    if (userEmail == null || !isCashier || _loadCashierOnlineOrdersInFlight) return;
+    if (!force &&
+        _cashierOnlineOrdersLoadedAt != null &&
+        DateTime.now().difference(_cashierOnlineOrdersLoadedAt!) < const Duration(seconds: 4)) {
+      return;
+    }
+    _loadCashierOnlineOrdersInFlight = true;
     try {
       final res = await http
           .post(
@@ -2667,12 +3008,22 @@ class AppState extends ChangeNotifier {
             return orderDataFromApiMap(map, orderLinesFromApiMap(map));
           }),
         );
+      _cashierOnlineOrdersLoadedAt = DateTime.now();
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _loadCashierOnlineOrdersInFlight = false;
+    }
   }
 
-  Future<void> loadCashierOrderHistory() async {
-    if (userEmail == null || !isCashier) return;
+  Future<void> loadCashierOrderHistory({bool force = false}) async {
+    if (userEmail == null || !isCashier || _loadCashierOrderHistoryInFlight) return;
+    if (!force &&
+        _cashierOrderHistoryLoadedAt != null &&
+        DateTime.now().difference(_cashierOrderHistoryLoadedAt!) < const Duration(seconds: 4)) {
+      return;
+    }
+    _loadCashierOrderHistoryInFlight = true;
     try {
       final res = await http
           .post(
@@ -2694,12 +3045,22 @@ class AppState extends ChangeNotifier {
             return orderDataFromApiMap(map, orderLinesFromApiMap(map));
           }),
         );
+      _cashierOrderHistoryLoadedAt = DateTime.now();
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _loadCashierOrderHistoryInFlight = false;
+    }
   }
 
-  Future<void> loadCashierWalkInQueues() async {
-    if (userEmail == null || !isCashier) return;
+  Future<void> loadCashierWalkInQueues({bool force = false}) async {
+    if (userEmail == null || !isCashier || _loadCashierWalkInQueuesInFlight) return;
+    if (!force &&
+        _cashierWalkInQueuesLoadedAt != null &&
+        DateTime.now().difference(_cashierWalkInQueuesLoadedAt!) < const Duration(seconds: 4)) {
+      return;
+    }
+    _loadCashierWalkInQueuesInFlight = true;
     try {
       Future<List<OrderData>> fetch(String filter) async {
         final res = await http
@@ -2727,8 +3088,12 @@ class AppState extends ChangeNotifier {
       cashierWalkInComplete
         ..clear()
         ..addAll(await fetch('claimed'));
+      _cashierWalkInQueuesLoadedAt = DateTime.now();
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _loadCashierWalkInQueuesInFlight = false;
+    }
   }
 
   Future<String?> claimWalkInOrder(int orderId) async {
@@ -2752,8 +3117,8 @@ class AppState extends ChangeNotifier {
           return 'Could not update (${res.statusCode})';
         }
       }
-      await loadCashierWalkInQueues();
-      await loadCashierOrderHistory();
+      await loadCashierWalkInQueues(force: true);
+      await loadCashierOrderHistory(force: true);
       notifyListeners();
       return null;
     } catch (e) {
@@ -2788,7 +3153,7 @@ class AppState extends ChangeNotifier {
           return 'Update failed (${res.statusCode})';
         }
       }
-      await loadCashierOnlineOrders();
+      await loadCashierOnlineOrders(force: true);
       notifyListeners();
       return null;
     } catch (e) {
@@ -2826,7 +3191,7 @@ class AppState extends ChangeNotifier {
           return 'Update failed (${res.statusCode})';
         }
       }
-      await loadCashierOnlineOrders();
+      await loadCashierOnlineOrders(force: true);
       notifyListeners();
       return null;
     } catch (e) {
@@ -2959,8 +3324,10 @@ class _AuthScreenState extends State<AuthScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFF242424),
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
+            Column(
+              children: [
             const SizedBox(height: 50),
             const Text(
               'WELCOME',
@@ -3214,6 +3581,31 @@ class _AuthScreenState extends State<AuthScreen> {
                 ),
               ),
             ),
+              ],
+            ),
+            if (busy)
+              Positioned.fill(
+                child: ColoredBox(
+                  color: Colors.black54,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.4)),
+                          SizedBox(width: 12),
+                          Text('Loading...'),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -3286,6 +3678,10 @@ class AppScaffold extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isCustomer = state.userRole == 'customer';
+    final keepHamburger = isCustomer && title != 'CHECKOUT' && title != 'PAYMENT';
+    final headerBg = isCustomer ? const Color(0xFF242424) : AppColors.brand;
+    final headerFg = isCustomer ? const Color(0xFFFFC024) : Theme.of(context).colorScheme.onPrimary;
     final qty = state.tray.fold<int>(0, (s, e) => s + e.qty);
     final pendingAttentionExists = state.orders.isEmpty
         ? state.orderNosWithUnreadAttention.isNotEmpty
@@ -3295,7 +3691,9 @@ class AppScaffold extends StatelessWidget {
     final showAttentionDot = state.unreadNotificationsCount > 0 || pendingAttentionExists;
     return Scaffold(
       appBar: AppBar(
-        leading: forceDrawerLeading && state.userEmail != null
+        foregroundColor: headerFg,
+        iconTheme: IconThemeData(color: headerFg),
+        leading: (forceDrawerLeading || keepHamburger) && state.userEmail != null
             ? Builder(
                 builder: (context) {
                   return Stack(
@@ -3356,17 +3754,10 @@ class AppScaffold extends StatelessWidget {
                       );
                     },
                   ),
-        backgroundColor: AppColors.brand,
-        title: Container(
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surface,
-            borderRadius: BorderRadius.circular(12),
-          ),
-          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-          child: Text(
-            title,
-            style: TextStyle(fontWeight: FontWeight.w800, color: Theme.of(context).colorScheme.onSurface),
-          ),
+        backgroundColor: headerBg,
+        title: Text(
+          title,
+          style: TextStyle(fontWeight: FontWeight.w800, color: headerFg),
         ),
         centerTitle: true,
         actions: [
@@ -3379,7 +3770,7 @@ class AppScaffold extends StatelessWidget {
               icon: Badge(
                 isLabelVisible: qty > 0,
                 label: Text('$qty'),
-                child: const Icon(Icons.shopping_cart_outlined),
+                child: Icon(Icons.shopping_cart_outlined, color: headerFg),
               ),
             ),
           ...?actions,
@@ -3401,6 +3792,9 @@ class AppDrawer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isCustomer = state.userRole == 'customer';
+    final drawerHeaderBg = isCustomer ? const Color(0xFF242424) : AppColors.brand;
+    final drawerHeaderFg = isCustomer ? const Color(0xFFFFC024) : Colors.black;
     final greet = state.profile.fullName.trim().isNotEmpty ? state.profile.fullName.trim() : (state.userEmail ?? '');
     final pendingAttentionExists = state.orders.isEmpty
         ? state.orderNosWithUnreadAttention.isNotEmpty
@@ -3412,14 +3806,18 @@ class AppDrawer extends StatelessWidget {
       child: ListView(
         children: [
           DrawerHeader(
-            decoration: const BoxDecoration(color: AppColors.brand),
+            decoration: BoxDecoration(color: drawerHeaderBg),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
                 Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
                 const SizedBox(height: 10),
-                if (greet.isNotEmpty) Text('Hi, $greet!', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                if (greet.isNotEmpty)
+                  Text(
+                    'Hi, $greet!',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: drawerHeaderFg),
+                  ),
               ],
             ),
           ),
@@ -3458,6 +3856,9 @@ class CustomerDashboardScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final who = state.profile.fullName.trim().isNotEmpty
+        ? state.profile.fullName.trim()
+        : (state.userEmail ?? '').trim();
     final items = <({String title, IconData icon, Widget screen})>[
       (title: 'Restaurant Menu', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state)),
       (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state)),
@@ -3471,39 +3872,77 @@ class CustomerDashboardScreen extends StatelessWidget {
       title: 'DASHBOARD',
       showTrayShortcut: false,
       forceDrawerLeading: true,
-      body: GridView.builder(
-        padding: const EdgeInsets.all(12),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 2,
-          crossAxisSpacing: 10,
-          mainAxisSpacing: 10,
-          childAspectRatio: 1.35,
-        ),
-        itemCount: items.length,
-        itemBuilder: (context, index) {
-          final item = items[index];
-          return Card(
-            child: InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: () {
-                Navigator.of(context).pushReplacement(
-                  MaterialPageRoute<void>(builder: (_) => item.screen),
-                );
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            decoration: const BoxDecoration(color: Color(0xFF242424)),
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+            child: Column(
+          crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+            Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 52, fit: BoxFit.contain)),
+                if (who.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    'Hi, $who!',
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Colors.white),
+                textAlign: TextAlign.center,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Expanded(
+            child: RefreshIndicator(
+              onRefresh: () async {
+                await Future.wait([
+                  state.loadMenu(force: true),
+                  state.loadSetMenus(force: true),
+                  state.loadProfile(force: true),
+                  state.loadOrders(force: true),
+                  state.loadInquiries(force: true),
+                ]);
+                await state.loadNotifications(force: true);
               },
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Icon(item.icon, color: AppColors.brand, size: 30),
-                    const Spacer(),
-                    Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
-                  ],
+              child: GridView.builder(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.all(12),
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 2,
+                  crossAxisSpacing: 10,
+                  mainAxisSpacing: 10,
+                  childAspectRatio: 1.35,
                 ),
+                itemCount: items.length,
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  return Card(
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        Navigator.of(context).pushReplacement(
+                          MaterialPageRoute<void>(builder: (_) => item.screen),
+                        );
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(item.icon, color: AppColors.brand, size: 30),
+                            const Spacer(),
+                            Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
-          );
-        },
+          ),
+        ],
       ),
     );
   }
@@ -3597,25 +4036,17 @@ class RestaurantMenuScreen extends StatefulWidget {
 class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   String _search = '';
   String _sectionFilter = 'ALL';
-  Timer? _realtimeRefreshTimer;
 
   @override
   void initState() {
     super.initState();
-    // Lightweight polling so updates from other clients show up quickly.
-    _realtimeRefreshTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
-      if (!mounted) return;
-      await widget.state.loadMenu();
-      if (widget.state.userEmail != null) {
-        await widget.state.loadOrders();
-      }
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await Future.wait([
+        widget.state.loadMenu(force: true),
+        widget.state.loadSetMenus(force: true),
+      ]);
+      if (mounted) setState(() {});
     });
-  }
-
-  @override
-  void dispose() {
-    _realtimeRefreshTimer?.cancel();
-    super.dispose();
   }
 
   String _dishCardDescription(MenuItemData item) {
@@ -3871,21 +4302,32 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
               ),
             ),
             Expanded(
-              child: filtered.isEmpty
-                  ? const Center(child: Text('No restaurant menu items in this filter.'))
-                  : _sectionFilter == 'ALL'
-                      ? GridView.builder(
-                          padding: const EdgeInsets.all(12),
-                          itemCount: allAlpha.length,
-                          gridDelegate: gridDelegate,
-                          itemBuilder: (context, index) => _dishCard(context, allAlpha[index]),
-                        )
-                      : GridView.builder(
-                          padding: const EdgeInsets.all(12),
-                          itemCount: filtered.length,
-                          gridDelegate: gridDelegate,
-                          itemBuilder: (context, index) => _dishCard(context, filtered[index]),
-                        ),
+              child: RefreshIndicator(
+                onRefresh: () async {
+                  await Future.wait([
+                    widget.state.loadMenu(force: true),
+                    widget.state.loadSetMenus(force: true),
+                  ]);
+                  if (mounted) setState(() {});
+                },
+                child: filtered.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [
+                          SizedBox(height: 120),
+                          Center(child: Text('No restaurant menu items in this filter.')),
+                        ],
+                      )
+                    : GridView.builder(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        padding: const EdgeInsets.all(12),
+                        itemCount: _sectionFilter == 'ALL' ? allAlpha.length : filtered.length,
+                        gridDelegate: gridDelegate,
+                        itemBuilder: (context, index) => _sectionFilter == 'ALL'
+                            ? _dishCard(context, allAlpha[index])
+                            : _dishCard(context, filtered[index]),
+                      ),
+              ),
             ),
           ],
         );
@@ -3908,100 +4350,8 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                   ],
                 );
               }
-              return Column(
-                children: [
-                  Expanded(child: menuBody),
-                  Container(
-                    decoration: const BoxDecoration(color: Colors.white, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
-                    padding: const EdgeInsets.all(12),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        if (widget.state.tray.isNotEmpty) ...[
-                          SizedBox(
-                            height: 92,
-                            child: ListView.builder(
-                              scrollDirection: Axis.horizontal,
-                              itemCount: widget.state.tray.length,
-                              itemBuilder: (context, i) {
-                                final e = widget.state.tray[i];
-                                return Container(
-                                  width: 220,
-                                  margin: const EdgeInsets.only(right: 8),
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    borderRadius: BorderRadius.circular(10),
-                                    border: Border.all(color: AppColors.border),
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      Expanded(
-                                        child: Text(
-                                          e.menu.name,
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
-                                        ),
-                                      ),
-                                      IconButton(
-                                        padding: EdgeInsets.zero,
-                                        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                                        icon: const Icon(Icons.remove_circle_outline, size: 20),
-                                        onPressed: () => widget.state.changeQty(e, -1),
-                                      ),
-                                      Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                      IconButton(
-                                        padding: EdgeInsets.zero,
-                                        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                                        icon: const Icon(Icons.add_circle_outline, size: 20),
-                                        onPressed: () => widget.state.changeQty(e, 1),
-                                      ),
-                                    ],
-                                  ),
-                                );
-                              },
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                        ],
-                        Text(
-                          'Subtotal ₱${subtotal.toStringAsFixed(2)}',
-                          style: const TextStyle(fontWeight: FontWeight.w800),
-                          textAlign: TextAlign.center,
-                        ),
-                        const SizedBox(height: 10),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: FilledButton(
-                                style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
-                                onPressed: () => widget.state.clearTray(),
-                                child: const Text('CANCEL'),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: FilledButton(
-                                style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                                onPressed: widget.state.tray.isEmpty
-                                    ? null
-                                    : () {
-                                        Navigator.of(context).push<void>(
-                                          MaterialPageRoute<void>(
-                                            builder: (_) => CheckoutScreen(state: widget.state),
-                                          ),
-                                        );
-                                      },
-                                child: const Text('CHECKOUT'),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              );
+              // Phone / narrow layout: scrollable menu only (tray & checkout live under Your Tray / checkout flow).
+              return menuBody;
             },
           ),
         );
@@ -5230,54 +5580,67 @@ class TrayScreen extends StatelessWidget {
           body: Column(
             children: [
               Expanded(
-                child: state.tray.isEmpty
-                    ? const Center(child: Text('Your tray is empty.'))
-                    : ListView.builder(
-                        padding: const EdgeInsets.all(12),
-                        itemCount: state.tray.length,
-                        itemBuilder: (context, index) {
-                          final item = state.tray[index];
-                          return Card(
-                            child: ListTile(
-                              leading: SizedBox(
-                                width: 56,
-                                height: 56,
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: _MenuThumb(item: item.menu, compact: true),
+                child: RefreshIndicator(
+                  onRefresh: () async {
+                    await state.loadMenu(force: true);
+                    await state.pullCustomerTrayDraftFromServer();
+                  },
+                  child: state.tray.isEmpty
+                      ? ListView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: const [
+                            SizedBox(height: 160),
+                            Center(child: Text('Your tray is empty.')),
+                          ],
+                        )
+                      : ListView.builder(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          padding: const EdgeInsets.all(12),
+                          itemCount: state.tray.length,
+                          itemBuilder: (context, index) {
+                            final item = state.tray[index];
+                            return Card(
+                              child: ListTile(
+                                leading: SizedBox(
+                                  width: 56,
+                                  height: 56,
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: _MenuThumb(item: item.menu, compact: true),
+                                  ),
+                                ),
+                                title: Text(item.menu.name),
+                                subtitle: Text('${item.dip.isEmpty ? 'No dip' : item.dip}\n₱${item.menu.price.toStringAsFixed(2)}'),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      onPressed: () {
+                                        state.changeQty(item, 1);
+                                        appSnack(context, 'Updated quantity');
+                                      },
+                                      icon: const Icon(Icons.add_circle, color: AppColors.success),
+                                    ),
+                                    Text('${item.qty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                                    IconButton(
+                                      onPressed: () {
+                                        final q = item.qty;
+                                        state.changeQty(item, -1);
+                                        if (q <= 1) {
+                                          appSnack(context, 'Removed ${item.menu.name} from tray');
+                                        } else {
+                                          appSnack(context, 'Updated quantity');
+                                        }
+                                      },
+                                      icon: const Icon(Icons.remove_circle, color: AppColors.accent),
+                                    ),
+                                  ],
                                 ),
                               ),
-                              title: Text(item.menu.name),
-                              subtitle: Text('${item.dip.isEmpty ? 'No dip' : item.dip}\n₱${item.menu.price.toStringAsFixed(2)}'),
-                              trailing: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  IconButton(
-                                    onPressed: () {
-                                      state.changeQty(item, 1);
-                                      appSnack(context, 'Updated quantity');
-                                    },
-                                    icon: const Icon(Icons.add_circle, color: AppColors.success),
-                                  ),
-                                  Text('${item.qty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
-                                  IconButton(
-                                    onPressed: () {
-                                      final q = item.qty;
-                                      state.changeQty(item, -1);
-                                      if (q <= 1) {
-                                        appSnack(context, 'Removed ${item.menu.name} from tray');
-                                      } else {
-                                        appSnack(context, 'Updated quantity');
-                                      }
-                                    },
-                                    icon: const Icon(Icons.remove_circle, color: AppColors.accent),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                      ),
+                            );
+                          },
+                        ),
+                ),
               ),
               SummaryFooter(
                 lines: [SummaryLine('SUBTOTAL', '₱${state.subtotal.toStringAsFixed(2)}')],
@@ -5331,6 +5694,17 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
       _selectedDeliveryAddress = _deliveryAddresses.first;
     }
     _selectedDeliveryTime = widget.state.checkoutDeliveryTime.trim().isEmpty ? 'NOW' : widget.state.checkoutDeliveryTime.trim();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await widget.state.loadMenu(force: true);
+      await widget.state.pullCustomerTrayDraftFromServer();
+      if (!mounted) return;
+      if (widget.state.tray.isEmpty) {
+        appSnack(context, 'Your tray is empty.');
+        Navigator.of(context).maybePop();
+        return;
+      }
+      setState(() {});
+    });
   }
 
   Future<void> _pickScheduledDelivery() async {
@@ -5362,12 +5736,20 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     return AppScaffold(
       state: s,
       title: 'CHECKOUT',
+      showTrayShortcut: false,
       body: Column(
         children: [
           Expanded(
-            child: ListView(
-              padding: const EdgeInsets.all(12),
-              children: [
+            child: RefreshIndicator(
+              onRefresh: () async {
+                await s.loadMenu(force: true);
+                await s.pullCustomerTrayDraftFromServer();
+                if (mounted) setState(() {});
+              },
+              child: ListView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.all(12),
+                children: [
                 ToggleSection(
                   title: 'DELIVERY INFORMATION',
                   expanded: showDelivery,
@@ -5463,6 +5845,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   ),
                 ),
               ],
+              ),
             ),
           ),
           SummaryFooter(
@@ -5471,6 +5854,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
             actionLabel: 'CONFIRM',
             onSecondary: () => Navigator.of(context).pop(),
             onAction: () async {
+              if (s.tray.isEmpty) {
+                appSnack(context, 'Your tray is empty.');
+                return;
+              }
               if ((_selectedDeliveryAddress ?? '').trim().isEmpty) {
                 appSnack(context, 'Select your delivery address.');
                 return;
@@ -5534,6 +5921,7 @@ class PaymentScreen extends StatefulWidget {
 class _PaymentScreenState extends State<PaymentScreen> {
   OrderData? _placedOrder;
   bool localProofUploaded = false;
+  bool _uploadingProof = false;
   bool showPayment = true;
   bool showTray = true;
   bool showNotes = true;
@@ -5545,8 +5933,16 @@ class _PaymentScreenState extends State<PaymentScreen> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await widget.state.loadOrders();
-      if (mounted) setState(() {});
+      await widget.state.loadOrders(force: true);
+      if (!mounted) return;
+      if (widget.draftCheckout &&
+          _placedOrder == null &&
+          widget.state.tray.isEmpty) {
+        appSnack(context, 'Your tray is empty.');
+        Navigator.of(context).maybePop();
+        return;
+      }
+      setState(() {});
     });
   }
 
@@ -5587,11 +5983,23 @@ class _PaymentScreenState extends State<PaymentScreen> {
   }
 
   Future<void> _pickAndUploadProof({required bool insufficient, ImageSource source = ImageSource.gallery}) async {
+    if (_uploadingProof) return;
+    if (widget.draftCheckout && widget.state.tray.isEmpty) {
+      appSnack(context, 'Your tray is empty.');
+      return;
+    }
     final picker = ImagePicker();
-    final file = await picker.pickImage(source: source);
+    final file = await picker.pickImage(
+      source: source,
+      imageQuality: 72,
+      maxWidth: 1600,
+      maxHeight: 1600,
+    );
     if (file == null) return;
     final bytes = await file.readAsBytes();
     final s = widget.state;
+    setState(() => _uploadingProof = true);
+    try {
     if (widget.draftCheckout && _placedOrder == null) {
       if (!mounted) return;
       showDialog<void>(
@@ -5607,10 +6015,10 @@ class _PaymentScreenState extends State<PaymentScreen> {
         return;
       }
       final newOrder = result.order!;
-      final ok = await s.uploadPaymentProof(newOrder.id, file);
+      final err = await s.uploadPaymentProof(newOrder.id, file);
       if (!mounted) return;
-      if (!ok) {
-        appSnack(context, 'Could not upload payment proof. Try again.');
+      if (err != null) {
+        appSnack(context, err);
         return;
       }
       await s.clearCheckoutAfterSuccessfulOrderAndPayment();
@@ -5620,15 +6028,15 @@ class _PaymentScreenState extends State<PaymentScreen> {
         _localProofBytes = bytes;
         localProofUploaded = true;
       });
-      await s.loadOrders();
+      await s.loadOrders(force: true);
       appSnack(context, 'Payment proof uploaded — your order is placed.');
       return;
     }
     final oid = (_placedOrder ?? widget.order)!.id;
-    final ok = await s.uploadPaymentProof(oid, file);
+    final err = await s.uploadPaymentProof(oid, file);
     if (!mounted) return;
-    if (!ok) {
-      appSnack(context, 'Upload failed. Try again.');
+    if (err != null) {
+      appSnack(context, err);
       return;
     }
     setState(() {
@@ -5637,6 +6045,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
       localProofUploaded = true;
     });
     appSnack(context, insufficient ? 'Balance payment proof uploaded' : 'Payment proof uploaded');
+    } finally {
+      if (mounted) setState(() => _uploadingProof = false);
+    }
   }
 
   Widget _paymentProofPreview(OrderData? synced) {
@@ -5715,12 +6126,20 @@ class _PaymentScreenState extends State<PaymentScreen> {
         return AppScaffold(
           state: s,
           title: 'PAYMENT',
+          showTrayShortcut: false,
           body: Column(
             children: [
+              if (_uploadingProof) const LinearProgressIndicator(minHeight: 3),
               Expanded(
-                child: ListView(
-                  padding: const EdgeInsets.all(12),
-                  children: [
+                child: RefreshIndicator(
+                  onRefresh: () async {
+                    await s.loadOrders(force: true);
+                    if (mounted) setState(() {});
+                  },
+                  child: ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(12),
+                    children: [
                     _OrderNoCard(displayNo: isDraft ? null : orderForUi.orderNo),
                     const SizedBox(height: 10),
                     if (insufficient) ...[
@@ -5790,7 +6209,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
                                       children: [
                                         Expanded(
                                           child: OutlinedButton(
-                                            onPressed: () => _pickAndUploadProof(insufficient: insufficient),
+                                            onPressed: _uploadingProof
+                                                ? null
+                                                : () => _pickAndUploadProof(insufficient: insufficient),
                                             child: Text(
                                               insufficient
                                                   ? (proofDone ? 'CHANGE BALANCE PROOF' : 'UPLOAD BALANCE PROOF')
@@ -5800,7 +6221,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
                                         ),
                                         const SizedBox(width: 8),
                                         OutlinedButton.icon(
-                                          onPressed: () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
+                                          onPressed: _uploadingProof
+                                              ? null
+                                              : () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
                                           icon: const Icon(Icons.photo_camera_outlined, size: 18),
                                           label: const Text('CAMERA'),
                                         ),
@@ -5819,7 +6242,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                                     ),
                                   ),
                                   OutlinedButton(
-                                    onPressed: () => _pickAndUploadProof(insufficient: insufficient),
+                                    onPressed: _uploadingProof ? null : () => _pickAndUploadProof(insufficient: insufficient),
                                     child: Text(
                                       insufficient
                                           ? (proofDone ? 'CHANGE BALANCE PROOF' : 'UPLOAD BALANCE PROOF')
@@ -5828,7 +6251,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
                                   ),
                                   const SizedBox(width: 8),
                                   OutlinedButton.icon(
-                                    onPressed: () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
+                                    onPressed: _uploadingProof
+                                        ? null
+                                        : () => _pickAndUploadProof(insufficient: insufficient, source: ImageSource.camera),
                                     icon: const Icon(Icons.photo_camera_outlined, size: 18),
                                     label: const Text('CAMERA'),
                                   ),
@@ -5915,7 +6340,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       title: 'NOTES',
                       expanded: showNotes,
                       onToggle: () => setState(() => showNotes = !showNotes),
-                      child: Text(widget.note),
+                      child: Text(widget.note.trim().isEmpty ? 'Notes is empty.' : widget.note),
                     ),
                     const SizedBox(height: 10),
                     ToggleSection(
@@ -5932,6 +6357,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       ),
                     ),
                   ],
+                  ),
                 ),
               ),
               SummaryFooter(
@@ -5994,7 +6420,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
   }
 }
 
-class OrderStatusScreen extends StatelessWidget {
+class OrderStatusScreen extends StatefulWidget {
   const OrderStatusScreen({
     super.key,
     required this.state,
@@ -6007,7 +6433,27 @@ class OrderStatusScreen extends StatelessWidget {
   final bool paymentUploaded;
 
   @override
+  State<OrderStatusScreen> createState() => _OrderStatusScreenState();
+}
+
+class _OrderStatusScreenState extends State<OrderStatusScreen> {
+  OrderData _resolvedOrder() {
+    for (final o in widget.state.orders) {
+      if (o.id == widget.order.id) return o;
+    }
+    return widget.order;
+  }
+
+  bool _proofReceived(OrderData o) {
+    return widget.paymentUploaded ||
+        o.paymentUploaded ||
+        (o.paymentProofBase64 != null && o.paymentProofBase64!.trim().isNotEmpty);
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final state = widget.state;
+    final order = _resolvedOrder();
     final track = order.deliveryTrackingUrl.trim();
     final st = order.status.toUpperCase();
     final canFollowUp = st.contains('WAITING FOR PAYMENT CONFIRMATION') ||
@@ -6022,96 +6468,105 @@ class OrderStatusScreen extends StatelessWidget {
           (_) => false,
         );
       },
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(order.orderNo, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 8),
-                    Text('Status: ${statusReadable(order.status)}'),
-                    Text('Total: ₱${order.total.toStringAsFixed(2)}'),
-                    Text('Payment proof: ${paymentUploaded ? 'Received' : 'Not uploaded yet'}'),
-                    if (canFollowUp) ...[
-                      const SizedBox(height: 10),
-                      OutlinedButton.icon(
-                        onPressed: () async {
-                          final err = await state.submitHelpRequest(
-                            area: 'Order Follow-up',
-                            problem: 'Follow-up on pending order ${order.orderNo}',
-                            desiredOutcome: 'Please review this order and update the payment/order confirmation status.',
-                          );
-                          if (!context.mounted) return;
-                          appSnack(context, err ?? 'Follow-up sent');
-                        },
-                        icon: const Icon(Icons.reply_outlined),
-                        label: const Text('FOLLOW UP'),
-                      ),
-                    ],
-                    if (track.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      Text('Delivery tracking', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
-                      const SizedBox(height: 6),
-                      Builder(
-                        builder: (context) {
-                          final u = Uri.tryParse(track);
-                          final tappable = u != null && u.hasScheme && (u.scheme == 'http' || u.scheme == 'https');
-                          if (tappable) {
-                            return InkWell(
-                              onTap: () => launchUrl(u, mode: LaunchMode.externalApplication),
-                              child: Text(
-                                track,
-                                style: TextStyle(
-                                  color: Colors.blue.shade800,
-                                  decoration: TextDecoration.underline,
-                                  height: 1.35,
-                                ),
-                              ),
-                            );
-                          }
-                          return SelectableText(track);
-                        },
-                      ),
-                      const SizedBox(height: 8),
-                      FilledButton.icon(
-                        onPressed: () async {
-                          final u = Uri.tryParse(track);
-                          if (u != null && await canLaunchUrl(u)) {
-                            await launchUrl(u, mode: LaunchMode.externalApplication);
-                          }
-                        },
-                        icon: const Icon(Icons.open_in_new),
-                        label: const Text('OPEN TRACKING LINK'),
-                      ),
-                    ],
-                  ],
+      body: RefreshIndicator(
+        onRefresh: () async {
+          await state.loadOrders(force: true);
+          if (mounted) setState(() {});
+        },
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(order.orderNo, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 8),
+                        Text('Status: ${statusReadable(order.status)}'),
+                        Text('Total: ₱${order.total.toStringAsFixed(2)}'),
+                        Text('Payment proof: ${_proofReceived(order) ? 'Received' : 'Not uploaded yet'}'),
+                        if (canFollowUp) ...[
+                          const SizedBox(height: 10),
+                          OutlinedButton.icon(
+                            onPressed: () async {
+                              final err = await state.submitHelpRequest(
+                                area: 'Order Follow-up',
+                                problem: 'Follow-up on pending order ${order.orderNo}',
+                                desiredOutcome: 'Please review this order and update the payment/order confirmation status.',
+                              );
+                              if (!context.mounted) return;
+                              appSnack(context, err ?? 'Follow-up sent');
+                            },
+                            icon: const Icon(Icons.reply_outlined),
+                            label: const Text('FOLLOW UP'),
+                          ),
+                        ],
+                        if (track.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Text('Delivery tracking', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 6),
+                          Builder(
+                            builder: (context) {
+                              final u = Uri.tryParse(track);
+                              final tappable = u != null && u.hasScheme && (u.scheme == 'http' || u.scheme == 'https');
+                              if (tappable) {
+                                return InkWell(
+                                  onTap: () => launchUrl(u, mode: LaunchMode.externalApplication),
+                                  child: Text(
+                                    track,
+                                    style: TextStyle(
+                                      color: Colors.blue.shade800,
+                                      decoration: TextDecoration.underline,
+                                      height: 1.35,
+                                    ),
+                                  ),
+                                );
+                              }
+                              return SelectableText(track);
+                            },
+                          ),
+                          const SizedBox(height: 8),
+                          FilledButton.icon(
+                            onPressed: () async {
+                              final u = Uri.tryParse(track);
+                              if (u != null && await canLaunchUrl(u)) {
+                                await launchUrl(u, mode: LaunchMode.externalApplication);
+                              }
+                            },
+                            icon: const Icon(Icons.open_in_new),
+                            label: const Text('OPEN TRACKING LINK'),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
                 ),
-              ),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: () {
+                    Navigator.of(context).pushAndRemoveUntil(
+                      MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)),
+                      (_) => false,
+                    );
+                  },
+                  child: const Text('BACK TO MENU'),
+                ),
+                const SizedBox(height: 10),
+                OutlinedButton(
+                  onPressed: () {
+                    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => MyOrdersScreen(state: state)));
+                  },
+                  child: const Text('MY ORDERS'),
+                ),
+              ],
             ),
-            const SizedBox(height: 16),
-            FilledButton(
-              onPressed: () {
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)),
-                  (_) => false,
-                );
-              },
-              child: const Text('BACK TO MENU'),
-            ),
-            const SizedBox(height: 10),
-            OutlinedButton(
-              onPressed: () {
-                Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => MyOrdersScreen(state: state)));
-              },
-              child: const Text('MY ORDERS'),
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -6127,7 +6582,6 @@ class MyOrdersScreen extends StatefulWidget {
 }
 
 class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProviderStateMixin {
-  Timer? _autoRefreshTimer;
   bool _isInsufficient(OrderData o) => o.status.toUpperCase().contains('INSUFFICIENT');
   bool _needsAttention(OrderData o) => widget.state.orderNosWithUnreadAttention.contains(o.orderNo);
   bool _canFollowUp(OrderData o) {
@@ -6176,6 +6630,22 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
         return Colors.grey.shade700;
     }
   }
+
+  Color _orderStatusBadgeBg(OrderData o) {
+    final up = statusReadableForOrder(o).toUpperCase();
+    if (up.contains('INSUFFICIENT')) return Colors.red.shade100;
+    if (up.contains('CONFIRMED')) return Colors.green.shade100;
+    if (up.contains('CANCEL')) return Colors.grey.shade300;
+    return Colors.amber.shade100;
+  }
+
+  Color _orderStatusBadgeFg(OrderData o) {
+    final up = statusReadableForOrder(o).toUpperCase();
+    if (up.contains('INSUFFICIENT')) return Colors.red.shade900;
+    if (up.contains('CONFIRMED')) return Colors.green.shade900;
+    if (up.contains('CANCEL')) return Colors.grey.shade900;
+    return Colors.orange.shade900;
+  }
   Future<void> _followUpOrder(OrderData o) async {
     final err = await widget.state.submitHelpRequest(
       area: 'Order Follow-up',
@@ -6188,20 +6658,20 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
 
   late TabController _tab;
   String _search = '';
+  String _filter = 'all';
 
   @override
   void initState() {
     super.initState();
     _tab = TabController(length: 4, vsync: this);
-    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 12), (_) {
-      if (!mounted) return;
-      widget.state.loadOrders();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await widget.state.loadOrders(force: true);
+      if (mounted) setState(() {});
     });
   }
 
   @override
   void dispose() {
-    _autoRefreshTimer?.cancel();
     _tab.dispose();
     super.dispose();
   }
@@ -6252,9 +6722,21 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
       return o.orderNo.toLowerCase().contains(query) ||
           statusReadable(o.status).toLowerCase().contains(query) ||
           fulfillmentStageReadable(o.fulfillmentStage).toLowerCase().contains(query);
+    }).where((o) {
+      switch (_filter) {
+        case 'attention':
+          return _needsAttention(o) || _isInsufficient(o);
+        case 'payment_uploaded':
+          return o.paymentUploaded || (o.paymentProofBase64?.trim().isNotEmpty ?? false);
+        default:
+          return true;
+      }
     }).toList();
     return RefreshIndicator(
-      onRefresh: widget.state.loadOrders,
+      onRefresh: () async {
+        await widget.state.loadOrders(force: true);
+        if (mounted) setState(() {});
+      },
       child: filtered.isEmpty
           ? ListView(
               physics: const AlwaysScrollableScrollPhysics(),
@@ -6263,6 +6745,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
               ],
             )
           : ListView.builder(
+              physics: const AlwaysScrollableScrollPhysics(),
               padding: const EdgeInsets.only(bottom: 16),
               itemCount: filtered.length,
               itemBuilder: (context, index) {
@@ -6281,43 +6764,60 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                           contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                           minVerticalPadding: 0,
                           leading: _paymentThumb(o),
-                          title: Text(o.orderNo),
-                    subtitle: Text.rich(
-                      TextSpan(
-                        style: DefaultTextStyle.of(context).style.copyWith(height: 1.2, fontSize: 12.5),
-                        children: [
-                          TextSpan(
-                            text: '${fulfillmentStageReadable(o.fulfillmentStage)}\n',
-                            style: TextStyle(
-                              fontWeight: FontWeight.w800,
-                              color: _fulfillmentStageColor(o.fulfillmentStage),
-                              height: 1.2,
-                            ),
+                          title: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                constraints: const BoxConstraints(maxWidth: 190),
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: _orderStatusBadgeBg(o),
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  statusReadableForOrder(o),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: _orderStatusBadgeFg(o),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(o.orderNo),
+                            ],
                           ),
-                          TextSpan(text: '${statusReadableForOrder(o)}'),
-                          if (o.loyaltyPointsEarned > 0 && (tabIndex == 1 || tabIndex == 2))
-                            TextSpan(text: '\nLoyalty: +${o.loyaltyPointsEarned} pts'),
-                          TextSpan(text: '\n${o.createdAt.toLocal()}'),
-                        ],
-                      ),
-                    ),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                fulfillmentStageReadable(o.fulfillmentStage),
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  color: _fulfillmentStageColor(o.fulfillmentStage),
+                                  height: 1.2,
+                                ),
+                              ),
+                              if (o.loyaltyPointsEarned > 0 && (tabIndex == 1 || tabIndex == 2))
+                                Text('Loyalty: +${o.loyaltyPointsEarned} pts', style: const TextStyle(fontSize: 12)),
+                              Text(formatDateTimeLocal(o.createdAt), style: const TextStyle(fontSize: 12)),
+                              const SizedBox(height: 4),
+                              Text(
+                                '₱${o.total.toStringAsFixed(2)}',
+                                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5),
+                              ),
+                            ],
+                          ),
                     isThreeLine: false,
                     trailing: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 200, minHeight: 0),
+                      constraints: const BoxConstraints(maxWidth: 92, minHeight: 0),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         mainAxisAlignment: MainAxisAlignment.end,
                         crossAxisAlignment: CrossAxisAlignment.center,
                         children: [
-                          Flexible(
-                            child: Text(
-                              '₱${o.total.toStringAsFixed(2)}',
-                              textAlign: TextAlign.end,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5),
-                            ),
-                          ),
                           if (tabIndex == 0 && _canFollowUp(o)) ...[
                             const SizedBox(width: 2),
                             IconButton(
@@ -6344,6 +6844,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                       ),
                     ),
                     onTap: () {
+                      widget.state.markOrderAttentionRead(o.orderNo);
                       showDialog<void>(
                         context: context,
                         builder: (ctx) => AlertDialog(
@@ -6358,7 +6859,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                 _detailLine('Fulfillment stage', fulfillmentStageReadable(o.fulfillmentStage)),
                                 if (o.loyaltyPointsEarned > 0)
                                   _detailLine('Loyalty points from this order', '+${o.loyaltyPointsEarned} pts'),
-                                _detailLine('Placed', o.createdAt.toLocal().toString()),
+                                _detailLine('Placed', formatDateTimeLocal(o.createdAt)),
                                 _detailLine('Account email', o.userEmail ?? '—'),
                                 const Divider(height: 24),
                                 const Text('Delivery & contact', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
@@ -6426,7 +6927,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                             ),
                           ),
                           actions: [
-                            if (o.status.toUpperCase().contains('INSUFFICIENT'))
+                            if (!customerOrderCancelled(o) && o.status.toUpperCase().contains('INSUFFICIENT'))
                               TextButton(
                                 onPressed: () {
                                   Navigator.of(ctx).pop();
@@ -6445,7 +6946,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                     },
                         ),
                       ),
-                      if (alert)
+                      if (widget.state.orderNosWithUnreadAttention.contains(o.orderNo))
                         Positioned(
                           right: 18,
                           top: 10,
@@ -6538,9 +7039,28 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
             children: [
               Padding(
                 padding: const EdgeInsets.all(12),
-                child: TextField(
-                  decoration: const InputDecoration(hintText: 'SEARCH ORDER NO OR STATUS'),
-                  onChanged: (v) => setState(() => _search = v),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        decoration: const InputDecoration(
+                          hintText: 'Search order no., status, fulfillment — use filter for presets',
+                        ),
+                        onChanged: (v) => setState(() => _search = v),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    PopupMenuButton<String>(
+                      tooltip: 'Filters',
+                      icon: Icon(Icons.filter_list, color: _filter == 'all' ? null : AppColors.accent),
+                      onSelected: (v) => setState(() => _filter = v),
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(value: 'all', child: Text('All')),
+                        PopupMenuItem(value: 'attention', child: Text('Needs attention')),
+                        PopupMenuItem(value: 'payment_uploaded', child: Text('With payment proof')),
+                      ],
+                    ),
+                  ],
                 ),
               ),
               Material(
@@ -6600,13 +7120,11 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
   final List<String> _addrSuggestions = [];
   Timer? _addrDebounce;
 
-  @override
-  void initState() {
-    super.initState();
+  void _applyProfileToControllers() {
     final p = widget.state.profile;
-    nameController = TextEditingController(text: p.fullName);
-    contactController = TextEditingController(text: p.contactNumber);
-    addressController = TextEditingController(text: p.deliveryAddress);
+    nameController.text = p.fullName;
+    contactController.text = p.contactNumber;
+    addressController.text = p.deliveryAddress;
     deliveryMapConfirmedLocal = p.deliveryMapConfirmed;
     mapLat = p.deliveryLat;
     mapLng = p.deliveryLng;
@@ -6615,6 +7133,20 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
     if (primary.isNotEmpty && !_savedAddresses.contains(primary)) {
       _savedAddresses.insert(0, primary);
     }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    nameController = TextEditingController();
+    contactController = TextEditingController();
+    addressController = TextEditingController();
+    _applyProfileToControllers();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await widget.state.loadProfile(force: true);
+      if (!mounted) return;
+      setState(_applyProfileToControllers);
+    });
   }
 
   @override
@@ -6691,13 +7223,21 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
     return AppScaffold(
       state: widget.state,
       title: 'MY PROFILE',
+      showTrayShortcut: false,
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
             Expanded(
-              child: ListView(
-                children: [
+              child: RefreshIndicator(
+                onRefresh: () async {
+                  await widget.state.loadProfile(force: true);
+                  if (!mounted) return;
+                  setState(_applyProfileToControllers);
+                },
+                child: ListView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  children: [
                   TextField(controller: nameController, decoration: const InputDecoration(labelText: 'Full Name')),
                   const SizedBox(height: 10),
                   TextField(controller: contactController, decoration: const InputDecoration(labelText: 'Contact Number')),
@@ -6881,6 +7421,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                     ),
                   ),
                 ],
+                ),
               ),
             ),
             FilledButton(
@@ -7229,6 +7770,10 @@ class InquiryScreen extends StatefulWidget {
 class _InquiryScreenState extends State<InquiryScreen> {
   String inquiryType = 'CATERING';
   bool curateOwn = false;
+  bool _menuChoicePicked = false;
+  bool _attemptedSubmit = false;
+  static const int _minSelectedDishesRequired = 4;
+  String _themeDesignChoice = '';
   String menuSuggestionNote = '';
   String themeSuggestionNote = '';
   final themeNotesController = TextEditingController();
@@ -7256,6 +7801,28 @@ class _InquiryScreenState extends State<InquiryScreen> {
   final foodTastingDate = TextEditingController();
   final foodTastingTime = TextEditingController();
   final menuSearchController = TextEditingController();
+
+  InputDecoration _requiredDecoration({
+    required String label,
+    required bool invalid,
+    String? hint,
+    Widget? suffixIcon,
+  }) {
+    final red = Colors.red.shade700;
+    final bad = _attemptedSubmit && invalid;
+    final borderSide = BorderSide(color: bad ? red : Colors.grey.shade400);
+    return InputDecoration(
+      labelText: label,
+      hintText: hint,
+      suffixIcon: suffixIcon,
+      errorText: bad ? 'Required' : null,
+      border: OutlineInputBorder(borderSide: borderSide),
+      enabledBorder: OutlineInputBorder(borderSide: borderSide),
+      focusedBorder: OutlineInputBorder(
+        borderSide: BorderSide(color: bad ? red : AppColors.brand, width: bad ? 1.5 : 2),
+      ),
+    );
+  }
 
   @override
   void initState() {
@@ -7458,8 +8025,40 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return eventTypeOther.text.trim();
   }
 
-  Future<void> _openAiThemeStudio() async {
-    // Event theme design editing is now web-only per product direction.
+  bool get _contactNumberInvalid {
+    final phone = contactNumber.text.trim();
+    if (phone.isEmpty) return true;
+    return phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone);
+  }
+
+  bool get _emailInvalid {
+    final email = inquiryEmail.text.trim();
+    if (email.isEmpty) return true;
+    return !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email);
+  }
+
+  bool get _eventTypeOtherInvalid => eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty;
+
+  bool get _hasAnyPartialWindow =>
+      _eventWindows.any((w) => w.date != null || w.from != null || w.to != null) &&
+      _eventWindows.any((w) => !(w.date != null && w.from != null && w.to != null));
+
+  bool get _hasNoCompleteWindow =>
+      _eventWindows.where((w) => w.date != null && w.from != null && w.to != null).isEmpty;
+
+  bool get _hasWindowTimeRangeError => _eventWindows.any((w) {
+    if (w.date == null || w.from == null || w.to == null) return false;
+    final sm = w.from!.hour * 60 + w.from!.minute;
+    final em = w.to!.hour * 60 + w.to!.minute;
+    return em <= sm;
+  });
+
+  bool get _guestCountInvalid {
+    final rawGuests = guestCount.text.trim();
+    if (rawGuests.isEmpty) return true;
+    final gNum = int.tryParse(rawGuests);
+    if (gNum == null || gNum < 1) return true;
+    return gNum < _minPaxForCurrentInquiry();
   }
 
   Future<void> _pickThemeReferenceImage() async {
@@ -7498,7 +8097,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
       final em = w.to!.hour * 60 + w.to!.minute;
       if (em <= sm) return 'End time must be after start time for each event.';
     }
-    if (curateOwn && selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
+    if (!_menuChoicePicked) return 'Choose a menu preference.';
+    if (curateOwn && selectedDishes.length < _minSelectedDishesRequired) {
+      return 'Select at least $_minSelectedDishesRequired dish(es) for the menu.';
+    }
+    if (inquiryType == 'CATERING AND EVENT' && _themeDesignChoice.isEmpty) {
+      return 'Choose an event theme design option.';
+    }
     if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
     if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
       return 'Describe the event type for “Other”.';
@@ -7522,7 +8127,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
       children: [
         DropdownButtonFormField<String>(
           value: kMobileEventTypeChoices.contains(eventTypeChoice) ? eventTypeChoice : 'Other',
-          decoration: const InputDecoration(labelText: 'Event type'),
+          decoration: _requiredDecoration(label: 'Event type', invalid: false),
           items: kMobileEventTypeChoices.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
           onChanged: (v) => setState(() => eventTypeChoice = v ?? 'Other'),
         ),
@@ -7530,7 +8135,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
           const SizedBox(height: 8),
           TextField(
             controller: eventTypeOther,
-            decoration: const InputDecoration(labelText: 'Describe event type'),
+            decoration: _requiredDecoration(
+              label: 'Describe event type',
+              invalid: _eventTypeOtherInvalid,
+            ),
             onChanged: (_) => setState(() {}),
           ),
         ],
@@ -7555,12 +8163,20 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return AppScaffold(
       state: state,
       title: 'INQUIRE CATERING SERVICE',
+      showTrayShortcut: false,
       body: Column(
         children: [
           Expanded(
-            child: ListView(
-              padding: const EdgeInsets.all(12),
-              children: [
+            child: RefreshIndicator(
+              onRefresh: () async {
+                await state.loadMenu(force: true);
+                await state.loadSetMenus(force: true);
+                if (mounted) setState(() {});
+              },
+              child: ListView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.all(12),
+                children: [
                 DropdownButtonFormField<String>(
                   value: inquiryType,
                   items: const [
@@ -7587,7 +8203,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      TextField(controller: eventTitle, decoration: const InputDecoration(labelText: 'Event title')),
+                      TextField(
+                        controller: eventTitle,
+                        decoration: _requiredDecoration(
+                          label: 'Event title',
+                          invalid: inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty,
+                        ),
+                      ),
                       const SizedBox(height: 8),
                       if (inquiryType == 'CATERING AND EVENT') ...[
                         _buildEventTypePicker(),
@@ -7605,11 +8227,29 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         ),
                         const SizedBox(height: 12),
                       ],
-                      TextField(controller: contactPerson, decoration: const InputDecoration(labelText: 'Contact person')),
+                      TextField(
+                        controller: contactPerson,
+                        decoration: _requiredDecoration(
+                          label: 'Contact person',
+                          invalid: contactPerson.text.trim().isEmpty,
+                        ),
+                      ),
                       const SizedBox(height: 8),
-                      TextField(controller: contactNumber, decoration: const InputDecoration(labelText: 'Contact number')),
+                      TextField(
+                        controller: contactNumber,
+                        decoration: _requiredDecoration(
+                          label: 'Contact number',
+                          invalid: _contactNumberInvalid,
+                        ),
+                      ),
                       const SizedBox(height: 8),
-                      TextField(controller: inquiryEmail, decoration: const InputDecoration(labelText: 'Email address')),
+                      TextField(
+                        controller: inquiryEmail,
+                        decoration: _requiredDecoration(
+                          label: 'Email address',
+                          invalid: _emailInvalid,
+                        ),
+                      ),
                       const SizedBox(height: 8),
                       Text('Event schedule (from / to)', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
                       const SizedBox(height: 6),
@@ -7670,6 +8310,27 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           ),
                         );
                       }),
+                      if (_attemptedSubmit && (_hasAnyPartialWindow || _hasNoCompleteWindow || _hasWindowTimeRangeError))
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Text(
+                            _hasAnyPartialWindow
+                                ? 'Complete date/start/end time for each row, or remove incomplete rows.'
+                                : _hasNoCompleteWindow
+                                    ? 'Set at least one event day with start and end time.'
+                                    : 'End time must be after start time for each event.',
+                            style: TextStyle(color: Colors.red.shade700, fontSize: 12),
+                          ),
+                        ),
+                      if (_publicScheduleConflictCount > 0)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Text(
+                            '$_publicScheduleConflictCount proposed window(s) overlap active For Processing schedules. '
+                            'You may still submit; Macrina\'s will confirm availability.',
+                            style: TextStyle(color: Colors.deepOrange.shade800, fontSize: 12),
+                          ),
+                        ),
                       Align(
                         alignment: Alignment.centerLeft,
                         child: TextButton.icon(
@@ -7683,8 +8344,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       const SizedBox(height: 8),
                       TextField(
                         controller: eventCity,
-                        decoration: InputDecoration(
-                          labelText: 'Event venue',
+                        decoration: _requiredDecoration(
+                          label: 'Event venue',
+                          invalid: eventCity.text.trim().isEmpty,
                           suffixIcon: IconButton(
                             tooltip: 'Pin on map',
                             onPressed: _pickVenueOnMap,
@@ -7744,12 +8406,19 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       const SizedBox(height: 4),
                       TextField(
                         controller: guestCount,
-                        decoration: const InputDecoration(labelText: 'Number of guests'),
+                        decoration: _requiredDecoration(
+                          label: 'Number of guests',
+                          invalid: _guestCountInvalid,
+                        ),
                         keyboardType: TextInputType.number,
                         onChanged: (_) => setState(() {}),
                       ),
                       const SizedBox(height: 8),
-                      TextField(controller: note, decoration: const InputDecoration(labelText: 'Note'), maxLines: 3),
+                      TextField(
+                        controller: note,
+                        decoration: const InputDecoration(labelText: 'Note (optional)'),
+                        maxLines: 3,
+                      ),
                       const SizedBox(height: 8),
                       Text('Service', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
                       Row(
@@ -7791,22 +8460,30 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       children: [
                         const Text('DO YOU ALREADY HAVE A DESIGN DIRECTION IN MIND?'),
                         const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: OutlinedButton(
-                                onPressed: () => setState(() {
-                                  themeSuggestionNote = 'No, suggest me a design.';
-                                }),
-                                child: const Text('NO, SUGGEST ME A DESIGN'),
-                              ),
-                            ),
-                          ],
+                        RadioListTile<String>(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          value: 'suggest',
+                          groupValue: _themeDesignChoice,
+                          title: const Text('No, suggest me a design'),
+                          onChanged: (v) => setState(() => _themeDesignChoice = v ?? 'suggest'),
                         ),
-                        if (themeSuggestionNote.isNotEmpty) ...[
-                          const SizedBox(height: 8),
-                          Text(themeSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
-                        ],
+                        RadioListTile<String>(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          value: 'create_own',
+                          groupValue: _themeDesignChoice,
+                          title: const Text('Yes, I would like to create my own design'),
+                          onChanged: (v) => setState(() => _themeDesignChoice = v ?? 'create_own'),
+                        ),
+                        if (_attemptedSubmit && _themeDesignChoice.isEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              'Required',
+                              style: TextStyle(color: Colors.red.shade700, fontSize: 12),
+                            ),
+                          ),
                         const SizedBox(height: 10),
                         TextField(
                           controller: themeNotesController,
@@ -7878,36 +8555,41 @@ class _InquiryScreenState extends State<InquiryScreen> {
                     children: [
                       const Text('WOULD YOU LIKE TO CURATE YOUR OWN MENU?'),
                       const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton(
-                              onPressed: () => setState(() {
-                                curateOwn = true;
-                                menuSuggestionNote = '';
-                                selectedSetMenu = 'All Dishes';
-                                selectedDishes.clear();
-                              }),
-                              child: const Text('YES, CURATE MY OWN MENU'),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: OutlinedButton(
-                              onPressed: () => setState(() {
-                                curateOwn = false;
-                                selectedDishes.clear();
-                                menuSuggestionNote = 'No, suggest me a menu instead.';
-                              }),
-                              child: const Text('NO, SUGGEST A MENU'),
-                            ),
-                          ),
-                        ],
+                      RadioListTile<bool>(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        value: true,
+                        groupValue: _menuChoicePicked ? curateOwn : null,
+                        title: const Text('Yes, curate my own menu'),
+                        onChanged: (v) => setState(() {
+                          _menuChoicePicked = true;
+                          curateOwn = true;
+                          menuSuggestionNote = '';
+                          selectedSetMenu = 'All Dishes';
+                          selectedDishes.clear();
+                        }),
                       ),
-                      if (!curateOwn && menuSuggestionNote.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        Text(menuSuggestionNote, style: const TextStyle(fontWeight: FontWeight.w700)),
-                      ],
+                      RadioListTile<bool>(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        value: false,
+                        groupValue: _menuChoicePicked ? curateOwn : null,
+                        title: const Text('No, suggest a menu'),
+                        onChanged: (v) => setState(() {
+                          _menuChoicePicked = true;
+                          curateOwn = false;
+                          selectedDishes.clear();
+                          menuSuggestionNote = 'No, suggest me a menu instead.';
+                        }),
+                      ),
+                      if (_attemptedSubmit && !_menuChoicePicked)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Text(
+                            'Required',
+                            style: TextStyle(color: Colors.red.shade700, fontSize: 12),
+                          ),
+                        ),
                       if (curateOwn) ...[
                         CheckboxListTile(
                           dense: true,
@@ -7928,7 +8610,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                 child: TextField(
                                   controller: foodTastingDate,
                                   readOnly: true,
-                                  decoration: const InputDecoration(hintText: 'date'),
+                                  decoration: _requiredDecoration(
+                                    label: 'Food tasting date',
+                                    invalid: foodTastingRequested && foodTastingDate.text.trim().isEmpty,
+                                    hint: 'date',
+                                  ),
                                   onTap: () async {
                                     final d = await showDatePicker(
                                       context: context,
@@ -7949,7 +8635,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                 child: TextField(
                                   controller: foodTastingTime,
                                   readOnly: true,
-                                  decoration: const InputDecoration(hintText: 'time'),
+                                  decoration: _requiredDecoration(
+                                    label: 'Food tasting time',
+                                    invalid: foodTastingRequested && foodTastingTime.text.trim().isEmpty,
+                                    hint: 'time',
+                                  ),
                                   onTap: () async {
                                     final t = await showTimePicker(context: context, initialTime: const TimeOfDay(hour: 13, minute: 0));
                                     if (t == null) return;
@@ -7994,6 +8684,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           },
                         ),
                         const SizedBox(height: 8),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                            'Required selected dishes: at least $_minSelectedDishesRequired',
+                            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
                         LayoutBuilder(
                           builder: (context, _) {
                             final sorted = availableDishes.toList()
@@ -8019,43 +8717,31 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                   final sel = selectedDishes.contains(dishName);
                                   return Padding(
                                     padding: const EdgeInsets.only(bottom: 6),
-                                    child: Material(
-                                      color: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
-                                      borderRadius: BorderRadius.circular(10),
-                                      child: InkWell(
-                                        borderRadius: BorderRadius.circular(10),
-                                        onTap: () => setState(() {
-                                          if (sel) {
-                                            selectedDishes.remove(dishName);
-                                          } else {
-                                            selectedDishes.add(dishName);
-                                          }
-                                        }),
-                                        child: Padding(
-                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                          child: Row(
-                                            children: [
-                                              ClipRRect(
-                                                borderRadius: BorderRadius.circular(6),
-                                                child: SizedBox(
-                                                  width: 40,
-                                                  height: 40,
-                                                  child: dish != null
-                                                      ? _MenuThumb(item: dish, compact: true)
-                                                      : const Icon(Icons.fastfood, size: 22),
-                                                ),
-                                              ),
-                                              const SizedBox(width: 10),
-                                              Expanded(child: Text(dishName, style: const TextStyle(fontSize: 13))),
-                                              Icon(
-                                                sel ? Icons.check_circle : Icons.circle_outlined,
-                                                size: 22,
-                                                color: sel ? AppColors.success : Colors.grey.shade500,
-                                              ),
-                                            ],
-                                          ),
+                                    child: CheckboxListTile(
+                                      dense: true,
+                                      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                      tileColor: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                      secondary: ClipRRect(
+                                        borderRadius: BorderRadius.circular(6),
+                                        child: SizedBox(
+                                          width: 40,
+                                          height: 40,
+                                          child: dish != null
+                                              ? _MenuThumb(item: dish, compact: true)
+                                              : const Icon(Icons.fastfood, size: 22),
                                         ),
                                       ),
+                                      title: Text(dishName, style: const TextStyle(fontSize: 13)),
+                                      value: sel,
+                                      onChanged: (_) => setState(() {
+                                        if (sel) {
+                                          selectedDishes.remove(dishName);
+                                        } else {
+                                          selectedDishes.add(dishName);
+                                        }
+                                      }),
+                                      controlAffinity: ListTileControlAffinity.leading,
                                     ),
                                   );
                                 }).toList(),
@@ -8063,11 +8749,20 @@ class _InquiryScreenState extends State<InquiryScreen> {
                             );
                           },
                         ),
+                        if (_attemptedSubmit && curateOwn && selectedDishes.length < _minSelectedDishesRequired)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Text(
+                              'Select at least $_minSelectedDishesRequired dish(es).',
+                              style: TextStyle(color: Colors.red.shade700, fontSize: 12),
+                            ),
+                          ),
                       ],
                     ],
                   ),
                 ),
               ],
+              ),
             ),
           ),
           SummaryFooter(
@@ -8078,6 +8773,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
             actionLabel: 'SUBMIT',
             onSecondary: () => Navigator.of(context).pop(),
             onAction: () async {
+              setState(() => _attemptedSubmit = true);
               final v = _validateInquiry();
               if (v != null) {
                 appSnack(context, v);
@@ -8119,8 +8815,31 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 ),
               );
               if (ok != true || !context.mounted) return;
+              showDialog<void>(
+                context: context,
+                barrierDismissible: false,
+                builder: (loadingCtx) => PopScope(
+                  canPop: false,
+                  child: AlertDialog(
+                    content: Row(
+                      children: [
+                        const CircularProgressIndicator(),
+                        const SizedBox(width: 18),
+                        Expanded(
+                          child: Text(
+                            'Submitting inquiry…',
+                            style: TextStyle(color: Colors.grey.shade800, fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+              String? err;
+              try {
               final guestsSaved = _guestCountForSubmit();
-              final err = await state.submitInquiry({
+              err = await state.submitInquiry({
                 'inquiry_type': inquiryType,
                 'event_title': eventTitle.text.trim(),
                 'event_type': (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
@@ -8131,8 +8850,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'date_of_event': _scheduleSlotsJsonForSubmit(),
                 'note': note.text.trim(),
                 'curate_own_menu': curateOwn,
-                'selected_set_menu': curateOwn ? selectedSetMenu : '',
-                'selected_dishes': curateOwn ? selectedDishes.toList() : <String>[],
+                'selected_set_menu': selectedSetMenu,
+                'selected_dishes': selectedDishes.toList(),
                 'include_event_theme': inquiryType == 'CATERING AND EVENT',
                 'guest_count': guestsSaved,
                 'estimated_total': est,
@@ -8148,7 +8867,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'service_included': serviceIncluded,
                 'formality_level': inquiryType == 'CATERING AND EVENT' ? formalityLevel : '',
                 'food_tasting_requested': foodTastingRequested,
+                'food_tasting_date': foodTastingDate.text.trim(),
+                'food_tasting_time': foodTastingTime.text.trim(),
               });
+              } finally {
+                if (context.mounted) Navigator.of(context).pop();
+              }
               if (!context.mounted) return;
               if (err != null) {
                 appSnack(context, err);
@@ -8174,11 +8898,92 @@ class MyInquiriesScreen extends StatefulWidget {
 
 class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTickerProviderStateMixin {
   late TabController _tab;
+  String _search = '';
+  String _filter = 'all';
+  Map<String, Map<String, dynamic>> _feedbackByInquiryId = <String, Map<String, dynamic>>{};
+  Set<String> _readCompletedInquiryIds = <String>{};
+
+  String get _feedbackPrefsKey {
+    final e = widget.state.userEmail?.trim().toLowerCase() ?? 'guest';
+    return 'inquiry_feedback_v1_$e';
+  }
+
+  String get _readCompletedPrefsKey {
+    final e = widget.state.userEmail?.trim().toLowerCase() ?? 'guest';
+    return 'inquiry_completed_read_v1_$e';
+  }
+
+  Future<void> _loadInquiryLocalState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final rawFeedback = prefs.getString(_feedbackPrefsKey);
+    final rawRead = prefs.getStringList(_readCompletedPrefsKey) ?? const <String>[];
+    final nextFeedback = <String, Map<String, dynamic>>{};
+    if (rawFeedback != null && rawFeedback.trim().isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawFeedback);
+        if (decoded is Map<String, dynamic>) {
+          decoded.forEach((k, v) {
+            if (v is Map<String, dynamic>) nextFeedback[k] = v;
+          });
+        }
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    setState(() {
+      _feedbackByInquiryId = nextFeedback;
+      _readCompletedInquiryIds = rawRead.map((e) => e.trim()).where((e) => e.isNotEmpty).toSet();
+    });
+  }
+
+  Future<void> _persistFeedbackState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_feedbackPrefsKey, jsonEncode(_feedbackByInquiryId));
+  }
+
+  Future<void> _persistReadState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_readCompletedPrefsKey, _readCompletedInquiryIds.toList()..sort());
+  }
+
+  bool _isCompletedInquiryUnread(InquiryRecord r) {
+    if (!r.isCompletedBooking) return false;
+    if (_feedbackByInquiryId.containsKey(r.id.toString())) return false;
+    return !_readCompletedInquiryIds.contains(r.id.toString());
+  }
+
+  Color _inquiryStatusBadgeBg(String status) {
+    final s = status.trim().toLowerCase();
+    if (s == 'completed') return Colors.green.shade100;
+    if (s == 'cancelled') return Colors.grey.shade300;
+    if (s == 'for_post_analysis' || s == 'for_processing') return Colors.blue.shade100;
+    return Colors.orange.shade100;
+  }
+
+  Color _inquiryStatusBadgeFg(String status) {
+    final s = status.trim().toLowerCase();
+    if (s == 'completed') return Colors.green.shade900;
+    if (s == 'cancelled') return Colors.grey.shade900;
+    if (s == 'for_post_analysis' || s == 'for_processing') return Colors.blue.shade900;
+    return Colors.orange.shade900;
+  }
+
+  Future<void> _markCompletedInquiryRead(InquiryRecord r) async {
+    if (!r.isCompletedBooking) return;
+    final id = r.id.toString();
+    if (_readCompletedInquiryIds.contains(id)) return;
+    setState(() => _readCompletedInquiryIds.add(id));
+    await _persistReadState();
+  }
 
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 3, vsync: this);
+    _tab = TabController(length: 4, vsync: this);
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _loadInquiryLocalState();
+      await widget.state.loadInquiries(force: true);
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -8197,6 +9002,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     final lines = <Widget>[
       line('Transaction no.: ${r.displayTransactionRef}'),
       line('Type: ${r.inquiryType}'),
+      line('Status: ${inquiryStatusReadable(r.status)}'),
     ];
     if (r.isCompletedBooking && r.loyaltyPointsEarned > 0) {
       lines.add(line('Catering loyalty: +${r.loyaltyPointsEarned} pts'));
@@ -8242,8 +9048,20 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
         !r.menuSuggestionNote.toLowerCase().contains('suggest me a menu instead')) {
       lines.add(line('Menu note: ${r.menuSuggestionNote}'));
     }
-    if (r.estimatedTotal > 0) lines.add(line('Estimated cost: ₱${r.estimatedTotal.toStringAsFixed(2)}'));
-    lines.add(line('Submitted: ${r.createdAt.toLocal()}'));
+    if (r.estimatedTotal > 0) {
+      final st = r.status.trim().toLowerCase();
+      final useFinal = st == 'for_processing' || st == 'for_post_analysis' || st == 'completed';
+      lines.add(
+        line('${useFinal ? 'Final cost' : 'Estimated cost'}: ₱${r.estimatedTotal.toStringAsFixed(2)}'),
+      );
+    }
+    if (r.downPaymentAmount > 0) {
+      lines.add(line('Down payment paid: ₱${r.downPaymentAmount.toStringAsFixed(2)}'));
+    }
+    if (r.fullPaymentAmount > 0) {
+      lines.add(line('Full payment recorded: ₱${r.fullPaymentAmount.toStringAsFixed(2)}'));
+    }
+    lines.add(line('Submitted: ${formatDateTimeLocal(r.createdAt)}'));
 
     return lines;
   }
@@ -8259,44 +9077,138 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     appSnack(context, err ?? 'Follow-up sent to manager');
   }
 
-  Future<void> _sendFeedback(InquiryRecord r) async {
-    final ctl = TextEditingController();
+  Future<void> _cancelInquiry(InquiryRecord r) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Feedback · ${r.displayTransactionRef}'),
-        content: TextField(
-          controller: ctl,
-          maxLines: 4,
-          decoration: const InputDecoration(
-            labelText: 'Your feedback',
-            hintText: 'Share your feedback for this completed catering order',
-          ),
-        ),
+        title: const Text('Cancel inquiry/order?'),
+        content: Text('Cancel ${r.displayTransactionRef}?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Submit')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes, cancel')),
         ],
       ),
     );
+    if (ok != true || !mounted) return;
+    final err = await widget.state.cancelInquiryAsCustomer(inquiryId: r.id);
+    if (!mounted) return;
+    appSnack(context, err ?? 'Inquiry cancelled');
+  }
+
+  Future<void> _sendFeedback(InquiryRecord r) async {
+    final ctl = TextEditingController(
+      text: (_feedbackByInquiryId[r.id.toString()]?['remarks'] ?? '').toString(),
+    );
+    var stars = 5;
+    final prevStars = _feedbackByInquiryId[r.id.toString()]?['stars'];
+    if (prevStars is int) {
+      stars = prevStars.clamp(1, 5);
+    } else if (prevStars != null) {
+      final n = int.tryParse('$prevStars');
+      if (n != null) stars = n.clamp(1, 5);
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) => AlertDialog(
+            title: Text('Feedback · ${r.displayTransactionRef}'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('How was your experience?'),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: List.generate(5, (idx) {
+                      final selected = idx < stars;
+                      return IconButton(
+                        visualDensity: VisualDensity.compact,
+                        splashRadius: 20,
+                        onPressed: () => setModalState(() => stars = idx + 1),
+                        icon: Icon(
+                          selected ? Icons.star : Icons.star_border,
+                          color: selected ? Colors.amber : null,
+                        ),
+                      );
+                    }),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: ctl,
+                    maxLines: 4,
+                    decoration: const InputDecoration(
+                      labelText: 'Remarks',
+                      hintText: 'Share your feedback for this completed catering order',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Submit')),
+            ],
+          ),
+        );
+      },
+    );
     final msg = ctl.text.trim();
     if (ok != true || msg.isEmpty || !mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
     final err = await widget.state.submitHelpRequest(
       area: 'Catering Feedback',
       problem: 'Customer feedback for ${r.displayTransactionRef}',
-      desiredOutcome: msg,
+      desiredOutcome: 'Rating: ${stars.toString()}/5\nRemarks: $msg',
     );
+    if (mounted) Navigator.of(context).pop();
     if (!mounted) return;
+    if (err == null) {
+      setState(() {
+        _feedbackByInquiryId[r.id.toString()] = <String, dynamic>{
+          'stars': stars,
+          'remarks': msg,
+          'submittedAt': DateTime.now().toIso8601String(),
+        };
+        _readCompletedInquiryIds.add(r.id.toString());
+      });
+      await _persistFeedbackState();
+      await _persistReadState();
+    }
     appSnack(context, err ?? 'Feedback submitted');
   }
 
   void _showDetail(InquiryRecord r, {required bool allowFollowUp}) {
+    _markCompletedInquiryRead(r);
+    final feedback = _feedbackByInquiryId[r.id.toString()];
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(r.displayTransactionRef),
         content: SingleChildScrollView(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: _inquiryDetailLines(r)),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ..._inquiryDetailLines(r),
+              if (feedback != null) ...[
+                const SizedBox(height: 8),
+                const Divider(height: 16),
+                Text(
+                  'Your feedback',
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 6),
+                Text('Rating: ${feedback['stars'] ?? 5}/5'),
+                const SizedBox(height: 4),
+                Text('Remarks: ${(feedback['remarks'] ?? '').toString()}'),
+              ],
+            ],
+          ),
         ),
         actions: [
           if (allowFollowUp) TextButton(onPressed: () => _followUp(r), child: const Text('Follow up')),
@@ -8310,18 +9222,41 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
   Widget build(BuildContext context) {
     final s = widget.state;
     final waiting = s.inquiries.where((r) => r.isWaiting).toList();
-    final responded = s.inquiries.where((r) => !r.isWaiting && !r.isCompletedBooking).toList();
+    final responded = s.inquiries.where((r) => !r.isWaiting && !r.isCompletedBooking && r.status.trim().toLowerCase() != 'cancelled').toList();
     final completed = s.inquiries.where((r) => r.isCompletedBooking).toList();
+    final cancelled = s.inquiries.where((r) => r.status.trim().toLowerCase() == 'cancelled').toList();
 
     Widget buildList(
       List<InquiryRecord> list, {
       required bool allowFollowUp,
       bool showLoyaltyHint = false,
       bool allowFeedback = false,
+      bool allowCancel = false,
     }) {
+      final q = _search.trim().toLowerCase();
+      final filtered = list.where((i) {
+        if (q.isNotEmpty) {
+          final ok = i.displayTransactionRef.toLowerCase().contains(q) ||
+              i.inquiryType.toLowerCase().contains(q) ||
+              i.eventTitle.toLowerCase().contains(q) ||
+              i.status.toLowerCase().contains(q);
+          if (!ok) return false;
+        }
+        switch (_filter) {
+          case 'event_only':
+            return i.inquiryType == 'CATERING AND EVENT';
+          case 'catering_only':
+            return i.inquiryType == 'CATERING';
+          default:
+            return true;
+        }
+      }).toList();
       return RefreshIndicator(
-        onRefresh: s.loadInquiries,
-        child: list.isEmpty
+        onRefresh: () async {
+          await s.loadInquiries(force: true);
+          if (mounted) setState(() {});
+        },
+        child: filtered.isEmpty
             ? ListView(
                 physics: const AlwaysScrollableScrollPhysics(),
                 children: const [
@@ -8332,35 +9267,131 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
             : ListView.builder(
                 physics: const AlwaysScrollableScrollPhysics(),
                 padding: const EdgeInsets.all(8),
-                itemCount: list.length,
+                itemCount: filtered.length,
                 itemBuilder: (context, index) {
-                  final i = list[index];
-                  return Card(
-                    margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                    child: ListTile(
-                      title: Text(i.displayTransactionRef),
-                      subtitle: Text(
-                        showLoyaltyHint && i.loyaltyPointsEarned > 0
-                            ? '${i.inquiryType} — ${i.eventTitle}\n'
-                                'Loyalty: +${i.loyaltyPointsEarned} pts\n'
-                                '${i.createdAt.toLocal()}'
-                            : '${i.inquiryType} — ${i.eventTitle}\n${i.createdAt.toLocal()}',
+                  final i = filtered[index];
+                  final hasFeedback = _feedbackByInquiryId.containsKey(i.id.toString());
+                  final hasUnreadCompleted = _isCompletedInquiryUnread(i);
+                  Widget? trailing;
+                  if (allowFollowUp) {
+                    trailing = Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.reply_outlined),
+                          tooltip: 'Follow up',
+                          onPressed: () => _followUp(i),
+                        ),
+                        if (allowCancel)
+                          IconButton(
+                            icon: Icon(Icons.cancel_outlined, color: Colors.red.shade800),
+                            tooltip: 'Cancel inquiry',
+                            onPressed: () => _cancelInquiry(i),
+                          ),
+                      ],
+                    );
+                  } else if (allowCancel && i.status.trim().toLowerCase() == 'for_processing') {
+                    trailing = IconButton(
+                      icon: Icon(Icons.cancel_outlined, color: Colors.red.shade800),
+                      tooltip: 'Cancel order',
+                      onPressed: () => _cancelInquiry(i),
+                    );
+                  } else if (allowFeedback) {
+                    trailing = Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (hasUnreadCompleted)
+                          const Padding(
+                            padding: EdgeInsets.only(right: 6),
+                            child: Icon(Icons.circle, color: Colors.red, size: 10),
+                          ),
+                        IconButton(
+                          icon: Icon(hasFeedback ? Icons.check_circle : Icons.rate_review_outlined),
+                          tooltip: hasFeedback ? 'Feedback submitted' : 'Feedback',
+                          onPressed: () => _sendFeedback(i),
+                        ),
+                      ],
+                    );
+                  }
+                  return Stack(
+                    children: [
+                      Card(
+                        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                        child: ListTile(
+                          title: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                constraints: const BoxConstraints(maxWidth: 165),
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: _inquiryStatusBadgeBg(i.status),
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  inquiryStatusReadable(i.status),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: _inquiryStatusBadgeFg(i.status),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(i.displayTransactionRef),
+                            ],
+                          ),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                showLoyaltyHint && i.loyaltyPointsEarned > 0
+                                    ? '${i.inquiryType} — ${i.eventTitle}\n'
+                                        'Loyalty: +${i.loyaltyPointsEarned} pts\n'
+                                        '${formatDateTimeLocal(i.createdAt)}'
+                                    : '${i.inquiryType} — ${i.eventTitle}\n${formatDateTimeLocal(i.createdAt)}',
+                              ),
+                              if (allowFeedback && hasFeedback) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Feedback: ${"★" * ((int.tryParse("${_feedbackByInquiryId[i.id.toString()]?['stars'] ?? 5}") ?? 5).clamp(1, 5))}',
+                                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                                ),
+                              ],
+                              if (allowFeedback && hasUnreadCompleted) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  "We'd love to have your feedback!",
+                                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.red.shade700),
+                                ),
+                              ],
+                              if (i.estimatedTotal > 0) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  '₱${i.estimatedTotal.toStringAsFixed(2)}',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w800,
+                                    color: Colors.blueGrey.shade800,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                          isThreeLine: true,
+                          trailing: trailing,
+                          onTap: () => _showDetail(i, allowFollowUp: allowFollowUp),
+                        ),
                       ),
-                      trailing: allowFollowUp
-                          ? IconButton(
-                              icon: const Icon(Icons.reply_outlined),
-                              tooltip: 'Follow up',
-                              onPressed: () => _followUp(i),
-                            )
-                          : allowFeedback
-                              ? IconButton(
-                                  icon: const Icon(Icons.rate_review_outlined),
-                                  tooltip: 'Feedback',
-                                  onPressed: () => _sendFeedback(i),
-                                )
-                              : null,
-                      onTap: () => _showDetail(i, allowFollowUp: allowFollowUp),
-                    ),
+                      if (allowFeedback && hasUnreadCompleted)
+                        const Positioned(
+                          right: 18,
+                          top: 10,
+                          child: Icon(Icons.circle, color: Colors.red, size: 10),
+                        ),
+                    ],
                   );
                 },
               ),
@@ -8370,24 +9401,61 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     return AppScaffold(
       state: s,
       title: 'MY CATERING INQUIRIES',
+      showTrayShortcut: false,
       body: Column(
         children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    decoration: const InputDecoration(
+                      hintText: 'SEARCH REF, TYPE, TITLE, STATUS',
+                      prefixIcon: Icon(Icons.search),
+                    ),
+                    onChanged: (v) => setState(() => _search = v),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                PopupMenuButton<String>(
+                  tooltip: 'Filters',
+                  icon: Icon(Icons.filter_list, color: _filter == 'all' ? null : AppColors.accent),
+                  onSelected: (v) => setState(() => _filter = v),
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'all', child: Text('All')),
+                    PopupMenuItem(value: 'catering_only', child: Text('Catering')),
+                    PopupMenuItem(value: 'event_only', child: Text('Catering+Event')),
+                  ],
+                ),
+              ],
+            ),
+          ),
           TabBar(
             controller: _tab,
             isScrollable: true,
-            tabs: const [
-              Tab(text: 'WAITING FOR RESPONSE'),
-              Tab(text: 'RESPONDED'),
-              Tab(text: 'COMPLETED CATERING ORDERS'),
+            tabs: [
+              const Tab(text: 'WAITING FOR RESPONSE'),
+              const Tab(text: 'RESPONDED'),
+              Tab(
+                child: Badge(
+                  isLabelVisible: completed.any((r) => _isCompletedInquiryUnread(r)),
+                  backgroundColor: Colors.red,
+                  smallSize: 10,
+                  child: const Text('COMPLETED CATERING ORDERS'),
+                ),
+              ),
+              const Tab(text: 'CANCELLED'),
             ],
           ),
           Expanded(
             child: TabBarView(
               controller: _tab,
               children: [
-                buildList(waiting, allowFollowUp: true),
-                buildList(responded, allowFollowUp: false),
+                buildList(waiting, allowFollowUp: true, allowCancel: true),
+                buildList(responded, allowFollowUp: false, allowCancel: true),
                 buildList(completed, allowFollowUp: false, showLoyaltyHint: true, allowFeedback: true),
+                buildList(cancelled, allowFollowUp: false),
               ],
             ),
           ),
@@ -8431,11 +9499,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (ok == true && context.mounted) {
-      final nav = Navigator.of(context, rootNavigator: true);
-      while (nav.canPop()) {
-        nav.pop();
-      }
       widget.state.logout();
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+        MaterialPageRoute<void>(builder: (_) => AuthScreen(state: widget.state, cashierMode: kPosLoginBuild)),
+        (_) => false,
+      );
     }
   }
 
@@ -8502,59 +9571,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return AppScaffold(
           state: widget.state,
           title: 'SETTINGS',
+          showTrayShortcut: false,
           body: Padding(
             padding: const EdgeInsets.all(14),
-            child: SingleChildScrollView(
-              child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                if (widget.state.isManagerOrSupervisor)
-                  const ListTile(
-                    leading: Icon(Icons.restaurant_menu),
-                    title: Text('Restaurant loyalty rewards'),
-                    subtitle: Text(
-                      'Customers earn loyalty points on confirmed restaurant orders (tracked separately from catering/event loyalty). '
-                      'Rates are applied automatically when orders complete.',
-                    ),
-                  ),
-                ListTile(
-                  leading: Icon(widget.state.themeMode == ThemeMode.dark ? Icons.dark_mode_outlined : Icons.light_mode_outlined),
-                  title: const Text('Appearance'),
-                  subtitle: Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: SegmentedButton<ThemeMode>(
-                      segments: const [
-                        ButtonSegment<ThemeMode>(
-                          value: ThemeMode.light,
-                          icon: Icon(Icons.light_mode),
-                          label: Text('Light'),
+            child: RefreshIndicator(
+              onRefresh: () async {
+                await widget.state.loadProfile(force: true);
+                if (mounted) setState(() {});
+              },
+              child: SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (widget.state.isManagerOrSupervisor)
+                      const ListTile(
+                        leading: Icon(Icons.restaurant_menu),
+                        title: Text('Restaurant loyalty rewards'),
+                        subtitle: Text(
+                          'Customers earn loyalty points on confirmed restaurant orders (tracked separately from catering/event loyalty). '
+                          'Rates are applied automatically when orders complete.',
                         ),
-                        ButtonSegment<ThemeMode>(
-                          value: ThemeMode.dark,
-                          icon: Icon(Icons.dark_mode),
-                          label: Text('Dark'),
+                      ),
+                    ListTile(
+                      leading: Icon(widget.state.themeMode == ThemeMode.dark ? Icons.dark_mode_outlined : Icons.light_mode_outlined),
+                      title: const Text('Appearance'),
+                      subtitle: Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: SegmentedButton<ThemeMode>(
+                          segments: const [
+                            ButtonSegment<ThemeMode>(
+                              value: ThemeMode.light,
+                              icon: Icon(Icons.light_mode),
+                              label: Text('Light'),
+                            ),
+                            ButtonSegment<ThemeMode>(
+                              value: ThemeMode.dark,
+                              icon: Icon(Icons.dark_mode),
+                              label: Text('Dark'),
+                            ),
+                          ],
+                          selected: {widget.state.themeMode},
+                          onSelectionChanged: (Set<ThemeMode> next) {
+                            if (next.isNotEmpty) widget.state.setThemeMode(next.first);
+                          },
                         ),
-                      ],
-                      selected: {widget.state.themeMode},
-                      onSelectionChanged: (Set<ThemeMode> next) {
-                        if (next.isNotEmpty) widget.state.setThemeMode(next.first);
-                      },
+                      ),
                     ),
-                  ),
+                    ListTile(
+                      leading: const Icon(Icons.help_outline),
+                      title: const Text('Help request'),
+                      subtitle: const Text('Describe your issue so we can help'),
+                      onTap: _openHelp,
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.logout),
+                      title: const Text('Log out'),
+                      onTap: _confirmLogout,
+                    ),
+                  ],
                 ),
-                ListTile(
-                  leading: const Icon(Icons.help_outline),
-                  title: const Text('Help request'),
-                  subtitle: const Text('Describe your issue so we can help'),
-                  onTap: _openHelp,
-                ),
-                ListTile(
-                  leading: const Icon(Icons.logout),
-                  title: const Text('Log out'),
-                  onTap: _confirmLogout,
-                ),
-              ],
-            ),
+              ),
             ),
           ),
         );
@@ -8781,10 +9858,26 @@ class PosOrderHistoryScreen extends StatefulWidget {
 }
 
 class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
+  Color _statusBadgeBg(String status) {
+    final up = status.toUpperCase();
+    if (up.contains('INSUFFICIENT')) return Colors.red.shade100;
+    if (up.contains('CONFIRMED') || up.contains('OVERPAYMENT')) return Colors.green.shade100;
+    if (up.contains('CANCEL')) return Colors.grey.shade300;
+    return Colors.orange.shade100;
+  }
+
+  Color _statusBadgeFg(String status) {
+    final up = status.toUpperCase();
+    if (up.contains('INSUFFICIENT')) return Colors.red.shade900;
+    if (up.contains('CONFIRMED') || up.contains('OVERPAYMENT')) return Colors.green.shade900;
+    if (up.contains('CANCEL')) return Colors.grey.shade900;
+    return Colors.orange.shade900;
+  }
+
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => widget.state.loadCashierOrderHistory());
+    WidgetsBinding.instance.addPostFrameCallback((_) => widget.state.loadCashierOrderHistory(force: true));
   }
 
   Widget _historyProofImage(BuildContext context, String? b64, {String title = 'Payment proof'}) {
@@ -8821,7 +9914,7 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('Placed: ${o.createdAt.toLocal()}'),
+              Text('Placed: ${formatDateTimeLocal(o.createdAt)}'),
               Text('Source: ${o.orderSource}'),
               Text('Status: ${statusReadable(o.status)}'),
               Text('Fulfillment: ${o.fulfillmentStage}'),
@@ -8885,7 +9978,7 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
         return Scaffold(
           appBar: AppBar(title: const Text('ORDER HISTORY'), backgroundColor: Colors.black87, foregroundColor: Colors.white),
           body: RefreshIndicator(
-            onRefresh: widget.state.loadCashierOrderHistory,
+            onRefresh: () => widget.state.loadCashierOrderHistory(force: true),
             child: rows.isEmpty
                 ? ListView(
                     physics: const AlwaysScrollableScrollPhysics(),
@@ -8900,9 +9993,32 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
                       final o = rows[i];
                       return Card(
                         child: ListTile(
-                          title: Text(o.orderNo),
+                          title: Row(
+                            children: [
+                              Expanded(child: Text(o.orderNo)),
+                              const SizedBox(width: 6),
+                              Container(
+                                constraints: const BoxConstraints(maxWidth: 180),
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: _statusBadgeBg(o.status),
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  statusReadable(o.status),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: _statusBadgeFg(o.status),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
                           subtitle: Text(
-                            '${o.orderSource} · ${statusReadable(o.status)}\n${o.createdAt.toLocal()}'
+                            '${o.orderSource}\n${formatDateTimeLocal(o.createdAt)}'
                             '${o.loyaltyPointsEarned > 0 ? '\nLoyalty: +${o.loyaltyPointsEarned} pts' : ''}',
                           ),
                           isThreeLine: true,
@@ -8931,7 +10047,6 @@ class ManagerCateringShellScreen extends StatefulWidget {
 
 class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen> with SingleTickerProviderStateMixin {
   late TabController _tab;
-  Timer? _realtimeManagerTimer;
   static const _stages = [
     'new_event',
     'online_inquiries',
@@ -8953,20 +10068,17 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
     super.initState();
     final idx = widget.initialTabIndex.clamp(0, 5);
     _tab = TabController(length: 6, vsync: this, initialIndex: idx);
+    widget.state.setManagerActiveStage(_stages[idx]);
     _tab.addListener(() {
       if (_tab.indexIsChanging) return;
-      widget.state.loadManagerCateringByStage(_stages[_tab.index]);
+      widget.state.setManagerActiveStage(_stages[_tab.index]);
+      widget.state.loadManagerCateringByStage(_stages[_tab.index], force: true);
     });
-    widget.state.loadManagerCateringByStage(_stages[idx]);
-    _realtimeManagerTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (!mounted) return;
-      widget.state.loadManagerCateringByStage(_stages[_tab.index]);
-    });
+    widget.state.loadManagerCateringByStage(_stages[idx], force: true);
   }
 
   @override
   void dispose() {
-    _realtimeManagerTimer?.cancel();
     _tab.dispose();
     super.dispose();
   }
@@ -9124,8 +10236,6 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   final laborManualAmountController = TextEditingController();
   final travelCostController = TextEditingController(text: '0');
   final themeCostController = TextEditingController(text: '0');
-  String _managerThemePreviewB64 = '';
-  String _managerThemeInputMode = 'suggest';
   final additionalCostLabelController = TextEditingController();
   final additionalCostAmountController = TextEditingController();
   final menuSearchController = TextEditingController();
@@ -9340,27 +10450,6 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   String _resolvedEventType() {
     if (eventTypeChoice != 'Other') return eventTypeChoice;
     return eventTypeOther.text.trim();
-  }
-
-  Future<void> _openAiThemeStudioForManagerNewEvent() async {
-    final res = await Navigator.of(context).push<AiThemeStudioResult>(
-      MaterialPageRoute(
-        builder: (_) => AiThemeStudioPage(
-          apiBase: widget.state.apiBase,
-          eventTitle: eventTitle.text.trim(),
-          eventType: _resolvedEventType(),
-          formalityLevel: formalityLevel,
-          initialNotes: themeSuggestionNote,
-        ),
-      ),
-    );
-    if (res == null || !mounted) return;
-    setState(() {
-      if (res.generatedNotes.isNotEmpty) {
-        themeSuggestionNote = res.generatedNotes;
-      }
-      _managerThemePreviewB64 = res.generatedImageBase64;
-    });
   }
 
   List<Map<String, String>> _scheduleSlotsPayload() {
@@ -9706,7 +10795,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         final p = await SharedPreferences.getInstance();
         await p.remove(_managerNewEventDraftKey);
       } catch (_) {}
-      await widget.state.loadManagerCateringByStage('new_event');
+      await widget.state.loadManagerCateringByStage('new_event', force: true);
       if (context.mounted) Navigator.of(context).pop();
     }
 
@@ -10418,11 +11507,29 @@ class _ManagerStageListTab extends StatelessWidget {
     return 'completed';
   }
 
+  Color _statusBadgeBg(String status) {
+    final s = status.trim().toLowerCase();
+    if (s == 'completed') return Colors.green.shade100;
+    if (s == 'cancelled') return Colors.grey.shade300;
+    if (s == 'for_post_analysis') return Colors.indigo.shade100;
+    if (s == 'for_processing') return Colors.blue.shade100;
+    return Colors.orange.shade100;
+  }
+
+  Color _statusBadgeFg(String status) {
+    final s = status.trim().toLowerCase();
+    if (s == 'completed') return Colors.green.shade900;
+    if (s == 'cancelled') return Colors.grey.shade900;
+    if (s == 'for_post_analysis') return Colors.indigo.shade900;
+    if (s == 'for_processing') return Colors.blue.shade900;
+    return Colors.orange.shade900;
+  }
+
   @override
   Widget build(BuildContext context) {
     final rows = state.managerCateringRows.where((e) => e.status == stage).toList();
     return RefreshIndicator(
-      onRefresh: () => state.loadManagerCateringByStage(stage),
+      onRefresh: () => state.loadManagerCateringByStage(stage, force: true),
       child: rows.isEmpty
           ? ListView(children: const [SizedBox(height: 140), Center(child: Text('No records in this stage.'))])
           : ListView.builder(
@@ -10460,7 +11567,32 @@ class _ManagerStageListTab extends StatelessWidget {
                         : (r.status == 'new_event' || r.status == 'online_inquiries')
                             ? Icon(Icons.notifications_active, color: Colors.red.shade700)
                             : null,
-                    title: Text(r.eventTitle.isEmpty ? r.customerName : r.eventTitle),
+                    title: Row(
+                      children: [
+                        Expanded(
+                          child: Text(r.eventTitle.isEmpty ? r.customerName : r.eventTitle),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          constraints: const BoxConstraints(maxWidth: 165),
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: _statusBadgeBg(r.status),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Text(
+                            inquiryStatusReadable(r.status),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w700,
+                              color: _statusBadgeFg(r.status),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                     subtitle: Text(subtitleLines.join('\n')),
                     isThreeLine: subtitleLines.length > 2,
                     trailing: isReadOnly
@@ -10501,7 +11633,7 @@ class _ManagerStageListTab extends StatelessWidget {
                                       return;
                                     }
                                     appSnack(context, 'Cancelled');
-                                    await state.loadManagerCateringByStage(stage);
+                                    await state.loadManagerCateringByStage(stage, force: true);
                                   },
                                   child: Text('Cancel', style: TextStyle(color: Colors.red.shade800)),
                                 ),
@@ -10533,7 +11665,7 @@ class _ManagerStageListTab extends StatelessWidget {
                                     return;
                                   }
                                   appSnack(context, 'Moved to next stage');
-                                  await state.loadManagerCateringByStage(stage);
+                                  await state.loadManagerCateringByStage(stage, force: true);
                                 },
                                 child: const Text('Next'),
                               ),
@@ -10601,8 +11733,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   String managerServiceIncluded = 'no';
   String managerFormalityLevel = 'casual';
   String managerEventSetting = 'open';
-  String _detailThemePreviewB64 = '';
-  String _detailThemeInputMode = 'suggest';
   /// Draft-stage inquiry kind (`catering` vs `event`); may differ from [d] until saved / migrated.
   String _draftOrderKind = 'event';
   final List<_InquiryEventWindow> _eventWindows = [_InquiryEventWindow()];
@@ -11909,7 +13039,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         return;
       }
       appSnack(context, target == 'completed' ? 'Order completed' : 'Moved to next stage');
-      await widget.state.loadManagerCateringByStage(widget.stage);
+      await widget.state.loadManagerCateringByStage(widget.stage, force: true);
       if (mounted) Navigator.of(context).pop();
     }
     Future<void> saveCurrentStage() async {
@@ -12026,7 +13156,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           final p = await SharedPreferences.getInstance();
           await p.remove(_localDraftKey);
         } catch (_) {}
-        await widget.state.loadManagerCateringByStage(widget.stage);
+        await widget.state.loadManagerCateringByStage(widget.stage, force: true);
         return;
       }
 
@@ -12056,7 +13186,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (!mounted) return;
       appSnack(context, err ?? 'Changes saved');
       if (err == null) {
-        await widget.state.loadManagerCateringByStage(widget.stage);
+        await widget.state.loadManagerCateringByStage(widget.stage, force: true);
       }
     }
     return Scaffold(
@@ -13223,39 +14353,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 style: TextStyle(fontWeight: FontWeight.w700),
               ),
             ),
-          if (false && (isProcessing || isPost || isOnlineInquiry || isDraftStage)) ...[
-            Padding(
-              padding: const EdgeInsets.only(top: 12, bottom: 10),
-              child: Center(
-                child: Column(
-                  children: [
-                    const Text('Estimated Cost', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 4),
-                    Text(
-                      '₱${totalComputed.toStringAsFixed(2)}',
-                      style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w800),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            if (isOnlineInquiry || isProcessing || isPost)
-              FilledButton(
-                onPressed: (isOnlineInquiry || isProcessing || isPost) ? submitNext : null,
-                child: Text(
-                  isOnlineInquiry
-                      ? 'Save and Move to For Processing'
-                      : (isPost ? 'Complete Order' : 'Submit to Next Stage'),
-                ),
-              ),
-            if (isDraftStage || isProcessing || isPost) ...[
-              if (isOnlineInquiry || isProcessing || isPost) const SizedBox(height: 8),
-              OutlinedButton(
-                onPressed: saveCurrentStage,
-                child: Text(isDraftStage ? 'Save draft' : 'Save'),
-              ),
-            ],
-          ],
         ],
       ),
       bottomNavigationBar: (!isCompleted && (isProcessing || isPost || isOnlineInquiry || isDraftStage))
@@ -13365,7 +14462,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
       if (!mounted) return;
       setState(() {});
       if (_tab.index == 2 && !_tab.indexIsChanging) {
-        widget.state.loadCashierWalkInQueues();
+        widget.state.loadCashierWalkInQueues(force: true);
       }
     });
   }
@@ -14126,7 +15223,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
   void initState() {
     super.initState();
     _walkTab = TabController(length: 2, vsync: this);
-    widget.state.loadCashierWalkInQueues();
+    widget.state.loadCashierWalkInQueues(force: true);
   }
 
   @override
@@ -14147,7 +15244,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
             children: [
               Text('Total: ₱${o.total.toStringAsFixed(2)}'),
               Text('Status: ${statusReadable(o.status)}'),
-              Text('Placed: ${o.createdAt.toLocal()}'),
+              Text('Placed: ${formatDateTimeLocal(o.createdAt)}'),
               Text('Payment: ${o.paymentMode.trim().isEmpty ? '—' : o.paymentMode}'),
               if (o.cashierAmountReceived != null)
                 Text('Amount received: ₱${o.cashierAmountReceived!.toStringAsFixed(2)}'),
@@ -14211,11 +15308,11 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                 controller: _walkTab,
                 children: [
                   RefreshIndicator(
-                    onRefresh: widget.state.loadCashierWalkInQueues,
+                    onRefresh: () => widget.state.loadCashierWalkInQueues(force: true),
                     child: _walkList(widget.state.cashierWalkInPreparing, showClaim: true),
                   ),
                   RefreshIndicator(
-                    onRefresh: widget.state.loadCashierWalkInQueues,
+                    onRefresh: () => widget.state.loadCashierWalkInQueues(force: true),
                     child: _walkList(widget.state.cashierWalkInComplete, showClaim: false),
                   ),
                 ],
@@ -14299,24 +15396,34 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
   late TabController _fulTab;
   String _search = '';
   Timer? _pendingReminderTimer;
-  Timer? _realtimeOrdersTimer;
   final Map<int, int> _pendingAlertStage = {};
+
+  Color _statusBadgeBg(String status) {
+    final up = status.toUpperCase();
+    if (up.contains('INSUFFICIENT')) return Colors.red.shade100;
+    if (up.contains('CONFIRMED') || up.contains('OVERPAYMENT')) return Colors.green.shade100;
+    if (up.contains('CANCEL')) return Colors.grey.shade300;
+    return Colors.orange.shade100;
+  }
+
+  Color _statusBadgeFg(String status) {
+    final up = status.toUpperCase();
+    if (up.contains('INSUFFICIENT')) return Colors.red.shade900;
+    if (up.contains('CONFIRMED') || up.contains('OVERPAYMENT')) return Colors.green.shade900;
+    if (up.contains('CANCEL')) return Colors.grey.shade900;
+    return Colors.orange.shade900;
+  }
 
   @override
   void initState() {
     super.initState();
     _fulTab = TabController(length: 4, vsync: this);
     _pendingReminderTimer = Timer.periodic(const Duration(seconds: 25), (_) => _tickPendingAlerts());
-    _realtimeOrdersTimer = Timer.periodic(const Duration(seconds: 12), (_) {
-      if (!mounted) return;
-      widget.state.loadCashierOnlineOrders();
-    });
   }
 
   @override
   void dispose() {
     _pendingReminderTimer?.cancel();
-    _realtimeOrdersTimer?.cancel();
     _fulTab.dispose();
     super.dispose();
   }
@@ -14397,7 +15504,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                 children: List.generate(4, (idx) {
                   final rows = _forIndex(idx);
                   return RefreshIndicator(
-                    onRefresh: widget.state.loadCashierOnlineOrders,
+                    onRefresh: () => widget.state.loadCashierOnlineOrders(force: true),
                     child: rows.isEmpty
                         ? ListView(
                             physics: const AlwaysScrollableScrollPhysics(),
@@ -14415,9 +15522,32 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                   leading: o.balanceProofPendingReview
                                       ? Icon(Icons.notifications_active, color: Colors.deepOrange.shade700)
                                       : null,
-                                  title: Text(o.orderNo),
+                                  title: Row(
+                                    children: [
+                                      Expanded(child: Text(o.orderNo)),
+                                      const SizedBox(width: 6),
+                                      Container(
+                                        constraints: const BoxConstraints(maxWidth: 180),
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                        decoration: BoxDecoration(
+                                          color: _statusBadgeBg(o.status),
+                                          borderRadius: BorderRadius.circular(999),
+                                        ),
+                                        child: Text(
+                                          statusReadable(o.status),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 10.5,
+                                            fontWeight: FontWeight.w700,
+                                            color: _statusBadgeFg(o.status),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                                   subtitle: Text(
-                                    '${statusReadable(o.status)}\n${cashierCustomerLabel(o)}'
+                                    '${cashierCustomerLabel(o)}'
                                     '${o.loyaltyPointsEarned > 0 && (o.status.toUpperCase().contains('ORDER CONFIRMED') || o.status.toUpperCase().contains('OVERPAYMENT')) ? '\nLoyalty: +${o.loyaltyPointsEarned} pts' : ''}',
                                   ),
                                   isThreeLine: true,
@@ -14428,7 +15558,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                         builder: (_) => PosOnlineOrderDetailScreen(state: widget.state, order: o),
                                       ),
                                     );
-                                    if (context.mounted) await widget.state.loadCashierOnlineOrders();
+                                    if (context.mounted) await widget.state.loadCashierOnlineOrders(force: true);
                                   },
                                 ),
                               );
@@ -14841,7 +15971,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                       LockedField(label: 'CUSTOMER EMAIL', value: o.userEmail?.trim().isNotEmpty == true ? o.userEmail! : '—'),
                       LockedField(label: 'ORDER STATUS', value: statusReadable(o.status)),
                       LockedField(label: 'FULFILLMENT STAGE', value: o.fulfillmentStage),
-                      LockedField(label: 'ORDERED AT', value: o.createdAt.toLocal().toString()),
+                      LockedField(label: 'ORDERED AT', value: formatDateTimeLocal(o.createdAt)),
                       LockedField(label: 'SUBTOTAL / TOTAL', value: '₱${o.total.toStringAsFixed(2)}'),
                     ],
                   ),
