@@ -155,6 +155,8 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
   final Set<String> _stallPromptedOrderNos = <String>{};
   Timer? _customerNotifPollTimer;
   Timer? _realtimeSyncTimer;
+  /// Last used interval for [_realtimeSyncTimer] (3 staff / 4 customer); used to restart when role changes.
+  int _realtimePollIntervalSec = 0;
   final Set<String> _lastAttentionOrderSnapshot = <String>{};
 
   @override
@@ -338,6 +340,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           _customerNotifPollTimer = null;
           _realtimeSyncTimer?.cancel();
           _realtimeSyncTimer = null;
+          _realtimePollIntervalSec = 0;
           _lastAttentionOrderSnapshot.clear();
         } else if (appState.userRole == 'customer' && email != _paymentWatchEmail) {
           _paymentWatchEmail = email;
@@ -349,9 +352,13 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           _customerNotifPollTimer = Timer.periodic(const Duration(seconds: 90), (_) => _pollCustomerAttentionNotifications());
           WidgetsBinding.instance.addPostFrameCallback((_) => _pollCustomerAttentionNotifications());
         }
-        if (email != null && (_realtimeSyncTimer == null || !_realtimeSyncTimer!.isActive)) {
-          _realtimeSyncTimer?.cancel();
-          _realtimeSyncTimer = Timer.periodic(const Duration(seconds: 6), (_) => appState.pollRealtimeSync());
+        if (email != null) {
+          final every = (appState.isCashier || appState.isManagerOrSupervisor) ? 3 : 4;
+          if (_realtimeSyncTimer == null || !_realtimeSyncTimer!.isActive || _realtimePollIntervalSec != every) {
+            _realtimePollIntervalSec = every;
+            _realtimeSyncTimer?.cancel();
+            _realtimeSyncTimer = Timer.periodic(Duration(seconds: every), (_) => appState.pollRealtimeSync());
+          }
         }
 
         return MaterialApp(
@@ -375,7 +382,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
               ? AuthScreen(
                   key: ValueKey(appState.authSessionKey),
                   state: appState,
-                  cashierMode: widget.forcePosLogin || kPosLoginBuild,
+                  cashierMode: widget.forcePosLogin || kPosLoginBuild || appState.reopenAuthAsStaff,
                 )
               : _PostLoginWelcomeScope(
                   state: appState,
@@ -1191,7 +1198,7 @@ class InquiryRecord {
     this.fullPaymentAmount = 0,
   });
 
-  final int id;
+  final String id;
   final String inquiryNo;
   /// From `event_orders` / `catering_orders` when set.
   final String transactionNo;
@@ -1482,6 +1489,8 @@ class AppState extends ChangeNotifier {
   bool showLoginWelcomeDialog = false;
   /// Bumped on [logout] so [AuthScreen] state resets (fixes staff re-login without app restart).
   int authSessionKey = 0;
+  /// When true, the combined app opens [AuthScreen] in staff mode after a staff session ended.
+  bool reopenAuthAsStaff = false;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
   final Set<String> _readAttentionOrderNos = <String>{};
@@ -1569,12 +1578,14 @@ class AppState extends ChangeNotifier {
         await loadMenu(force: true);
         await loadCashierOnlineOrders(force: true);
         await loadCashierWalkInQueues(force: true);
+        await loadNotifications(force: true);
       } else if (isManagerOrSupervisor) {
         await Future.wait([
           loadMenu(force: true),
           loadSetMenus(force: true),
           loadManagerCateringByStage('new_event', force: true),
         ]);
+        await loadNotifications(force: true);
       } else {
         await Future.wait([
           loadMenu(force: true),
@@ -1589,6 +1600,7 @@ class AppState extends ChangeNotifier {
       }
       await bootstrapRealtimeSync();
       showLoginWelcomeDialog = true;
+      reopenAuthAsStaff = false;
       notifyListeners();
       return null;
     } catch (e) {
@@ -1746,6 +1758,16 @@ class AppState extends ChangeNotifier {
     await p.remove('customer_checkout_note_v1_$e');
     await p.remove('customer_checkout_addr_v1_$e');
     await p.remove('customer_checkout_time_v1_$e');
+  }
+
+  /// After order is placed (before payment), empty tray so checkout items do not linger in UI.
+  Future<void> clearTrayPersistOnly() async {
+    tray.clear();
+    notifyListeners();
+    final e = userEmail?.toLowerCase();
+    if (e == null || userRole != 'customer') return;
+    final p = await SharedPreferences.getInstance();
+    await p.remove('customer_tray_v1_$e');
   }
 
   Future<void> restoreCustomerDraftAfterLogin() async {
@@ -1923,12 +1945,14 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<String?> cancelInquiryAsCustomer({required int inquiryId}) async {
+  Future<String?> cancelInquiryAsCustomer({required String inquiryId}) async {
     if (userEmail == null) return 'Not signed in';
+    final id = inquiryId.trim();
+    if (id.isEmpty) return 'Invalid inquiry';
     try {
       final res = await http
           .patch(
-            _uri('/api/mobile/inquiries/$inquiryId/cancel-customer'),
+            _uri('/api/mobile/inquiries/$id/cancel-customer'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({'user_email': userEmail}),
           )
@@ -1962,6 +1986,7 @@ class AppState extends ChangeNotifier {
 
   void logout() {
     final persistedEmail = userEmail?.toLowerCase();
+    reopenAuthAsStaff = isCashier || isManagerOrSupervisor;
     authSessionKey++;
     unreadNotificationsCount = 0;
     orderNosWithUnreadAttention.clear();
@@ -2101,6 +2126,11 @@ class AppState extends ChangeNotifier {
             jobs.add(loadCashierWalkInQueues(force: true));
           }
         }
+        if (_stampChanged(previous, next, 'notifications')) {
+          final notifIds = delta?['notification_ids'];
+          final allow = delta == null || (notifIds is List && notifIds.isNotEmpty);
+          if (allow) jobs.add(loadNotifications(force: true));
+        }
       } else if (isManagerOrSupervisor) {
         if (_stampChanged(previous, next, 'manager_catering') ||
             _stampChanged(previous, next, 'restaurant_orders')) {
@@ -2116,6 +2146,11 @@ class AppState extends ChangeNotifier {
           if (allow) {
             jobs.add(loadManagerCateringByStage(managerActiveStage, force: true));
           }
+        }
+        if (_stampChanged(previous, next, 'notifications')) {
+          final notifIds = delta?['notification_ids'];
+          final allow = delta == null || (notifIds is List && notifIds.isNotEmpty);
+          if (allow) jobs.add(loadNotifications(force: true));
         }
       } else {
         if (_stampChanged(previous, next, 'restaurant_orders')) {
@@ -2450,9 +2485,9 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<String?> uploadPaymentProof(int orderId, XFile file) async {
+  Future<String?> uploadPaymentProof(int orderId, XFile file, {String? paymentProofBase64}) async {
     try {
-      final encoded = base64Encode(await file.readAsBytes());
+      final encoded = paymentProofBase64 ?? base64Encode(await file.readAsBytes());
       final res = await http.patch(
         _uri('/api/mobile/orders/$orderId/payment'),
         headers: {'Content-Type': 'application/json'},
@@ -2719,6 +2754,42 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<String?> managerSendOrderSummaryEmail({
+    required String orderKind,
+    required String id,
+    required String customerEmail,
+    required String pdfBase64,
+  }) async {
+    if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/pos/catering/send-order-summary-email'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+              'order_kind': orderKind,
+              'id': id,
+              'customer_email': customerEmail.trim().toLowerCase(),
+              'pdf_base64': pdfBase64,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not send email'}';
+        } catch (_) {
+          return 'Could not send email (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
   /// Persist catering record while still in New Event / Online Inquiries (no stage transition).
   Future<String?> managerSaveCateringDraft({
     required String id,
@@ -2833,7 +2904,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> loadNotifications({bool force = false}) async {
-    if (userEmail == null || isCashier || isManagerOrSupervisor || _loadNotificationsInFlight) return;
+    if (userEmail == null || _loadNotificationsInFlight) return;
     if (!force &&
         _notificationsLoadedAt != null &&
         DateTime.now().difference(_notificationsLoadedAt!) < const Duration(seconds: 4)) {
@@ -2846,6 +2917,11 @@ class AppState extends ChangeNotifier {
       final map = jsonDecode(res.body);
       if (map is! Map<String, dynamic>) return;
       unreadNotificationsCount = jsonToInt(map['unread_count']);
+      if (isCashier || isManagerOrSupervisor) {
+        _notificationsLoadedAt = DateTime.now();
+        notifyListeners();
+        return;
+      }
       orderNosWithUnreadAttention.clear();
       final raw = map['notifications'];
       if (raw is List) {
@@ -2932,10 +3008,12 @@ class AppState extends ChangeNotifier {
     for (final e in body) {
       try {
         final map = e as Map<String, dynamic>;
+        final idStr = '${map['id'] ?? ''}'.trim();
+        if (idStr.isEmpty) continue;
         final dishes = inquirySelectedDishLabels(map['selected_dishes']);
         parsed.add(
           InquiryRecord(
-            id: jsonToInt(map['id']),
+            id: idStr,
             inquiryNo: '${map['inquiry_no']}',
             inquiryType: '${map['inquiry_type']}',
             eventTitle: '${map['event_title']}',
@@ -3299,7 +3377,8 @@ class _AuthScreenState extends State<AuthScreen> {
   bool otpSent = false;
   bool forgotRequested = false;
   String forgotChannel = 'email';
-  bool busy = false;
+  /// Non-null while a blocking auth action runs (login, signup OTP, etc.).
+  String? busyMessage;
 
   @override
   void dispose() {
@@ -3363,10 +3442,10 @@ class _AuthScreenState extends State<AuthScreen> {
                       if (!widget.cashierMode && signupMode) ...[
                         const SizedBox(height: 10),
                         FilledButton(
-                          onPressed: busy
+                          onPressed: busyMessage != null
                               ? null
                               : () async {
-                                  setState(() => busy = true);
+                                  setState(() => busyMessage = 'Sending code...');
                                   try {
                                     final err = await widget.state.requestSignupOtp(emailController.text);
                                     if (!mounted) return;
@@ -3377,7 +3456,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                     setState(() => otpSent = true);
                                     await _toast('Check your email for the OTP code.');
                                   } finally {
-                                    if (mounted) setState(() => busy = false);
+                                    if (mounted) setState(() => busyMessage = null);
                                   }
                                 },
                           style: FilledButton.styleFrom(
@@ -3396,14 +3475,14 @@ class _AuthScreenState extends State<AuthScreen> {
                           _LabeledInput(label: 'CONFIRM PASSWORD', controller: confirmPasswordController, obscure: true),
                           const SizedBox(height: 14),
                           FilledButton(
-                            onPressed: busy
+                            onPressed: busyMessage != null
                                 ? null
                                 : () async {
                                     if (passwordController.text != confirmPasswordController.text) {
                                       await _toast('Passwords do not match');
                                       return;
                                     }
-                                    setState(() => busy = true);
+                                    setState(() => busyMessage = 'Creating account...');
                                     try {
                                       final err = await widget.state.completeSignup(
                                         email: emailController.text,
@@ -3413,7 +3492,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                       if (!mounted) return;
                                       if (err != null) await _toast(err);
                                     } finally {
-                                      if (mounted) setState(() => busy = false);
+                                      if (mounted) setState(() => busyMessage = null);
                                     }
                                   },
                             style: FilledButton.styleFrom(
@@ -3428,10 +3507,10 @@ class _AuthScreenState extends State<AuthScreen> {
                       if (!signupMode) ...[
                         const SizedBox(height: 18),
                         FilledButton(
-                          onPressed: busy
+                          onPressed: busyMessage != null
                               ? null
                               : () async {
-                                  setState(() => busy = true);
+                                  setState(() => busyMessage = 'Signing in...');
                                   try {
                                     final err = await widget.state.login(
                                       emailController.text,
@@ -3440,7 +3519,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                     if (!mounted) return;
                                     if (err != null) await _toast(err);
                                   } finally {
-                                    if (mounted) setState(() => busy = false);
+                                    if (mounted) setState(() => busyMessage = null);
                                   }
                                 },
                           style: FilledButton.styleFrom(
@@ -3452,7 +3531,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                         const SizedBox(height: 8),
                         TextButton(
-                          onPressed: busy
+                          onPressed: busyMessage != null
                               ? null
                               : () async {
                                   await showDialog<void>(
@@ -3564,7 +3643,7 @@ class _AuthScreenState extends State<AuthScreen> {
                       ],
                       if (!widget.cashierMode)
                         TextButton(
-                          onPressed: busy
+                          onPressed: busyMessage != null
                               ? null
                               : () => setState(() {
                                     signupMode = !signupMode;
@@ -3583,7 +3662,7 @@ class _AuthScreenState extends State<AuthScreen> {
             ),
               ],
             ),
-            if (busy)
+            if (busyMessage != null)
               Positioned.fill(
                 child: ColoredBox(
                   color: Colors.black54,
@@ -3594,12 +3673,16 @@ class _AuthScreenState extends State<AuthScreen> {
                         color: Colors.white,
                         borderRadius: BorderRadius.circular(12),
                       ),
-                      child: const Row(
+                      child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.4)),
-                          SizedBox(width: 12),
-                          Text('Logging in...'),
+                          const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2.4),
+                          ),
+                          const SizedBox(width: 12),
+                          Text(busyMessage!),
                         ],
                       ),
                     ),
@@ -3850,6 +3933,213 @@ class AppDrawer extends StatelessWidget {
   }
 }
 
+/// Payment methods recorded in catering [postAnalysis] for manager "For processing" flows.
+const List<String> kManagerPaymentMethods = ['Cash', 'E-Wallet', 'Bank Transfer', 'Cheque'];
+
+Widget _buildManagerHamburgerLeading(BuildContext context, AppState state) {
+  final dot = state.unreadNotificationsCount > 0 || state.hasManagerAttentionBadge;
+  return Builder(
+    builder: (ctx) => Stack(
+      clipBehavior: Clip.none,
+      children: [
+        IconButton(
+          icon: const Icon(Icons.menu, color: Color(0xFFFFC024)),
+          onPressed: () => Scaffold.of(ctx).openDrawer(),
+        ),
+        if (dot)
+          const Positioned(
+            right: 9,
+            top: 9,
+            child: SizedBox(
+              width: 10,
+              height: 10,
+              child: DecoratedBox(
+                decoration: BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+              ),
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
+Widget _buildCashierHamburgerLeading(BuildContext context, AppState state) {
+  final dot = state.hasCashierAttentionBadge || state.unreadNotificationsCount > 0;
+  return Builder(
+    builder: (ctx) => Stack(
+      clipBehavior: Clip.none,
+      children: [
+        IconButton(
+          icon: const Icon(Icons.menu, color: AppColors.brand),
+          onPressed: () => Scaffold.of(ctx).openDrawer(),
+        ),
+        if (dot)
+          const Positioned(
+            right: 9,
+            top: 9,
+            child: SizedBox(
+              width: 10,
+              height: 10,
+              child: DecoratedBox(
+                decoration: BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+              ),
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
+/// Cashier drawer: matches POS shell; use [closeExtraRouteForManageOrders] on pushed routes (e.g. order history).
+class CashierRoleDrawer extends StatelessWidget {
+  const CashierRoleDrawer({
+    super.key,
+    required this.state,
+    this.tabController,
+    this.closeExtraRouteForManageOrders = false,
+  });
+  final AppState state;
+  final TabController? tabController;
+  final bool closeExtraRouteForManageOrders;
+
+  @override
+  Widget build(BuildContext context) {
+    return Drawer(
+      child: ListView(
+        children: [
+          DrawerHeader(
+            decoration: const BoxDecoration(color: AppColors.brand),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
+                const SizedBox(height: 10),
+                Text(
+                  'Hi, ${state.cashierDisplayName.isNotEmpty ? state.cashierDisplayName : 'Cashier'}',
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
+                ),
+                Text(state.userEmail ?? '', style: const TextStyle(fontSize: 13)),
+              ],
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.dashboard_customize_outlined),
+            title: const Text('Manage Orders'),
+            onTap: () {
+              Navigator.pop(context);
+              if (closeExtraRouteForManageOrders) {
+                Navigator.of(context).pop();
+              } else {
+                tabController?.animateTo(0);
+              }
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.history),
+            title: const Text('Order history'),
+            onTap: () {
+              Navigator.pop(context);
+              if (!closeExtraRouteForManageOrders) {
+                Navigator.of(context).push(
+                  MaterialPageRoute<void>(builder: (_) => PosOrderHistoryScreen(state: state)),
+                );
+              }
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.help_outline),
+            title: const Text('Help request'),
+            onTap: () {
+              Navigator.pop(context);
+              showCashierHelpDialog(context, state);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.settings),
+            title: const Text('Settings'),
+            onTap: () {
+              Navigator.pop(context);
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ManagerRoleDrawer extends StatelessWidget {
+  const ManagerRoleDrawer({
+    super.key,
+    required this.state,
+    required this.onDashboard,
+    required this.onManageEvents,
+  });
+  final AppState state;
+  final VoidCallback onDashboard;
+  final VoidCallback onManageEvents;
+
+  @override
+  Widget build(BuildContext context) {
+    final who = state.cashierDisplayName.trim().isNotEmpty
+        ? state.cashierDisplayName.trim()
+        : (state.userEmail ?? '');
+    return Drawer(
+      child: ListView(
+        children: [
+          DrawerHeader(
+            decoration: const BoxDecoration(color: Color(0xFF242424)),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
+                const SizedBox(height: 10),
+                if (who.isNotEmpty)
+                  Text(
+                    'Hi, $who!',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 18,
+                      color: Color(0xFFFFC024),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.dashboard_outlined),
+            title: const Text('Dashboard'),
+            onTap: () {
+              Navigator.pop(context);
+              onDashboard();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.dashboard_customize_outlined),
+            title: const Text('Manage Events'),
+            onTap: () {
+              Navigator.pop(context);
+              onManageEvents();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.settings),
+            title: const Text('Settings'),
+            onTap: () {
+              Navigator.pop(context);
+              Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)));
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class CustomerDashboardScreen extends StatelessWidget {
   const CustomerDashboardScreen({super.key, required this.state});
   final AppState state;
@@ -3954,6 +4244,9 @@ class ManagerDashboardScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final who = state.cashierDisplayName.trim().isNotEmpty
+        ? state.cashierDisplayName.trim()
+        : (state.userEmail ?? '').trim();
     final cards = <({String title, IconData icon, int tabIdx})>[
       (title: 'New Event', icon: Icons.add_box_outlined, tabIdx: 0),
       (title: 'Online Inquiries', icon: Icons.inbox_outlined, tabIdx: 1),
@@ -3963,63 +4256,104 @@ class ManagerDashboardScreen extends StatelessWidget {
       (title: 'Cancelled', icon: Icons.cancel_outlined, tabIdx: 5),
     ];
     return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
-        backgroundColor: Colors.black87,
-        foregroundColor: Colors.white,
-        title: const Text('MANAGER DASHBOARD'),
+        backgroundColor: const Color(0xFF242424),
+        foregroundColor: const Color(0xFFFFC024),
+        leading: _buildManagerHamburgerLeading(context, state),
+        title: const Text('DASHBOARD', style: TextStyle(fontWeight: FontWeight.w800)),
+        centerTitle: true,
       ),
-      body: GridView.builder(
-        padding: const EdgeInsets.all(12),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 2,
-          crossAxisSpacing: 10,
-          mainAxisSpacing: 10,
-          childAspectRatio: 1.35,
-        ),
-        itemCount: cards.length + 1,
-        itemBuilder: (context, index) {
-          if (index == cards.length) {
-            return Card(
-              child: InkWell(
-                borderRadius: BorderRadius.circular(12),
-                onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state))),
-                child: const Padding(
-                  padding: EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(Icons.settings_outlined, color: AppColors.brand, size: 30),
-                      Spacer(),
-                      Text('Settings', style: TextStyle(fontWeight: FontWeight.w800)),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          }
-          final item = cards[index];
-          return Card(
-            child: InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => ManagerCateringShellScreen(state: state, initialTabIndex: item.tabIdx),
-                ),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Icon(item.icon, color: AppColors.brand, size: 30),
-                    const Spacer(),
-                    Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
-                  ],
-                ),
-              ),
-            ),
+      drawer: ManagerRoleDrawer(
+        state: state,
+        onDashboard: () {},
+        onManageEvents: () {
+          Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => ManagerCateringShellScreen(state: state)),
           );
         },
+      ),
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            decoration: const BoxDecoration(color: Color(0xFF242424)),
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 52, fit: BoxFit.contain)),
+                if (who.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    'Hi, $who!',
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Colors.white),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Expanded(
+            child: GridView.builder(
+              padding: const EdgeInsets.all(12),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                crossAxisSpacing: 10,
+                mainAxisSpacing: 10,
+                childAspectRatio: 1.35,
+              ),
+              itemCount: cards.length + 1,
+              itemBuilder: (context, index) {
+                if (index == cards.length) {
+                  return Card(
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
+                      ),
+                      child: const Padding(
+                        padding: EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(Icons.settings_outlined, color: AppColors.brand, size: 30),
+                            Spacer(),
+                            Text('Settings', style: TextStyle(fontWeight: FontWeight.w800)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                }
+                final item = cards[index];
+                return Card(
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () {
+                      Navigator.of(context).pushReplacement(
+                        MaterialPageRoute<void>(
+                          builder: (_) => ManagerCateringShellScreen(state: state, initialTabIndex: item.tabIdx),
+                        ),
+                      );
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(item.icon, color: AppColors.brand, size: 30),
+                          const Spacer(),
+                          Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -5988,12 +6322,13 @@ class _PaymentScreenState extends State<PaymentScreen> {
     final picker = ImagePicker();
     final file = await picker.pickImage(
       source: source,
-      imageQuality: 72,
-      maxWidth: 1600,
-      maxHeight: 1600,
+      imageQuality: 58,
+      maxWidth: 1280,
+      maxHeight: 1280,
     );
     if (file == null) return;
     final bytes = await file.readAsBytes();
+    final proofB64 = base64Encode(bytes);
     final s = widget.state;
     setState(() => _uploadingProof = true);
     try {
@@ -6012,7 +6347,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
         return;
       }
       final newOrder = result.order!;
-      final err = await s.uploadPaymentProof(newOrder.id, file);
+      await s.clearTrayPersistOnly();
+      final err = await s.uploadPaymentProof(newOrder.id, file, paymentProofBase64: proofB64);
       if (!mounted) return;
       if (err != null) {
         appSnack(context, err);
@@ -6026,11 +6362,11 @@ class _PaymentScreenState extends State<PaymentScreen> {
         localProofUploaded = true;
       });
       await s.loadOrders(force: true);
-      appSnack(context, 'Payment proof uploaded — your order is placed.');
+      await showCustomerCheckoutCompleteNotification(newOrder.orderNo);
       return;
     }
     final oid = (_placedOrder ?? widget.order)!.id;
-    final err = await s.uploadPaymentProof(oid, file);
+    final err = await s.uploadPaymentProof(oid, file, paymentProofBase64: proofB64);
     if (!mounted) return;
     if (err != null) {
       appSnack(context, err);
@@ -6041,7 +6377,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
       _localProofBytes = bytes;
       localProofUploaded = true;
     });
-    appSnack(context, insufficient ? 'Balance payment proof uploaded' : 'Payment proof uploaded');
+    final on = (_placedOrder ?? widget.order)!.orderNo;
+    await showCustomerCheckoutCompleteNotification(on);
     } finally {
       if (mounted) setState(() => _uploadingProof = false);
     }
@@ -6120,7 +6457,18 @@ class _PaymentScreenState extends State<PaymentScreen> {
             : ((synced?.paymentUploaded ?? false) ||
                 localProofUploaded ||
                 ((synced?.paymentProofBase64?.isNotEmpty ?? false)));
-        return AppScaffold(
+        final interceptBack =
+            localProofUploaded || _placedOrder != null || (!widget.draftCheckout && widget.order != null);
+        return PopScope(
+          canPop: !interceptBack,
+          onPopInvokedWithResult: (didPop, _) {
+            if (didPop) return;
+            Navigator.of(context).pushAndRemoveUntil(
+              MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: s)),
+              (_) => false,
+            );
+          },
+          child: AppScaffold(
           state: s,
           title: 'PAYMENT',
           showTrayShortcut: false,
@@ -6411,6 +6759,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
               ),
             ],
           ),
+        ),
         );
       },
     );
@@ -7237,7 +7586,15 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                   children: [
                   TextField(controller: nameController, decoration: const InputDecoration(labelText: 'Full Name')),
                   const SizedBox(height: 10),
-                  TextField(controller: contactController, decoration: const InputDecoration(labelText: 'Contact Number')),
+                  TextField(
+                    controller: contactController,
+                    keyboardType: TextInputType.phone,
+                    maxLength: 11,
+                    decoration: const InputDecoration(
+                      labelText: 'Contact Number',
+                      counterText: '',
+                    ),
+                  ),
                   const SizedBox(height: 10),
                   TextField(
                     controller: addressController,
@@ -8025,6 +8382,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
   bool get _contactNumberInvalid {
     final phone = contactNumber.text.trim();
     if (phone.isEmpty) return true;
+    if (phone.length > 11) return true;
     return phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone);
   }
 
@@ -8073,6 +8431,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
     final phone = contactNumber.text.trim();
     if (phone.isEmpty) return 'Enter contact number.';
+    if (phone.length > 11) return 'Contact number must be at most 11 characters.';
     if (phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone)) {
       return 'Enter a valid contact number.';
     }
@@ -8234,10 +8593,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       const SizedBox(height: 8),
                       TextField(
                         controller: contactNumber,
+                        keyboardType: TextInputType.phone,
+                        maxLength: 11,
                         decoration: _requiredDecoration(
                           label: 'Contact number',
                           invalid: _contactNumberInvalid,
-                        ),
+                        ).copyWith(counterText: ''),
                       ),
                       const SizedBox(height: 8),
                       TextField(
@@ -8944,8 +9305,8 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
 
   bool _isCompletedInquiryUnread(InquiryRecord r) {
     if (!r.isCompletedBooking) return false;
-    if (_feedbackByInquiryId.containsKey(r.id.toString())) return false;
-    return !_readCompletedInquiryIds.contains(r.id.toString());
+    if (_feedbackByInquiryId.containsKey(r.id)) return false;
+    return !_readCompletedInquiryIds.contains(r.id);
   }
 
   Color _inquiryStatusBadgeBg(String status) {
@@ -8966,7 +9327,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
 
   Future<void> _markCompletedInquiryRead(InquiryRecord r) async {
     if (!r.isCompletedBooking) return;
-    final id = r.id.toString();
+    final id = r.id;
     if (_readCompletedInquiryIds.contains(id)) return;
     setState(() => _readCompletedInquiryIds.add(id));
     await _persistReadState();
@@ -9094,10 +9455,10 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
 
   Future<void> _sendFeedback(InquiryRecord r) async {
     final ctl = TextEditingController(
-      text: (_feedbackByInquiryId[r.id.toString()]?['remarks'] ?? '').toString(),
+      text: (_feedbackByInquiryId[r.id]?['remarks'] ?? '').toString(),
     );
     var stars = 5;
-    final prevStars = _feedbackByInquiryId[r.id.toString()]?['stars'];
+    final prevStars = _feedbackByInquiryId[r.id]?['stars'];
     if (prevStars is int) {
       stars = prevStars.clamp(1, 5);
     } else if (prevStars != null) {
@@ -9167,12 +9528,12 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     if (!mounted) return;
     if (err == null) {
       setState(() {
-        _feedbackByInquiryId[r.id.toString()] = <String, dynamic>{
+        _feedbackByInquiryId[r.id] = <String, dynamic>{
           'stars': stars,
           'remarks': msg,
           'submittedAt': DateTime.now().toIso8601String(),
         };
-        _readCompletedInquiryIds.add(r.id.toString());
+        _readCompletedInquiryIds.add(r.id);
       });
       await _persistFeedbackState();
       await _persistReadState();
@@ -9182,7 +9543,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
 
   void _showDetail(InquiryRecord r, {required bool allowFollowUp}) {
     _markCompletedInquiryRead(r);
-    final feedback = _feedbackByInquiryId[r.id.toString()];
+    final feedback = _feedbackByInquiryId[r.id];
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -9474,6 +9835,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final helpArea = TextEditingController();
   final helpProblem = TextEditingController();
   final helpWant = TextEditingController();
+  bool _loggingOut = false;
 
   @override
   void dispose() {
@@ -9495,14 +9857,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       ),
     );
-    if (ok == true && context.mounted) {
-      widget.state.logout();
-      if (!mounted) return;
-      Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
-        MaterialPageRoute<void>(builder: (_) => AuthScreen(state: widget.state, cashierMode: kPosLoginBuild)),
-        (_) => false,
-      );
-    }
+    if (ok != true || !context.mounted) return;
+    setState(() => _loggingOut = true);
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    widget.state.logout();
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => AuthScreen(
+          state: widget.state,
+          cashierMode: kPosLoginBuild || widget.state.reopenAuthAsStaff,
+        ),
+      ),
+      (_) => false,
+    );
   }
 
   void _openHelp() {
@@ -9560,77 +9928,157 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _settingsContent() {
+    return Padding(
+      padding: const EdgeInsets.all(14),
+      child: RefreshIndicator(
+        onRefresh: () async {
+          if (widget.state.userRole == 'customer') {
+            await widget.state.loadProfile(force: true);
+            if (mounted) setState(() {});
+          }
+        },
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (widget.state.isManagerOrSupervisor)
+                const ListTile(
+                  leading: Icon(Icons.restaurant_menu),
+                  title: Text('Restaurant loyalty rewards'),
+                  subtitle: Text(
+                    'Customers earn loyalty points on confirmed restaurant orders (tracked separately from catering/event loyalty). '
+                    'Rates are applied automatically when orders complete.',
+                  ),
+                ),
+              ListTile(
+                leading: Icon(
+                  widget.state.themeMode == ThemeMode.dark ? Icons.dark_mode_outlined : Icons.light_mode_outlined,
+                ),
+                title: const Text('Appearance'),
+                subtitle: Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: SegmentedButton<ThemeMode>(
+                    segments: const [
+                      ButtonSegment<ThemeMode>(
+                        value: ThemeMode.light,
+                        icon: Icon(Icons.light_mode),
+                        label: Text('Light'),
+                      ),
+                      ButtonSegment<ThemeMode>(
+                        value: ThemeMode.dark,
+                        icon: Icon(Icons.dark_mode),
+                        label: Text('Dark'),
+                      ),
+                    ],
+                    selected: {widget.state.themeMode},
+                    onSelectionChanged: (Set<ThemeMode> next) {
+                      if (next.isNotEmpty) widget.state.setThemeMode(next.first);
+                    },
+                  ),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.help_outline),
+                title: const Text('Help request'),
+                subtitle: const Text('Describe your issue so we can help'),
+                onTap: _openHelp,
+              ),
+              ListTile(
+                leading: const Icon(Icons.logout),
+                title: const Text('Log out'),
+                onTap: _confirmLogout,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _logoutOverlay() {
+    if (!_loggingOut) return const SizedBox.shrink();
+    return Positioned.fill(
+      child: ColoredBox(
+        color: Colors.black54,
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.4)),
+                SizedBox(width: 12),
+                Text('Logging out...'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: widget.state,
       builder: (context, _) {
-        return AppScaffold(
-          state: widget.state,
-          title: 'SETTINGS',
-          showTrayShortcut: false,
-          body: Padding(
-            padding: const EdgeInsets.all(14),
-            child: RefreshIndicator(
-              onRefresh: () async {
-                await widget.state.loadProfile(force: true);
-                if (mounted) setState(() {});
-              },
-              child: SingleChildScrollView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    if (widget.state.isManagerOrSupervisor)
-                      const ListTile(
-                        leading: Icon(Icons.restaurant_menu),
-                        title: Text('Restaurant loyalty rewards'),
-                        subtitle: Text(
-                          'Customers earn loyalty points on confirmed restaurant orders (tracked separately from catering/event loyalty). '
-                          'Rates are applied automatically when orders complete.',
-                        ),
-                      ),
-                    ListTile(
-                      leading: Icon(widget.state.themeMode == ThemeMode.dark ? Icons.dark_mode_outlined : Icons.light_mode_outlined),
-                      title: const Text('Appearance'),
-                      subtitle: Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: SegmentedButton<ThemeMode>(
-                          segments: const [
-                            ButtonSegment<ThemeMode>(
-                              value: ThemeMode.light,
-                              icon: Icon(Icons.light_mode),
-                              label: Text('Light'),
-                            ),
-                            ButtonSegment<ThemeMode>(
-                              value: ThemeMode.dark,
-                              icon: Icon(Icons.dark_mode),
-                              label: Text('Dark'),
-                            ),
-                          ],
-                          selected: {widget.state.themeMode},
-                          onSelectionChanged: (Set<ThemeMode> next) {
-                            if (next.isNotEmpty) widget.state.setThemeMode(next.first);
-                          },
-                        ),
-                      ),
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.help_outline),
-                      title: const Text('Help request'),
-                      subtitle: const Text('Describe your issue so we can help'),
-                      onTap: _openHelp,
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.logout),
-                      title: const Text('Log out'),
-                      onTap: _confirmLogout,
-                    ),
-                  ],
+        final s = widget.state;
+        if (s.isManagerOrSupervisor) {
+          return Stack(
+            children: [
+              Scaffold(
+                backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+                appBar: AppBar(
+                  backgroundColor: const Color(0xFF242424),
+                  foregroundColor: const Color(0xFFFFC024),
+                  leading: _buildManagerHamburgerLeading(context, s),
+                  title: const Text('SETTINGS', style: TextStyle(fontWeight: FontWeight.w800)),
+                  centerTitle: true,
                 ),
+                drawer: ManagerRoleDrawer(
+                  state: s,
+                  onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+                  onManageEvents: () => Navigator.of(context).pop(),
+                ),
+                body: _settingsContent(),
               ),
+              _logoutOverlay(),
+            ],
+          );
+        }
+        if (s.isCashier) {
+          return Stack(
+            children: [
+              Scaffold(
+                backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+                appBar: AppBar(
+                  backgroundColor: Colors.black87,
+                  foregroundColor: Colors.white,
+                  title: const Text('SETTINGS', style: TextStyle(fontWeight: FontWeight.w700)),
+                  centerTitle: true,
+                ),
+                body: _settingsContent(),
+              ),
+              _logoutOverlay(),
+            ],
+          );
+        }
+        return Stack(
+          children: [
+            AppScaffold(
+              state: s,
+              title: 'SETTINGS',
+              showTrayShortcut: false,
+              body: _settingsContent(),
             ),
-          ),
+            _logoutOverlay(),
+          ],
         );
       },
     );
@@ -9973,7 +10421,14 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
       builder: (context, _) {
         final rows = widget.state.cashierOrderHistory;
         return Scaffold(
-          appBar: AppBar(title: const Text('ORDER HISTORY'), backgroundColor: Colors.black87, foregroundColor: Colors.white),
+          appBar: AppBar(
+            backgroundColor: Colors.black87,
+            foregroundColor: Colors.white,
+            leading: _buildCashierHamburgerLeading(context, widget.state),
+            title: const Text('ORDER HISTORY', style: TextStyle(fontWeight: FontWeight.w700)),
+            centerTitle: true,
+          ),
+          drawer: CashierRoleDrawer(state: widget.state, closeExtraRouteForManageOrders: true),
           body: RefreshIndicator(
             onRefresh: () => widget.state.loadCashierOrderHistory(force: true),
             child: rows.isEmpty
@@ -10082,72 +10537,33 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
 
   @override
   Widget build(BuildContext context) {
-    final who = widget.state.cashierDisplayName.trim().isNotEmpty
-        ? widget.state.cashierDisplayName
-        : (widget.state.userEmail ?? 'User');
     return AnimatedBuilder(
       animation: widget.state,
       builder: (context, _) {
         return Scaffold(
           appBar: AppBar(
-            backgroundColor: Colors.black87,
-            foregroundColor: Colors.white,
-            leading: Builder(
-              builder: (ctx) => IconButton(
-                icon: const Icon(Icons.menu, color: AppColors.brand),
-                onPressed: () => Scaffold.of(ctx).openDrawer(),
-              ),
-            ),
-            title: Text((_labels[_tab.index]).toUpperCase()),
+            backgroundColor: const Color(0xFF242424),
+            foregroundColor: const Color(0xFFFFC024),
+            leading: _buildManagerHamburgerLeading(context, widget.state),
+            title: Text((_labels[_tab.index]).toUpperCase(), style: const TextStyle(fontWeight: FontWeight.w800)),
+            centerTitle: true,
             bottom: TabBar(
               controller: _tab,
               isScrollable: true,
+              indicatorColor: const Color(0xFFFFC024),
+              labelColor: const Color(0xFFFFC024),
+              unselectedLabelColor: Colors.white70,
               tabs: _labels.map((lab) => Tab(text: lab)).toList(),
             ),
           ),
-          drawer: Drawer(
-            child: ListView(
-              children: [
-                DrawerHeader(
-                  decoration: const BoxDecoration(color: AppColors.brand),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
-                      const SizedBox(height: 10),
-                      Text('Hi, $who!', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
-                    ],
-                  ),
-                ),
-                ListTile(
-                  leading: const Icon(Icons.dashboard_outlined),
-                  title: const Text('Dashboard'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    Navigator.of(context).pushReplacement(
-                      MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
-                    );
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.dashboard_customize_outlined),
-                  title: const Text('Manage Events'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _tab.animateTo(0);
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.settings),
-                  title: const Text('Settings'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: widget.state)));
-                  },
-                ),
-              ],
-            ),
+          drawer: ManagerRoleDrawer(
+            state: widget.state,
+            onDashboard: () {
+              Navigator.of(context).popUntil((route) => route.isFirst);
+            },
+            onManageEvents: () {
+              _tab.animateTo(0);
+            },
           ),
           body: TabBarView(
             controller: _tab,
@@ -10584,7 +11000,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
 
   String? _validateManagerNewEvent() {
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
-    if (contactNumber.text.trim().isEmpty) return 'Enter contact number.';
+    final phone = contactNumber.text.trim();
+    if (phone.isEmpty) return 'Enter contact number.';
+    if (phone.length > 11) return 'Contact number must be at most 11 characters.';
+    if (phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone)) {
+      return 'Enter a valid contact number.';
+    }
     if (inquiryEmail.text.trim().isEmpty) return 'Enter email address.';
     if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
     for (final w in _eventWindows) {
@@ -10900,7 +11321,19 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text('NEW EVENT')),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF242424),
+        foregroundColor: const Color(0xFFFFC024),
+        leading: _buildManagerHamburgerLeading(context, widget.state),
+        title: const Text('NEW EVENT', style: TextStyle(fontWeight: FontWeight.w800)),
+        centerTitle: true,
+      ),
+      drawer: ManagerRoleDrawer(
+        state: widget.state,
+        onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+        onManageEvents: () => Navigator.of(context).pop(),
+      ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(12, 12, 12, 220),
         children: [
@@ -10977,7 +11410,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               const SizedBox(height: 8),
               TextField(controller: contactPerson, decoration: const InputDecoration(labelText: 'Contact person')),
               const SizedBox(height: 8),
-              TextField(controller: contactNumber, decoration: const InputDecoration(labelText: 'Contact number')),
+              TextField(
+                controller: contactNumber,
+                keyboardType: TextInputType.phone,
+                maxLength: 11,
+                decoration: const InputDecoration(labelText: 'Contact number', counterText: ''),
+              ),
               const SizedBox(height: 8),
               TextField(controller: inquiryEmail, decoration: const InputDecoration(labelText: 'Email address')),
               const SizedBox(height: 8),
@@ -11492,11 +11930,20 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   }
 }
 
-class _ManagerStageListTab extends StatelessWidget {
+class _ManagerStageListTab extends StatefulWidget {
   const _ManagerStageListTab({required this.state, required this.stage, required this.isReadOnly});
   final AppState state;
   final String stage;
   final bool isReadOnly;
+
+  @override
+  State<_ManagerStageListTab> createState() => _ManagerStageListTabState();
+}
+
+class _ManagerStageListTabState extends State<_ManagerStageListTab> {
+  String _q = '';
+  String _kind = 'all';
+
   String _next(String s) {
     if (s == 'new_event' || s == 'online_inquiries') return 'for_processing';
     if (s == 'for_processing') return 'for_post_analysis';
@@ -11524,161 +11971,215 @@ class _ManagerStageListTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final rows = state.managerCateringRows.where((e) => e.status == stage).toList();
-    return RefreshIndicator(
-      onRefresh: () => state.loadManagerCateringByStage(stage, force: true),
-      child: rows.isEmpty
-          ? ListView(children: const [SizedBox(height: 140), Center(child: Text('No records in this stage.'))])
-          : ListView.builder(
-              padding: const EdgeInsets.all(10),
-              itemCount: rows.length,
-              itemBuilder: (context, i) {
-                final r = rows[i];
-                final entered = r.stageEnteredAt ?? r.updatedAt;
-                final whenStr = formatDateTimeLocal(entered);
-                final scheduleLine =
-                    r.schedulePreview.trim().isNotEmpty ? 'Event date/time: ${r.schedulePreview}' : '';
-                final settingLabel = managerEventSettingDisplayLabel(r.eventSetting);
-                final settingLine = settingLabel.isNotEmpty ? 'Setting: $settingLabel' : '';
-                final conflictLine = stage == 'for_processing' && r.processingScheduleOverlaps > 0
-                    ? 'Schedule overlap: crosses ${r.processingScheduleOverlaps} other active order(s) — open for details.'
-                    : '';
-                final stLower = r.status.trim().toLowerCase();
-                final loyaltyLine = r.cateringLoyaltyPointsEarned > 0 && stLower == 'completed'
-                    ? 'Catering loyalty applied: +${r.cateringLoyaltyPointsEarned} pts'
-                    : (stLower != 'completed' && r.cateringLoyaltyEligiblePointsIfCompleted > 0)
-                        ? 'If completed at this total: +${r.cateringLoyaltyEligiblePointsIfCompleted} pts (min ₱${kCateringLoyaltyMinOrderTotal.toStringAsFixed(0)} catering)'
-                        : '';
-                final subtitleLines = <String>[
-                  r.contactPerson,
-                  '${managerStageListTimestampLabel(stage)}: $whenStr',
-                  if (scheduleLine.isNotEmpty) scheduleLine,
-                  if (settingLine.isNotEmpty) settingLine,
-                  if (conflictLine.isNotEmpty) conflictLine,
-                  if (loyaltyLine.isNotEmpty) loyaltyLine,
-                ];
-                return Card(
-                  child: ListTile(
-                    leading: stage == 'for_processing' && r.processingScheduleOverlaps > 0
-                        ? Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800)
-                        : (r.status == 'new_event' || r.status == 'online_inquiries')
-                            ? Icon(Icons.notifications_active, color: Colors.red.shade700)
-                            : null,
-                    title: Row(
-                      children: [
-                        Expanded(
-                          child: Text(r.eventTitle.isEmpty ? r.customerName : r.eventTitle),
-                        ),
-                        const SizedBox(width: 6),
-                        Container(
-                          constraints: const BoxConstraints(maxWidth: 165),
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                          decoration: BoxDecoration(
-                            color: _statusBadgeBg(r.status),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text(
-                            inquiryStatusReadable(r.status),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w700,
-                              color: _statusBadgeFg(r.status),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    subtitle: Text(subtitleLines.join('\n')),
-                    isThreeLine: subtitleLines.length > 2,
-                    trailing: isReadOnly
-                        ? const Icon(Icons.lock_outline)
-                        : Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            crossAxisAlignment: CrossAxisAlignment.end,
-                            mainAxisSize: MainAxisSize.min,
+    final state = widget.state;
+    final stage = widget.stage;
+    var rows = state.managerCateringRows.where((e) => e.status == stage).toList();
+    if (_kind == 'catering') rows = rows.where((r) => r.orderKind == 'catering').toList();
+    if (_kind == 'event') rows = rows.where((r) => r.orderKind == 'event').toList();
+    final q = _q.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      rows = rows.where((r) {
+        return r.customerName.toLowerCase().contains(q) ||
+            r.emailAddress.toLowerCase().contains(q) ||
+            r.transactionNo.toLowerCase().contains(q) ||
+            r.eventTitle.toLowerCase().contains(q) ||
+            r.contactPerson.toLowerCase().contains(q);
+      }).toList();
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  decoration: const InputDecoration(
+                    hintText: 'Search name, email, ref…',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                  ),
+                  onChanged: (v) => setState(() => _q = v),
+                ),
+              ),
+              PopupMenuButton<String>(
+                tooltip: 'Filter type',
+                onSelected: (v) => setState(() => _kind = v),
+                itemBuilder: (ctx) => const [
+                  PopupMenuItem(value: 'all', child: Text('All types')),
+                  PopupMenuItem(value: 'catering', child: Text('Catering only')),
+                  PopupMenuItem(value: 'event', child: Text('Catering + Event')),
+                ],
+                child: const Icon(Icons.filter_list),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: RefreshIndicator(
+            onRefresh: () => state.loadManagerCateringByStage(stage, force: true),
+            child: rows.isEmpty
+                ? ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    children: const [
+                      SizedBox(height: 140),
+                      Center(child: Text('No records in this stage.')),
+                    ],
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.all(10),
+                    itemCount: rows.length,
+                    itemBuilder: (context, i) {
+                      final r = rows[i];
+                      final entered = r.stageEnteredAt ?? r.updatedAt;
+                      final whenStr = formatDateTimeLocal(entered);
+                      final scheduleLine =
+                          r.schedulePreview.trim().isNotEmpty ? 'Event date/time: ${r.schedulePreview}' : '';
+                      final settingLabel = managerEventSettingDisplayLabel(r.eventSetting);
+                      final settingLine = settingLabel.isNotEmpty ? 'Setting: $settingLabel' : '';
+                      final conflictLine = stage == 'for_processing' && r.processingScheduleOverlaps > 0
+                          ? 'Schedule overlap: crosses ${r.processingScheduleOverlaps} other active order(s) — open for details.'
+                          : '';
+                      final stLower = r.status.trim().toLowerCase();
+                      final loyaltyLine = r.cateringLoyaltyPointsEarned > 0 && stLower == 'completed'
+                          ? 'Catering loyalty applied: +${r.cateringLoyaltyPointsEarned} pts'
+                          : (stLower != 'completed' && r.cateringLoyaltyEligiblePointsIfCompleted > 0)
+                              ? 'If completed at this total: +${r.cateringLoyaltyEligiblePointsIfCompleted} pts (min ₱${kCateringLoyaltyMinOrderTotal.toStringAsFixed(0)} catering)'
+                              : '';
+                      final subtitleLines = <String>[
+                        r.contactPerson,
+                        '${managerStageListTimestampLabel(stage)}: $whenStr',
+                        if (scheduleLine.isNotEmpty) scheduleLine,
+                        if (settingLine.isNotEmpty) settingLine,
+                        if (conflictLine.isNotEmpty) conflictLine,
+                        if (loyaltyLine.isNotEmpty) loyaltyLine,
+                      ];
+                      return Card(
+                        child: ListTile(
+                          leading: stage == 'for_processing' && r.processingScheduleOverlaps > 0
+                              ? Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800)
+                              : (r.status == 'new_event' || r.status == 'online_inquiries')
+                                  ? Icon(Icons.notifications_active, color: Colors.red.shade700)
+                                  : null,
+                          title: Row(
                             children: [
-                              if (stage == 'new_event' || stage == 'online_inquiries')
-                                TextButton(
-                                  onPressed: () async {
-                                    final ok = await showDialog<bool>(
-                                      context: context,
-                                      builder: (ctx) => AlertDialog(
-                                        title: const Text('Cancel this inquiry?'),
-                                        content: const Text(
-                                          'It will move to the Cancelled tab. This cannot be undone from the app.',
-                                        ),
-                                        actions: [
-                                          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
-                                          FilledButton(
-                                            onPressed: () => Navigator.pop(ctx, true),
-                                            child: const Text('Yes, cancel'),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                    if (ok != true || !context.mounted) return;
-                                    final err = await state.managerAdvanceCateringStage(
-                                      id: r.id,
-                                      orderKind: r.orderKind,
-                                      status: 'cancelled',
-                                    );
-                                    if (!context.mounted) return;
-                                    if (err != null) {
-                                      appSnack(context, err);
-                                      return;
-                                    }
-                                    appSnack(context, 'Cancelled');
-                                    await state.loadManagerCateringByStage(stage, force: true);
-                                  },
-                                  child: Text('Cancel', style: TextStyle(color: Colors.red.shade800)),
+                              Expanded(
+                                child: Text(r.eventTitle.isEmpty ? r.customerName : r.eventTitle),
+                              ),
+                              const SizedBox(width: 6),
+                              Container(
+                                constraints: const BoxConstraints(maxWidth: 165),
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: _statusBadgeBg(r.status),
+                                  borderRadius: BorderRadius.circular(999),
                                 ),
-                              FilledButton(
-                                onPressed: () async {
-                                  final target = _next(stage);
-                                  if (!state.isManager && target == 'completed') {
-                                    appSnack(context, 'Supervisor cannot complete orders.');
-                                    return;
-                                  }
-                                  if (target == 'completed') {
-                                    final double tc = r.totalCost > 0 ? r.totalCost : 1.0;
-                                    if (!cateringFullPaymentConfirmed(r, tc)) {
-                                      appSnack(context, 'Full payment confirmation is required before completing this order.');
-                                      return;
-                                    }
-                                  }
-                                  final err = await state.managerAdvanceCateringStage(
-                                    id: r.id,
-                                    orderKind: r.orderKind,
-                                    status: target,
-                                    downPaymentAmount: stage == 'for_processing' ? (r.totalCost * 0.5) : null,
-                                    fullPaymentAmount: null,
-                                    postAnalysis: stage == 'for_post_analysis' ? {'completed_by': state.userEmail} : null,
-                                  );
-                                  if (!context.mounted) return;
-                                  if (err != null) {
-                                    appSnack(context, err);
-                                    return;
-                                  }
-                                  appSnack(context, 'Moved to next stage');
-                                  await state.loadManagerCateringByStage(stage, force: true);
-                                },
-                                child: const Text('Next'),
+                                child: Text(
+                                  inquiryStatusReadable(r.status),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: _statusBadgeFg(r.status),
+                                  ),
+                                ),
                               ),
                             ],
                           ),
-                    onTap: () {
-                      Navigator.of(context).push<void>(
-                        MaterialPageRoute<void>(
-                          builder: (_) => ManagerCateringDetailScreen(state: state, row: r, stage: stage),
+                          subtitle: Text(subtitleLines.join('\n')),
+                          isThreeLine: subtitleLines.length > 2,
+                          trailing: widget.isReadOnly
+                              ? const Icon(Icons.lock_outline)
+                              : Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (stage == 'new_event' || stage == 'online_inquiries')
+                                      TextButton(
+                                        onPressed: () async {
+                                          final ok = await showDialog<bool>(
+                                            context: context,
+                                            builder: (ctx) => AlertDialog(
+                                              title: const Text('Cancel this inquiry?'),
+                                              content: const Text(
+                                                'It will move to the Cancelled tab. This cannot be undone from the app.',
+                                              ),
+                                              actions: [
+                                                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+                                                FilledButton(
+                                                  onPressed: () => Navigator.pop(ctx, true),
+                                                  child: const Text('Yes, cancel'),
+                                                ),
+                                              ],
+                                            ),
+                                          );
+                                          if (ok != true || !context.mounted) return;
+                                          final err = await state.managerAdvanceCateringStage(
+                                            id: r.id,
+                                            orderKind: r.orderKind,
+                                            status: 'cancelled',
+                                          );
+                                          if (!context.mounted) return;
+                                          if (err != null) {
+                                            appSnack(context, err);
+                                            return;
+                                          }
+                                          appSnack(context, 'Cancelled');
+                                          await state.loadManagerCateringByStage(stage, force: true);
+                                        },
+                                        child: Text('Cancel', style: TextStyle(color: Colors.red.shade800)),
+                                      ),
+                                    FilledButton(
+                                      onPressed: () async {
+                                        final target = _next(stage);
+                                        if (!state.isManager && target == 'completed') {
+                                          appSnack(context, 'Supervisor cannot complete orders.');
+                                          return;
+                                        }
+                                        if (target == 'completed') {
+                                          final double tc = r.totalCost > 0 ? r.totalCost : 1.0;
+                                          if (!cateringFullPaymentConfirmed(r, tc)) {
+                                            appSnack(context, 'Full payment confirmation is required before completing this order.');
+                                            return;
+                                          }
+                                        }
+                                        final err = await state.managerAdvanceCateringStage(
+                                          id: r.id,
+                                          orderKind: r.orderKind,
+                                          status: target,
+                                          downPaymentAmount: stage == 'for_processing' ? (r.totalCost * 0.5) : null,
+                                          fullPaymentAmount: null,
+                                          postAnalysis: stage == 'for_post_analysis' ? {'completed_by': state.userEmail} : null,
+                                        );
+                                        if (!context.mounted) return;
+                                        if (err != null) {
+                                          appSnack(context, err);
+                                          return;
+                                        }
+                                        appSnack(context, 'Moved to next stage');
+                                        await state.loadManagerCateringByStage(stage, force: true);
+                                      },
+                                      child: const Text('Next'),
+                                    ),
+                                  ],
+                                ),
+                          onTap: () {
+                            Navigator.of(context).push<void>(
+                              MaterialPageRoute<void>(
+                                builder: (_) => ManagerCateringDetailScreen(state: state, row: r, stage: stage),
+                              ),
+                            );
+                          },
                         ),
                       );
                     },
                   ),
-                );
-              },
-            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -11755,6 +12256,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   final List<String> actualEventImages = [];
   Uint8List? _managerDownPaymentProofBytes;
   Uint8List? _managerFullPaymentProofBytes;
+  String _managerDownPaymentMethod = 'Cash';
+  String _managerFullPaymentMethod = 'Cash';
 
   double _sumCostRows(List<Map<String, dynamic>> rows) {
     double sum = 0;
@@ -12171,13 +12674,24 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   Future<void> _sendOrderSummaryPdfToCustomer() async {
     final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: additionalCosts);
     final d = _loadedDetailRow ?? widget.row;
-    final tx = d.transactionNo.trim().isEmpty ? d.id : d.transactionNo.trim();
-    await Printing.sharePdf(
-      bytes: bytes,
-      filename: 'order_summary_$tx.pdf',
-      subject: 'Order summary $tx',
-      body: 'Please see attached order summary for ${d.customerName}.',
+    final to = d.emailAddress.trim().toLowerCase();
+    if (!to.contains('@')) {
+      appSnack(context, 'Customer email is missing or invalid.');
+      return;
+    }
+    final b64 = base64Encode(bytes);
+    final err = await widget.state.managerSendOrderSummaryEmail(
+      orderKind: d.orderKind,
+      id: d.id,
+      customerEmail: to,
+      pdfBase64: b64,
     );
+    if (!mounted) return;
+    if (err != null) {
+      appSnack(context, err);
+    } else {
+      appSnack(context, 'Order summary emailed to $to');
+    }
   }
 
   Future<void> _capturePostAnalysisPdf1IfNeeded() async {
@@ -12464,6 +12978,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         _managerFullPaymentProofBytes = Uint8List.fromList(base64Decode(fpb.trim()));
       } catch (_) {}
     }
+    String normPm(String raw) {
+      final t = raw.trim();
+      if (kManagerPaymentMethods.contains(t)) return t;
+      return 'Cash';
+    }
+
+    _managerDownPaymentMethod = normPm('${row.postAnalysis['manager_down_payment_method'] ?? 'Cash'}');
+    _managerFullPaymentMethod = normPm('${row.postAnalysis['manager_full_payment_method'] ?? 'Cash'}');
     if (widget.stage == 'for_post_analysis') {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!mounted) return;
@@ -12510,7 +13032,24 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   Widget build(BuildContext context) {
     if (!_detailReady) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Loading…')),
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+        appBar: AppBar(
+          backgroundColor: const Color(0xFF242424),
+          foregroundColor: const Color(0xFFFFC024),
+          leading: _buildManagerHamburgerLeading(context, widget.state),
+          title: const Text('Loading…', style: TextStyle(fontWeight: FontWeight.w800)),
+          centerTitle: true,
+        ),
+        drawer: ManagerRoleDrawer(
+          state: widget.state,
+          onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+          onManageEvents: () {
+            Navigator.of(context).popUntil((route) => route.isFirst);
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => ManagerCateringShellScreen(state: widget.state)),
+            );
+          },
+        ),
         body: const Center(child: CircularProgressIndicator()),
       );
     }
@@ -12545,7 +13084,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (n.isEmpty) return item;
         for (final m in widget.state.menu) {
           if (m.name.trim() == n && m.ingredients.isNotEmpty) {
-            return '$n (${m.ingredients.join(', ')})';
+            return '$n\n${m.ingredients.join(', ')}';
           }
         }
         return item;
@@ -12962,6 +13501,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           'event_type': managerEventTypeChoice == 'Other'
               ? managerEventTypeOtherController.text.trim()
               : managerEventTypeChoice,
+        if (isProcessing) 'manager_down_payment_method': _managerDownPaymentMethod,
+        if (isPost) 'manager_full_payment_method': _managerFullPaymentMethod,
       };
       if (_managerDownPaymentProofBytes != null) {
         postAnalysis['manager_down_payment_proof_b64'] = base64Encode(_managerDownPaymentProofBytes!);
@@ -13096,6 +13637,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (rowBase.postAnalysis['additional_costs_payment_confirmed'] == true)
           'additional_costs_payment_confirmed': true,
         if (isOnlineInquiry || widget.stage == 'new_event') 'event_type': et,
+        if (isProcessingHere) 'manager_down_payment_method': _managerDownPaymentMethod,
+        if (widget.stage == 'for_post_analysis') 'manager_full_payment_method': _managerFullPaymentMethod,
       };
       if (_managerDownPaymentProofBytes != null) {
         postAnalysis['manager_down_payment_proof_b64'] = base64Encode(_managerDownPaymentProofBytes!);
@@ -13187,7 +13730,22 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
     }
     return Scaffold(
-      appBar: AppBar(title: Text(row.eventTitle.isEmpty ? row.customerName : row.eventTitle)),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF242424),
+        foregroundColor: const Color(0xFFFFC024),
+        leading: _buildManagerHamburgerLeading(context, widget.state),
+        title: Text(
+          row.eventTitle.isEmpty ? row.customerName : row.eventTitle,
+          style: const TextStyle(fontWeight: FontWeight.w800),
+        ),
+        centerTitle: true,
+      ),
+      drawer: ManagerRoleDrawer(
+        state: widget.state,
+        onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+        onManageEvents: () => Navigator.of(context).pop(),
+      ),
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
@@ -13242,8 +13800,25 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       decoration: const InputDecoration(labelText: 'Downpayment amount paid (manual input)'),
                     ),
                     const SizedBox(height: 10),
-                    const Text('Proof of down payment (GCash)', style: TextStyle(fontWeight: FontWeight.w700)),
+                    const Text('Proof of down payment', style: TextStyle(fontWeight: FontWeight.w700)),
                     const SizedBox(height: 6),
+                    DropdownButtonFormField<String>(
+                      value: _managerDownPaymentMethod,
+                      decoration: const InputDecoration(
+                        labelText: 'Payment method',
+                        isDense: true,
+                      ),
+                      items: kManagerPaymentMethods
+                          .map((e) => DropdownMenuItem<String>(value: e, child: Text(e)))
+                          .toList(),
+                      onChanged: !isProcessing
+                          ? null
+                          : (v) {
+                              if (v == null) return;
+                              setState(() => _managerDownPaymentMethod = v);
+                            },
+                    ),
+                    const SizedBox(height: 8),
                     Row(
                       children: [
                         Expanded(
@@ -13279,9 +13854,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     ),
                     if (_managerDownPaymentProofBytes != null) ...[
                       const SizedBox(height: 8),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.memory(_managerDownPaymentProofBytes!, height: 120, fit: BoxFit.contain),
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: () => showProofFullScreen(
+                            context,
+                            _managerDownPaymentProofBytes!,
+                            title: 'Down payment proof',
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.memory(_managerDownPaymentProofBytes!, height: 120, fit: BoxFit.contain),
+                          ),
+                        ),
                       ),
                     ],
                     const SizedBox(height: 10),
@@ -13356,8 +13941,25 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       decoration: const InputDecoration(labelText: 'Full payment amount'),
                     ),
                     const SizedBox(height: 10),
-                    const Text('Proof of full payment (GCash)', style: TextStyle(fontWeight: FontWeight.w700)),
+                    const Text('Proof of full payment', style: TextStyle(fontWeight: FontWeight.w700)),
                     const SizedBox(height: 6),
+                    DropdownButtonFormField<String>(
+                      value: _managerFullPaymentMethod,
+                      decoration: const InputDecoration(
+                        labelText: 'Payment method',
+                        isDense: true,
+                      ),
+                      items: kManagerPaymentMethods
+                          .map((e) => DropdownMenuItem<String>(value: e, child: Text(e)))
+                          .toList(),
+                      onChanged: !isPost
+                          ? null
+                          : (v) {
+                              if (v == null) return;
+                              setState(() => _managerFullPaymentMethod = v);
+                            },
+                    ),
+                    const SizedBox(height: 8),
                     Row(
                       children: [
                         Expanded(
@@ -13393,9 +13995,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     ),
                     if (_managerFullPaymentProofBytes != null) ...[
                       const SizedBox(height: 8),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.memory(_managerFullPaymentProofBytes!, height: 120, fit: BoxFit.contain),
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: () => showProofFullScreen(
+                            context,
+                            _managerFullPaymentProofBytes!,
+                            title: 'Full payment proof',
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.memory(_managerFullPaymentProofBytes!, height: 120, fit: BoxFit.contain),
+                          ),
+                        ),
                       ),
                     ],
                     const SizedBox(height: 8),
@@ -13615,7 +14227,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     TextFormField(
                       readOnly: !canEditStage,
                       initialValue: row.contactNumber,
-                      decoration: const InputDecoration(labelText: 'Contact number'),
+                      keyboardType: TextInputType.phone,
+                      maxLength: 11,
+                      decoration: const InputDecoration(labelText: 'Contact number', counterText: ''),
                     ),
                     const SizedBox(height: 8),
                     TextFormField(
@@ -14483,29 +15097,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
           appBar: AppBar(
             backgroundColor: Colors.black87,
             foregroundColor: Colors.white,
-            leading: Builder(
-              builder: (ctx) => Stack(
-                clipBehavior: Clip.none,
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.menu, color: AppColors.brand),
-                    onPressed: () => Scaffold.of(ctx).openDrawer(),
-                  ),
-                  if (widget.state.hasCashierAttentionBadge)
-                    const Positioned(
-                      right: 9,
-                      top: 9,
-                      child: SizedBox(
-                        width: 10,
-                        height: 10,
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
+            leading: _buildCashierHamburgerLeading(context, widget.state),
             title: Text(name, style: const TextStyle(fontWeight: FontWeight.w700, letterSpacing: 0.5)),
             actions: [
               Padding(
@@ -14546,64 +15138,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
               ],
             ),
           ),
-          drawer: Drawer(
-            child: ListView(
-              children: [
-                DrawerHeader(
-                  decoration: const BoxDecoration(color: AppColors.brand),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
-                      const SizedBox(height: 10),
-                      Text(
-                        'Hi, ${widget.state.cashierDisplayName.isNotEmpty ? widget.state.cashierDisplayName : 'Cashier'}',
-                        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
-                      ),
-                      Text(widget.state.userEmail ?? '', style: const TextStyle(fontSize: 13)),
-                    ],
-                  ),
-                ),
-                ListTile(
-                  leading: const Icon(Icons.dashboard_customize_outlined),
-                  title: const Text('Manage Orders'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _tab.animateTo(0);
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.history),
-                  title: const Text('Order history'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    Navigator.of(context).push(
-                      MaterialPageRoute<void>(builder: (_) => PosOrderHistoryScreen(state: widget.state)),
-                    );
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.help_outline),
-                  title: const Text('Help request'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    showCashierHelpDialog(context, widget.state);
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.settings),
-                  title: const Text('Settings'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    Navigator.of(context).push(
-                      MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: widget.state)),
-                    );
-                  },
-                ),
-              ],
-            ),
-          ),
+          drawer: CashierRoleDrawer(state: widget.state, tabController: _tab),
           body: TabBarView(
             controller: _tab,
             children: [
@@ -15215,6 +15750,8 @@ class PosWalkInOngoingTab extends StatefulWidget {
 
 class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTickerProviderStateMixin {
   late TabController _walkTab;
+  String _search = '';
+  String _payFilter = 'all';
 
   @override
   void initState() {
@@ -15287,6 +15824,33 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
       builder: (context, _) {
         return Column(
           children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      decoration: const InputDecoration(
+                        hintText: 'Search order no, walk-in label…',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (v) => setState(() => _search = v),
+                    ),
+                  ),
+                  PopupMenuButton<String>(
+                    tooltip: 'Filter',
+                    onSelected: (v) => setState(() => _payFilter = v),
+                    itemBuilder: (ctx) => const [
+                      PopupMenuItem(value: 'all', child: Text('All payments')),
+                      PopupMenuItem(value: 'gcash', child: Text('GCash')),
+                      PopupMenuItem(value: 'cash', child: Text('Cash')),
+                    ],
+                    child: const Icon(Icons.filter_list),
+                  ),
+                ],
+              ),
+            ),
             Material(
               color: Theme.of(context).colorScheme.surface,
               child: TabBar(
@@ -15322,7 +15886,27 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
   }
 
   Widget _walkList(List<OrderData> rows, {required bool showClaim}) {
-    if (rows.isEmpty) {
+    var filtered = rows;
+    final q = _search.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      filtered = filtered
+          .where(
+            (o) =>
+                o.orderNo.toLowerCase().contains(q) ||
+                o.posCustomerLabel.toLowerCase().contains(q) ||
+                statusReadable(o.status).toLowerCase().contains(q),
+          )
+          .toList();
+    }
+    if (_payFilter == 'gcash') {
+      filtered = filtered.where((o) => o.paymentMode.toUpperCase().contains('GCASH')).toList();
+    } else if (_payFilter == 'cash') {
+      filtered = filtered.where((o) {
+        final pm = o.paymentMode.toUpperCase();
+        return pm.contains('CASH') && !pm.contains('GCASH');
+      }).toList();
+    }
+    if (filtered.isEmpty) {
       return ListView(
         physics: const AlwaysScrollableScrollPhysics(),
         children: const [
@@ -15332,9 +15916,9 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
     }
     return ListView.builder(
       padding: const EdgeInsets.all(12),
-      itemCount: rows.length,
+      itemCount: filtered.length,
       itemBuilder: (context, i) {
-        final o = rows[i];
+        final o = filtered[i];
         final submitted = formatDateTimeLocal(o.createdAt);
         final completed =
             o.updatedAt != null ? formatDateTimeLocal(o.updatedAt!) : '';
@@ -15392,6 +15976,8 @@ class PosOnlineOrdersTab extends StatefulWidget {
 class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTickerProviderStateMixin {
   late TabController _fulTab;
   String _search = '';
+  /// `all` | `balance_review` | `gcash` | `cash`
+  String _payFilter = 'all';
   Timer? _pendingReminderTimer;
   final Map<int, int> _pendingAlertStage = {};
 
@@ -15462,6 +16048,15 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
               cashierCustomerLabel(o).toLowerCase().contains(q) ||
               statusReadable(o.status).toLowerCase().contains(q);
         })
+        .where((o) {
+          if (_payFilter == 'balance_review') return o.balanceProofPendingReview;
+          final pm = o.paymentMode.toUpperCase();
+          if (_payFilter == 'gcash') return pm.contains('GCASH');
+          if (_payFilter == 'cash') {
+            return pm.contains('CASH') && !pm.contains('GCASH');
+          }
+          return true;
+        })
         .toList();
   }
 
@@ -15473,10 +16068,31 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
         return Column(
           children: [
             Padding(
-              padding: const EdgeInsets.all(12),
-              child: TextField(
-                decoration: const InputDecoration(hintText: 'SEARCH ORDER NO / EMAIL / STATUS'),
-                onChanged: (v) => setState(() => _search = v),
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      decoration: const InputDecoration(
+                        hintText: 'SEARCH ORDER NO / EMAIL / STATUS',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (v) => setState(() => _search = v),
+                    ),
+                  ),
+                  PopupMenuButton<String>(
+                    tooltip: 'Filter',
+                    onSelected: (v) => setState(() => _payFilter = v),
+                    itemBuilder: (ctx) => const [
+                      PopupMenuItem(value: 'all', child: Text('All payments')),
+                      PopupMenuItem(value: 'balance_review', child: Text('Balance proof review')),
+                      PopupMenuItem(value: 'gcash', child: Text('GCash')),
+                      PopupMenuItem(value: 'cash', child: Text('Cash')),
+                    ],
+                    child: const Icon(Icons.filter_list),
+                  ),
+                ],
               ),
             ),
             Material(

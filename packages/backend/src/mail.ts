@@ -45,3 +45,26 @@ export async function sendMailRequired(to: string, subject: string, text: string
   }
   await t.sendMail({ from, to, subject, text });
 }
+
+/** PDF attachment (Buffer) — same SMTP config as [sendMailSafe]. */
+export async function sendMailWithPdfAttachment(
+  to: string,
+  subject: string,
+  text: string,
+  pdfFilename: string,
+  pdfBuffer: Buffer,
+): Promise<void> {
+  const from = process.env.TRANSPORTER_EMAIL?.trim();
+  const t = getTransport();
+  if (!t || !from) {
+    console.warn("Email not configured (TRANSPORTER_EMAIL / TRANSPORTER_PASSWORD); skipping send.");
+    return;
+  }
+  await t.sendMail({
+    from,
+    to,
+    subject,
+    text,
+    attachments: [{ filename: pdfFilename, content: pdfBuffer }],
+  });
+}

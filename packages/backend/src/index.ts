@@ -8,7 +8,7 @@ dns.setDefaultResultOrder("ipv4first");
 import bcrypt from "bcrypt";
 import cors from "cors";
 import express from "express";
-import { isMailConfigured, sendMailRequired, sendMailSafe } from "./mail.js";
+import { isMailConfigured, sendMailRequired, sendMailSafe, sendMailWithPdfAttachment } from "./mail.js";
 import { formatDbStartupError, getPool, initDb } from "./db.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
@@ -2055,6 +2055,15 @@ app.post("/api/mobile/orders", async (req, res) => {
       total,
       item_count: parsedItems.length,
     });
+    void sendMailSafe(
+      userEmail,
+      `${orderNo} — order received`,
+      `Thanks for ordering with Macrina's Kitchen.\n\n` +
+        `Your order ${orderNo} was placed successfully.\n` +
+        `Total: ₱${total.toFixed(2)}\n\n` +
+        `Next step: complete GCash payment using the QR in the app and upload your payment proof on the Payment screen.\n` +
+        `We'll confirm your order after review.`,
+    );
     res.status(201).json({ id: orderId, order_no: orderNo, total });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -2199,6 +2208,17 @@ app.patch("/api/mobile/inquiries/:id/cancel-customer", async (req, res) => {
       await client.query("ROLLBACK");
       res.status(400).json({ error: "this inquiry can no longer be cancelled" });
       return;
+    }
+    try {
+      await client.query(
+        `INSERT INTO notifications (user_id, message)
+         SELECT email, $1
+         FROM users
+         WHERE LOWER(TRIM(role)) IN ('manager', 'supervisor') AND COALESCE(archived, FALSE) = FALSE`,
+        [`Inquiry cancelled: ${second.tx} (${userEmail}). Check the Cancelled tab.`],
+      );
+    } catch (notifyErr) {
+      console.warn("[inquiry-cancel] manager notify skipped:", notifyErr instanceof Error ? notifyErr.message : notifyErr);
     }
     await client.query("COMMIT");
     res.json({ ok: true, transaction_no: second.tx });
@@ -3978,6 +3998,57 @@ app.post("/api/mobile/pos/catering/:id/switch-order-kind", async (req, res) => {
     });
   } finally {
     client.release();
+  }
+});
+
+app.post("/api/mobile/pos/catering/send-order-summary-email", async (req, res) => {
+  const cashierEmail = String(req.body?.cashier_email ?? "").trim().toLowerCase();
+  const cashierPassword = String(req.body?.cashier_password ?? "");
+  const orderKind = String(req.body?.order_kind ?? "").trim().toLowerCase();
+  const id = String(req.body?.id ?? "").trim();
+  const pdfBase64 = String(req.body?.pdf_base64 ?? "");
+  const toEmail = String(req.body?.customer_email ?? "").trim().toLowerCase();
+  if (!cashierEmail || !cashierPassword || !orderKind || !id || !pdfBase64 || !toEmail) {
+    res.status(400).json({ error: "cashier credentials, order_kind, id, customer_email, and pdf_base64 are required" });
+    return;
+  }
+  if (!(await verifyPosStaff(cashierEmail, cashierPassword, ["manager", "supervisor"])).ok) {
+    res.status(403).json({ error: "invalid manager credentials" });
+    return;
+  }
+  if (!toEmail.includes("@")) {
+    res.status(400).json({ error: "valid customer_email is required" });
+    return;
+  }
+  try {
+    const buf = Buffer.from(pdfBase64, "base64");
+    if (buf.length < 64) {
+      res.status(400).json({ error: "invalid pdf payload" });
+      return;
+    }
+    const table = orderKind === "catering" ? "catering_orders" : "event_orders";
+    const { rows } = await getPool().query(
+      `SELECT LOWER(TRIM(email_address)) AS em FROM ${table} WHERE id::text = $1 LIMIT 1`,
+      [id],
+    );
+    const rowEm = String((rows[0] as { em?: string } | undefined)?.em ?? "").trim().toLowerCase();
+    if (!rowEm || rowEm !== toEmail) {
+      res.status(400).json({ error: "customer_email does not match this order" });
+      return;
+    }
+    const safeName = `order_summary_${id.replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 24)}.pdf`;
+    await sendMailWithPdfAttachment(
+      toEmail,
+      "Your catering order summary",
+      "Thank you for choosing Macrina's Kitchen. Please find your order summary attached.\n\n"
+        + "If you have questions, reply to this email or contact us through the app.",
+      safeName,
+      buf,
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "could not send email" });
   }
 });
 

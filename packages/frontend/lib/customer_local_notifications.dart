@@ -48,6 +48,31 @@ void clearCustomerNotificationDedupe() {
   _notifiedOrderNos.clear();
 }
 
+/// Shown after successful restaurant checkout (payment proof uploaded).
+Future<void> showCustomerCheckoutCompleteNotification(String orderNo) async {
+  await initCustomerLocalNotifications();
+  const android = AndroidNotificationDetails(
+    'customer_checkout',
+    'Orders',
+    channelDescription: 'Checkout and order status',
+    importance: Importance.high,
+    priority: Priority.high,
+  );
+  const details = NotificationDetails(
+    android: android,
+    iOS: DarwinNotificationDetails(),
+  );
+  final key = orderNo.trim();
+  if (key.isEmpty) return;
+  final id = key.hashCode & 0x7fffffff;
+  await customerLocalNotifications.show(
+    id,
+    'Order placed',
+    '$key — we received your payment proof. We will confirm your order soon.',
+    details,
+  );
+}
+
 /// POS / staff alerts (checkout validation, pending online orders, etc.).
 Future<void> showStaffPosNotification(String title, String body) async {
   await initCustomerLocalNotifications();

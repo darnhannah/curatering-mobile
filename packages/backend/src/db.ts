@@ -472,4 +472,22 @@ export async function initDb(): Promise<void> {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  // Customer / manager cancellation requires `cancelled` on event inquiries too (older DBs may omit it from CHECK).
+  try {
+    await p.query(`ALTER TABLE event_orders DROP CONSTRAINT IF EXISTS event_orders_status_check`);
+  } catch {
+    // ignore
+  }
+  try {
+    await p.query(`
+      ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
+      CHECK (status = ANY (ARRAY[
+        'new_event'::text, 'online_inquiries'::text, 'for_processing'::text,
+        'for_post_analysis'::text, 'completed'::text, 'cancelled'::text
+      ]))
+    `);
+  } catch {
+    // Constraint may already be correct or renamed in some deployments.
+  }
 }
