@@ -21,6 +21,8 @@ import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 const app = express();
 const port = Number(process.env.PORT) || 8080;
 const otpExpiryMinutes = Number(process.env.MOBILE_OTP_EXPIRY_MINUTES) || 15;
+/** When true and SMTP is not configured, OTPs are logged to the server console instead of emailed (local dev only). */
+const mobileDevOtpLogging = String(process.env.MOBILE_DEV_OTP_LOGGING ?? "").trim() === "true";
 let ensureNewEventSchemaPromise: Promise<void> | null = null;
 
 app.use(cors());
@@ -89,14 +91,36 @@ function ensureNewEventSchemaOnce(): Promise<void> {
 
 function parseJsonTextArray(raw: unknown): string[] {
   if (raw == null) return [];
+  if (Array.isArray(raw)) {
+    return raw.map((x) => String(x)).filter((t) => t.trim().length > 0);
+  }
   const s = String(raw).trim();
   if (!s) return [];
   try {
     const v = JSON.parse(s);
-    return Array.isArray(v) ? v.map((x) => String(x)) : [];
+    return Array.isArray(v) ? v.map((x) => String(x)).filter((t) => t.trim().length > 0) : [];
   } catch {
     return [];
   }
+}
+
+/** Down payment vs on-going work within `for_processing` (see `post_analysis.processing_phase`). */
+function processingSubstageFromRow(row: Record<string, unknown>): "down_payment" | "ongoing" {
+  const raw = String(row.processing_phase_sk ?? "").trim().toLowerCase();
+  if (raw === "ongoing") return "ongoing";
+  if (raw === "down_payment") return "down_payment";
+  const n = Number(row.checklist_count_summary ?? 0);
+  if (Number.isFinite(n) && n > 0) return "ongoing";
+  return "down_payment";
+}
+
+function processingSubstageFromPostAndChecklist(postAnalysis: unknown, checklistRaw: unknown): "down_payment" | "ongoing" {
+  const post = postAnalysis && typeof postAnalysis === "object" ? (postAnalysis as Record<string, unknown>) : {};
+  const raw = String(post.processing_phase ?? "").trim().toLowerCase();
+  if (raw === "ongoing") return "ongoing";
+  if (raw === "down_payment") return "down_payment";
+  if (normalizeChecklist(checklistRaw).length > 0) return "ongoing";
+  return "down_payment";
 }
 
 const fallbackThemeSuggestions: Array<Record<string, string>> = [
@@ -955,7 +979,7 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
     res.status(400).json({ error: "valid email is required" });
     return;
   }
-  if (!isMailConfigured()) {
+  if (!isMailConfigured() && !mobileDevOtpLogging) {
     res.status(503).json({
       error:
         "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
@@ -992,6 +1016,11 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
+    return;
+  }
+  if (mobileDevOtpLogging && !isMailConfigured()) {
+    console.warn(`[MOBILE_DEV_OTP_LOGGING] signup OTP for ${email}: ${code} (expires in ${otpExpiryMinutes}m)`);
+    res.json({ ok: true });
     return;
   }
   try {
@@ -1142,7 +1171,7 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
     res.status(400).json({ error: "cashier password reset supports email only" });
     return;
   }
-  if (!isMailConfigured()) {
+  if (!isMailConfigured() && !mobileDevOtpLogging) {
     res.status(503).json({
       error:
         "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
@@ -1186,7 +1215,13 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
       channel === "phone"
         ? `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.\n\n(You requested verification using your phone number on file; this code was sent to your registered email.)`
         : `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.`;
-    await sendMailRequired(targetEmail, "Reset your Curatering password", otpBody);
+    if (mobileDevOtpLogging && !isMailConfigured()) {
+      console.warn(
+        `[MOBILE_DEV_OTP_LOGGING] password reset OTP for ${targetEmail} (channel=${channel}, role=${role}): ${otp}`,
+      );
+    } else {
+      await sendMailRequired(targetEmail, "Reset your Curatering password", otpBody);
+    }
     if (channel === "phone") {
       await logActionBestEffort(
         "auth.reset.request_phone_channel",
@@ -2208,12 +2243,12 @@ app.post("/api/mobile/orders", async (req, res) => {
     });
     void sendMailSafe(
       userEmail,
-      `${orderNo} — order received`,
-      `Thanks for ordering with Macrina's Kitchen.\n\n` +
-        `We received your order ${orderNo}.\n` +
+      `${orderNo} — order placed`,
+      `Thank you for ordering with Macrina's Kitchen and Catering.\n\n` +
+        `Your restaurant order ${orderNo} has been placed and is awaiting payment confirmation from our team.\n` +
         `Total: ₱${total.toFixed(2)}\n\n` +
-        `Next step: complete GCash payment using the QR in the app and upload your payment proof on the Payment screen.\n` +
-        `Your order will move to "order placed" after our cashier confirms it.`,
+        `Please complete payment (GCash) and upload your proof in the app if you have not already.\n` +
+        `You will be notified when your payment has been confirmed.`,
     );
     res.status(201).json({ id: orderId, order_no: orderNo, total });
   } catch (err) {
@@ -3266,7 +3301,10 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     void sendMailSafe(
       userEmail,
       `Inquiry ${inquiryNo} received`,
-      `Your catering inquiry ${inquiryNo} was submitted at ${new Date().toISOString()}.\nEvent: ${eventTitle || "(no title)"}`,
+      `Thank you for contacting Macrina's Kitchen and Catering.\n\n` +
+        `Your catering inquiry ${inquiryNo} was submitted successfully.\n` +
+        `Event: ${eventTitle || "(no title)"}\n\n` +
+        `Your request is awaiting review and payment confirmation. You will be notified by email soon with next steps.`,
     );
     res.status(201).json({ id, inquiry_no: inquiryNo });
   } catch (err) {
@@ -3337,7 +3375,12 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                     ))
                   END
                 ) AS schedule_preview,
-                COALESCE(points_earned, 0) AS points_earned
+                COALESCE(points_earned, 0) AS points_earned,
+                (CASE
+                  WHEN jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) = 'array' THEN COALESCE(jsonb_array_length(checklist::jsonb), 0)
+                  ELSE 0
+                END) AS checklist_count_summary,
+                NULLIF(TRIM(COALESCE(post_analysis->>'processing_phase', '')), '') AS processing_phase_sk
          FROM event_orders
          WHERE status = $1
          UNION ALL
@@ -3383,7 +3426,12 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                     ))
                   END
                 ) AS schedule_preview,
-                COALESCE(points_earned, 0) AS points_earned
+                COALESCE(points_earned, 0) AS points_earned,
+                (CASE
+                  WHEN jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) = 'array' THEN COALESCE(jsonb_array_length(checklist::jsonb), 0)
+                  ELSE 0
+                END) AS checklist_count_summary,
+                NULLIF(TRIM(COALESCE(post_analysis->>'processing_phase', '')), '') AS processing_phase_sk
          FROM catering_orders
          WHERE status = $1
        ) q
@@ -3392,6 +3440,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
     );
     if (stage === "for_processing" || stage === "for_post_analysis" || stage === "completed") {
       for (const r of rows as Array<Record<string, unknown>>) {
+        if (stage === "for_processing" && processingSubstageFromRow(r) !== "ongoing") continue;
         const existingChecklist = normalizeChecklist(r.checklist);
         if (existingChecklist.length > 0) continue;
         const autoChecklist = await generateChecklistFromMenu(r.menu);
@@ -3729,6 +3778,15 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
         return;
       }
     }
+    if (String(before.status ?? "").trim().toLowerCase() === "for_processing" && nextStatus === "for_post_analysis") {
+      const sub = processingSubstageFromPostAndChecklist(before.post_analysis, before.checklist);
+      if (sub !== "ongoing") {
+        res.status(400).json({
+          error: "complete the Down Payment step and move this order to On Going before advancing to For Full Payment",
+        });
+        return;
+      }
+    }
     const existingChecklist = normalizeChecklist(before.checklist);
     const incomingChecklist = checklist != null ? normalizeChecklist(checklist) : null;
     if (auth.role === "supervisor" && incomingChecklist != null) {
@@ -3755,6 +3813,7 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
       nextStatus === "for_processing"
         ? (() => {
             const base = mergedPost ?? { ...existingPost };
+            if (!base.processing_phase) base.processing_phase = "down_payment";
             const taskRowsRaw = base.task_assignment_rows;
             if (!Array.isArray(taskRowsRaw) || taskRowsRaw.length === 0) {
               base.task_assignment_rows = defaultTaskAssignmentRows();

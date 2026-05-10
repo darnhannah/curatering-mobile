@@ -515,7 +515,7 @@ String managerEventSettingDisplayLabel(String raw) {
 String managerStageListTimestampLabel(String stage) {
   switch (stage) {
     case 'for_processing':
-      return 'In For Processing since';
+      return 'In this stage since';
     case 'for_post_analysis':
       return 'In For Full Payment since';
     case 'completed':
@@ -932,6 +932,41 @@ double orderLineSubtotal(OrderLineItem line) {
   return line.qty * line.price + extra;
 }
 
+double cartAddonExtraSubtotal(CartItem item) {
+  final dip = item.dip.trim();
+  if (dip.isEmpty) return 0;
+  final dq = item.dipQty < 1 ? 1 : item.dipQty;
+  return math.max(0, dq - 1) * kRestaurantAddonExtraPhp * item.qty;
+}
+
+double orderLineAddonExtraSubtotal(OrderLineItem line) {
+  final dip = line.dip.trim();
+  if (dip.isEmpty) return 0;
+  final dq = line.dipQty < 1 ? 1 : line.dipQty;
+  return math.max(0, dq - 1) * kRestaurantAddonExtraPhp * line.qty;
+}
+
+/// Subtitle for tray/checkout: main price, add-on qty and extra charge, line total.
+String cartLineDetailSubtitle(CartItem e) {
+  final main = 'Main ×${e.qty} @ ₱${e.menu.price.toStringAsFixed(2)}';
+  final dip = e.dip.trim();
+  if (dip.isEmpty) return '$main · Line ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
+  final extra = cartAddonExtraSubtotal(e);
+  final addOn =
+      'Add-on: $dip × ${e.dipQty}${extra > 0 ? ' · +₱${extra.toStringAsFixed(0)} extra' : ' · included'}';
+  return '$main\n$addOn · Line ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
+}
+
+String orderLineDetailSubtitle(OrderLineItem l) {
+  final main = 'Main ×${l.qty} @ ₱${l.price.toStringAsFixed(2)}';
+  final dip = l.dip.trim();
+  if (dip.isEmpty) return '$main · Line ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
+  final extra = orderLineAddonExtraSubtotal(l);
+  final addOn =
+      'Add-on: $dip × ${l.dipQty}${extra > 0 ? ' · +₱${extra.toStringAsFixed(0)} extra' : ' · included'}';
+  return '$main\n$addOn · Line ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
+}
+
 /// Builds line items from API `items` or fallback JSON snapshot on the order row.
 List<OrderLineItem> orderLinesFromApiMap(Map<String, dynamic> map) {
   final out = <OrderLineItem>[];
@@ -1152,7 +1187,7 @@ String inquiryStatusReadable(String status) {
     case 'online_inquiries':
       return 'Online Inquiries';
     case 'for_processing':
-      return 'For Processing';
+      return 'For Down Payment';
     case 'for_post_analysis':
       return 'For Full Payment';
     default:
@@ -1163,6 +1198,14 @@ String inquiryStatusReadable(String status) {
           .map((w) => '${w[0].toUpperCase()}${w.substring(1).toLowerCase()}')
           .join(' ');
   }
+}
+
+String cateringManagerListStatusLabelFor(String status, String processingSubstageLabel) {
+  final low = status.trim().toLowerCase();
+  if (low == 'for_processing') {
+    return processingSubstageLabel == 'ongoing' ? 'On Going' : 'For Down Payment';
+  }
+  return inquiryStatusReadable(status);
 }
 
 void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
@@ -1338,6 +1381,8 @@ class CateringEventRecord {
     this.schedulePreview = '',
     this.processingScheduleOverlaps = 0,
     this.cateringLoyaltyPointsEarned = 0,
+    this.checklistCountSummary = 0,
+    this.processingPhaseSk = '',
   });
   final String id;
   final String orderKind;
@@ -1381,6 +1426,22 @@ class CateringEventRecord {
 
   /// Points applied when this catering/event order is completed (from `points_earned` in DB).
   final int cateringLoyaltyPointsEarned;
+
+  /// List summary only: checklist row count (for processing substage).
+  final int checklistCountSummary;
+
+  /// List summary: `post_analysis.processing_phase` (`down_payment` | `ongoing`).
+  final String processingPhaseSk;
+
+  /// While [status] is `for_processing`: which workflow tab this row belongs in.
+  String get processingSubstageLabel {
+    if (status.trim().toLowerCase() != 'for_processing') return '';
+    final p = processingPhaseSk.trim().toLowerCase();
+    if (p == 'ongoing') return 'ongoing';
+    if (p == 'down_payment') return 'down_payment';
+    if (checklistCountSummary > 0) return 'ongoing';
+    return 'down_payment';
+  }
 
   int get cateringLoyaltyEligiblePointsIfCompleted =>
       totalCost >= kCateringLoyaltyMinOrderTotal ? kCateringLoyaltyPointsAward : 0;
@@ -1471,6 +1532,8 @@ class CateringEventRecord {
       schedulePreview: '${m['schedule_preview'] ?? ''}',
       processingScheduleOverlaps: jsonToInt(m['processing_schedule_overlaps']),
       cateringLoyaltyPointsEarned: jsonToInt(m['points_earned']),
+      checklistCountSummary: jsonToInt(m['checklist_count_summary']),
+      processingPhaseSk: '${m['processing_phase_sk'] ?? ''}',
     );
   }
 }
@@ -1520,7 +1583,7 @@ class AppState extends ChangeNotifier {
   final List<OrderData> cashierWalkInPreparing = [];
   final List<OrderData> cashierWalkInComplete = [];
   final List<OrderData> cashierWalkInCancelled = [];
-  final List<CateringEventRecord> managerCateringRows = [];
+  final Map<String, List<CateringEventRecord>> _managerCateringByStage = {};
   final List<LoyaltyHistoryItem> loyaltyHistory = [];
   bool showLoginWelcomeDialog = false;
   /// Bumped on [logout] so [AuthScreen] state resets (fixes staff re-login without app restart).
@@ -1558,8 +1621,15 @@ class AppState extends ChangeNotifier {
   DateTime? _setMenusLoadedAt;
   DateTime? _loyaltyHistoryLoadedAt;
   bool get hasCashierAttentionBadge => cashierOnlineOrders.any((o) => o.balanceProofPendingReview);
-  bool get hasManagerAttentionBadge =>
-      managerCateringRows.any((r) => r.status == 'new_event' || r.status == 'online_inquiries');
+  List<CateringEventRecord> managerRowsForStage(String stage) =>
+      List.unmodifiable(_managerCateringByStage[stage] ?? const <CateringEventRecord>[]);
+
+  /// Rows for the last manager tab API stage ([_managerActiveStage]).
+  List<CateringEventRecord> get managerCateringRows => managerRowsForStage(_managerActiveStage);
+
+  bool get hasManagerAttentionBadge => _managerCateringByStage.values.any(
+        (list) => list.any((r) => r.status == 'new_event' || r.status == 'online_inquiries'),
+      );
   bool get hasAnyAttentionBadge =>
       unreadNotificationsCount > 0 || hasCashierAttentionBadge || hasManagerAttentionBadge;
 
@@ -2089,7 +2159,7 @@ class AppState extends ChangeNotifier {
     cashierWalkInPreparing.clear();
     cashierWalkInComplete.clear();
     cashierWalkInCancelled.clear();
-    managerCateringRows.clear();
+    _managerCateringByStage.clear();
     loyaltyHistory.clear();
     showLoginWelcomeDialog = false;
     profile = ProfileData();
@@ -2472,6 +2542,14 @@ class AppState extends ChangeNotifier {
     _persistCustomerTraySnapshot().catchError((_) {});
   }
 
+  void changeDipQty(CartItem item, int delta) {
+    if (item.dip.trim().isEmpty) return;
+    item.dipQty += delta;
+    if (item.dipQty < 1) item.dipQty = 1;
+    notifyListeners();
+    _persistCustomerTraySnapshot().catchError((_) {});
+  }
+
   /// Customer menu + cashier POS: optional add-on / quantity before adding a line to the tray.
   Future<void> promptAndAddRestaurantDish(BuildContext context, MenuItemData item) async {
     var selectedDip = '';
@@ -2764,11 +2842,8 @@ class AppState extends ChangeNotifier {
       if (res.statusCode != 200) return;
       final body = jsonDecode(res.body);
       if (body is! List) return;
-      managerCateringRows
-        ..clear()
-        ..addAll(
-          body.whereType<Map<String, dynamic>>().map(CateringEventRecord.fromApiMap),
-        );
+      _managerCateringByStage[stage] =
+          body.whereType<Map<String, dynamic>>().map(CateringEventRecord.fromApiMap).toList();
       _managerCateringLoadedAt[stage] = DateTime.now();
       notifyListeners();
     } catch (_) {
@@ -3552,6 +3627,7 @@ class AppState extends ChangeNotifier {
         }
       }
       clearTray();
+      await loadCashierWalkInQueues(force: true);
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -4540,6 +4616,9 @@ class CustomerDashboardScreen extends StatelessWidget {
                 itemBuilder: (context, index) {
                   final item = items[index];
                   return Card(
+                    color: Colors.white,
+                    elevation: 2,
+                    shadowColor: Colors.black26,
                     child: InkWell(
                       borderRadius: BorderRadius.circular(12),
                       onTap: () {
@@ -4582,10 +4661,11 @@ class ManagerDashboardScreen extends StatelessWidget {
     final cards = <({String title, IconData icon, int tabIdx})>[
       (title: 'New Event', icon: Icons.add_box_outlined, tabIdx: 0),
       (title: 'Online Inquiries', icon: Icons.inbox_outlined, tabIdx: 1),
-      (title: 'For Processing', icon: Icons.pending_actions_outlined, tabIdx: 2),
-      (title: 'For Full Payment', icon: Icons.payments_outlined, tabIdx: 3),
-      (title: 'Completed', icon: Icons.task_alt_outlined, tabIdx: 4),
-      (title: 'Cancelled', icon: Icons.cancel_outlined, tabIdx: 5),
+      (title: 'For Down Payment', icon: Icons.pending_actions_outlined, tabIdx: 2),
+      (title: 'On Going', icon: Icons.event_note_outlined, tabIdx: 3),
+      (title: 'For Full Payment', icon: Icons.payments_outlined, tabIdx: 4),
+      (title: 'Completed', icon: Icons.task_alt_outlined, tabIdx: 5),
+      (title: 'Cancelled', icon: Icons.cancel_outlined, tabIdx: 6),
     ];
     return Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
@@ -4641,6 +4721,9 @@ class ManagerDashboardScreen extends StatelessWidget {
               itemBuilder: (context, index) {
                 if (index == cards.length) {
                   return Card(
+                    color: Colors.white,
+                    elevation: 2,
+                    shadowColor: Colors.black26,
                     child: InkWell(
                       borderRadius: BorderRadius.circular(12),
                       onTap: () => Navigator.of(context).push(
@@ -4662,6 +4745,9 @@ class ManagerDashboardScreen extends StatelessWidget {
                 }
                 final item = cards[index];
                 return Card(
+                  color: Colors.white,
+                  elevation: 2,
+                  shadowColor: Colors.black26,
                   child: InkWell(
                     borderRadius: BorderRadius.circular(12),
                     onTap: () {
@@ -4793,36 +4879,61 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                     itemBuilder: (context, i) {
                       final e = widget.state.tray[i];
                       return Card(
-                        child: ListTile(
-                          dense: true,
-                          title: Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis),
-                          subtitle: Text(
-                            e.dip.isEmpty ? '—' : (e.dipQty > 1 ? '${e.dip} × ${e.dipQty}' : e.dip),
-                            maxLines: 1,
-                          ),
-                          trailing: SizedBox(
-                            width: 108,
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.end,
-                              children: [
-                                IconButton(
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                  icon: const Icon(Icons.remove_circle_outline, size: 22),
-                                  onPressed: () => widget.state.changeQty(e, -1),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
+                              const SizedBox(height: 4),
+                              Text(
+                                cartLineDetailSubtitle(e),
+                                style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade800),
+                              ),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: [
+                                  IconButton(
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                    icon: const Icon(Icons.remove_circle_outline, size: 22),
+                                    onPressed: () => widget.state.changeQty(e, -1),
+                                  ),
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                                    child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                  ),
+                                  IconButton(
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                    icon: const Icon(Icons.add_circle_outline, size: 22),
+                                    onPressed: () => widget.state.changeQty(e, 1),
+                                  ),
+                                ],
+                              ),
+                              if (e.dip.trim().isNotEmpty)
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.end,
+                                  children: [
+                                    IconButton(
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                      icon: const Icon(Icons.remove_circle_outline, size: 20),
+                                      onPressed: e.dipQty > 1 ? () => widget.state.changeDipQty(e, -1) : null,
+                                    ),
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                                      child: Text('${e.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+                                    ),
+                                    IconButton(
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                      icon: const Icon(Icons.add_circle_outline, size: 20),
+                                      onPressed: () => widget.state.changeDipQty(e, 1),
+                                    ),
+                                  ],
                                 ),
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                                  child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                ),
-                                IconButton(
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                  icon: const Icon(Icons.add_circle_outline, size: 22),
-                                  onPressed: () => widget.state.changeQty(e, 1),
-                                ),
-                              ],
-                            ),
+                            ],
                           ),
                         ),
                       );
@@ -6246,37 +6357,80 @@ class TrayScreen extends StatelessWidget {
                           itemBuilder: (context, index) {
                             final item = state.tray[index];
                             return Card(
-                              child: ListTile(
-                                leading: SizedBox(
-                                  width: 56,
-                                  height: 56,
-                                  child: ClipRRect(
-                                    borderRadius: BorderRadius.circular(8),
-                                    child: _MenuThumb(item: item.menu, compact: true),
-                                  ),
-                                ),
-                                title: Text(item.menu.name),
-                                subtitle: Text('${item.dip.isEmpty ? 'No dip' : item.dip}\n₱${item.menu.price.toStringAsFixed(2)}'),
-                                trailing: Row(
-                                  mainAxisSize: MainAxisSize.min,
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.stretch,
                                   children: [
-                                    IconButton(
-                                      onPressed: () {
-                                        state.changeQty(item, 1);
-                                      },
-                                      icon: const Icon(Icons.add_circle, color: AppColors.success),
+                                    Row(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        SizedBox(
+                                          width: 56,
+                                          height: 56,
+                                          child: ClipRRect(
+                                            borderRadius: BorderRadius.circular(8),
+                                            child: _MenuThumb(item: item.menu, compact: true),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            children: [
+                                              Text(item.menu.name, style: const TextStyle(fontWeight: FontWeight.w700)),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                cartLineDetailSubtitle(item),
+                                                style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ],
                                     ),
-                                    Text('${item.qty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
-                                    IconButton(
-                                      onPressed: () {
-                                        final q = item.qty;
-                                        state.changeQty(item, -1);
-                                        if (q <= 1) {
-                                          appSnack(context, 'Removed ${item.menu.name} from tray');
-                                        }
-                                      },
-                                      icon: const Icon(Icons.remove_circle, color: AppColors.accent),
+                                    const SizedBox(height: 8),
+                                    Row(
+                                      children: [
+                                        const Text('Main qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+                                        const Spacer(),
+                                        IconButton(
+                                          onPressed: () {
+                                            state.changeQty(item, 1);
+                                          },
+                                          icon: const Icon(Icons.add_circle, color: AppColors.success),
+                                        ),
+                                        Text('${item.qty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                                        IconButton(
+                                          onPressed: () {
+                                            final q = item.qty;
+                                            state.changeQty(item, -1);
+                                            if (q <= 1) {
+                                              appSnack(context, 'Removed ${item.menu.name} from tray');
+                                            }
+                                          },
+                                          icon: const Icon(Icons.remove_circle, color: AppColors.accent),
+                                        ),
+                                      ],
                                     ),
+                                    if (item.dip.trim().isNotEmpty) ...[
+                                      const SizedBox(height: 4),
+                                      Row(
+                                        children: [
+                                          const Text('Add-on qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+                                          const Spacer(),
+                                          IconButton(
+                                            onPressed: item.dipQty > 1 ? () => state.changeDipQty(item, -1) : null,
+                                            icon: const Icon(Icons.remove_circle_outline),
+                                          ),
+                                          Text('${item.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                          IconButton(
+                                            onPressed: () => state.changeDipQty(item, 1),
+                                            icon: const Icon(Icons.add_circle_outline),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
                                   ],
                                 ),
                               ),
@@ -6467,11 +6621,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                         .map(
                           (e) => ListTile(
                             dense: true,
+                            isThreeLine: e.dip.trim().isNotEmpty,
                             title: Text(e.menu.name),
-                            subtitle: Text(
-                              e.dip.isEmpty ? '-' : (e.dipQty > 1 ? '${e.dip} × ${e.dipQty}' : e.dip),
-                            ),
-                            trailing: Text('x${e.qty}  ₱${cartLineSubtotal(e).toStringAsFixed(2)}'),
+                            subtitle: Text(cartLineDetailSubtitle(e)),
+                            trailing: Text('₱${cartLineSubtotal(e).toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
                           ),
                         )
                         .toList(),
@@ -6976,11 +7129,10 @@ class _PaymentScreenState extends State<PaymentScreen> {
                             ...s.tray.map(
                               (e) => ListTile(
                                 dense: true,
+                                isThreeLine: e.dip.trim().isNotEmpty,
                                 title: Text(e.menu.name),
-                                subtitle: Text(
-                                  e.dip.isEmpty ? '-' : (e.dipQty > 1 ? '${e.dip} × ${e.dipQty}' : e.dip),
-                                ),
-                                trailing: Text('x${e.qty}  ₱${cartLineSubtotal(e).toStringAsFixed(2)}'),
+                                subtitle: Text(cartLineDetailSubtitle(e)),
+                                trailing: Text('₱${cartLineSubtotal(e).toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
                               ),
                             )
                           else if (orderForUi.lines.isEmpty)
@@ -6989,11 +7141,10 @@ class _PaymentScreenState extends State<PaymentScreen> {
                             ...orderForUi.lines.map(
                               (l) => ListTile(
                                 dense: true,
+                                isThreeLine: l.dip.trim().isNotEmpty,
                                 title: Text(l.itemName),
-                                subtitle: Text(
-                                  l.dip.isEmpty ? '-' : (l.dipQty > 1 ? '${l.dip} × ${l.dipQty}' : l.dip),
-                                ),
-                                trailing: Text('x${l.qty}  ₱${orderLineSubtotal(l).toStringAsFixed(2)}'),
+                                subtitle: Text(orderLineDetailSubtitle(l)),
+                                trailing: Text('₱${orderLineSubtotal(l).toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
                               ),
                             ),
                         ],
@@ -9452,7 +9603,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
           ),
           SummaryFooter(
             lines: [
-              SummaryLine('Estimated Cost', '₱${estimate.toStringAsFixed(2)}', isTotal: true),
+              SummaryLine('Total Cost', '₱${estimate.toStringAsFixed(2)}', isTotal: true),
             ],
             secondaryLabel: 'CANCEL',
             actionLabel: 'SUBMIT',
@@ -10826,9 +10977,11 @@ class ManagerCateringShellScreen extends StatefulWidget {
 
 class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen> with SingleTickerProviderStateMixin {
   late TabController _tab;
+  /// API stage per tab (Down Payment + On Going both use `for_processing`).
   static const _stages = [
     'new_event',
     'online_inquiries',
+    'for_processing',
     'for_processing',
     'for_post_analysis',
     'completed',
@@ -10837,7 +10990,8 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
   static const _labels = [
     'New Event',
     'Online Inquiries',
-    'For Processing',
+    'For Down Payment',
+    'On Going',
     'For Full Payment',
     'Completed',
     'Cancelled',
@@ -10845,8 +10999,8 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
   @override
   void initState() {
     super.initState();
-    final idx = widget.initialTabIndex.clamp(0, 5);
-    _tab = TabController(length: 6, vsync: this, initialIndex: idx);
+    final idx = widget.initialTabIndex.clamp(0, 6);
+    _tab = TabController(length: 7, vsync: this, initialIndex: idx);
     widget.state.setManagerActiveStage(_stages[idx]);
     _tab.addListener(() {
       if (_tab.indexIsChanging) return;
@@ -10905,7 +11059,18 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
             children: [
               _ManagerNewEventListTab(state: widget.state),
               _ManagerStageListTab(state: widget.state, stage: 'online_inquiries', isReadOnly: false),
-              _ManagerStageListTab(state: widget.state, stage: 'for_processing', isReadOnly: false),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: 'for_processing',
+                isReadOnly: false,
+                processingSubstageFilter: 'down_payment',
+              ),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: 'for_processing',
+                isReadOnly: false,
+                processingSubstageFilter: 'ongoing',
+              ),
               _ManagerStageListTab(state: widget.state, stage: 'for_post_analysis', isReadOnly: false),
               _ManagerStageListTab(state: widget.state, stage: 'completed', isReadOnly: true),
               _ManagerStageListTab(state: widget.state, stage: 'cancelled', isReadOnly: true),
@@ -12242,7 +12407,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               Center(
                 child: Column(
                   children: [
-                    const Text('Estimated Cost', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const Text('Total Cost', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 2),
                     Text(
                       '₱${estimate.toStringAsFixed(2)}',
@@ -12270,10 +12435,17 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
 }
 
 class _ManagerStageListTab extends StatefulWidget {
-  const _ManagerStageListTab({required this.state, required this.stage, required this.isReadOnly});
+  const _ManagerStageListTab({
+    required this.state,
+    required this.stage,
+    required this.isReadOnly,
+    this.processingSubstageFilter,
+  });
   final AppState state;
   final String stage;
   final bool isReadOnly;
+  /// When [stage] is `for_processing`, keep only `down_payment` or `ongoing` rows.
+  final String? processingSubstageFilter;
 
   @override
   State<_ManagerStageListTab> createState() => _ManagerStageListTabState();
@@ -12312,7 +12484,10 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
   Widget build(BuildContext context) {
     final state = widget.state;
     final stage = widget.stage;
-    var rows = state.managerCateringRows.where((e) => e.status == stage).toList();
+    var rows = state.managerRowsForStage(stage);
+    if (widget.processingSubstageFilter != null && stage == 'for_processing') {
+      rows = rows.where((e) => e.processingSubstageLabel == widget.processingSubstageFilter).toList();
+    }
     if (_kind == 'catering') rows = rows.where((r) => r.orderKind == 'catering').toList();
     if (_kind == 'event') rows = rows.where((r) => r.orderKind == 'event').toList();
     final q = _q.trim().toLowerCase();
@@ -12373,14 +12548,15 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                       final r = rows[i];
                       final entered = r.stageEnteredAt ?? r.updatedAt;
                       final whenStr = formatDateTimeLocal(entered);
-                      final scheduleLine =
-                          r.schedulePreview.trim().isNotEmpty ? 'Event date/time: ${r.schedulePreview}' : '';
+                      final stLower = r.status.trim().toLowerCase();
+                      final scheduleLine = (stLower == 'for_post_analysis' || stLower == 'completed') && r.totalCost > 0
+                          ? 'Total cost: ₱${r.totalCost.toStringAsFixed(2)}'
+                          : (r.schedulePreview.trim().isNotEmpty ? 'Event date/time: ${r.schedulePreview}' : '');
                       final settingLabel = managerEventSettingDisplayLabel(r.eventSetting);
                       final settingLine = settingLabel.isNotEmpty ? 'Setting: $settingLabel' : '';
                       final conflictLine = stage == 'for_processing' && r.processingScheduleOverlaps > 0
                           ? 'Schedule overlap: crosses ${r.processingScheduleOverlaps} other active order(s) — open for details.'
                           : '';
-                      final stLower = r.status.trim().toLowerCase();
                       final loyaltyLine = r.cateringLoyaltyPointsEarned > 0 && stLower == 'completed'
                           ? 'Catering loyalty applied: +${r.cateringLoyaltyPointsEarned} pts'
                           : (stLower != 'completed' && r.cateringLoyaltyEligiblePointsIfCompleted > 0)
@@ -12415,7 +12591,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                   borderRadius: BorderRadius.circular(999),
                                 ),
                                 child: Text(
-                                  inquiryStatusReadable(r.status),
+                                  cateringManagerListStatusLabelFor(r.status, r.processingSubstageLabel),
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
@@ -12479,6 +12655,13 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                           return;
                                         }
                                         if (target == 'for_post_analysis') {
+                                          if (stage == 'for_processing' && r.processingSubstageLabel != 'ongoing') {
+                                            appSnack(
+                                              context,
+                                              'Open the order and move it to On Going before advancing to For Full Payment.',
+                                            );
+                                            return;
+                                          }
                                           final dueHalf = r.totalCost * 0.5;
                                           if (!cateringDownPaymentConfirmed(r, dueHalf)) {
                                             appSnack(
@@ -12616,6 +12799,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   final List<String> actualEventImages = [];
   Uint8List? _managerDownPaymentProofBytes;
   Uint8List? _managerFullPaymentProofBytes;
+  Uint8List? _managerAdditionalCostsProofBytes;
   String _managerDownPaymentMethod = 'Cash';
   String _managerFullPaymentMethod = 'Cash';
 
@@ -12948,7 +13132,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         final label = '${e['label'] ?? ''}'.trim();
         final amount = jsonToDouble(e['amount']);
         if (label.isEmpty && amount <= 0) continue;
-        addRows.add(labelValueRow(label.isEmpty ? 'Additional item' : label, 'PHP ${amount.toStringAsFixed(2)}'));
+        addRows.add(
+          labelValueRow(
+            'Additional costs',
+            '${label.isEmpty ? 'Item' : label}: PHP ${amount.toStringAsFixed(2)}',
+          ),
+        );
       }
       addRows.add(labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'));
       doc.addPage(
@@ -13330,6 +13519,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       ..addAll(taskRows.map((e) => Map<String, dynamic>.from(e)));
     _managerDownPaymentProofBytes = null;
     _managerFullPaymentProofBytes = null;
+    _managerAdditionalCostsProofBytes = null;
     final dpb = row.postAnalysis['manager_down_payment_proof_b64'];
     if (dpb is String && dpb.trim().isNotEmpty) {
       try {
@@ -13340,6 +13530,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     if (fpb is String && fpb.trim().isNotEmpty) {
       try {
         _managerFullPaymentProofBytes = Uint8List.fromList(base64Decode(fpb.trim()));
+      } catch (_) {}
+    }
+    final acpb = row.postAnalysis['manager_additional_costs_proof_b64'];
+    if (acpb is String && acpb.trim().isNotEmpty) {
+      try {
+        _managerAdditionalCostsProofBytes = Uint8List.fromList(base64Decode(acpb.trim()));
       } catch (_) {}
     }
     String normPm(String raw) {
@@ -13492,9 +13688,63 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18, color: Colors.red.shade900),
                     ),
                     const SizedBox(height: 8),
+                    const Text('Proof of additional costs payment', style: TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: !widget.state.isManager ||
+                                    (d.postAnalysis['additional_costs_payment_confirmed'] == true)
+                                ? null
+                                : () async {
+                                    final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+                                    if (x == null || !mounted) return;
+                                    final b = await x.readAsBytes();
+                                    setState(() => _managerAdditionalCostsProofBytes = b);
+                                  },
+                            icon: const Icon(Icons.upload_file, size: 18),
+                            label: const Text('Upload'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: !widget.state.isManager ||
+                                    (d.postAnalysis['additional_costs_payment_confirmed'] == true)
+                                ? null
+                                : () async {
+                                    final x = await ImagePicker().pickImage(source: ImageSource.camera);
+                                    if (x == null || !mounted) return;
+                                    final b = await x.readAsBytes();
+                                    setState(() => _managerAdditionalCostsProofBytes = b);
+                                  },
+                            icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                            label: const Text('Camera'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_managerAdditionalCostsProofBytes != null) ...[
+                      const SizedBox(height: 8),
+                      InkWell(
+                        onTap: () => showProofFullScreen(
+                          context,
+                          _managerAdditionalCostsProofBytes!,
+                          title: 'Additional costs proof',
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.memory(_managerAdditionalCostsProofBytes!, height: 120, fit: BoxFit.contain),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
                     FilledButton(
                       style: FilledButton.styleFrom(backgroundColor: Colors.red.shade800),
-                      onPressed: !widget.state.isManager || (d.postAnalysis['additional_costs_payment_confirmed'] == true)
+                      onPressed: !widget.state.isManager ||
+                              (d.postAnalysis['additional_costs_payment_confirmed'] == true) ||
+                              _managerAdditionalCostsProofBytes == null
                           ? null
                           : () async {
                               final ok = await showDialog<bool>(
@@ -13520,7 +13770,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               final err = await widget.state.managerPatchCateringPostAnalysis(
                                 id: d.id,
                                 orderKind: d.orderKind,
-                                patch: {'additional_costs_payment_confirmed': true},
+                                patch: {
+                                  'additional_costs_payment_confirmed': true,
+                                  'manager_additional_costs_proof_b64':
+                                      base64Encode(_managerAdditionalCostsProofBytes!),
+                                },
                               );
                               if (!mounted) return;
                               if (err != null) {
@@ -13615,6 +13869,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
     final row = d;
     final isProcessing = widget.stage == 'for_processing';
+    final processingSubstage = row.processingSubstageLabel;
+    final isDownPaymentSubstage = isProcessing && processingSubstage == 'down_payment';
+    final isOngoingSubstage = isProcessing && processingSubstage == 'ongoing';
     final isPost = widget.stage == 'for_post_analysis';
     final isCompleted = widget.stage == 'completed';
     final isOnlineInquiry = widget.stage == 'online_inquiries';
@@ -13630,6 +13887,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final downPaymentDue = displayInvoiceTotal * 0.5;
     final isDownPaymentConfirmed = cateringDownPaymentConfirmed(row, downPaymentDue);
     final isFullPaymentConfirmed = cateringFullPaymentConfirmed(row, totalComputed);
+    final hasFullPaymentProofImage = _managerFullPaymentProofBytes != null ||
+        ('${row.postAnalysis['manager_full_payment_proof_b64'] ?? ''}'.trim().isNotEmpty);
+    final hasDownPaymentProofImage = _managerDownPaymentProofBytes != null ||
+        ('${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim().isNotEmpty);
     final laborCostComputed = _laborCostComputed();
     final rowMenu = normalizeCateringMenuList(row.menu);
     Future<void> _generateChecklistPdf() async {
@@ -13645,7 +13906,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (n.isEmpty) return item;
         for (final m in widget.state.menu) {
           if (m.name.trim() == n && m.ingredients.isNotEmpty) {
-            return '$n\n${m.ingredients.join(', ')}';
+            return '$n — ${m.ingredients.join(', ')}';
           }
         }
         return item;
@@ -13996,6 +14257,56 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
 
     Future<void> submitNext() async {
+      final processingSubstageEarly = d.processingSubstageLabel;
+      if (widget.stage == 'for_processing' && processingSubstageEarly == 'down_payment') {
+        final invoiceEarly = _baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts);
+        final dueHalfEarly = invoiceEarly * 0.5;
+        if (!cateringDownPaymentConfirmed(d, dueHalfEarly)) {
+          appSnack(context, 'Confirm down payment with proof before continuing to On Going.');
+          return;
+        }
+        final okCont = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Continue to On Going'),
+            content: const Text(
+              'Down payment is confirmed. Move this order to On Going for checklist and task assignment?',
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Continue')),
+            ],
+          ),
+        );
+        if (okCont != true || !mounted) return;
+        showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => const Center(child: CircularProgressIndicator()),
+        );
+        try {
+          final err = await widget.state.managerPatchCateringPostAnalysis(
+            id: d.id,
+            orderKind: d.orderKind,
+            patch: {'processing_phase': 'ongoing'},
+          );
+          if (!mounted) return;
+          Navigator.of(context).pop();
+          if (err != null) {
+            appSnack(context, err);
+            return;
+          }
+          final full = await widget.state.loadManagerCateringItem(id: d.id, orderKind: d.orderKind);
+          if (!mounted) return;
+          if (full != null) setState(() => _loadedDetailRow = full);
+          await widget.state.loadManagerCateringByStage(widget.stage, force: true);
+          appSnack(context, 'Moved to On Going');
+        } catch (_) {
+          if (mounted) Navigator.of(context).pop();
+        }
+        return;
+      }
+
       final target = widget.stage == 'online_inquiries'
           ? 'for_processing'
           : widget.stage == 'new_event'
@@ -14325,9 +14636,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
         onManageEvents: () => Navigator.of(context).pop(),
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(12),
+      body: Column(
         children: [
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.all(12),
+              children: [
           if (row.cateringLoyaltyPointsEarned > 0 && row.status.trim().toLowerCase() == 'completed')
             Card(
               color: Colors.amber.shade50,
@@ -14350,7 +14664,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (isProcessing)
+          if (isDownPaymentSubstage)
             Card(
               color: Colors.orange.shade50,
               child: Padding(
@@ -14453,7 +14767,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onPressed: (!isProcessing ||
                               isDownPaymentConfirmed ||
                               !widget.state.isManager ||
-                              _managerDownPaymentProofBytes == null)
+                              !hasDownPaymentProofImage)
                           ? null
                           : () async {
                               final paid = double.tryParse(downPaymentPaidController.text.trim()) ?? 0;
@@ -14504,7 +14818,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (isProcessing) _additionalCostsCard(draft: false, processing: true, post: false),
+          if (isDownPaymentSubstage) _additionalCostsCard(draft: false, processing: true, post: false),
           if (isPost || isCompleted)
             Card(
               color: Colors.green.shade50,
@@ -14634,9 +14948,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onPressed: (!widget.state.isManager ||
                               !isPost ||
                               isFullPaymentConfirmed ||
-                              _managerFullPaymentProofBytes == null)
+                              !hasFullPaymentProofImage)
                           ? null
                           : () async {
+                              if (_sumCostRows(additionalCosts) > 0.01 &&
+                                  row.postAnalysis['additional_costs_payment_confirmed'] != true) {
+                                appSnack(context, 'Confirm additional costs payment (with proof) first.');
+                                return;
+                              }
                               final balanceDue =
                                   totalComputed - (double.tryParse(downPaymentPaidController.text.trim()) ?? 0);
                               final ok = await showDialog<bool>(
@@ -14681,7 +15000,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ),
             ),
           if (isPost) _additionalCostsCard(draft: false, processing: false, post: true),
-          if (isProcessing || isPost || isCompleted)
+          if (isOngoingSubstage || isPost || isCompleted)
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -14691,10 +15010,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     const Text('Checklist and Task Assignment', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
                     Text(
-                      isProcessing
+                      isOngoingSubstage
                           ? 'Open each section in a separate window for easier card-based editing.'
                           : isPost
-                              ? 'Checklist and tasks reflect what was saved in For Processing. Export PDFs from here.'
+                              ? 'Checklist and tasks reflect what was saved in On Going. Export PDFs from here.'
                               : 'PDF generation is available in this stage. Editing is disabled.',
                     ),
                     const SizedBox(height: 10),
@@ -14702,7 +15021,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       spacing: 8,
                       runSpacing: 8,
                       children: [
-                        if (isProcessing) ...[
+                        if (isOngoingSubstage) ...[
                           OutlinedButton(onPressed: _openChecklistEditor, child: const Text('Open Checklist Editor')),
                           OutlinedButton(onPressed: _openTaskEditor, child: const Text('Open Task Assignment Editor')),
                         ],
@@ -14749,7 +15068,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         if (isProcessing && row.processingScheduleOverlaps > 0) ...[
                           const SizedBox(height: 8),
                           Text(
-                            'This date and time conflicts with another event in For Processing.',
+                            'This date and time conflicts with another event in For Down Payment / On Going.',
                             style: TextStyle(color: Colors.red.shade800, fontWeight: FontWeight.w600),
                           ),
                         ],
@@ -14931,7 +15250,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           Padding(
                             padding: const EdgeInsets.only(top: 8),
                             child: Text(
-                              'Conflicts detected with an existing event in For Processing.',
+                              'Conflicts detected with an existing event in For Down Payment / On Going.',
                               style: TextStyle(
                                 color: Colors.red.shade700,
                                 fontWeight: FontWeight.w700,
@@ -15387,6 +15706,31 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 style: TextStyle(fontWeight: FontWeight.w700),
               ),
             ),
+              ],
+            ),
+          ),
+          if (isCompleted)
+            Material(
+              elevation: 8,
+              shadowColor: Colors.black26,
+              color: Theme.of(context).scaffoldBackgroundColor,
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Total Cost', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                      Text(
+                        '₱${(row.totalCost > 0 ? row.totalCost : totalComputed).toStringAsFixed(2)}',
+                        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 22),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
       bottomNavigationBar: (!isCompleted && (isProcessing || isPost || isOnlineInquiry || isDraftStage))
@@ -15404,9 +15748,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     Center(
                       child: Column(
                         children: [
-                          Text(
-                            isProcessing ? 'Final Cost' : 'Estimated Cost',
-                            style: const TextStyle(fontWeight: FontWeight.w800),
+                          const Text(
+                            'Total Cost',
+                            style: TextStyle(fontWeight: FontWeight.w800),
                           ),
                           const SizedBox(height: 2),
                           Text(
@@ -15454,8 +15798,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         onPressed: submitNext,
                         child: Text(
                           isDraftStage
-                              ? 'Save and Move to For Processing'
-                              : (isPost ? 'Complete Order' : 'Submit to Next Stage'),
+                              ? 'Save and Move to For Down Payment'
+                              : (isPost
+                                  ? 'Complete Order'
+                                  : (isDownPaymentSubstage ? 'Continue to On Going' : 'Submit to Next Stage')),
                         ),
                       ),
                     ],
@@ -15534,7 +15880,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
                           ? 'NEW ORDER'
                           : _tab.index == 1
                               ? 'ONLINE ORDERS'
-                              : 'ONGOING WALK-IN',
+                              : 'WALK-IN ORDERS',
                       style: const TextStyle(color: AppColors.ink, fontWeight: FontWeight.w800, fontSize: 12),
                     ),
                   ),
@@ -15563,7 +15909,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
                         child: const Text('Online Orders'),
                       ),
                     ),
-                    const Tab(text: 'Walk-in ongoing'),
+                    const Tab(text: 'Walk-In Orders'),
                   ],
                 ),
               ),
@@ -15677,36 +16023,61 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                     itemBuilder: (context, i) {
                       final e = widget.state.tray[i];
                       return Card(
-                        child: ListTile(
-                          dense: true,
-                          title: Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis),
-                          subtitle: Text(
-                            e.dip.isEmpty ? '—' : (e.dipQty > 1 ? '${e.dip} × ${e.dipQty}' : e.dip),
-                            maxLines: 1,
-                          ),
-                          trailing: SizedBox(
-                            width: 108,
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.end,
-                              children: [
-                                IconButton(
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                  icon: const Icon(Icons.remove_circle_outline, size: 22),
-                                  onPressed: () => widget.state.changeQty(e, -1),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
+                              const SizedBox(height: 4),
+                              Text(
+                                cartLineDetailSubtitle(e),
+                                style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade800),
+                              ),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: [
+                                  IconButton(
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                    icon: const Icon(Icons.remove_circle_outline, size: 22),
+                                    onPressed: () => widget.state.changeQty(e, -1),
+                                  ),
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                                    child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                  ),
+                                  IconButton(
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                    icon: const Icon(Icons.add_circle_outline, size: 22),
+                                    onPressed: () => widget.state.changeQty(e, 1),
+                                  ),
+                                ],
+                              ),
+                              if (e.dip.trim().isNotEmpty)
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.end,
+                                  children: [
+                                    IconButton(
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                      icon: const Icon(Icons.remove_circle_outline, size: 20),
+                                      onPressed: e.dipQty > 1 ? () => widget.state.changeDipQty(e, -1) : null,
+                                    ),
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                                      child: Text('${e.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+                                    ),
+                                    IconButton(
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                      icon: const Icon(Icons.add_circle_outline, size: 20),
+                                      onPressed: () => widget.state.changeDipQty(e, 1),
+                                    ),
+                                  ],
                                 ),
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                                  child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                ),
-                                IconButton(
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                  icon: const Icon(Icons.add_circle_outline, size: 22),
-                                  onPressed: () => widget.state.changeQty(e, 1),
-                                ),
-                              ],
-                            ),
+                            ],
                           ),
                         ),
                       );
@@ -15882,20 +16253,76 @@ class PosYourTrayScreen extends StatelessWidget {
                     itemBuilder: (context, i) {
                       final e = state.tray[i];
                       return Card(
-                        child: ListTile(
-                          leading: SizedBox(
-                            width: 56,
-                            height: 56,
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: _MenuThumb(item: e.menu),
-                            ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  SizedBox(
+                                    width: 56,
+                                    height: 56,
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: _MenuThumb(item: e.menu),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(e.menu.name, style: const TextStyle(fontWeight: FontWeight.w700)),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          cartLineDetailSubtitle(e),
+                                          style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Text(
+                                    '₱${cartLineSubtotal(e).toStringAsFixed(2)}',
+                                    style: const TextStyle(fontWeight: FontWeight.w800),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  const Text('Main qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+                                  const Spacer(),
+                                  IconButton(
+                                    onPressed: () => state.changeQty(e, 1),
+                                    icon: const Icon(Icons.add_circle, color: AppColors.success),
+                                  ),
+                                  Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                                  IconButton(
+                                    onPressed: () => state.changeQty(e, -1),
+                                    icon: const Icon(Icons.remove_circle, color: AppColors.accent),
+                                  ),
+                                ],
+                              ),
+                              if (e.dip.trim().isNotEmpty)
+                                Row(
+                                  children: [
+                                    const Text('Add-on qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+                                    const Spacer(),
+                                    IconButton(
+                                      onPressed: e.dipQty > 1 ? () => state.changeDipQty(e, -1) : null,
+                                      icon: const Icon(Icons.remove_circle_outline),
+                                    ),
+                                    Text('${e.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                    IconButton(
+                                      onPressed: () => state.changeDipQty(e, 1),
+                                      icon: const Icon(Icons.add_circle_outline),
+                                    ),
+                                  ],
+                                ),
+                            ],
                           ),
-                          title: Text(e.menu.name),
-                          subtitle: Text(
-                            e.dip.isEmpty ? '—' : (e.dipQty > 1 ? '${e.dip} × ${e.dipQty}' : e.dip),
-                          ),
-                          trailing: Text('x${e.qty}  ₱${cartLineSubtotal(e).toStringAsFixed(2)}'),
                         ),
                       );
                     },
@@ -16111,7 +16538,7 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                       children: [
                         Expanded(
                           child: Text(
-                            '${e.menu.name}${e.dip.trim().isNotEmpty ? ' — ${e.dip}${e.dipQty > 1 ? ' ×${e.dipQty}' : ''}' : ''} × ${e.qty}',
+                            '${e.menu.name}\n${cartLineDetailSubtitle(e)}',
                             style: const TextStyle(height: 1.25),
                           ),
                         ),
@@ -16230,7 +16657,12 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
               if (o.note.trim().isNotEmpty) Text('Note: ${o.note}'),
               const SizedBox(height: 12),
               const Text('Items', style: TextStyle(fontWeight: FontWeight.w800)),
-              ...o.lines.map((l) => Text('• ${l.itemName}${l.dip.isEmpty ? '' : ' — ${l.dip}'} ×${l.qty}')),
+              ...o.lines.map(
+                (l) => Text(
+                  '• ${l.itemName} — ${orderLineDetailSubtitle(l).replaceAll('\n', ' ')}',
+                  style: const TextStyle(height: 1.35),
+                ),
+              ),
               if (o.paymentProofBase64 != null && o.paymentProofBase64!.trim().isNotEmpty) ...[
                 const SizedBox(height: 12),
                 const Text('Payment proof', style: TextStyle(fontWeight: FontWeight.w800)),
@@ -16382,71 +16814,107 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
           elevation: 2,
           color: Colors.white,
           shadowColor: Colors.black26,
-          child: ListTile(
-            title: Text(o.orderNo),
-            subtitle: Text(
-              [
-                'Submitted: $submitted',
-                if (isCancelledList) 'Status: ${statusReadable(o.status)}',
-                if (!isCancelledList && !showClaim && completed.isNotEmpty) 'Completed: $completed',
-                if (!isCancelledList && !showClaim && o.loyaltyPointsEarned > 0) 'Loyalty earned: +${o.loyaltyPointsEarned} pts',
-                if (o.posCustomerLabel.trim().isNotEmpty) o.posCustomerLabel.trim(),
-                if (o.paymentMode.trim().isNotEmpty) o.paymentMode.toUpperCase(),
-              ].where((s) => s.isNotEmpty).join('\n'),
-            ),
-            isThreeLine: true,
-            trailing: showClaim
-                ? Wrap(
-                    alignment: WrapAlignment.end,
-                    spacing: 6,
-                    children: [
-                      TextButton(
-                        onPressed: () async {
-                          final yes = await showDialog<bool>(
-                            context: context,
-                            builder: (ctx) => AlertDialog(
-                              title: const Text('Cancel this walk-in order?'),
-                              content: Text('${o.orderNo} will move to Cancelled.'),
-                              actions: [
-                                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
-                                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes, cancel')),
-                              ],
-                            ),
-                          );
-                          if (yes != true || !context.mounted) return;
-                          final err = await widget.state.cancelWalkInOrder(o.id);
-                          if (mounted && err != null) appSnack(context, err);
-                        },
-                        child: const Text('Cancel'),
-                      ),
-                      FilledButton(
-                        onPressed: () async {
-                          final yes = await showDialog<bool>(
-                            context: context,
-                            builder: (ctx) => AlertDialog(
-                              title: const Text('Mark order claimed?'),
-                              content: Text(
-                                'Confirm when ${o.orderNo} has been picked up by the customer. It will move to Complete here and appear in Order history.',
-                              ),
-                              actions: [
-                                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-                                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm')),
-                              ],
-                            ),
-                          );
-                          if (yes != true || !context.mounted) return;
-                          final err = await widget.state.claimWalkInOrder(o.id);
-                          if (mounted && err != null) appSnack(context, err);
-                        },
-                        child: const Text('Claim'),
-                      ),
-                    ],
-                  )
-                : Icon(
-                    isCancelledList ? Icons.cancel_outlined : Icons.check_circle_outline,
-                    color: isCancelledList ? Colors.redAccent : AppColors.success,
-                  ),
+          child: InkWell(
             onTap: () => _showWalkInDetail(o),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(o.orderNo, style: const TextStyle(fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 4),
+                        Text(
+                          [
+                            'Submitted: $submitted',
+                            if (isCancelledList) 'Status: ${statusReadable(o.status)}',
+                            if (!isCancelledList && !showClaim && completed.isNotEmpty) 'Completed: $completed',
+                            if (!isCancelledList && !showClaim && o.loyaltyPointsEarned > 0)
+                              'Loyalty earned: +${o.loyaltyPointsEarned} pts',
+                            if (o.posCustomerLabel.trim().isNotEmpty) o.posCustomerLabel.trim(),
+                            if (o.paymentMode.trim().isNotEmpty) o.paymentMode.toUpperCase(),
+                          ].where((s) => s.isNotEmpty).join('\n'),
+                          style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.25),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(
+                        '₱${o.total.toStringAsFixed(2)}',
+                        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
+                      ),
+                      if (showClaim) ...[
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 4,
+                          alignment: WrapAlignment.end,
+                          children: [
+                            TextButton(
+                              onPressed: () async {
+                                final yes = await showDialog<bool>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text('Cancel this walk-in order?'),
+                                    content: Text('${o.orderNo} will move to Cancelled.'),
+                                    actions: [
+                                      TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+                                      FilledButton(
+                                        onPressed: () => Navigator.pop(ctx, true),
+                                        child: const Text('Yes, cancel'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                                if (yes != true || !context.mounted) return;
+                                final err = await widget.state.cancelWalkInOrder(o.id);
+                                if (mounted && err != null) appSnack(context, err);
+                              },
+                              child: const Text('Cancel'),
+                            ),
+                            FilledButton(
+                              onPressed: () async {
+                                final yes = await showDialog<bool>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text('Mark order claimed?'),
+                                    content: Text(
+                                      'Confirm when ${o.orderNo} has been picked up by the customer. It will move to Complete here and appear in Order history.',
+                                    ),
+                                    actions: [
+                                      TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                                      FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm')),
+                                    ],
+                                  ),
+                                );
+                                if (yes != true || !context.mounted) return;
+                                final err = await widget.state.claimWalkInOrder(o.id);
+                                if (mounted && err != null) appSnack(context, err);
+                              },
+                              child: const Text('Claim'),
+                            ),
+                          ],
+                        ),
+                      ] else
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Icon(
+                            isCancelledList ? Icons.cancel_outlined : Icons.check_circle_outline,
+                            color: isCancelledList ? Colors.redAccent : AppColors.success,
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
           ),
         );
       },
