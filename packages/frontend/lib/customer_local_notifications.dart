@@ -48,7 +48,7 @@ void clearCustomerNotificationDedupe() {
   _notifiedOrderNos.clear();
 }
 
-/// Shown after successful restaurant checkout (payment proof uploaded).
+/// Shown after payment proof is uploaded (order is pending cashier confirmation).
 Future<void> showCustomerCheckoutCompleteNotification(String orderNo) async {
   await initCustomerLocalNotifications();
   const android = AndroidNotificationDetails(
@@ -67,8 +67,8 @@ Future<void> showCustomerCheckoutCompleteNotification(String orderNo) async {
   final id = key.hashCode & 0x7fffffff;
   await customerLocalNotifications.show(
     id,
-    'Order placed',
-    '$key — we received your payment proof. We will confirm your order soon.',
+    'Payment proof received',
+    '$key — we received your payment proof. We will confirm your order after review.',
     details,
   );
 }

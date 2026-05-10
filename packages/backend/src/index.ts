@@ -8,7 +8,13 @@ dns.setDefaultResultOrder("ipv4first");
 import bcrypt from "bcrypt";
 import cors from "cors";
 import express from "express";
-import { isMailConfigured, sendMailRequired, sendMailSafe, sendMailWithPdfAttachment } from "./mail.js";
+import {
+  isMailConfigured,
+  sendMailRequired,
+  sendMailSafe,
+  sendMailWithPdfAttachment,
+  sendMailWithPdfRequired,
+} from "./mail.js";
 import { formatDbStartupError, getPool, initDb } from "./db.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
@@ -541,25 +547,26 @@ async function generateChecklistFromMenu(menuRaw: unknown): Promise<ChecklistIte
       })
       .filter((x) => x.length > 0);
     if (dishNames.length === 0) return [];
-    const { rows } = await getPool().query(
-      `SELECT name, ingredients FROM menu_dishes WHERE LOWER(name) = ANY($1::text[])`,
-      [dishNames.map((d) => d.toLowerCase())],
-    );
-    const items = new Set<string>();
-    for (const r of rows as Array<{ ingredients: unknown }>) {
-      const ingredients = parseJsonTextArray((r as unknown as Record<string, unknown>).ingredients);
+    const out: ChecklistItem[] = [];
+    for (const dishName of dishNames) {
+      const { rows } = await getPool().query(
+        `SELECT ingredients FROM menu_dishes WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) LIMIT 1`,
+        [dishName],
+      );
+      const ingredients = parseJsonTextArray((rows[0] as Record<string, unknown> | undefined)?.ingredients);
       for (const ing of ingredients) {
         const cleaned = ing.trim();
-        if (cleaned) items.add(cleaned);
+        if (!cleaned) continue;
+        out.push({
+          item: cleaned,
+          description: dishName,
+          quantity: "",
+          cost: "",
+          status: "not done",
+        });
       }
     }
-    return Array.from(items).map((item) => ({
-      item,
-      description: "",
-      quantity: "",
-      cost: "",
-      status: "not done" as const,
-    }));
+    return out;
   } catch (err) {
     console.error("[checklist] generateChecklistFromMenu skipped:", err);
     return [];
@@ -584,6 +591,37 @@ const CATERING_LOYALTY_STEP_AMOUNT = 500;
 const CATERING_LOYALTY_STEP_POINTS = 8;
 const CATERING_ONLY_MIN_GUESTS = 10;
 const CATERING_EVENT_MIN_GUESTS = 50;
+
+/** Extra add-on units beyond the first cost this much each (per main dish qty). */
+const RESTAURANT_ADDON_EXTRA_PHP = 15;
+
+type ParsedRestaurantLine = {
+  item_name: string;
+  dip: string;
+  dip_qty: number;
+  qty: number;
+  price: number;
+};
+
+function parseRestaurantOrderLine(i: unknown): ParsedRestaurantLine | null {
+  if (!i || typeof i !== "object") return null;
+  const r = i as Record<string, unknown>;
+  let dip = String(r.dip ?? "").trim();
+  if (dip.toLowerCase() === "none") dip = "";
+  const item_name = String(r.item_name ?? "").trim();
+  const qty = Number(r.qty ?? 0);
+  const price = Number(r.price ?? 0);
+  let dip_qty = Math.floor(Number(r.dip_qty ?? 1));
+  if (!Number.isFinite(dip_qty) || dip_qty < 1) dip_qty = 1;
+  if (!item_name || qty <= 0 || price < 0) return null;
+  return { item_name, dip, dip_qty, qty, price };
+}
+
+function restaurantLineSubtotal(line: ParsedRestaurantLine): number {
+  const hasDip = line.dip.length > 0;
+  const extra = hasDip ? Math.max(0, line.dip_qty - 1) * RESTAURANT_ADDON_EXTRA_PHP * line.qty : 0;
+  return Math.round((line.qty * line.price + extra) * 100) / 100;
+}
 
 type LoyaltyEarnKind = "restaurant_mobile" | "catering_event";
 
@@ -918,7 +956,10 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
     return;
   }
   if (!isMailConfigured()) {
-    res.status(503).json({ error: "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD" });
+    res.status(503).json({
+      error:
+        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+    });
     return;
   }
   const code = String(crypto.randomInt(100000, 1000000));
@@ -1047,7 +1088,10 @@ app.post("/api/mobile/auth/login", async (req, res) => {
         pos_role: String(cRow.pos_role ?? ""),
       });
       const role = posRole ?? "customer";
-      const displayName = String(cRow.display_name ?? "").trim();
+      let displayName = String(cRow.display_name ?? "").trim();
+      if (!displayName && posRole === "manager") {
+        displayName = "Manager";
+      }
       await logActionBestEffort("auth.login", email, "Staff login successful", { role });
       res.json({ ok: true, email, role, display_name: displayName });
       return;
@@ -1098,8 +1142,11 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
     res.status(400).json({ error: "cashier password reset supports email only" });
     return;
   }
-  if (channel === "email" && !isMailConfigured()) {
-    res.status(503).json({ error: "SMTP not configured" });
+  if (!isMailConfigured()) {
+    res.status(503).json({
+      error:
+        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+    });
     return;
   }
   const otp = String(crypto.randomInt(100000, 1000000));
@@ -1122,7 +1169,10 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
     } else {
       const account = await resolveCustomerAccountByIdentity(identity);
       if (!account) {
-        res.json({ ok: true });
+        res.status(404).json({
+          error: "not_registered",
+          message: "This email or phone number is not registered.",
+        });
         return;
       }
       targetEmail = account.email;
@@ -1132,18 +1182,16 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
         [targetEmail, otp, expiresAt.toISOString()],
       );
     }
-    if (channel === "email") {
-      await sendMailRequired(
-        targetEmail,
-        "Reset your Curatering password",
-        `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.`,
-      );
-    } else {
-      // Mobile app currently has no SMS provider configured; keep best-effort audit trail.
+    const otpBody =
+      channel === "phone"
+        ? `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.\n\n(You requested verification using your phone number on file; this code was sent to your registered email.)`
+        : `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.`;
+    await sendMailRequired(targetEmail, "Reset your Curatering password", otpBody);
+    if (channel === "phone") {
       await logActionBestEffort(
-        "auth.reset.request_phone_notification",
+        "auth.reset.request_phone_channel",
         targetEmail,
-        "Password reset requested via phone notification",
+        "Password reset OTP emailed (phone channel selected in app)",
         { phone_number: targetPhone, otp_masked: "***" },
       );
     }
@@ -1153,6 +1201,60 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
       "Password reset requested",
       { channel, role },
     );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
+/** Validates OTP before showing the new-password step (does not consume the OTP). */
+app.post("/api/mobile/auth/check-password-reset-otp", async (req, res) => {
+  const identity = String(req.body?.identity ?? req.body?.email ?? "").trim().toLowerCase();
+  const otp = String(req.body?.otp ?? "").trim();
+  const role = String(req.body?.role ?? "customer").trim().toLowerCase();
+  if (!identity || !otp) {
+    res.status(400).json({ error: "identity and otp are required" });
+    return;
+  }
+  try {
+    let email = "";
+    let row:
+      | { password_reset_otp: string | null; password_reset_expires_at: Date | null }
+      | undefined;
+    if (role === "cashier") {
+      const { rows } = await getPool().query(
+        `SELECT email, password_reset_otp, password_reset_expires_at FROM users WHERE LOWER(email) = $1`,
+        [identity],
+      );
+      const r = rows[0] as
+        | { email: string; password_reset_otp: string | null; password_reset_expires_at: Date | null }
+        | undefined;
+      if (r) {
+        email = r.email;
+        row = { password_reset_otp: r.password_reset_otp, password_reset_expires_at: r.password_reset_expires_at };
+      }
+    } else {
+      const account = await resolveCustomerAccountByIdentity(identity);
+      if (account) {
+        email = account.email;
+        const { rows } = await getPool().query(
+          `SELECT password_reset_otp, password_reset_expires_at FROM customer_accounts WHERE email = $1`,
+          [email],
+        );
+        row = rows[0] as { password_reset_otp: string | null; password_reset_expires_at: Date | null } | undefined;
+      }
+    }
+    if (
+      !email ||
+      !row?.password_reset_otp ||
+      row.password_reset_otp !== otp ||
+      !row.password_reset_expires_at ||
+      new Date(row.password_reset_expires_at) < new Date()
+    ) {
+      res.status(400).json({ error: "invalid or expired reset OTP" });
+      return;
+    }
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -1227,6 +1329,12 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
       );
     }
     await logActionBestEffort("auth.reset.complete", email, "Password reset completed", {});
+    const ts = new Date().toISOString();
+    void sendMailSafe(
+      email,
+      "Your Curatering password was reset",
+      `The password for ${email} was successfully reset at ${ts}.\n\nIf you did not make this change, contact support immediately.`,
+    );
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -1605,19 +1713,12 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
     res.status(400).json({ error: "payment_method must be CASH or GCASH" });
     return;
   }
-  const parsedItems = items
-    .map((i) => ({
-      item_name: String((i as Record<string, unknown>)?.item_name ?? ""),
-      dip: String((i as Record<string, unknown>)?.dip ?? ""),
-      qty: Number((i as Record<string, unknown>)?.qty ?? 0),
-      price: Number((i as Record<string, unknown>)?.price ?? 0),
-    }))
-    .filter((i) => i.item_name && i.qty > 0 && i.price >= 0);
+  const parsedItems = items.map((i) => parseRestaurantOrderLine(i)).filter((x): x is ParsedRestaurantLine => x != null);
   if (parsedItems.length === 0) {
     res.status(400).json({ error: "valid items are required" });
     return;
   }
-  const total = parsedItems.reduce((sum, i) => sum + i.qty * i.price, 0);
+  const total = parsedItems.reduce((sum, i) => sum + restaurantLineSubtotal(i), 0);
   const amountReceived = Number(amountReceivedRaw);
   const changeDue =
     !Number.isNaN(amountReceived) && amountReceived >= 0 ? Math.round((amountReceived - total) * 100) / 100 : null;
@@ -1695,6 +1796,7 @@ async function attachOrderItems(rows: Array<Record<string, unknown>>): Promise<A
       items = arr.map((it: Record<string, unknown>) => ({
         item_name: String(it.item_name ?? ""),
         dip: String(it.dip ?? ""),
+        dip_qty: Math.max(1, Math.floor(Number(it.dip_qty ?? 1)) || 1),
         qty: Number(it.qty ?? 0),
         price: Number(it.price ?? 0),
       }));
@@ -1747,7 +1849,7 @@ app.post("/api/mobile/pos/order-history", async (req, res) => {
   }
 });
 
-/** Walk-in POS queue: preparing (not claimed) vs claimed (picked up — still shown here until staff clears view). */
+/** Walk-in POS queue: preparing (not claimed) vs claimed vs cancelled. */
 app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
   const cashierEmail = String(req.body?.cashier_email ?? "").trim().toLowerCase();
   const cashierPassword = String(req.body?.cashier_password ?? "");
@@ -1760,26 +1862,82 @@ app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
     res.status(403).json({ error: "invalid cashier credentials" });
     return;
   }
-  if (!["preparing", "claimed"].includes(filter)) {
-    res.status(400).json({ error: "filter must be preparing or claimed" });
+  if (!["preparing", "claimed", "cancelled"].includes(filter)) {
+    res.status(400).json({ error: "filter must be preparing, claimed, or cancelled" });
     return;
   }
+  const loyaltySql = `CASE
+                WHEN upper(status) LIKE '%ORDER CONFIRMED%' OR upper(status) LIKE '%OVERPAYMENT%'
+                  THEN FLOOR(COALESCE(total, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
+                ELSE 0
+              END AS loyalty_points_earned`;
   try {
+    if (filter === "cancelled") {
+      const { rows } = await getPool().query(
+        `SELECT mobile_id AS id, user_email, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
+                delivery_name, delivery_contact, delivery_address, delivery_time, total, created_at, updated_at,
+                order_source, pos_customer_label, cashier_amount_received, cashier_change,
+                fulfillment_stage, delivery_tracking_url, order_lines_snapshot, pos_claimed,
+                supplemental_payment_proof, cashier_secondary_amount_received, balance_proof_pending_review,
+                0 AS loyalty_points_earned
+         FROM restaurant_orders
+         WHERE order_source = 'POS' AND upper(COALESCE(status, '')) LIKE '%CANCEL%'
+         ORDER BY updated_at DESC NULLS LAST, created_at DESC
+         LIMIT 120`,
+      );
+      const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
+      res.json(out);
+      return;
+    }
     const claimed = filter === "claimed";
     const { rows } = await getPool().query(
       `SELECT mobile_id AS id, user_email, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
               delivery_name, delivery_contact, delivery_address, delivery_time, total, created_at, updated_at,
               order_source, pos_customer_label, cashier_amount_received, cashier_change,
               fulfillment_stage, delivery_tracking_url, order_lines_snapshot, pos_claimed,
-              supplemental_payment_proof, cashier_secondary_amount_received, balance_proof_pending_review
+              supplemental_payment_proof, cashier_secondary_amount_received, balance_proof_pending_review,
+              ${loyaltySql}
        FROM restaurant_orders
        WHERE order_source = 'POS' AND pos_claimed = $1
+         AND upper(COALESCE(status, '')) NOT LIKE '%CANCEL%'
        ORDER BY created_at DESC
        LIMIT 120`,
       [claimed],
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
     res.json(out);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
+app.patch("/api/mobile/pos/walkin-orders/:id/cancel", async (req, res) => {
+  const id = Number(req.params.id);
+  const cashierEmail = String(req.body?.cashier_email ?? "").trim().toLowerCase();
+  const cashierPassword = String(req.body?.cashier_password ?? "");
+  if (!id || !cashierEmail || !cashierPassword) {
+    res.status(400).json({ error: "id and cashier credentials are required" });
+    return;
+  }
+  if (!(await verifyPosStaff(cashierEmail, cashierPassword, ["cashier"])).ok) {
+    res.status(403).json({ error: "invalid cashier credentials" });
+    return;
+  }
+  try {
+    const { rows } = await getPool().query(
+      `UPDATE restaurant_orders
+       SET status = 'CANCELLED BY CASHIER', updated_at = NOW()
+       WHERE mobile_id = $1 AND order_source = 'POS' AND pos_claimed = FALSE
+         AND upper(COALESCE(status, '')) NOT LIKE '%CANCEL%'
+       RETURNING mobile_id AS id`,
+      [id],
+    );
+    if (!rows[0]) {
+      res.status(404).json({ error: "walk-in order cannot be cancelled (not found, already claimed, or already cancelled)" });
+      return;
+    }
+    res.json({ ok: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
@@ -2017,19 +2175,12 @@ app.post("/api/mobile/orders", async (req, res) => {
     res.status(400).json({ error: "delivery_name, delivery_contact, and delivery_address are required" });
     return;
   }
-  const parsedItems = items
-    .map((i) => ({
-      item_name: String((i as Record<string, unknown>)?.item_name ?? ""),
-      dip: String((i as Record<string, unknown>)?.dip ?? ""),
-      qty: Number((i as Record<string, unknown>)?.qty ?? 0),
-      price: Number((i as Record<string, unknown>)?.price ?? 0),
-    }))
-    .filter((i) => i.item_name && i.qty > 0 && i.price >= 0);
+  const parsedItems = items.map((i) => parseRestaurantOrderLine(i)).filter((x): x is ParsedRestaurantLine => x != null);
   if (parsedItems.length === 0) {
     res.status(400).json({ error: "valid items are required" });
     return;
   }
-  const total = parsedItems.reduce((sum, i) => sum + i.qty * i.price, 0);
+  const total = parsedItems.reduce((sum, i) => sum + restaurantLineSubtotal(i), 0);
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
@@ -2059,10 +2210,10 @@ app.post("/api/mobile/orders", async (req, res) => {
       userEmail,
       `${orderNo} — order received`,
       `Thanks for ordering with Macrina's Kitchen.\n\n` +
-        `Your order ${orderNo} was placed successfully.\n` +
+        `We received your order ${orderNo}.\n` +
         `Total: ₱${total.toFixed(2)}\n\n` +
         `Next step: complete GCash payment using the QR in the app and upload your payment proof on the Payment screen.\n` +
-        `We'll confirm your order after review.`,
+        `Your order will move to "order placed" after our cashier confirms it.`,
     );
     res.status(201).json({ id: orderId, order_no: orderNo, total });
   } catch (err) {
@@ -3725,7 +3876,11 @@ app.patch("/api/mobile/pos/catering/:id/post-analysis-patch", async (req, res) =
     res.status(403).json({ error: "invalid manager/supervisor credentials" });
     return;
   }
-  const paymentKeys = ["manager_full_payment_confirmed", "additional_costs_payment_confirmed"];
+  const paymentKeys = [
+    "manager_down_payment_confirmed",
+    "manager_full_payment_confirmed",
+    "additional_costs_payment_confirmed",
+  ];
   const patchKeys = Object.keys(patch as Record<string, unknown>);
   if (patchKeys.some((k) => paymentKeys.includes(k)) && auth.role !== "manager") {
     res.status(403).json({ error: "only a manager can update payment confirmation flags" });
@@ -4020,6 +4175,13 @@ app.post("/api/mobile/pos/catering/send-order-summary-email", async (req, res) =
     res.status(400).json({ error: "valid customer_email is required" });
     return;
   }
+  if (!isMailConfigured()) {
+    res.status(503).json({
+      error:
+        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+    });
+    return;
+  }
   try {
     const buf = Buffer.from(pdfBase64, "base64");
     if (buf.length < 64) {
@@ -4037,7 +4199,7 @@ app.post("/api/mobile/pos/catering/send-order-summary-email", async (req, res) =
       return;
     }
     const safeName = `order_summary_${id.replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 24)}.pdf`;
-    await sendMailWithPdfAttachment(
+    await sendMailWithPdfRequired(
       toEmail,
       "Your catering order summary",
       "Thank you for choosing Macrina's Kitchen. Please find your order summary attached.\n\n"
@@ -4048,7 +4210,8 @@ app.post("/api/mobile/pos/catering/send-order-summary-email", async (req, res) =
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "could not send email" });
+    const msg = err instanceof Error ? err.message : "could not send email";
+    res.status(500).json({ error: msg });
   }
 });
 
