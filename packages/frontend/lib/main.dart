@@ -732,6 +732,50 @@ void appSnack(BuildContext context, String message) {
 const int kMinCateringOnlyPax = 10;
 const int kMinCateringEventPax = 50;
 const double kPesosPerPax = 500;
+const double kRestaurantLat = 14.513436;
+const double kRestaurantLng = 121.059198;
+const double kDeliveryMaxDistanceKm = 5.0;
+const List<String> kCateringAllowedRegions = [
+  'ncr',
+  'national capital region',
+  'metro manila',
+  'bulacan',
+  'cavite',
+  'rizal',
+  'laguna',
+];
+
+double haversineKm({
+  required double lat1,
+  required double lng1,
+  required double lat2,
+  required double lng2,
+}) {
+  const r = 6371.0;
+  final dLat = (lat2 - lat1) * math.pi / 180.0;
+  final dLng = (lng2 - lng1) * math.pi / 180.0;
+  final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+      math.cos(lat1 * math.pi / 180.0) *
+          math.cos(lat2 * math.pi / 180.0) *
+          math.sin(dLng / 2) *
+          math.sin(dLng / 2);
+  final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+  return r * c;
+}
+
+bool isAllowedCateringAddressInCoverage(String address) {
+  final t = address.trim().toLowerCase();
+  if (t.isEmpty) return false;
+  final hasAllowedRegion = kCateringAllowedRegions.any((p) => t.contains(p));
+  if (!hasAllowedRegion) return false;
+  // Keep PH-only intent while still allowing local short entries (e.g. "Taguig, Metro Manila").
+  if (t.contains('philippines') || t.contains('ph')) return true;
+  return true;
+}
+
+String cateringCoverageErrorText() {
+  return 'Service area is limited to NCR, Bulacan, Cavite, Rizal, and Laguna (Philippines).';
+}
 /// Catering/event loyalty (matches backend `loyalty-calculation` thresholds).
 const double kCateringLoyaltyMinOrderTotal = 500;
 const int kCateringLoyaltyPointsAward = 8;
@@ -7935,6 +7979,79 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
   final TextEditingController _newAddressManual = TextEditingController();
   final List<String> _addrSuggestions = [];
   Timer? _addrDebounce;
+  bool _deliveryRangeBusy = false;
+  double? _deliveryDistanceKm;
+  String? _deliveryRangeError;
+
+  bool get _deliveryOutOfRange =>
+      _deliveryDistanceKm != null && _deliveryDistanceKm! > kDeliveryMaxDistanceKm;
+
+  Future<void> _evaluateDeliveryRangeFromLatLng(double lat, double lng) async {
+    final d = haversineKm(
+      lat1: kRestaurantLat,
+      lng1: kRestaurantLng,
+      lat2: lat,
+      lng2: lng,
+    );
+    if (!mounted) return;
+    setState(() {
+      _deliveryDistanceKm = d;
+      _deliveryRangeError = null;
+      _deliveryRangeBusy = false;
+    });
+  }
+
+  Future<void> _resolveAndEvaluateDeliveryRangeFromAddress(String address) async {
+    final q = address.trim();
+    if (q.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _deliveryDistanceKm = null;
+        _deliveryRangeError = null;
+        _deliveryRangeBusy = false;
+      });
+      return;
+    }
+    setState(() {
+      _deliveryRangeBusy = true;
+      _deliveryRangeError = null;
+    });
+    try {
+      final uri = Uri.parse(
+        'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=1',
+      );
+      final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        if (!mounted) return;
+        setState(() {
+          _deliveryRangeError = 'Could not verify delivery range yet.';
+          _deliveryRangeBusy = false;
+        });
+        return;
+      }
+      final list = jsonDecode(res.body) as List<dynamic>;
+      if (list.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _deliveryRangeError = 'Could not locate this address for range validation.';
+          _deliveryRangeBusy = false;
+        });
+        return;
+      }
+      final m = list.first as Map<String, dynamic>;
+      final lat = jsonToDouble(m['lat']);
+      final lng = jsonToDouble(m['lon']);
+      mapLat = lat;
+      mapLng = lng;
+      await _evaluateDeliveryRangeFromLatLng(lat, lng);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _deliveryRangeError = 'Could not verify delivery range yet.';
+        _deliveryRangeBusy = false;
+      });
+    }
+  }
 
   void _applyProfileToControllers() {
     final p = widget.state.profile;
@@ -7949,6 +8066,21 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
     if (primary.isNotEmpty && !_savedAddresses.contains(primary)) {
       _savedAddresses.insert(0, primary);
     }
+    if (mapLat != null && mapLng != null) {
+      final d = haversineKm(
+        lat1: kRestaurantLat,
+        lng1: kRestaurantLng,
+        lat2: mapLat!,
+        lng2: mapLng!,
+      );
+      _deliveryDistanceKm = d;
+      _deliveryRangeError = null;
+      _deliveryRangeBusy = false;
+    } else {
+      _deliveryDistanceKm = null;
+      _deliveryRangeError = null;
+      _deliveryRangeBusy = false;
+    }
   }
 
   @override
@@ -7958,10 +8090,16 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
     contactController = TextEditingController();
     addressController = TextEditingController();
     _applyProfileToControllers();
+    if ((mapLat == null || mapLng == null) && addressController.text.trim().isNotEmpty) {
+      unawaited(_resolveAndEvaluateDeliveryRangeFromAddress(addressController.text.trim()));
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await widget.state.loadProfile(force: true);
       if (!mounted) return;
       setState(_applyProfileToControllers);
+      if ((mapLat == null || mapLng == null) && addressController.text.trim().isNotEmpty) {
+        unawaited(_resolveAndEvaluateDeliveryRangeFromAddress(addressController.text.trim()));
+      }
     });
   }
 
@@ -7975,7 +8113,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
     super.dispose();
   }
 
-  void _suggestAddress(String q) {
+  void _suggestAddress(String q, {bool evaluateRange = true}) {
     _addrDebounce?.cancel();
     final query = q.trim();
     if (query.length < 3) {
@@ -7983,6 +8121,9 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
       return;
     }
     _addrDebounce = Timer(const Duration(milliseconds: 280), () async {
+      if (evaluateRange) {
+        unawaited(_resolveAndEvaluateDeliveryRangeFromAddress(query));
+      }
       try {
         final local = _savedAddresses.where((a) => a.toLowerCase().contains(query.toLowerCase())).take(5).toList();
         final uri = Uri.parse(
@@ -8030,6 +8171,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
           _savedAddresses.add(r.address.trim());
         }
       });
+      await _evaluateDeliveryRangeFromLatLng(r.lat, r.lng);
       appSnack(context, 'Location pinned. Save your profile to keep coordinates and address.');
     }
   }
@@ -8072,7 +8214,9 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                   const SizedBox(height: 10),
                   TextField(
                     controller: addressController,
-                    onChanged: _suggestAddress,
+                    onChanged: (v) {
+                      _suggestAddress(v, evaluateRange: true);
+                    },
                     decoration: InputDecoration(
                       labelText: 'Primary delivery address',
                       hintText: 'Street, building, landmarks…',
@@ -8085,10 +8229,39 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                     minLines: 2,
                     maxLines: 4,
                   ),
+                  if (_deliveryRangeBusy)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 6),
+                      child: LinearProgressIndicator(minHeight: 2),
+                    ),
+                  if (_deliveryOutOfRange)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        'Delivery address is out of range (max ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km from restaurant).',
+                        style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700),
+                      ),
+                    )
+                  else if (_deliveryDistanceKm != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        'Distance from restaurant: ${_deliveryDistanceKm!.toStringAsFixed(2)} km',
+                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  if (_deliveryRangeError != null && _deliveryRangeError!.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        _deliveryRangeError!,
+                        style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700),
+                      ),
+                    ),
                   const SizedBox(height: 10),
                   TextField(
                     controller: _newAddressManual,
-                    onChanged: _suggestAddress,
+                    onChanged: (v) => _suggestAddress(v, evaluateRange: false),
                     decoration: InputDecoration(
                       labelText: 'Add another address',
                       hintText: 'Type an address, then tap Add',
@@ -8119,6 +8292,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                                     _newAddressManual.text = s;
                                   } else {
                                     addressController.text = s;
+                                    unawaited(_resolveAndEvaluateDeliveryRangeFromAddress(s));
                                   }
                                   _addrSuggestions.clear();
                                 }),
@@ -8255,6 +8429,26 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
             FilledButton(
               onPressed: () async {
                 final primary = addressController.text.trim();
+                if (primary.isNotEmpty) {
+                  if (mapLat == null || mapLng == null) {
+                    await _resolveAndEvaluateDeliveryRangeFromAddress(primary);
+                  }
+                  if (_deliveryOutOfRange) {
+                    if (mounted) {
+                      appSnack(
+                        context,
+                        'Delivery address is out of range. Please use an address within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km.',
+                      );
+                    }
+                    return;
+                  }
+                  if (_deliveryDistanceKm == null) {
+                    if (mounted) {
+                      appSnack(context, 'Unable to validate delivery range. Please pin your location on the map.');
+                    }
+                    return;
+                  }
+                }
                 final merged = <String>{..._savedAddresses};
                 if (primary.isNotEmpty) merged.add(primary);
                 await widget.state.saveProfile(
@@ -8609,6 +8803,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
+  final paxBuffer = TextEditingController();
   final eventTitle = TextEditingController();
   final eventTypeOther = TextEditingController();
   String eventTypeChoice = 'Birthday';
@@ -8669,6 +8864,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     _venueDebounce?.cancel();
     eventCity.removeListener(_onVenueChanged);
     guestCount.dispose();
+    paxBuffer.dispose();
     eventTitle.dispose();
     eventTypeOther.dispose();
     contactPerson.dispose();
@@ -8694,6 +8890,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
     if (g <= 0) return 0;
     final min = _minPaxForCurrentInquiry();
     return g < min ? min : g;
+  }
+
+  int _paxBufferForPricing() {
+    final raw = paxBuffer.text.trim();
+    if (raw.isEmpty) return 0;
+    final n = int.tryParse(raw) ?? 0;
+    return n < 0 ? 0 : n;
   }
 
   /// Stored guest count when submitting (minimum pax applies if the field is empty).
@@ -8846,7 +9049,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     });
   }
 
-  double _estimatedCost() => _billableGuestCountForPricing() * kPesosPerPax;
+  double _estimatedCost() => (_billableGuestCountForPricing() + _paxBufferForPricing()) * kPesosPerPax;
 
   String _resolvedEventType() {
     if (eventTypeChoice != 'Other') return eventTypeChoice;
@@ -8890,6 +9093,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return gNum < _minPaxForCurrentInquiry();
   }
 
+  bool get _venueOutOfCoverage {
+    final venue = eventCity.text.trim();
+    if (venue.isEmpty) return false;
+    return !isAllowedCateringAddressInCoverage(venue);
+  }
+
   Future<void> _pickThemeReferenceImage() async {
     final x = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 85);
     if (x == null) return;
@@ -8915,6 +9124,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
       return 'Enter a valid email address.';
     }
     if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
+    if (!isAllowedCateringAddressInCoverage(eventCity.text.trim())) {
+      return cateringCoverageErrorText();
+    }
     for (final w in _eventWindows) {
       final any = w.date != null || w.from != null || w.to != null;
       final all = w.date != null && w.from != null && w.to != null;
@@ -9021,7 +9233,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 ],
                 const SizedBox(height: 10),
                 Text(
-                  'Catering only: minimum $kMinCateringOnlyPax guests. Catering & event: minimum $kMinCateringEventPax guests. Estimated cost is ₱${kPesosPerPax.toStringAsFixed(0)} × guests (shows ₱0 until you enter a guest count).',
+                  'Catering only: minimum $kMinCateringOnlyPax guests. Catering & event: minimum $kMinCateringEventPax guests. Estimated cost is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
                   style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 10),
@@ -9190,6 +9402,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           ),
                         ),
                       ),
+                      if (_venueOutOfCoverage)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            cateringCoverageErrorText(),
+                            style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700),
+                          ),
+                        ),
                       if (_venueSuggestions.isNotEmpty)
                         Container(
                           margin: const EdgeInsets.only(top: 6),
@@ -9245,6 +9465,16 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         decoration: _requiredDecoration(
                           label: 'Number of guests',
                           invalid: _guestCountInvalid,
+                        ),
+                        keyboardType: TextInputType.number,
+                        onChanged: (_) => setState(() {}),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: paxBuffer,
+                        decoration: const InputDecoration(
+                          labelText: 'Pax Buffer (optional)',
+                          helperText: 'Additional pax for estimate only (₱500 per pax)',
                         ),
                         keyboardType: TextInputType.number,
                         onChanged: (_) => setState(() {}),
@@ -9635,6 +9865,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         Text('Event type: $typeLabel'),
                         const SizedBox(height: 6),
                         Text('Guests: ${guestCount.text.trim()}'),
+                        if (_paxBufferForPricing() > 0) ...[
+                          const SizedBox(height: 6),
+                          Text('Pax buffer: ${_paxBufferForPricing()}'),
+                        ],
                         const SizedBox(height: 6),
                         Text('Venue: ${eventCity.text.trim()}'),
                         const SizedBox(height: 6),
@@ -9675,6 +9909,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
               String? err;
               try {
               final guestsSaved = _guestCountForSubmit();
+              final paxBufferSaved = _paxBufferForPricing();
               err = await state.submitInquiry({
                 'inquiry_type': inquiryType,
                 'event_title': eventTitle.text.trim(),
@@ -9690,7 +9925,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'selected_dishes': selectedDishes.toList(),
                 'include_event_theme': inquiryType == 'CATERING AND EVENT',
                 'guest_count': guestsSaved,
+                'pax_buffer': paxBufferSaved,
                 'estimated_total': est,
+                'cost_breakdown': [
+                  {'label': 'Base food cost', 'amount': guestsSaved * kPesosPerPax},
+                  {'label': 'Pax buffer', 'amount': paxBufferSaved * kPesosPerPax},
+                ],
                 'menu_suggestion_note': curateOwn ? '' : menuSuggestionNote,
                 'theme_suggestion_note': themeNotesController.text.trim(),
                 if (inquiryType == 'CATERING AND EVENT')
@@ -11124,6 +11364,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
+  final paxBuffer = TextEditingController();
   String menuSuggestionNote = '';
   String themeSuggestionNote = '';
   final eventTitle = TextEditingController();
@@ -11164,6 +11405,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     _restoreLocalDraft();
     for (final c in [
       guestCount,
+      paxBuffer,
       eventTitle,
       eventTypeOther,
       contactPerson,
@@ -11188,6 +11430,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   @override
   void dispose() {
     guestCount.dispose();
+    paxBuffer.dispose();
     _venueDebounce?.cancel();
     eventCity.removeListener(_onVenueChanged);
     eventTitle.dispose();
@@ -11232,6 +11475,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         'eventCity': eventCity.text.trim(),
         'note': note.text.trim(),
         'guestCount': guestCount.text.trim(),
+        'paxBuffer': paxBuffer.text.trim(),
         'eventSetting': eventSetting,
         'serviceIncluded': serviceIncluded,
         'formalityLevel': formalityLevel,
@@ -11261,6 +11505,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       eventCity.text = '${m['eventCity'] ?? ''}';
       note.text = '${m['note'] ?? ''}';
       guestCount.text = '${m['guestCount'] ?? ''}';
+      paxBuffer.text = '${m['paxBuffer'] ?? ''}';
       eventSetting = '${m['eventSetting'] ?? eventSetting}';
       serviceIncluded = '${m['serviceIncluded'] ?? serviceIncluded}';
       formalityLevel = '${m['formalityLevel'] ?? formalityLevel}';
@@ -11286,6 +11531,13 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     if (g <= 0) return 0;
     final min = _minPaxForCurrentInquiry();
     return g < min ? min : g;
+  }
+
+  int _paxBufferForPricing() {
+    final raw = paxBuffer.text.trim();
+    if (raw.isEmpty) return 0;
+    final n = int.tryParse(raw) ?? 0;
+    return n < 0 ? 0 : n;
   }
 
   int _guestCountForSubmit() {
@@ -11354,7 +11606,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   double _themeCostComputed() => double.tryParse(themeCostController.text.trim()) ?? 0;
 
   double _estimatedCost() =>
-      (_billableGuestCountForPricing() * kPesosPerPax) +
+      ((_billableGuestCountForPricing() + _paxBufferForPricing()) * kPesosPerPax) +
       _laborCostComputed() +
       _travelCostComputed() +
       _themeCostComputed() +
@@ -11508,6 +11760,9 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     }
     if (inquiryEmail.text.trim().isEmpty) return 'Enter email address.';
     if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
+    if (!isAllowedCateringAddressInCoverage(eventCity.text.trim())) {
+      return cateringCoverageErrorText();
+    }
     for (final w in _eventWindows) {
       final any = w.date != null || w.from != null || w.to != null;
       final all = w.date != null && w.from != null && w.to != null;
@@ -11536,6 +11791,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     final min = _minPaxForCurrentInquiry();
     if (gNum < min) return 'Minimum guests for this inquiry type is $min.';
     return null;
+  }
+
+  bool get _venueOutOfCoverage {
+    final venue = eventCity.text.trim();
+    if (venue.isEmpty) return false;
+    return !isAllowedCateringAddressInCoverage(venue);
   }
 
   Widget _buildEventTypePicker() {
@@ -11632,6 +11893,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final menuPayload = selectedDishes.toList();
       final themeDesign = <String, dynamic>{
         'note': note.text.trim(),
+        'pax_buffer': _paxBufferForPricing(),
         'event_setting': eventSetting,
         'service_included': serviceIncluded,
         'food_tasting_requested': foodTastingRequested,
@@ -11644,6 +11906,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       };
       final costBreakdown = <Map<String, dynamic>>[
         {'label': 'Base food cost', 'amount': _billableGuestCountForPricing() * kPesosPerPax},
+        {'label': 'Pax buffer', 'amount': _paxBufferForPricing() * kPesosPerPax},
         {'label': 'Labor cost', 'amount': _laborCostComputed()},
         {'label': 'Travel cost', 'amount': _travelCostComputed()},
         {'label': 'Theme design cost', 'amount': _themeCostComputed()},
@@ -11667,6 +11930,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 Text('Event type: ${_resolvedEventType()}'),
                 const SizedBox(height: 6),
                 Text('Guests: ${guestCount.text.trim()}'),
+                if (_paxBufferForPricing() > 0) ...[
+                  const SizedBox(height: 6),
+                  Text('Pax buffer: ${_paxBufferForPricing()}'),
+                ],
                 const SizedBox(height: 6),
                 Text('Venue: ${eventCity.text.trim()}'),
                 const SizedBox(height: 6),
@@ -11728,6 +11995,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final eventWhen = _scheduleSlotsPayload().map((e) => e['label'] ?? '').where((e) => e.trim().isNotEmpty).join(' ; ');
       final menuLines = selectedDishes.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
       final guestCountValue = _guestCountForSubmit();
+      final paxBufferValue = _paxBufferForPricing();
       final baseFoodCost = _billableGuestCountForPricing() * kPesosPerPax;
       final laborCost = _laborCostComputed();
       final travelCost = _travelCostComputed();
@@ -11792,6 +12060,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               'No. of PAX and cost',
               '$guestCountValue x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${baseFoodCost.toStringAsFixed(2)}',
             ),
+            labelValueRow(
+              'PAX buffer and cost',
+              '$paxBufferValue x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${(paxBufferValue * kPesosPerPax).toStringAsFixed(2)}',
+            ),
             labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
             labelValueRow('Labor cost', 'PHP ${laborCost.toStringAsFixed(2)}'),
             labelValueRow('Travel cost', 'PHP ${travelCost.toStringAsFixed(2)}'),
@@ -11838,7 +12110,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         padding: const EdgeInsets.fromLTRB(12, 12, 12, 220),
         children: [
         Text(
-          'Catering only: minimum $kMinCateringOnlyPax guests. Catering + Event: minimum $kMinCateringEventPax guests. Estimated cost uses ₱${kPesosPerPax.toStringAsFixed(0)} × billable guests.',
+          'Catering only: minimum $kMinCateringOnlyPax guests. Catering + Event: minimum $kMinCateringEventPax guests. Estimated cost uses ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
           style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
         ),
         const SizedBox(height: 10),
@@ -11934,6 +12206,14 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   ),
                 ),
               ),
+              if (_venueOutOfCoverage)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    cateringCoverageErrorText(),
+                    style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700),
+                  ),
+                ),
               if (_venueSuggestions.isNotEmpty)
                 Container(
                   margin: const EdgeInsets.only(top: 6),
@@ -12029,6 +12309,16 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               TextField(
                 controller: guestCount,
                 decoration: const InputDecoration(labelText: 'Number of guests'),
+                keyboardType: TextInputType.number,
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: paxBuffer,
+                decoration: const InputDecoration(
+                  labelText: 'Pax Buffer (optional)',
+                  helperText: 'Additional pax for estimate only (₱500 per pax)',
+                ),
                 keyboardType: TextInputType.number,
                 onChanged: (_) => setState(() {}),
               ),
@@ -14246,6 +14536,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (kind == 'event' && managerDraftEventTitleController.text.trim().isEmpty) {
         return 'Enter an event title for Catering + Event.';
       }
+      if (!isAllowedCateringAddressInCoverage(d.address)) {
+        return cateringCoverageErrorText();
+      }
       final gc = int.tryParse(managerGuestCountController.text.trim());
       if (gc == null || gc < 1) return 'Enter a valid number of guests.';
       final minPax = kind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
@@ -15050,6 +15343,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     Text('Contact number: ${row.contactNumber}'),
                     Text('Email: ${row.emailAddress}'),
                     Text('Address: ${row.address}'),
+                    if (!isAllowedCateringAddressInCoverage(row.address))
+                      Text(
+                        cateringCoverageErrorText(),
+                        style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700),
+                      ),
                     Text('Guests: ${row.guestCount}'),
                     Text('Payment method: ${row.paymentMethod}'),
                     Text('Labor cost: ₱${laborCostComputed.toStringAsFixed(2)}'),
@@ -15180,6 +15478,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       initialValue: row.address,
                       decoration: const InputDecoration(labelText: 'Event venue'),
                     ),
+                    if (!isAllowedCateringAddressInCoverage(row.address))
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(
+                          cateringCoverageErrorText(),
+                          style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.w700),
+                        ),
+                      ),
                     const SizedBox(height: 8),
                     const Text('Date & time of event', style: TextStyle(fontWeight: FontWeight.w600)),
                     const SizedBox(height: 4),
