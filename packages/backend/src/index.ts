@@ -1,10 +1,5 @@
 import "./envBootstrap.js";
-import dns from "node:dns";
 import crypto from "node:crypto";
-
-// Prefer IPv4 when resolving DB hosts — avoids intermittent ENOTFOUND on some Windows
-// networks where IPv6 DNS for Supabase pooler hosts misbehaves.
-dns.setDefaultResultOrder("ipv4first");
 import bcrypt from "bcrypt";
 import cors from "cors";
 import express from "express";
@@ -22,7 +17,7 @@ if (isMailConfigured()) {
   console.info("[mail] SMTP credentials loaded; OTP and notification emails are enabled.");
 } else {
   console.warn(
-    "[mail] SMTP not configured. Add SMTP_USER + SMTP_PASS to packages/backend/.env (see .env.example), then restart.",
+    "[mail] SMTP not configured. Add TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD to packages/backend/.env (see .env.example), then restart.",
   );
 }
 
@@ -991,7 +986,7 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
   if (!isMailConfigured() && !mobileDevOtpLogging) {
     res.status(503).json({
       error:
-        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     });
     return;
   }
@@ -1183,7 +1178,7 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
   if (!isMailConfigured() && !mobileDevOtpLogging) {
     res.status(503).json({
       error:
-        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     });
     return;
   }
@@ -4247,7 +4242,7 @@ app.post("/api/mobile/pos/catering/send-order-summary-email", async (req, res) =
   if (!isMailConfigured()) {
     res.status(503).json({
       error:
-        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     });
     return;
   }

@@ -1,4 +1,14 @@
+import dns from "node:dns";
 import nodemailer from "nodemailer";
+
+/** Force IPv4 for SMTP — avoids ENETUNREACH / ETIMEDOUT when `smtp.gmail.com` resolves to IPv6-only on hosts without v6 egress (e.g. Railway). */
+function smtpLookup(
+  hostname: string,
+  _options: object,
+  callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+): void {
+  dns.lookup(hostname, { family: 4 }, callback);
+}
 
 let transporter: nodemailer.Transporter | null = null;
 let transporterKey = "";
@@ -7,7 +17,6 @@ let transporterKey = "";
 function smtpUser(): string {
   return (
     process.env.TRANSPORTER_EMAIL?.trim() ||
-    process.env.SMTP_USER?.trim() ||
     process.env.SMTP_LOGIN?.trim() ||
     process.env.GMAIL_USER?.trim() ||
     process.env.EMAIL_USER?.trim() ||
@@ -19,7 +28,6 @@ function smtpUser(): string {
 function smtpPass(): string {
   return (
     process.env.TRANSPORTER_PASSWORD?.trim() ||
-    process.env.SMTP_PASS?.trim() ||
     process.env.SMTP_PASSWORD?.trim() ||
     process.env.GMAIL_APP_PASSWORD?.trim() ||
     process.env.EMAIL_PASSWORD?.trim() ||
@@ -51,12 +59,17 @@ function getTransport() {
   }
   const key = `${host}|${port}|${user}|${pass}`;
   if (!transporter || transporterKey !== key) {
+    // SMTP pool options (lookup, timeouts) are valid for nodemailer but not on the narrowest TransportOptions overload.
     transporter = nodemailer.createTransport({
       host,
       port,
       secure: port === 465,
       auth: { user, pass },
-    });
+      lookup: smtpLookup,
+      connectionTimeout: 20_000,
+      greetingTimeout: 15_000,
+      socketTimeout: 45_000,
+    } as nodemailer.TransportOptions);
     transporterKey = key;
   }
   return transporter;
@@ -68,7 +81,7 @@ export async function sendMailSafe(to: string, subject: string, text: string): P
   const t = getTransport();
   if (!t || !from) {
     console.warn(
-      "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS / GMAIL_USER + GMAIL_APP_PASSWORD); skipping send.",
+      "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD); skipping send.",
     );
     return;
   }
@@ -81,7 +94,7 @@ export async function sendMailRequired(to: string, subject: string, text: string
   const t = getTransport();
   if (!t || !from) {
     throw new Error(
-      "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+      "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     );
   }
   await t.sendMail({ from, to, subject, text });
@@ -99,7 +112,7 @@ export async function sendMailWithPdfAttachment(
   const t = getTransport();
   if (!t || !from) {
     console.warn(
-      "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS); skipping send.",
+      "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD; skipping send.",
     );
     return;
   }
@@ -124,7 +137,7 @@ export async function sendMailWithPdfRequired(
   const t = getTransport();
   if (!t || !from) {
     throw new Error(
-      "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or SMTP_USER + SMTP_PASS, or GMAIL_USER + GMAIL_APP_PASSWORD)",
+      "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     );
   }
   await t.sendMail({
