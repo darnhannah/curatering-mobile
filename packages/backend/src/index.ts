@@ -1085,7 +1085,9 @@ app.post("/api/mobile/auth/signup/complete", async (req, res) => {
     );
     await logActionBestEffort("auth.signup.complete", email, "Customer account created", {});
     const ts = new Date().toISOString();
-    await sendMailSafe(email, "Welcome to Curatering", `Your account ${email} was created at ${ts}.`);
+    void sendMailSafe(email, "Welcome to Curatering", `Your account ${email} was created at ${ts}.`).catch((mailErr) => {
+      console.warn("[mail] welcome email failed (signup still succeeded):", mailErr);
+    });
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -1144,11 +1146,13 @@ app.post("/api/mobile/auth/login", async (req, res) => {
       return;
     }
     const ts = new Date().toISOString();
-    await sendMailSafe(
+    void sendMailSafe(
       email,
       "Macrina's Kitchen login notice",
       `A login was completed for ${email} at ${ts}. If this was not you, change your password.`,
-    );
+    ).catch((mailErr) => {
+      console.warn("[mail] login notice email failed (login still succeeds):", mailErr);
+    });
     const role = "customer";
     const displayName = String(row?.full_name ?? "").trim();
     await logActionBestEffort("auth.login", email, "Customer login successful", { role: "customer" });
@@ -1184,9 +1188,9 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
   }
   const otp = String(crypto.randomInt(100000, 1000000));
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  let targetEmail = "";
+  let targetPhone = "";
   try {
-    let targetEmail = "";
-    let targetPhone = "";
     if (role === "cashier") {
       const { rows } = await getPool().query(`SELECT email FROM users WHERE LOWER(email) = $1 LIMIT 1`, [identity]);
       const row = rows[0] as { email: string } | undefined;
@@ -1215,17 +1219,31 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
         [targetEmail, otp, expiresAt.toISOString()],
       );
     }
-    const otpBody =
-      channel === "phone"
-        ? `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.\n\n(You requested verification using your phone number on file; this code was sent to your registered email.)`
-        : `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.`;
-    if (mobileDevOtpLogging && !isMailConfigured()) {
-      console.warn(
-        `[MOBILE_DEV_OTP_LOGGING] password reset OTP for ${targetEmail} (channel=${channel}, role=${role}): ${otp}`,
-      );
-    } else {
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+    return;
+  }
+  const otpBody =
+    channel === "phone"
+      ? `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.\n\n(You requested verification using your phone number on file; this code was sent to your registered email.)`
+      : `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.`;
+  if (mobileDevOtpLogging && !isMailConfigured()) {
+    console.warn(
+      `[MOBILE_DEV_OTP_LOGGING] password reset OTP for ${targetEmail} (channel=${channel}, role=${role}): ${otp}`,
+    );
+  } else {
+    try {
       await sendMailRequired(targetEmail, "Reset your Curatering password", otpBody);
+    } catch (err) {
+      console.error(err);
+      res.status(503).json({
+        error: err instanceof Error ? err.message : "failed to send reset email",
+      });
+      return;
     }
+  }
+  try {
     if (channel === "phone") {
       await logActionBestEffort(
         "auth.reset.request_phone_channel",
@@ -1240,11 +1258,10 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
       "Password reset requested",
       { channel, role },
     );
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "database error" });
+  } catch (logErr) {
+    console.warn("[auth] password reset logging failed (non-fatal):", logErr);
   }
+  res.json({ ok: true });
 });
 
 /** Validates OTP before showing the new-password step (does not consume the OTP). */

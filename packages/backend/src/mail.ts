@@ -1,13 +1,32 @@
 import dns from "node:dns";
+import net from "node:net";
 import nodemailer from "nodemailer";
 
-/** Force IPv4 for SMTP — avoids ENETUNREACH / ETIMEDOUT when `smtp.gmail.com` resolves to IPv6-only on hosts without v6 egress (e.g. Railway). */
-function smtpLookup(
-  hostname: string,
-  _options: object,
-  callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
-): void {
-  dns.lookup(hostname, { family: 4 }, callback);
+/** Node provides `dns.lookupSync`; keep a narrow cast for older `@types/node` stubs. */
+function lookupIpv4Sync(hostname: string): string | null {
+  try {
+    const fn = (dns as unknown as { lookupSync?: (h: string, o: { family: number }) => string }).lookupSync;
+    if (typeof fn !== "function") return null;
+    return fn(hostname, { family: 4 });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Railway often has no outbound IPv6; nodemailer may still connect to Gmail's AAAA.
+ * Resolve to IPv4 and connect by IP with TLS SNI set to the real hostname.
+ */
+function smtpConnectHost(logicalHost: string): { host: string; tls?: { servername: string } } {
+  const h = logicalHost.trim();
+  if (!h) return { host: logicalHost };
+  if (h.includes(":")) return { host: h };
+  if (net.isIP(h)) return { host: h };
+  const ipv4 = lookupIpv4Sync(h);
+  if (ipv4 && net.isIP(ipv4) === 4 && ipv4 !== h) {
+    return { host: ipv4, tls: { servername: h } };
+  }
+  return { host: h };
 }
 
 let transporter: nodemailer.Transporter | null = null;
@@ -50,22 +69,22 @@ export function isMailConfigured(): boolean {
 }
 
 function getTransport() {
-  const host = process.env.TRANSPORTER_SMTP_HOST?.trim() || process.env.SMTP_HOST?.trim() || "smtp.gmail.com";
+  const logicalHost = process.env.TRANSPORTER_SMTP_HOST?.trim() || process.env.SMTP_HOST?.trim() || "smtp.gmail.com";
   const port = Number(process.env.TRANSPORTER_SMTP_PORT ?? process.env.SMTP_PORT) || 465;
   const user = smtpUser();
   const pass = smtpPass();
   if (!user || !pass) {
     return null;
   }
-  const key = `${host}|${port}|${user}|${pass}`;
+  const { host, tls: tlsExtra } = smtpConnectHost(logicalHost);
+  const key = `${logicalHost}|${host}|${port}|${user}|${pass}`;
   if (!transporter || transporterKey !== key) {
-    // SMTP pool options (lookup, timeouts) are valid for nodemailer but not on the narrowest TransportOptions overload.
     transporter = nodemailer.createTransport({
       host,
       port,
       secure: port === 465,
       auth: { user, pass },
-      lookup: smtpLookup,
+      ...(tlsExtra ? { tls: tlsExtra } : {}),
       connectionTimeout: 20_000,
       greetingTimeout: 15_000,
       socketTimeout: 45_000,
