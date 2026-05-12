@@ -1,4 +1,4 @@
-import "dotenv/config";
+import "./envBootstrap.js";
 import dns from "node:dns";
 import crypto from "node:crypto";
 
@@ -17,6 +17,14 @@ import {
 } from "./mail.js";
 import { formatDbStartupError, getPool, initDb } from "./db.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
+
+if (isMailConfigured()) {
+  console.info("[mail] SMTP credentials loaded; OTP and notification emails are enabled.");
+} else {
+  console.warn(
+    "[mail] SMTP not configured. Add SMTP_USER + SMTP_PASS to packages/backend/.env (see .env.example), then restart.",
+  );
+}
 
 const app = express();
 const port = Number(process.env.PORT) || 8080;
@@ -636,7 +644,8 @@ function parseRestaurantOrderLine(i: unknown): ParsedRestaurantLine | null {
   const qty = Number(r.qty ?? 0);
   const price = Number(r.price ?? 0);
   let dip_qty = Math.floor(Number(r.dip_qty ?? 1));
-  if (!Number.isFinite(dip_qty) || dip_qty < 1) dip_qty = 1;
+  if (!Number.isFinite(dip_qty) || dip_qty < 0) dip_qty = 0;
+  if (!dip) dip_qty = 1;
   if (!item_name || qty <= 0 || price < 0) return null;
   return { item_name, dip, dip_qty, qty, price };
 }
@@ -1831,7 +1840,7 @@ async function attachOrderItems(rows: Array<Record<string, unknown>>): Promise<A
       items = arr.map((it: Record<string, unknown>) => ({
         item_name: String(it.item_name ?? ""),
         dip: String(it.dip ?? ""),
-        dip_qty: Math.max(1, Math.floor(Number(it.dip_qty ?? 1)) || 1),
+        dip_qty: Math.max(0, Math.floor(Number(it.dip_qty ?? 1)) || 0),
         qty: Number(it.qty ?? 0),
         price: Number(it.price ?? 0),
       }));
@@ -2246,9 +2255,9 @@ app.post("/api/mobile/orders", async (req, res) => {
       `${orderNo} — order placed`,
       `Thank you for ordering with Macrina's Kitchen and Catering.\n\n` +
         `Your restaurant order ${orderNo} has been placed and is awaiting payment confirmation from our team.\n` +
+        `You will be notified by email as soon as your payment has been confirmed.\n\n` +
         `Total: ₱${total.toFixed(2)}\n\n` +
-        `Please complete payment (GCash) and upload your proof in the app if you have not already.\n` +
-        `You will be notified when your payment has been confirmed.`,
+        `Please complete payment (GCash) and upload your proof in the app if you have not already.`,
     );
     res.status(201).json({ id: orderId, order_no: orderNo, total });
   } catch (err) {
@@ -3302,9 +3311,10 @@ app.post("/api/mobile/inquiries", async (req, res) => {
       userEmail,
       `Inquiry ${inquiryNo} received`,
       `Thank you for contacting Macrina's Kitchen and Catering.\n\n` +
-        `Your catering inquiry ${inquiryNo} was submitted successfully.\n` +
-        `Event: ${eventTitle || "(no title)"}\n\n` +
-        `Your request is awaiting review and payment confirmation. You will be notified by email soon with next steps.`,
+        `Your catering / catering+event inquiry ${inquiryNo} has been submitted successfully.\n` +
+        `Our team will review your request and you will be notified by email soon with next steps.\n\n` +
+        `Reference: ${inquiryNo}\n` +
+        (eventTitle ? `Event: ${eventTitle}\n` : ""),
     );
     res.status(201).json({ id, inquiry_no: inquiryNo });
   } catch (err) {
