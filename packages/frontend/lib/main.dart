@@ -763,6 +763,28 @@ double haversineKm({
   return r * c;
 }
 
+/// Geocode [address] and return straight-line km from the restaurant (for delivery-radius checks).
+Future<double?> geocodeAddressDistanceKmFromRestaurant(String address) async {
+  final q = address.trim();
+  if (q.isEmpty) return null;
+  try {
+    final uri = Uri.parse(
+      'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=1',
+    );
+    final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+    if (res.statusCode != 200) return null;
+    final list = jsonDecode(res.body);
+    if (list is! List || list.isEmpty) return null;
+    final m = list.first;
+    if (m is! Map) return null;
+    final lat = jsonToDouble(m['lat']);
+    final lng = jsonToDouble(m['lon']);
+    return haversineKm(lat1: kRestaurantLat, lng1: kRestaurantLng, lat2: lat, lng2: lng);
+  } catch (_) {
+    return null;
+  }
+}
+
 bool isAllowedCateringAddressInCoverage(String address) {
   final t = address.trim().toLowerCase();
   if (t.isEmpty) return false;
@@ -778,9 +800,14 @@ String cateringCoverageErrorText() {
 }
 
 /// Shown at top of Restaurant Menu and My Catering Inquiries for customer awareness.
-const String kCustomerDeliveryAndCateringAreaNotice =
-    'Restaurant delivery is available within 5 km of our Taguig kitchen. '
-    'Catering and catering+event service is available in NCR, Bulacan, Cavite, Rizal, and Laguna only.';
+const String kCustomerOnlineOrdersAreaNotice =
+    'Online orders is available within 5 KM of our restaurant located in Taguig City. Please set your delivery address in your profile beforehand.';
+
+const String kCustomerCateringInquiriesAreaNotice =
+    'Our catering service is available in NCR, Bulacan, Cavite, Rizal, and Laguna ONLY.';
+
+/// Legacy combined notice (avoid breaking imports); prefer the specific constants above.
+const String kCustomerDeliveryAndCateringAreaNotice = kCustomerOnlineOrdersAreaNotice;
 
 bool isWithinPast30Days(DateTime t) => DateTime.now().difference(t) <= const Duration(days: 30);
 
@@ -960,6 +987,13 @@ class LoyaltyHistoryItem {
   final String source;
 }
 
+/// Sum of positive catering loyalty entries (completed catering / catering+event awards from history).
+int cateringCompletedLoyaltyEarnedFromHistory(List<LoyaltyHistoryItem> history) {
+  return history
+      .where((h) => h.source == 'catering' && h.pointsDelta > 0)
+      .fold<int>(0, (sum, h) => sum + h.pointsDelta);
+}
+
 class OrderLineItem {
   OrderLineItem({
     required this.itemName,
@@ -1002,21 +1036,21 @@ double orderLineAddonExtraSubtotal(OrderLineItem line) {
 String cartLineDetailSubtitle(CartItem e) {
   final main = 'Main ×${e.qty} @ ₱${e.menu.price.toStringAsFixed(2)}';
   final dip = e.dip.trim();
-  if (dip.isEmpty) return '$main · Line ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
+  if (dip.isEmpty) return '$main · ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
   final extra = cartAddonExtraSubtotal(e);
   final addOn =
       'Add-on: $dip × ${e.dipQty}${extra > 0 ? ' · +₱${extra.toStringAsFixed(0)} extra' : (e.dipQty == 0 ? ' · no extra portions' : ' · included')}';
-  return '$main\n$addOn · Line ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
+  return '$main\n$addOn · ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
 }
 
 String orderLineDetailSubtitle(OrderLineItem l) {
   final main = 'Main ×${l.qty} @ ₱${l.price.toStringAsFixed(2)}';
   final dip = l.dip.trim();
-  if (dip.isEmpty) return '$main · Line ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
+  if (dip.isEmpty) return '$main · ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
   final extra = orderLineAddonExtraSubtotal(l);
   final addOn =
       'Add-on: $dip × ${l.dipQty}${extra > 0 ? ' · +₱${extra.toStringAsFixed(0)} extra' : (l.dipQty == 0 ? ' · no extra portions' : ' · included')}';
-  return '$main\n$addOn · Line ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
+  return '$main\n$addOn · ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
 }
 
 /// Builds line items from API `items` or fallback JSON snapshot on the order row.
@@ -5077,16 +5111,20 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: Text(
-                kCustomerDeliveryAndCateringAreaNotice,
-                style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
+              child: TextField(
+                decoration: const InputDecoration(hintText: 'SEARCH'),
+                onChanged: (v) => setState(() => _search = v),
               ),
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: TextField(
-                decoration: const InputDecoration(hintText: 'SEARCH'),
-                onChanged: (v) => setState(() => _search = v),
+              child: Align(
+                alignment: Alignment.center,
+                child: Text(
+                  kCustomerOnlineOrdersAreaNotice,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
+                ),
               ),
             ),
             SizedBox(
@@ -6532,24 +6570,16 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   final List<String> _deliveryAddresses = [];
   String? _selectedDeliveryAddress;
   String _selectedDeliveryTime = 'NOW';
+  bool _deliveryAddressOptionsLoading = true;
 
   @override
   void initState() {
     super.initState();
     noteController.text = widget.state.checkoutNote;
-    final profile = widget.state.profile;
-    final fromProfile = List<String>.from(profile.deliveryAddresses);
-    final primary = profile.deliveryAddress.trim();
-    final merged = <String>{...fromProfile};
-    if (primary.isNotEmpty) merged.add(primary);
-    _deliveryAddresses.addAll(merged);
-    final savedSel = widget.state.checkoutSelectedAddress?.trim();
-    if (savedSel != null && savedSel.isNotEmpty && _deliveryAddresses.contains(savedSel)) {
-      _selectedDeliveryAddress = savedSel;
-    } else if (_deliveryAddresses.isNotEmpty) {
-      _selectedDeliveryAddress = _deliveryAddresses.first;
-    }
+    _deliveryAddresses.clear();
+    _selectedDeliveryAddress = null;
     _selectedDeliveryTime = widget.state.checkoutDeliveryTime.trim().isEmpty ? 'NOW' : widget.state.checkoutDeliveryTime.trim();
+    unawaited(_loadInRangeDeliveryAddresses());
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await widget.state.loadMenu(force: true);
       await widget.state.pullCustomerTrayDraftFromServer();
@@ -6561,6 +6591,53 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
       }
       setState(() {});
     });
+  }
+
+  Future<void> _loadInRangeDeliveryAddresses() async {
+    final profile = widget.state.profile;
+    final fromProfile = List<String>.from(profile.deliveryAddresses);
+    final primary = profile.deliveryAddress.trim();
+    final merged = <String>{...fromProfile};
+    if (primary.isNotEmpty) merged.add(primary);
+    final ordered = merged.toList();
+    const eps = 0.05;
+    final kept = <String>[];
+    for (final a in ordered) {
+      final trim = a.trim();
+      if (trim.isEmpty) continue;
+      double? d;
+      if (trim == primary && profile.deliveryLat != null && profile.deliveryLng != null) {
+        d = haversineKm(
+          lat1: kRestaurantLat,
+          lng1: kRestaurantLng,
+          lat2: profile.deliveryLat!,
+          lng2: profile.deliveryLng!,
+        );
+      } else {
+        d = await geocodeAddressDistanceKmFromRestaurant(trim);
+      }
+      if (d != null && d <= kDeliveryMaxDistanceKm + eps) kept.add(a);
+    }
+    if (!mounted) return;
+    final savedSel = widget.state.checkoutSelectedAddress?.trim();
+    String? nextSel;
+    if (savedSel != null && savedSel.isNotEmpty && kept.contains(savedSel)) {
+      nextSel = savedSel;
+    } else if (kept.isNotEmpty) {
+      nextSel = kept.first;
+    }
+    setState(() {
+      _deliveryAddresses
+        ..clear()
+        ..addAll(kept);
+      _selectedDeliveryAddress = nextSel;
+      _deliveryAddressOptionsLoading = false;
+    });
+    if (nextSel != null) {
+      widget.state.updateCheckoutDraftAddress(nextSel);
+    } else {
+      widget.state.updateCheckoutDraftAddress(null);
+    }
   }
 
   Future<void> _pickScheduledDelivery() async {
@@ -6598,8 +6675,12 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
           Expanded(
             child: RefreshIndicator(
               onRefresh: () async {
+                await s.loadProfile(force: true);
                 await s.loadMenu(force: true);
                 await s.pullCustomerTrayDraftFromServer();
+                if (!mounted) return;
+                setState(() => _deliveryAddressOptionsLoading = true);
+                await _loadInRangeDeliveryAddresses();
                 if (mounted) setState(() {});
               },
               child: ListView(
@@ -6614,34 +6695,40 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                     children: [
                       LockedField(label: 'NAME', value: s.profile.fullName),
                       LockedField(label: 'CONTACT NUMBER', value: s.profile.contactNumber),
-                      DropdownButtonFormField<String>(
-                        isExpanded: true,
-                        value: _selectedDeliveryAddress,
-                        decoration: const InputDecoration(labelText: 'DELIVERY ADDRESS'),
-                        items: _deliveryAddresses
-                            .map(
-                              (a) => DropdownMenuItem<String>(
-                                value: a,
-                                child: Text(
-                                  a,
-                                  maxLines: 3,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            )
-                            .toList(),
-                        onChanged: (v) {
-                          setState(() => _selectedDeliveryAddress = v);
-                          widget.state.updateCheckoutDraftAddress(v);
-                        },
-                      ),
-                      if (_deliveryAddresses.isEmpty)
+                      if (_deliveryAddressOptionsLoading)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 16),
+                          child: Center(child: CircularProgressIndicator()),
+                        )
+                      else if (_deliveryAddresses.isEmpty)
                         Padding(
-                          padding: const EdgeInsets.only(top: 8),
+                          padding: const EdgeInsets.only(top: 4, bottom: 4),
                           child: Text(
-                            'Add addresses in My Profile first.',
+                            'No saved addresses are within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km. Add or pin an in-range address in My Profile.',
                             style: TextStyle(color: Colors.red.shade800, fontSize: 13),
                           ),
+                        )
+                      else
+                        DropdownButtonFormField<String>(
+                          isExpanded: true,
+                          value: _selectedDeliveryAddress,
+                          decoration: const InputDecoration(labelText: 'DELIVERY ADDRESS'),
+                          items: _deliveryAddresses
+                              .map(
+                                (a) => DropdownMenuItem<String>(
+                                  value: a,
+                                  child: Text(
+                                    a,
+                                    maxLines: 3,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: (v) {
+                            setState(() => _selectedDeliveryAddress = v);
+                            widget.state.updateCheckoutDraftAddress(v);
+                          },
                         ),
                       LockedField(label: 'TIME OF DELIVERY', value: _selectedDeliveryTime),
                       const SizedBox(height: 8),
@@ -6711,6 +6798,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
             actionLabel: 'CONFIRM',
             onSecondary: () => Navigator.of(context).pop(),
             onAction: () async {
+              if (_deliveryAddressOptionsLoading) {
+                appSnack(context, 'Still checking which addresses are in range.');
+                return;
+              }
               if (s.tray.isEmpty) {
                 appSnack(context, 'Your tray is empty.');
                 return;
@@ -7979,19 +8070,57 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                         tooltip: 'Completed orders date range',
                         icon: Icon(Icons.date_range, color: _completedOrdersRange == 'past_30' ? AppColors.accent : null),
                         onSelected: (v) => setState(() => _completedOrdersRange = v),
-                        itemBuilder: (_) => const [
-                          PopupMenuItem(value: 'past_30', child: Text('Past 30 days')),
-                          PopupMenuItem(value: 'all', child: Text('All time')),
+                        itemBuilder: (ctx) => [
+                          PopupMenuItem<String>(
+                            value: 'past_30',
+                            child: Row(
+                              children: [
+                                if (_completedOrdersRange == 'past_30')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_completedOrdersRange == 'past_30') const SizedBox(width: 4),
+                                const Text('Past 30 days'),
+                              ],
+                            ),
+                          ),
                         ],
                       ),
                     PopupMenuButton<String>(
                       tooltip: 'Filters',
                       icon: Icon(Icons.filter_list, color: _filter == 'all' ? null : AppColors.accent),
                       onSelected: (v) => setState(() => _filter = v),
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(value: 'all', child: Text('All')),
-                        PopupMenuItem(value: 'attention', child: Text('Needs attention')),
-                        PopupMenuItem(value: 'payment_uploaded', child: Text('With payment proof')),
+                      itemBuilder: (ctx) => [
+                        PopupMenuItem<String>(
+                          value: 'all',
+                          child: Row(
+                            children: [
+                              if (_filter == 'all') Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_filter == 'all') const SizedBox(width: 4),
+                              const Text('All'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'attention',
+                          child: Row(
+                            children: [
+                              if (_filter == 'attention')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_filter == 'attention') const SizedBox(width: 4),
+                              const Text('Needs attention'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'payment_uploaded',
+                          child: Row(
+                            children: [
+                              if (_filter == 'payment_uploaded')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_filter == 'payment_uploaded') const SizedBox(width: 4),
+                              const Text('With payment proof'),
+                            ],
+                          ),
+                        ),
                       ],
                     ),
                   ],
@@ -8453,6 +8582,13 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                               style: const TextStyle(fontWeight: FontWeight.w900),
                             ),
                           ],
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'Points earned from completed catering & events: ${cateringCompletedLoyaltyEarnedFromHistory(widget.state.loyaltyHistory)} pts',
+                            style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
+                          ),
                         ),
                         const Divider(height: 16),
                         Row(
@@ -10570,13 +10706,6 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
       body: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: Text(
-              kCustomerDeliveryAndCateringAreaNotice,
-              style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
-            ),
-          ),
-          Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
             child: Row(
               children: [
@@ -10595,22 +10724,68 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
                     tooltip: 'Completed inquiries date range',
                     icon: Icon(Icons.date_range, color: _inquiryCompletedRange == 'past_30' ? AppColors.accent : null),
                     onSelected: (v) => setState(() => _inquiryCompletedRange = v),
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(value: 'past_30', child: Text('Past 30 days')),
-                      PopupMenuItem(value: 'all', child: Text('All time')),
+                    itemBuilder: (_) => [
+                      PopupMenuItem<String>(
+                        value: 'past_30',
+                        child: Row(
+                          children: [
+                            if (_inquiryCompletedRange == 'past_30') const Icon(Icons.check, size: 18),
+                            const SizedBox(width: 4),
+                            const Text('Past 30 days'),
+                          ],
+                        ),
+                      ),
                     ],
                   ),
                 PopupMenuButton<String>(
                   tooltip: 'Filters',
                   icon: Icon(Icons.filter_list, color: _filter == 'all' ? null : AppColors.accent),
                   onSelected: (v) => setState(() => _filter = v),
-                  itemBuilder: (_) => const [
-                    PopupMenuItem(value: 'all', child: Text('All')),
-                    PopupMenuItem(value: 'catering_only', child: Text('Catering')),
-                    PopupMenuItem(value: 'event_only', child: Text('Catering+Event')),
+                  itemBuilder: (ctx) => [
+                    PopupMenuItem<String>(
+                      value: 'all',
+                      child: Row(
+                        children: [
+                          if (_filter == 'all') Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                          if (_filter == 'all') const SizedBox(width: 4),
+                          const Text('All'),
+                        ],
+                      ),
+                    ),
+                    PopupMenuItem<String>(
+                      value: 'catering_only',
+                      child: Row(
+                        children: [
+                          if (_filter == 'catering_only') Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                          if (_filter == 'catering_only') const SizedBox(width: 4),
+                          const Text('Catering'),
+                        ],
+                      ),
+                    ),
+                    PopupMenuItem<String>(
+                      value: 'event_only',
+                      child: Row(
+                        children: [
+                          if (_filter == 'event_only') Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                          if (_filter == 'event_only') const SizedBox(width: 4),
+                          const Text('Catering+Event'),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
               ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: Align(
+              alignment: Alignment.center,
+              child: Text(
+                kCustomerCateringInquiriesAreaNotice,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
+              ),
             ),
           ),
           TabBar(
@@ -16860,6 +17035,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
           return okSection && okSearch;
         }).toList();
         final subtotal = widget.state.tray.fold<double>(0, (s, e) => s + cartLineSubtotal(e));
+        final trayDishQty = widget.state.tray.fold<int>(0, (s, e) => s + e.qty);
         final cw = restaurantGridCrossAxisCount(MediaQuery.sizeOf(context).width);
         final gridDelegate = SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: cw,
@@ -16937,7 +17113,25 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                               MaterialPageRoute<void>(builder: (_) => PosYourTrayScreen(state: widget.state, subtotal: subtotal)),
                             );
                           },
-                          child: const Text('YOUR TRAY'),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              const Text('YOUR TRAY'),
+                              if (trayDishQty > 0) ...[
+                                const SizedBox(width: 10),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+                                  alignment: Alignment.center,
+                                  decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                                  child: Text(
+                                    '$trayDishQty',
+                                    style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w900),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
                         ),
                       ),
                     ],

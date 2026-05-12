@@ -1146,13 +1146,15 @@ app.post("/api/mobile/auth/login", async (req, res) => {
       return;
     }
     const ts = new Date().toISOString();
-    void sendMailSafe(
-      email,
-      "Macrina's Kitchen login notice",
-      `A login was completed for ${email} at ${ts}. If this was not you, change your password.`,
-    ).catch((mailErr) => {
+    try {
+      await sendMailSafe(
+        email,
+        "Macrina's Kitchen login notice",
+        `A login was completed for ${email} at ${ts}. If this was not you, change your password.`,
+      );
+    } catch (mailErr) {
       console.warn("[mail] login notice email failed (login still succeeds):", mailErr);
-    });
+    }
     const role = "customer";
     const displayName = String(row?.full_name ?? "").trim();
     await logActionBestEffort("auth.login", email, "Customer login successful", { role: "customer" });

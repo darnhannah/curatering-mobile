@@ -2,35 +2,10 @@ import dns from "node:dns";
 import net from "node:net";
 import nodemailer from "nodemailer";
 
-/** Node provides `dns.lookupSync`; keep a narrow cast for older `@types/node` stubs. */
-function lookupIpv4Sync(hostname: string): string | null {
-  try {
-    const fn = (dns as unknown as { lookupSync?: (h: string, o: { family: number }) => string }).lookupSync;
-    if (typeof fn !== "function") return null;
-    return fn(hostname, { family: 4 });
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Railway often has no outbound IPv6; nodemailer may still connect to Gmail's AAAA.
- * Resolve to IPv4 and connect by IP with TLS SNI set to the real hostname.
- */
-function smtpConnectHost(logicalHost: string): { host: string; tls?: { servername: string } } {
-  const h = logicalHost.trim();
-  if (!h) return { host: logicalHost };
-  if (h.includes(":")) return { host: h };
-  if (net.isIP(h)) return { host: h };
-  const ipv4 = lookupIpv4Sync(h);
-  if (ipv4 && net.isIP(ipv4) === 4 && ipv4 !== h) {
-    return { host: ipv4, tls: { servername: h } };
-  }
-  return { host: h };
-}
-
 let transporter: nodemailer.Transporter | null = null;
 let transporterKey = "";
+/** Serializes transport creation so concurrent mail sends share one `resolve4` + `createTransport`. */
+let transportChain: Promise<void> = Promise.resolve();
 
 /** SMTP login user (Gmail = full email address). */
 function smtpUser(): string {
@@ -68,7 +43,11 @@ export function isMailConfigured(): boolean {
   return !!(smtpUser() && smtpPass());
 }
 
-function getTransport() {
+/**
+ * Build nodemailer transport. Prefer connecting to an IPv4 from `resolve4` so Railway
+ * (no outbound IPv6) does not hit Gmail's AAAA and ENETUNREACH on 465.
+ */
+async function buildTransport(): Promise<nodemailer.Transporter | null> {
   const logicalHost = process.env.TRANSPORTER_SMTP_HOST?.trim() || process.env.SMTP_HOST?.trim() || "smtp.gmail.com";
   const port = Number(process.env.TRANSPORTER_SMTP_PORT ?? process.env.SMTP_PORT) || 465;
   const user = smtpUser();
@@ -76,28 +55,85 @@ function getTransport() {
   if (!user || !pass) {
     return null;
   }
-  const { host, tls: tlsExtra } = smtpConnectHost(logicalHost);
-  const key = `${logicalHost}|${host}|${port}|${user}|${pass}`;
-  if (!transporter || transporterKey !== key) {
-    transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure: port === 465,
-      auth: { user, pass },
-      ...(tlsExtra ? { tls: tlsExtra } : {}),
-      connectionTimeout: 20_000,
-      greetingTimeout: 15_000,
-      socketTimeout: 45_000,
-    } as nodemailer.TransportOptions);
-    transporterKey = key;
+
+  let connectHost = logicalHost;
+  let tlsServername: string | undefined;
+
+  if (!logicalHost.includes(":") && net.isIP(logicalHost) === 0) {
+    try {
+      const v4 = await dns.promises.resolve4(logicalHost);
+      if (v4.length > 0) {
+        connectHost = v4[0]!;
+        tlsServername = logicalHost;
+      }
+    } catch (err) {
+      console.warn(`[mail] resolve4(${logicalHost}) failed; falling back to hostname (may fail on IPv6-only egress):`, err);
+    }
   }
+
+  const secure = port === 465;
+  const baseTls =
+    tlsServername != null
+      ? { servername: tlsServername, rejectUnauthorized: true as const }
+      : { rejectUnauthorized: true as const };
+
+  let usePort = port;
+  let useSecure = secure;
+  let requireTLS = false;
+  // If we still only have a hostname (resolve4 failed), Gmail on 465 often resolves to IPv6 and breaks on Railway.
+  if (
+    connectHost === logicalHost &&
+    net.isIP(logicalHost) === 0 &&
+    /^smtp\.gmail\.com$/i.test(logicalHost) &&
+    port === 465
+  ) {
+    console.warn("[mail] Falling back to smtp.gmail.com:587 STARTTLS (hostname-only after resolve4).");
+    usePort = 587;
+    useSecure = false;
+    requireTLS = true;
+  }
+
+  return nodemailer.createTransport({
+    host: connectHost,
+    port: usePort,
+    secure: useSecure,
+    requireTLS,
+    auth: { user, pass },
+    tls: baseTls,
+    connectionTimeout: 25_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 45_000,
+  } as nodemailer.TransportOptions);
+}
+
+/** Singleflight async init — always `resolve4` before connecting (Railway / IPv6-safe). */
+async function ensureTransport(): Promise<nodemailer.Transporter | null> {
+  const logicalHost = process.env.TRANSPORTER_SMTP_HOST?.trim() || process.env.SMTP_HOST?.trim() || "smtp.gmail.com";
+  const port = Number(process.env.TRANSPORTER_SMTP_PORT ?? process.env.SMTP_PORT) || 465;
+  const user = smtpUser();
+  const pass = smtpPass();
+  const key = `${logicalHost}|${port}|${user}|${pass}`;
+  if (!user || !pass) {
+    return null;
+  }
+  if (transporter && transporterKey === key) {
+    return transporter;
+  }
+  await (transportChain = transportChain.then(async () => {
+    if (transporter && transporterKey === key) return;
+    transporter = null;
+    transporterKey = "";
+    const t = await buildTransport();
+    transporter = t;
+    transporterKey = t ? key : "";
+  }));
   return transporter;
 }
 
 /** Sends email; skips quietly if SMTP is not configured (non-critical notifications). */
 export async function sendMailSafe(to: string, subject: string, text: string): Promise<void> {
   const from = smtpFrom();
-  const t = getTransport();
+  const t = await ensureTransport();
   if (!t || !from) {
     console.warn(
       "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD); skipping send.",
@@ -110,7 +146,7 @@ export async function sendMailSafe(to: string, subject: string, text: string): P
 /** Throws if SMTP is missing or delivery fails — use for OTP and must-deliver flows. */
 export async function sendMailRequired(to: string, subject: string, text: string): Promise<void> {
   const from = smtpFrom();
-  const t = getTransport();
+  const t = await ensureTransport();
   if (!t || !from) {
     throw new Error(
       "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
@@ -128,7 +164,7 @@ export async function sendMailWithPdfAttachment(
   pdfBuffer: Buffer,
 ): Promise<void> {
   const from = smtpFrom();
-  const t = getTransport();
+  const t = await ensureTransport();
   if (!t || !from) {
     console.warn(
       "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD; skipping send.",
@@ -153,7 +189,7 @@ export async function sendMailWithPdfRequired(
   pdfBuffer: Buffer,
 ): Promise<void> {
   const from = smtpFrom();
-  const t = getTransport();
+  const t = await ensureTransport();
   if (!t || !from) {
     throw new Error(
       "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
