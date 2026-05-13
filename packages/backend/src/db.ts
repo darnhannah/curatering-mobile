@@ -60,18 +60,27 @@ function tlsRejectUnauthorized(): boolean {
   return true;
 }
 
+const poolCommon = {
+  max: 10,
+  /** Recycle pooled sockets so Supabase pooler / idle disconnects (XX000 / EDBHANDLEREXITED) are less likely. */
+  idleTimeoutMillis: 20_000,
+  connectionTimeoutMillis: 15_000,
+  // @types/pg includes maxUses on PoolConfig for pg 8+ pooler recycling.
+  maxUses: 200,
+} as const;
+
 export function getPool(): pg.Pool {
   if (!pool) {
     const verify = tlsRejectUnauthorized();
     if (verify) {
       pool = new Pool({
         connectionString: connectionStringForVerify(),
-        max: 10,
+        ...poolCommon,
       });
     } else {
       pool = new Pool({
         connectionString: stripTlsQueryParams(rawDatabaseUrl()),
-        max: 10,
+        ...poolCommon,
         ssl: { rejectUnauthorized: false },
       });
     }

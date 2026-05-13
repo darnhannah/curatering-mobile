@@ -43,19 +43,72 @@ function resendApiKey(): string {
   return process.env.RESEND_API_KEY?.trim() || "";
 }
 
+const kResendFromFallback = "onboarding@resend.dev";
+
+/** Strip BOM / smart quotes / repeated outer quotes (common when pasting Railway env values). */
+function stripMailEnvDecorators(raw: string): string {
+  let s = raw.replace(/^\ufeff/, "").trim();
+  s = s.replace(/[\u201c\u201d\u2018\u2019\u00ab\u00bb]/g, '"');
+  for (let i = 0; i < 3; i++) {
+    const again = s.trim();
+    if ((again.startsWith('"') && again.endsWith('"')) || (again.startsWith("'") && again.endsWith("'"))) {
+      s = again.slice(1, -1).trim();
+    } else {
+      break;
+    }
+  }
+  return s.trim();
+}
+
+/**
+ * Resend only accepts `email@x.y` or `Display Name <email@x.y>`.
+ * Railway / .env mistakes (extra quotes, smart quotes, missing `>`) produce HTTP 422.
+ */
+function normalizeResendFrom(raw: string): string {
+  const s0 = stripMailEnvDecorators(raw);
+  if (!s0) return kResendFromFallback;
+
+  const angle = s0.match(/^(.+?)\s*<\s*([^<>]+?)\s*>$/);
+  if (angle) {
+    const display = angle[1].replace(/[<>]/g, "").trim();
+    const addr = angle[2].trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr)) {
+      return display.length > 0 ? `${display} <${addr}>` : addr;
+    }
+  }
+
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s0)) {
+    return s0;
+  }
+
+  const loose = s0.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+  if (loose) {
+    const addr = loose[0];
+    console.warn(
+      `[mail] RESEND_FROM "${raw.slice(0, 80)}${raw.length > 80 ? "…" : ""}" was normalized to bare address "${addr}". Prefer explicit: Name <${addr}>`,
+    );
+    return addr;
+  }
+
+  console.warn(
+    `[mail] RESEND_FROM is not a valid Resend "from" (need email@domain or Name <email@domain>). Using ${kResendFromFallback}.`,
+  );
+  return kResendFromFallback;
+}
+
 /**
  * Verified-domain "from" for Resend. If unset, falls back to other mail env vars, then SMTP user,
  * then Resend's sandbox sender (testing only — see https://resend.com/docs ).
  */
 function resendFromAddress(): string {
-  return (
+  const raw =
     process.env.RESEND_FROM?.trim() ||
     process.env.TRANSPORTER_FROM?.trim() ||
     process.env.SMTP_FROM?.trim() ||
     process.env.MAIL_FROM?.trim() ||
     smtpUser() ||
-    "onboarding@resend.dev"
-  );
+    kResendFromFallback;
+  return normalizeResendFrom(raw);
 }
 
 /** When set, all mail goes over HTTPS to Resend (works on Railway where outbound SMTP may be blocked). */
