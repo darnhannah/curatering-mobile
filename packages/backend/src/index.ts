@@ -5,6 +5,7 @@ import cors from "cors";
 import express from "express";
 import {
   isMailConfigured,
+  mailUsesResend,
   sendMailRequired,
   sendMailSafe,
   sendMailWithPdfAttachment,
@@ -14,10 +15,16 @@ import { formatDbStartupError, getPool, initDb } from "./db.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
 if (isMailConfigured()) {
-  console.info("[mail] SMTP credentials loaded; OTP and notification emails are enabled.");
+  if (mailUsesResend()) {
+    console.info(
+      "[mail] Resend API (HTTPS) enabled — OTP and notification emails bypass outbound SMTP (recommended on Railway Hobby / blocked SMTP).",
+    );
+  } else {
+    console.info("[mail] SMTP credentials loaded; OTP and notification emails are enabled.");
+  }
 } else {
   console.warn(
-    "[mail] SMTP not configured. Add TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD to packages/backend/.env (see .env.example), then restart.",
+    "[mail] Mail not configured. On Railway Free/Hobby, outbound SMTP (465/587) is often blocked — use RESEND_API_KEY + RESEND_FROM (see .env.example), or upgrade for SMTP. Otherwise set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD.",
   );
 }
 
@@ -576,10 +583,19 @@ async function generateChecklistFromMenu(menuRaw: unknown): Promise<ChecklistIte
     if (dishNames.length === 0) return [];
     const out: ChecklistItem[] = [];
     for (const dishName of dishNames) {
-      const { rows } = await getPool().query(
+      let { rows } = await getPool().query(
         `SELECT ingredients FROM menu_dishes WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) LIMIT 1`,
         [dishName],
       );
+      if (!rows.length) {
+        ({ rows } = await getPool().query(
+          `SELECT ingredients FROM menu_dishes
+           WHERE LENGTH(TRIM($1::text)) > 2 AND LOWER(TRIM(name)) LIKE '%' || LOWER(TRIM($1::text)) || '%'
+           ORDER BY LENGTH(name) ASC
+           LIMIT 1`,
+          [dishName],
+        ));
+      }
       const ingredients = parseJsonTextArray((rows[0] as Record<string, unknown> | undefined)?.ingredients);
       for (const ing of ingredients) {
         const cleaned = ing.trim();
@@ -762,6 +778,9 @@ async function applyLoyaltyRewardsBestEffort(
   const pointsEarned = loyaltyPointsFor(kind, totalAmount);
   if (!userEmail || pointsEarned <= 0) return;
   const email = userEmail.trim().toLowerCase();
+  if (email.endsWith("@guest.curatering.internal")) {
+    return;
+  }
   const paymentRef = `${MOBILE_LOYALTY_PAYMENT_PREFIX}${orderNo}`;
   try {
     const dup = await getPool().query(`SELECT 1 FROM restaurant_orders WHERE payment_reference = $1 LIMIT 1`, [
@@ -1525,10 +1544,18 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
     if (action === "confirm") {
       const proof2 =
         ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0;
-      const pendingReview = ord.balance_proof_pending_review === true;
+      const bpr = ord.balance_proof_pending_review as unknown;
+      const pendingReview =
+        bpr === true ||
+        bpr === 1 ||
+        String(bpr ?? "")
+          .trim()
+          .toLowerCase() === "t";
       const statusUp = String(ord.status).toUpperCase();
+      const awaitingBalanceConfirm =
+        statusUp.includes("WAITING FOR BALANCE") || statusUp.includes("BALANCE PAYMENT CONFIRMATION");
 
-      if (pendingReview && proof2) {
+      if (proof2 && (pendingReview || awaitingBalanceConfirm)) {
         if (!Number.isFinite(supplementalAmtIn) || supplementalAmtIn < 0) {
           res.status(400).json({ error: "supplemental_amount_received is required (balance payment amount)" });
           return;
@@ -2179,6 +2206,7 @@ app.get("/api/mobile/orders", async (req, res) => {
               fulfillment_stage, delivery_tracking_url, order_lines_snapshot,
               supplemental_payment_proof, cashier_secondary_amount_received, balance_proof_pending_review,
               CASE
+                WHEN LOWER(TRIM(COALESCE(user_email, ''))) LIKE '%@guest.curatering.internal' THEN 0
                 WHEN upper(status) LIKE '%ORDER CONFIRMED%' OR upper(status) LIKE '%OVERPAYMENT%'
                   THEN FLOOR(COALESCE(total, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
                 ELSE 0
@@ -2388,7 +2416,8 @@ app.patch("/api/mobile/inquiries/:id/cancel-customer", async (req, res) => {
       const { rows } = await client.query(
         `SELECT id::text AS id, status, COALESCE(NULLIF(TRIM(transaction_no), ''), CONCAT('TRX-', id::text)) AS tx
          FROM ${table}
-         WHERE id::text = $1 AND LOWER(TRIM(email_address)) = $2
+         WHERE id::text = $1
+           AND (LOWER(TRIM(email_address)) = $2 OR LOWER(TRIM(COALESCE(customer_id::text, ''))) = $2)
          FOR UPDATE`,
         [id, userEmail],
       );
@@ -2401,7 +2430,8 @@ app.patch("/api/mobile/inquiries/:id/cancel-customer", async (req, res) => {
       await client.query(
         `UPDATE ${table}
          SET status = 'cancelled', updated_at = NOW(), updated_by = $3
-         WHERE id::text = $1 AND LOWER(TRIM(email_address)) = $2`,
+         WHERE id::text = $1
+           AND (LOWER(TRIM(email_address)) = $2 OR LOWER(TRIM(COALESCE(customer_id::text, ''))) = $2)`,
         [id, userEmail, userEmail],
       );
       return { found: true, cancelled: true, tx: row.tx };
@@ -3061,7 +3091,8 @@ app.get("/api/mobile/inquiries", async (req, res) => {
               COALESCE(formality_level, '') AS formality_level,
               FALSE AS food_tasting_requested
          FROM event_orders
-         WHERE LOWER(email_address) = $1
+         WHERE LOWER(TRIM(COALESCE(customer_id::text, ''))) = $1
+            OR LOWER(TRIM(email_address)) = $1
          UNION ALL
          SELECT id::text AS id,
                 ('INQ-' || UPPER(SUBSTRING(id::text, 1, 8))) AS inquiry_no,
@@ -3101,7 +3132,8 @@ app.get("/api/mobile/inquiries", async (req, res) => {
                 '' AS formality_level,
                 FALSE AS food_tasting_requested
          FROM catering_orders
-         WHERE LOWER(email_address) = $1
+         WHERE LOWER(TRIM(COALESCE(customer_id::text, ''))) = $1
+            OR LOWER(TRIM(email_address)) = $1
        ) q
        ORDER BY created_at DESC`,
       [userEmail],
@@ -4021,6 +4053,10 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
   const eventTitle = req.body?.event_title != null ? String(req.body.event_title) : null;
   const eventType = req.body?.event_type != null ? String(req.body.event_type) : null;
   const formalityLevel = req.body?.formality_level != null ? String(req.body.formality_level) : null;
+  const customerName = req.body?.customer_name != null ? String(req.body.customer_name).trim() : null;
+  const contactPerson = req.body?.contact_person != null ? String(req.body.contact_person).trim() : null;
+  const contactNumber = req.body?.contact_number != null ? String(req.body.contact_number).trim() : null;
+  const emailAddress = req.body?.email_address != null ? String(req.body.email_address).trim() : null;
   try {
     if (orderKind === "catering") {
       await getPool().query(
@@ -4039,7 +4075,11 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           down_payment_amount = COALESCE($12, down_payment_amount),
           guest_count = COALESCE($13, guest_count),
           address = COALESCE($14, address),
-          schedule_slots = COALESCE($15::jsonb, schedule_slots)
+          schedule_slots = COALESCE($15::jsonb, schedule_slots),
+          customer_name = COALESCE($16, customer_name),
+          contact_person = COALESCE($17, contact_person),
+          contact_number = COALESCE($18, contact_number),
+          email_address = COALESCE($19, email_address)
         WHERE id::text = $1 AND status IN ('new_event', 'online_inquiries')`,
         [
           id,
@@ -4057,6 +4097,10 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           Number.isFinite(guestCount) ? Math.max(0, Math.floor(guestCount)) : null,
           address,
           scheduleSlots ? JSON.stringify(scheduleSlots) : null,
+          customerName || null,
+          contactPerson || null,
+          contactNumber || null,
+          emailAddress || null,
         ],
       );
     } else {
@@ -4079,7 +4123,11 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           schedule_slots = COALESCE($15::jsonb, schedule_slots),
           event_title = COALESCE($16, event_title),
           event_type = COALESCE($17, event_type),
-          formality_level = COALESCE($18, formality_level)
+          formality_level = COALESCE($18, formality_level),
+          customer_name = COALESCE($19, customer_name),
+          contact_person = COALESCE($20, contact_person),
+          contact_number = COALESCE($21, contact_number),
+          email_address = COALESCE($22, email_address)
         WHERE id::text = $1 AND status IN ('new_event', 'online_inquiries')`,
         [
           id,
@@ -4100,6 +4148,10 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           eventTitle,
           eventType,
           formalityLevel,
+          customerName || null,
+          contactPerson || null,
+          contactNumber || null,
+          emailAddress || null,
         ],
       );
     }

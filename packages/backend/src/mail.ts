@@ -39,8 +39,70 @@ function smtpFrom(): string {
   );
 }
 
+function resendApiKey(): string {
+  return process.env.RESEND_API_KEY?.trim() || "";
+}
+
+/**
+ * Verified-domain "from" for Resend. If unset, falls back to other mail env vars, then SMTP user,
+ * then Resend's sandbox sender (testing only — see https://resend.com/docs ).
+ */
+function resendFromAddress(): string {
+  return (
+    process.env.RESEND_FROM?.trim() ||
+    process.env.TRANSPORTER_FROM?.trim() ||
+    process.env.SMTP_FROM?.trim() ||
+    process.env.MAIL_FROM?.trim() ||
+    smtpUser() ||
+    "onboarding@resend.dev"
+  );
+}
+
+/** When set, all mail goes over HTTPS to Resend (works on Railway where outbound SMTP may be blocked). */
+export function mailUsesResend(): boolean {
+  return resendApiKey().length > 0;
+}
+
 export function isMailConfigured(): boolean {
+  if (mailUsesResend()) return true;
   return !!(smtpUser() && smtpPass());
+}
+
+async function sendViaResend(
+  to: string,
+  subject: string,
+  text: string,
+  attachments?: { filename: string; content: Buffer }[],
+): Promise<void> {
+  const apiKey = resendApiKey();
+  if (!apiKey) {
+    throw new Error("RESEND_API_KEY is not set");
+  }
+  const from = resendFromAddress();
+  const body: Record<string, unknown> = {
+    from,
+    to: [to],
+    subject,
+    text,
+  };
+  if (attachments && attachments.length > 0) {
+    body.attachments = attachments.map((a) => ({
+      filename: a.filename,
+      content: a.content.toString("base64"),
+    }));
+  }
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Resend API HTTP ${res.status}: ${errText || res.statusText}`);
+  }
 }
 
 /**
@@ -108,6 +170,9 @@ async function buildTransport(): Promise<nodemailer.Transporter | null> {
 
 /** Singleflight async init — always `resolve4` before connecting (Railway / IPv6-safe). */
 async function ensureTransport(): Promise<nodemailer.Transporter | null> {
+  if (mailUsesResend()) {
+    return null;
+  }
   const logicalHost = process.env.TRANSPORTER_SMTP_HOST?.trim() || process.env.SMTP_HOST?.trim() || "smtp.gmail.com";
   const port = Number(process.env.TRANSPORTER_SMTP_PORT ?? process.env.SMTP_PORT) || 465;
   const user = smtpUser();
@@ -132,30 +197,46 @@ async function ensureTransport(): Promise<nodemailer.Transporter | null> {
 
 /** Sends email; skips quietly if SMTP is not configured (non-critical notifications). */
 export async function sendMailSafe(to: string, subject: string, text: string): Promise<void> {
+  if (mailUsesResend()) {
+    try {
+      await sendViaResend(to, subject, text);
+    } catch (err) {
+      console.warn("[mail] Resend send failed:", err);
+    }
+    return;
+  }
   const from = smtpFrom();
   const t = await ensureTransport();
   if (!t || !from) {
     console.warn(
-      "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD); skipping send.",
+      "Email not configured; set RESEND_API_KEY or TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD; skipping send.",
     );
     return;
   }
-  await t.sendMail({ from, to, subject, text });
+  try {
+    await t.sendMail({ from, to, subject, text });
+  } catch (err) {
+    console.warn("[mail] SMTP send failed:", err);
+  }
 }
 
 /** Throws if SMTP is missing or delivery fails — use for OTP and must-deliver flows. */
 export async function sendMailRequired(to: string, subject: string, text: string): Promise<void> {
+  if (mailUsesResend()) {
+    await sendViaResend(to, subject, text);
+    return;
+  }
   const from = smtpFrom();
   const t = await ensureTransport();
   if (!t || !from) {
     throw new Error(
-      "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
+      "Mail not configured: set RESEND_API_KEY (recommended on Railway) or TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD",
     );
   }
   await t.sendMail({ from, to, subject, text });
 }
 
-/** PDF attachment (Buffer) — same SMTP config as [sendMailSafe]. */
+/** PDF attachment (Buffer) — same mail config as [sendMailSafe]. */
 export async function sendMailWithPdfAttachment(
   to: string,
   subject: string,
@@ -163,24 +244,36 @@ export async function sendMailWithPdfAttachment(
   pdfFilename: string,
   pdfBuffer: Buffer,
 ): Promise<void> {
+  if (mailUsesResend()) {
+    try {
+      await sendViaResend(to, subject, text, [{ filename: pdfFilename, content: pdfBuffer }]);
+    } catch (err) {
+      console.warn("[mail] Resend send (PDF) failed:", err);
+    }
+    return;
+  }
   const from = smtpFrom();
   const t = await ensureTransport();
   if (!t || !from) {
     console.warn(
-      "Email not configured; set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD; skipping send.",
+      "Email not configured; set RESEND_API_KEY or TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD; skipping send.",
     );
     return;
   }
-  await t.sendMail({
-    from,
-    to,
-    subject,
-    text,
-    attachments: [{ filename: pdfFilename, content: pdfBuffer }],
-  });
+  try {
+    await t.sendMail({
+      from,
+      to,
+      subject,
+      text,
+      attachments: [{ filename: pdfFilename, content: pdfBuffer }],
+    });
+  } catch (err) {
+    console.warn("[mail] SMTP send (PDF) failed:", err);
+  }
 }
 
-/** PDF attachment — throws if SMTP is missing or send fails (order-summary emails). */
+/** PDF attachment — throws if mail is missing or send fails (order-summary emails). */
 export async function sendMailWithPdfRequired(
   to: string,
   subject: string,
@@ -188,11 +281,15 @@ export async function sendMailWithPdfRequired(
   pdfFilename: string,
   pdfBuffer: Buffer,
 ): Promise<void> {
+  if (mailUsesResend()) {
+    await sendViaResend(to, subject, text, [{ filename: pdfFilename, content: pdfBuffer }]);
+    return;
+  }
   const from = smtpFrom();
   const t = await ensureTransport();
   if (!t || !from) {
     throw new Error(
-      "SMTP not configured: set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
+      "Mail not configured: set RESEND_API_KEY (recommended on Railway) or TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD",
     );
   }
   await t.sendMail({

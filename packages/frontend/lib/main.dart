@@ -732,6 +732,18 @@ void appSnack(BuildContext context, String message) {
 const int kMinCateringOnlyPax = 10;
 const int kMinCateringEventPax = 50;
 const double kPesosPerPax = 500;
+
+/// Layout variant for manager catering order summary PDFs.
+enum _ManagerOrderSummaryPdfVariant {
+  /// Quote before down payment is received.
+  beforeDownPayment,
+  /// After down payment; balance still due until full payment.
+  afterDownPayment,
+  /// Supplemental sheet for post-analysis additional costs.
+  additionalCostsSheet,
+  /// Completed / fully settled totals.
+  fullyPaid,
+}
 const double kRestaurantLat = 14.513436;
 const double kRestaurantLng = 121.059198;
 const double kDeliveryMaxDistanceKm = 5.0;
@@ -951,6 +963,7 @@ class ProfileData {
   ProfileData({
     this.fullName = '',
     this.contactNumber = '',
+    this.contactEmail = '',
     this.deliveryAddress = '',
     this.deliveryMapConfirmed = false,
     this.deliveryLat,
@@ -963,6 +976,8 @@ class ProfileData {
 
   String fullName;
   String contactNumber;
+  /// Contact email (guest checkout / inquiry); not persisted to profile API for registered users unless added server-side.
+  String contactEmail;
   String deliveryAddress;
   bool deliveryMapConfirmed;
   double? deliveryLat;
@@ -1319,6 +1334,103 @@ void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 
   );
 }
 
+/// Blocking loading dialog for cashier POS; pops automatically when [future] completes.
+Future<T?> withCashierBlockingProgress<T>(
+  BuildContext context,
+  String message,
+  Future<T> future,
+) async {
+  showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => AlertDialog(
+      content: Row(
+        children: [
+          const SizedBox(width: 8),
+          const SizedBox(
+            width: 28,
+            height: 28,
+            child: CircularProgressIndicator(strokeWidth: 3),
+          ),
+          const SizedBox(width: 20),
+          Expanded(child: Text(message)),
+        ],
+      ),
+    ),
+  );
+  try {
+    return await future;
+  } finally {
+    if (context.mounted) Navigator.of(context).pop();
+  }
+}
+
+int cashierOnlinePendingSortPriority(OrderData o) {
+  final u = statusReadableForOrder(o).toUpperCase();
+  if (u.contains('BALANCE PAYMENT CONFIRMATION') ||
+      u.contains('WAITING FOR BALANCE') ||
+      (o.balanceProofPendingReview && (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false))) {
+    return 0;
+  }
+  if (u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+      u.contains('WAITING FOR ORDER CONFIRMATION') ||
+      u.contains('WAITING FOR ORDER')) {
+    return 1;
+  }
+  if (u.contains('INSUFFICIENT') || u.contains('PAYMENT INSUFFICIENT')) {
+    return 2;
+  }
+  return 3;
+}
+
+bool orderMatchesCashierOnlinePendingFilter(OrderData o, String mode) {
+  final u = statusReadableForOrder(o).toUpperCase();
+  switch (mode) {
+    case 'past_30':
+      return isWithinPast30Days(o.createdAt);
+    case 'wait_payment':
+      return u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+          u.contains('WAITING FOR ORDER CONFIRMATION') ||
+          u.contains('WAITING FOR ORDER');
+    case 'payment_insufficient':
+      return u.contains('INSUFFICIENT') || u.contains('PAYMENT INSUFFICIENT');
+    case 'wait_balance':
+      return u.contains('BALANCE PAYMENT CONFIRMATION') ||
+          u.contains('WAITING FOR BALANCE') ||
+          (o.balanceProofPendingReview && (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false));
+    default:
+      return true;
+  }
+}
+
+bool orderMatchesCashierOnlinePreparingFilter(OrderData o, String mode) {
+  final u = o.status.toUpperCase();
+  switch (mode) {
+    case 'payment_confirmed':
+      return u.contains('ORDER CONFIRMED') && !u.contains('OVERPAYMENT');
+    case 'overpayment':
+      return u.contains('OVERPAYMENT');
+    default:
+      return true;
+  }
+}
+
+bool orderMatchesCashierOnlineDeliveredFilter(OrderData o, String mode) {
+  final pm = o.paymentMode.toUpperCase();
+  switch (mode) {
+    case 'past_30':
+      return isWithinPast30Days(o.createdAt);
+    case 'balance_proof':
+      return (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false);
+    case 'cash':
+      return pm.contains('CASH') && !pm.contains('GCASH');
+    case 'gcash':
+      return pm.contains('GCASH');
+    default:
+      return true;
+  }
+}
+
 class InquiryRecord {
   InquiryRecord({
     required this.id,
@@ -1408,6 +1520,13 @@ class InquiryRecord {
     };
     return waiting.contains(s);
   }
+}
+
+/// Sum of loyalty credits shown on completed catering / catering+event inquiries in the app.
+int cateringCompletedLoyaltyFromInquiries(List<InquiryRecord> inquiries) {
+  return inquiries
+      .where((r) => r.isCompletedBooking && r.loyaltyPointsEarned > 0)
+      .fold<int>(0, (sum, r) => sum + r.loyaltyPointsEarned);
 }
 
 class SubmitOrderResult {
@@ -1720,6 +1839,10 @@ class AppState extends ChangeNotifier {
       unreadNotificationsCount > 0 || hasCashierAttentionBadge || hasManagerAttentionBadge;
 
   bool get isCashier => userRole == 'cashier';
+  bool get isGuestSession {
+    final em = (userEmail ?? '').trim().toLowerCase();
+    return em.endsWith('@guest.curatering.internal');
+  }
   bool get isManager => userRole == 'manager';
   bool get isManagerOrSupervisor => userRole == 'manager' || userRole == 'supervisor';
 
@@ -2097,7 +2220,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> _pushCustomerTrayDraftToServer(List<Map<String, dynamic>> lines) async {
     final email = userEmail;
-    if (email == null || userRole != 'customer') return;
+    if (email == null || userRole != 'customer' || isGuestSession) return;
     try {
       final res = await http
           .put(
@@ -2116,7 +2239,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> pullCustomerTrayDraftFromServer() async {
     final email = userEmail;
-    if (email == null || userRole != 'customer') return;
+    if (email == null || userRole != 'customer' || isGuestSession) return;
     try {
       final res =
           await http.get(_uri('/api/mobile/customer/tray-draft', {'user_email': email})).timeout(_apiTimeout);
@@ -2296,6 +2419,34 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Local-only session for ordering without an account (see [isGuestSession]).
+  Future<void> enterGuestCheckoutSession() async {
+    final salt = DateTime.now().millisecondsSinceEpoch;
+    final r = math.Random().nextInt(1 << 30);
+    userEmail = 'guest_${salt}_$r@guest.curatering.internal'.toLowerCase();
+    loginPassword = '';
+    userRole = 'customer';
+    cashierDisplayName = '';
+    profile = ProfileData();
+    loyaltyHistory.clear();
+    orders.clear();
+    inquiries.clear();
+    tray.clear();
+    checkoutNote = '';
+    checkoutSelectedAddress = null;
+    checkoutDeliveryTime = 'NOW';
+    authSessionKey++;
+    showLoginWelcomeDialog = false;
+    _profileLoadedAt = DateTime.now();
+    notifyListeners();
+    await Future.wait([
+      loadMenu(force: true),
+      loadSetMenus(force: true),
+    ]);
+    await loadOrders(force: true);
+    await loadInquiries(force: true);
+  }
+
   Uri _uri(String path, [Map<String, String>? query]) =>
       Uri.parse('${normalizeApiBase(apiBase)}$path').replace(queryParameters: query);
 
@@ -2417,7 +2568,7 @@ class AppState extends ChangeNotifier {
           final profileChanged = delta?['profile_changed'] == true;
           final loyaltyChanged = delta?['loyalty_changed'] == true;
           final allow = delta == null || profileChanged || loyaltyChanged;
-          if (allow) jobs.add(loadProfile(force: true));
+          if (allow && !isGuestSession) jobs.add(loadProfile(force: true));
         }
         if (_stampChanged(previous, next, 'notifications')) {
           final notifIds = delta?['notification_ids'];
@@ -2505,7 +2656,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> loadProfile({bool force = false}) async {
-    if (userEmail == null || _loadProfileInFlight) return;
+    if (userEmail == null || isGuestSession || _loadProfileInFlight) return;
     if (!force && _profileLoadedAt != null && DateTime.now().difference(_profileLoadedAt!) < const Duration(seconds: 4)) {
       return;
     }
@@ -2525,6 +2676,7 @@ class AppState extends ChangeNotifier {
       profile = ProfileData(
       fullName: '${map['full_name'] ?? ''}',
       contactNumber: '${map['contact_number'] ?? ''}',
+      contactEmail: '${map['contact_email'] ?? ''}',
       deliveryAddress: '${map['delivery_address'] ?? ''}',
       deliveryMapConfirmed: jsonToBool(map['delivery_map_confirmed']),
       deliveryLat: map['delivery_lat'] != null ? jsonToDouble(map['delivery_lat']) : null,
@@ -2543,7 +2695,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> loadLoyaltyHistory({bool force = false}) async {
-    if (userEmail == null || _loadLoyaltyHistoryInFlight) return;
+    if (userEmail == null || isGuestSession || _loadLoyaltyHistoryInFlight) return;
     if (!force &&
         _loyaltyHistoryLoadedAt != null &&
         DateTime.now().difference(_loyaltyHistoryLoadedAt!) < const Duration(seconds: 6)) {
@@ -2575,7 +2727,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> saveProfile(ProfileData updated) async {
-    if (userEmail == null) return;
+    if (userEmail == null || isGuestSession) return;
     final res = await http.put(
       _uri('/api/mobile/profile'),
       headers: {'Content-Type': 'application/json'},
@@ -2594,6 +2746,7 @@ class AppState extends ChangeNotifier {
       profile = ProfileData(
         fullName: updated.fullName,
         contactNumber: updated.contactNumber,
+        contactEmail: updated.contactEmail,
         deliveryAddress: updated.deliveryAddress,
         deliveryMapConfirmed: updated.deliveryMapConfirmed,
         deliveryLat: updated.deliveryLat,
@@ -2605,6 +2758,26 @@ class AppState extends ChangeNotifier {
       );
       notifyListeners();
     }
+  }
+
+  void updateGuestCheckoutContact({
+    String? fullName,
+    String? contactNumber,
+    String? contactEmail,
+    String? deliveryAddress,
+    double? deliveryLat,
+    double? deliveryLng,
+    bool? deliveryMapConfirmed,
+  }) {
+    if (!isGuestSession) return;
+    if (fullName != null) profile.fullName = fullName;
+    if (contactNumber != null) profile.contactNumber = contactNumber;
+    if (contactEmail != null) profile.contactEmail = contactEmail;
+    if (deliveryAddress != null) profile.deliveryAddress = deliveryAddress;
+    if (deliveryLat != null) profile.deliveryLat = deliveryLat;
+    if (deliveryLng != null) profile.deliveryLng = deliveryLng;
+    if (deliveryMapConfirmed != null) profile.deliveryMapConfirmed = deliveryMapConfirmed;
+    notifyListeners();
   }
 
   void addToTray(MenuItemData menuItem, {String dip = '', int dipQty = 1}) {
@@ -2720,6 +2893,15 @@ class AppState extends ChangeNotifier {
   Future<SubmitOrderResult> submitOrder({bool clearCheckoutDraft = true}) async {
     if (userEmail == null || tray.isEmpty) {
       return SubmitOrderResult(error: 'Missing profile or empty tray');
+    }
+    if (isGuestSession) {
+      if (profile.fullName.trim().isEmpty || profile.contactNumber.trim().isEmpty || profile.deliveryAddress.trim().isEmpty) {
+        return SubmitOrderResult(error: 'Enter your name, contact number, and delivery address.');
+      }
+      final em = profile.contactEmail.trim();
+      if (em.isEmpty || !em.contains('@') || !em.contains('.')) {
+        return SubmitOrderResult(error: 'Enter a valid contact email.');
+      }
     }
     try {
       final res = await http
@@ -3386,11 +3568,18 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> loadCashierOnlineOrders({bool force = false}) async {
-    if (userEmail == null || !isCashier || _loadCashierOnlineOrdersInFlight) return;
+    if (userEmail == null || !isCashier) return;
     if (!force &&
         _cashierOnlineOrdersLoadedAt != null &&
         DateTime.now().difference(_cashierOnlineOrdersLoadedAt!) < const Duration(seconds: 2)) {
       return;
+    }
+    if (_loadCashierOnlineOrdersInFlight) {
+      if (!force) return;
+      for (var i = 0; i < 60 && _loadCashierOnlineOrdersInFlight; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+      }
+      if (_loadCashierOnlineOrdersInFlight) return;
     }
     _loadCashierOnlineOrdersInFlight = true;
     try {
@@ -3896,6 +4085,27 @@ class _AuthScreenState extends State<AuthScreen> {
                           ),
                           child: const Text('LOG IN'),
                         ),
+                        if (!widget.cashierMode) ...[
+                          const SizedBox(height: 10),
+                          OutlinedButton(
+                            onPressed: busyMessage != null
+                                ? null
+                                : () async {
+                                    setState(() => busyMessage = 'Opening…');
+                                    try {
+                                      await widget.state.enterGuestCheckoutSession();
+                                      if (!mounted) return;
+                                    } finally {
+                                      if (mounted) setState(() => busyMessage = null);
+                                    }
+                                  },
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppColors.ink,
+                              side: const BorderSide(color: AppColors.ink),
+                            ),
+                            child: const Text('CONTINUE AS GUEST'),
+                          ),
+                        ],
                         const SizedBox(height: 8),
                         TextButton(
                           onPressed: busyMessage != null
@@ -4366,7 +4576,9 @@ class AppDrawer extends StatelessWidget {
     final isCustomer = state.userRole == 'customer';
     final drawerHeaderBg = isCustomer ? const Color(0xFF242424) : AppColors.brand;
     final drawerHeaderFg = isCustomer ? const Color(0xFFFFC024) : Colors.black;
-    final greet = state.profile.fullName.trim().isNotEmpty ? state.profile.fullName.trim() : (state.userEmail ?? '');
+    final greet = state.isGuestSession && state.profile.fullName.trim().isEmpty
+        ? 'Guest'
+        : (state.profile.fullName.trim().isNotEmpty ? state.profile.fullName.trim() : (state.userEmail ?? ''));
     final pendingAttentionExists = state.orders.isEmpty
         ? state.orderNosWithUnreadAttention.isNotEmpty
         : state.orders
@@ -4396,7 +4608,8 @@ class AppDrawer extends StatelessWidget {
             title: const Text('Dashboard'),
             onTap: () => open(context, CustomerDashboardScreen(state: state)),
           ),
-          ListTile(title: const Text('My Profile'), onTap: () => open(context, MyProfileScreen(state: state))),
+          if (!state.isGuestSession)
+            ListTile(title: const Text('My Profile'), onTap: () => open(context, MyProfileScreen(state: state))),
           ListTile(
             title: const Text('My Orders'),
             trailing: showAttentionDot
@@ -4640,9 +4853,11 @@ class CustomerDashboardScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final who = state.profile.fullName.trim().isNotEmpty
-        ? state.profile.fullName.trim()
-        : (state.userEmail ?? '').trim();
+    final who = state.isGuestSession && state.profile.fullName.trim().isEmpty
+        ? 'Guest'
+        : (state.profile.fullName.trim().isNotEmpty
+            ? state.profile.fullName.trim()
+            : (state.userEmail ?? '').trim());
     final items = <({String title, IconData icon, Widget screen})>[
       (title: 'Restaurant Menu', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state)),
       (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state)),
@@ -4651,6 +4866,7 @@ class CustomerDashboardScreen extends StatelessWidget {
       (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state)),
       (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state)),
     ];
+    final gridItems = state.isGuestSession ? items.where((e) => e.title != 'My Profile').toList() : items;
     return AppScaffold(
       state: state,
       title: 'DASHBOARD',
@@ -4680,13 +4896,14 @@ class CustomerDashboardScreen extends StatelessWidget {
           Expanded(
             child: RefreshIndicator(
               onRefresh: () async {
-                await Future.wait([
+                final wait = <Future<void>>[
                   state.loadMenu(force: true),
                   state.loadSetMenus(force: true),
-                  state.loadProfile(force: true),
                   state.loadOrders(force: true),
                   state.loadInquiries(force: true),
-                ]);
+                ];
+                if (!state.isGuestSession) wait.add(state.loadProfile(force: true));
+                await Future.wait(wait);
                 await state.loadNotifications(force: true);
               },
               child: GridView.builder(
@@ -4698,9 +4915,9 @@ class CustomerDashboardScreen extends StatelessWidget {
                   mainAxisSpacing: 10,
                   childAspectRatio: 1.35,
                 ),
-                itemCount: items.length,
+                itemCount: gridItems.length,
                 itemBuilder: (context, index) {
-                  final item = items[index];
+                  final item = gridItems[index];
                   return Card(
                     color: Colors.white,
                     elevation: 2,
@@ -6571,18 +6788,32 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   String? _selectedDeliveryAddress;
   String _selectedDeliveryTime = 'NOW';
   bool _deliveryAddressOptionsLoading = true;
+  final TextEditingController _guestNameCtl = TextEditingController();
+  final TextEditingController _guestContactCtl = TextEditingController();
+  final TextEditingController _guestEmailCtl = TextEditingController();
+  final TextEditingController _guestDeliveryCtl = TextEditingController();
+  double? _guestDeliveryKm;
+  bool _guestDeliveryBusy = false;
+  Timer? _guestGeoDebounce;
 
   @override
   void initState() {
     super.initState();
     noteController.text = widget.state.checkoutNote;
+    final p = widget.state.profile;
+    _guestNameCtl.text = p.fullName;
+    _guestContactCtl.text = p.contactNumber;
+    _guestEmailCtl.text = p.contactEmail;
+    _guestDeliveryCtl.text = p.deliveryAddress;
     _deliveryAddresses.clear();
     _selectedDeliveryAddress = null;
     _selectedDeliveryTime = widget.state.checkoutDeliveryTime.trim().isEmpty ? 'NOW' : widget.state.checkoutDeliveryTime.trim();
     unawaited(_loadInRangeDeliveryAddresses());
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await widget.state.loadMenu(force: true);
-      await widget.state.pullCustomerTrayDraftFromServer();
+      if (!widget.state.isGuestSession) {
+        await widget.state.pullCustomerTrayDraftFromServer();
+      }
       if (!mounted) return;
       if (widget.state.tray.isEmpty) {
         appSnack(context, 'Your tray is empty.');
@@ -6640,6 +6871,32 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     }
   }
 
+  void _debounceGuestDeliveryRange() {
+    _guestGeoDebounce?.cancel();
+    _guestGeoDebounce = Timer(const Duration(milliseconds: 450), () async {
+      final q = _guestDeliveryCtl.text.trim();
+      widget.state.updateGuestCheckoutContact(deliveryAddress: q);
+      if (q.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _guestDeliveryKm = null;
+            _guestDeliveryBusy = false;
+          });
+        }
+        await _loadInRangeDeliveryAddresses();
+        return;
+      }
+      if (mounted) setState(() => _guestDeliveryBusy = true);
+      final d = await geocodeAddressDistanceKmFromRestaurant(q);
+      if (!mounted) return;
+      setState(() {
+        _guestDeliveryBusy = false;
+        _guestDeliveryKm = d;
+      });
+      await _loadInRangeDeliveryAddresses();
+    });
+  }
+
   Future<void> _pickScheduledDelivery() async {
     final now = DateTime.now();
     final d = await showDatePicker(
@@ -6659,7 +6916,12 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 
   @override
   void dispose() {
+    _guestGeoDebounce?.cancel();
     noteController.dispose();
+    _guestNameCtl.dispose();
+    _guestContactCtl.dispose();
+    _guestEmailCtl.dispose();
+    _guestDeliveryCtl.dispose();
     super.dispose();
   }
 
@@ -6675,9 +6937,9 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
           Expanded(
             child: RefreshIndicator(
               onRefresh: () async {
-                await s.loadProfile(force: true);
+                if (!s.isGuestSession) await s.loadProfile(force: true);
                 await s.loadMenu(force: true);
-                await s.pullCustomerTrayDraftFromServer();
+                if (!s.isGuestSession) await s.pullCustomerTrayDraftFromServer();
                 if (!mounted) return;
                 setState(() => _deliveryAddressOptionsLoading = true);
                 await _loadInRangeDeliveryAddresses();
@@ -6693,8 +6955,60 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   onToggle: () => setState(() => showDelivery = !showDelivery),
                   child: Column(
                     children: [
-                      LockedField(label: 'NAME', value: s.profile.fullName),
-                      LockedField(label: 'CONTACT NUMBER', value: s.profile.contactNumber),
+                      if (s.isGuestSession) ...[
+                        TextField(
+                          controller: _guestNameCtl,
+                          decoration: const InputDecoration(labelText: 'NAME'),
+                          onChanged: (v) => s.updateGuestCheckoutContact(fullName: v),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _guestContactCtl,
+                          keyboardType: TextInputType.phone,
+                          maxLength: 11,
+                          decoration: const InputDecoration(labelText: 'CONTACT NUMBER', counterText: ''),
+                          onChanged: (v) => s.updateGuestCheckoutContact(contactNumber: v),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _guestEmailCtl,
+                          keyboardType: TextInputType.emailAddress,
+                          decoration: const InputDecoration(labelText: 'EMAIL ADDRESS'),
+                          onChanged: (v) => s.updateGuestCheckoutContact(contactEmail: v),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _guestDeliveryCtl,
+                          minLines: 2,
+                          maxLines: 4,
+                          decoration: const InputDecoration(
+                            labelText: 'DELIVERY ADDRESS',
+                            hintText: 'Within 5 km of our Taguig restaurant',
+                          ),
+                          onChanged: (_) => _debounceGuestDeliveryRange(),
+                        ),
+                        if (_guestDeliveryBusy) const Padding(
+                          padding: EdgeInsets.only(top: 6),
+                          child: LinearProgressIndicator(minHeight: 2),
+                        ),
+                        if (_guestDeliveryKm != null)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Text(
+                              _guestDeliveryKm! <= kDeliveryMaxDistanceKm
+                                  ? 'Within delivery range (~${_guestDeliveryKm!.toStringAsFixed(1)} km)'
+                                  : 'Out of range (~${_guestDeliveryKm!.toStringAsFixed(1)} km; max ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km)',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: _guestDeliveryKm! <= kDeliveryMaxDistanceKm ? Colors.green.shade800 : Colors.red.shade800,
+                              ),
+                            ),
+                          ),
+                      ] else ...[
+                        LockedField(label: 'NAME', value: s.profile.fullName),
+                        LockedField(label: 'CONTACT NUMBER', value: s.profile.contactNumber),
+                      ],
+                      if (!s.isGuestSession) ...[
                       if (_deliveryAddressOptionsLoading)
                         const Padding(
                           padding: EdgeInsets.symmetric(vertical: 16),
@@ -6730,6 +7044,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                             widget.state.updateCheckoutDraftAddress(v);
                           },
                         ),
+                      ],
                       LockedField(label: 'TIME OF DELIVERY', value: _selectedDeliveryTime),
                       const SizedBox(height: 8),
                       Wrap(
@@ -6798,7 +7113,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
             actionLabel: 'CONFIRM',
             onSecondary: () => Navigator.of(context).pop(),
             onAction: () async {
-              if (_deliveryAddressOptionsLoading) {
+              if (!s.isGuestSession && _deliveryAddressOptionsLoading) {
                 appSnack(context, 'Still checking which addresses are in range.');
                 return;
               }
@@ -6806,15 +7121,39 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 appSnack(context, 'Your tray is empty.');
                 return;
               }
-              if ((_selectedDeliveryAddress ?? '').trim().isEmpty) {
-                appSnack(context, 'Select your delivery address.');
-                return;
+              if (s.isGuestSession) {
+                s.updateGuestCheckoutContact(
+                  fullName: _guestNameCtl.text.trim(),
+                  contactNumber: _guestContactCtl.text.trim(),
+                  contactEmail: _guestEmailCtl.text.trim(),
+                  deliveryAddress: _guestDeliveryCtl.text.trim(),
+                );
+                if (s.profile.fullName.trim().isEmpty ||
+                    s.profile.contactNumber.trim().isEmpty ||
+                    s.profile.deliveryAddress.trim().isEmpty) {
+                  appSnack(context, 'Enter your name, contact number, and delivery address.');
+                  return;
+                }
+                final em = s.profile.contactEmail.trim();
+                if (em.isEmpty || !em.contains('@') || !em.contains('.')) {
+                  appSnack(context, 'Enter a valid email address.');
+                  return;
+                }
+                if (_guestDeliveryKm == null || _guestDeliveryKm! > kDeliveryMaxDistanceKm + 0.05) {
+                  appSnack(context, 'Delivery address must be within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km of the restaurant.');
+                  return;
+                }
+              } else {
+                if ((_selectedDeliveryAddress ?? '').trim().isEmpty) {
+                  appSnack(context, 'Select your delivery address.');
+                  return;
+                }
+                if (s.profile.fullName.trim().isEmpty || s.profile.contactNumber.trim().isEmpty) {
+                  appSnack(context, 'Complete your name and contact number in My Profile first.');
+                  return;
+                }
+                s.profile.deliveryAddress = _selectedDeliveryAddress!.trim();
               }
-              if (s.profile.fullName.trim().isEmpty || s.profile.contactNumber.trim().isEmpty) {
-                appSnack(context, 'Complete your name and contact number in My Profile first.');
-                return;
-              }
-              s.profile.deliveryAddress = _selectedDeliveryAddress!.trim();
               s.updateCheckoutDraftDeliveryTime(_selectedDeliveryTime);
               final okCheckout = await showDialog<bool>(
                 context: context,
@@ -6876,6 +7215,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
   bool showDelivery = true;
   XFile? uploadedFile;
   Uint8List? _localProofBytes;
+  /// Keeps first GCash proof visible after customer uploads balance proof (server field can lag on refresh).
+  String? _pinnedInitialProofB64;
 
   @override
   void initState() {
@@ -6982,6 +7323,15 @@ class _PaymentScreenState extends State<PaymentScreen> {
       await s.loadOrders(force: true);
       return;
     }
+    final ordPre = _placedOrder ?? widget.order;
+    if (ordPre != null) {
+      final st = ordPre.status.toUpperCase();
+      final ins = st.contains('INSUFFICIENT') || st.contains('PAYMENT INSUFFICIENT');
+      if (ins) {
+        final pb = ordPre.paymentProofBase64?.trim();
+        if (pb != null && pb.isNotEmpty) _pinnedInitialProofB64 ??= pb;
+      }
+    }
     final oid = (_placedOrder ?? widget.order)!.id;
     final err = await s.uploadPaymentProof(oid, file, paymentProofBase64: proofB64);
     if (!mounted) return;
@@ -6995,6 +7345,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
       localProofUploaded = true;
     });
     await s.loadOrders(force: true);
+    final syPin = _syncedOrder(s);
+    final pbp = syPin?.paymentProofBase64?.trim();
+    if (pbp != null && pbp.isNotEmpty) _pinnedInitialProofB64 ??= pbp;
     } finally {
       if (mounted) setState(() => _uploadingProof = false);
     }
@@ -7228,21 +7581,26 @@ class _PaymentScreenState extends State<PaymentScreen> {
                           ),
                           if (!insufficient) _paymentProofPreview(synced),
                           if (insufficient) ...[
-                            if (synced?.paymentProofBase64?.isNotEmpty ?? false) ...[
+                            if (((_pinnedInitialProofB64 ?? synced?.paymentProofBase64) ?? '').trim().isNotEmpty) ...[
                               const SizedBox(height: 10),
                               const Text('Original payment proof', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
                               Padding(
                                 padding: const EdgeInsets.only(top: 6),
                                 child: InkWell(
-                                  onTap: () => showProofFullScreen(
-                                    context,
-                                    Uint8List.fromList(base64Decode(synced.paymentProofBase64!)),
-                                    title: 'Original payment proof',
-                                  ),
+                                  onTap: () {
+                                    final b64 = (_pinnedInitialProofB64 ?? synced?.paymentProofBase64 ?? '').trim();
+                                    showProofFullScreen(
+                                      context,
+                                      Uint8List.fromList(base64Decode(b64)),
+                                      title: 'Original payment proof',
+                                    );
+                                  },
                                   child: ClipRRect(
                                     borderRadius: BorderRadius.circular(10),
                                     child: Image.memory(
-                                      Uint8List.fromList(base64Decode(synced!.paymentProofBase64!)),
+                                      Uint8List.fromList(
+                                        base64Decode((_pinnedInitialProofB64 ?? synced?.paymentProofBase64 ?? '').trim()),
+                                      ),
                                       height: 120,
                                       fit: BoxFit.contain,
                                     ),
@@ -7665,9 +8023,12 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
 
   late TabController _tab;
   String _search = '';
-  String _filter = 'all';
-  /// For Completed tab only: `past_30` (default) or `all`.
-  String _completedOrdersRange = 'past_30';
+  /// Tab 0 — Pending Confirmation: All, Past 30 days, Waiting for Payment Confirmation, Payment Insufficient
+  String _pendingFilterMode = 'all';
+  /// Tabs 1 and 3 — Confirmed / Cancelled: All vs Past 30 days
+  String _ordersDateRangeNonPending = 'all';
+  /// Tab 2 — Completed: All vs Past 30 days
+  String _completedOrdersRange = 'all';
 
   @override
   void initState() {
@@ -7735,17 +8096,31 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
           statusReadable(o.status).toLowerCase().contains(query) ||
           fulfillmentStageReadable(o.fulfillmentStage).toLowerCase().contains(query);
     }).where((o) {
-      if (tabIndex == 2 && _completedOrdersRange == 'past_30' && !isWithinPast30Days(o.createdAt)) {
-        return false;
+      if (tabIndex == 0) {
+        switch (_pendingFilterMode) {
+          case 'past_30':
+            if (!isWithinPast30Days(o.createdAt)) return false;
+            break;
+          case 'wait_payment_confirm':
+            final u = o.status.toUpperCase();
+            if (!(u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+                u.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION') ||
+                u.contains('WAITING FOR ORDER CONFIRMATION') ||
+                u.contains('WAITING FOR ORDER'))) {
+              return false;
+            }
+            break;
+          case 'payment_insufficient':
+            final u = o.status.toUpperCase();
+            if (!u.contains('INSUFFICIENT') && !u.contains('PAYMENT INSUFFICIENT')) return false;
+            break;
+        }
+      } else if (tabIndex == 1 || tabIndex == 3) {
+        if (_ordersDateRangeNonPending == 'past_30' && !isWithinPast30Days(o.createdAt)) return false;
+      } else if (tabIndex == 2) {
+        if (_completedOrdersRange == 'past_30' && !isWithinPast30Days(o.createdAt)) return false;
       }
-      switch (_filter) {
-        case 'attention':
-          return _needsAttention(o) || _isInsufficient(o);
-        case 'payment_uploaded':
-          return o.paymentUploaded || (o.paymentProofBase64?.trim().isNotEmpty ?? false);
-        default:
-          return true;
-      }
+      return true;
     }).toList();
     return RefreshIndicator(
       onRefresh: () async {
@@ -7815,7 +8190,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                   height: 1.2,
                                 ),
                               ),
-                              if (o.loyaltyPointsEarned > 0 && (tabIndex == 1 || tabIndex == 2))
+                              if (o.loyaltyPointsEarned > 0 && (tabIndex == 1 || tabIndex == 2) && !widget.state.isGuestSession)
                                 Text('Loyalty: +${o.loyaltyPointsEarned} pts', style: const TextStyle(fontSize: 12)),
                               Text(formatDateTimeLocal(o.createdAt), style: const TextStyle(fontSize: 12)),
                               const SizedBox(height: 4),
@@ -7823,6 +8198,34 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                 '₱${o.total.toStringAsFixed(2)}',
                                 style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5),
                               ),
+                              if (tabIndex == 1 &&
+                                  o.fulfillmentStage.toUpperCase() == 'OUT_FOR_DELIVERY' &&
+                                  o.deliveryTrackingUrl.trim().isNotEmpty) ...[
+                                const SizedBox(height: 6),
+                                Builder(
+                                  builder: (ctx) {
+                                    final u = Uri.tryParse(o.deliveryTrackingUrl.trim());
+                                    final ok = u != null && u.hasScheme && (u.scheme == 'http' || u.scheme == 'https');
+                                    if (ok) {
+                                      return InkWell(
+                                        onTap: () => launchUrl(u, mode: LaunchMode.externalApplication),
+                                        child: Text(
+                                          'Tracking: ${o.deliveryTrackingUrl.trim()}',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: Colors.blue.shade800,
+                                            decoration: TextDecoration.underline,
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                    return SelectableText(
+                                      'Tracking: ${o.deliveryTrackingUrl.trim()}',
+                                      style: const TextStyle(fontSize: 12, height: 1.3),
+                                    );
+                                  },
+                                ),
+                              ],
                             ],
                           ),
                     isThreeLine: false,
@@ -8065,12 +8468,105 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                       ),
                     ),
                     const SizedBox(width: 8),
+                    if (_tab.index == 0)
+                      PopupMenuButton<String>(
+                        tooltip: 'Pending filters',
+                        icon: Icon(Icons.filter_list, color: _pendingFilterMode == 'all' ? null : AppColors.accent),
+                        onSelected: (v) => setState(() => _pendingFilterMode = v),
+                        itemBuilder: (ctx) => [
+                          PopupMenuItem<String>(
+                            value: 'all',
+                            child: Row(
+                              children: [
+                                if (_pendingFilterMode == 'all')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_pendingFilterMode == 'all') const SizedBox(width: 4),
+                                const Text('All'),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem<String>(
+                            value: 'past_30',
+                            child: Row(
+                              children: [
+                                if (_pendingFilterMode == 'past_30')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_pendingFilterMode == 'past_30') const SizedBox(width: 4),
+                                const Text('Past 30 days'),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem<String>(
+                            value: 'wait_payment_confirm',
+                            child: Row(
+                              children: [
+                                if (_pendingFilterMode == 'wait_payment_confirm')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_pendingFilterMode == 'wait_payment_confirm') const SizedBox(width: 4),
+                                const Text('Waiting for Payment Confirmation'),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem<String>(
+                            value: 'payment_insufficient',
+                            child: Row(
+                              children: [
+                                if (_pendingFilterMode == 'payment_insufficient')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_pendingFilterMode == 'payment_insufficient') const SizedBox(width: 4),
+                                const Text('Payment Insufficient'),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    if (_tab.index == 1 || _tab.index == 3)
+                      PopupMenuButton<String>(
+                        tooltip: 'Date range',
+                        icon: Icon(Icons.date_range, color: _ordersDateRangeNonPending == 'past_30' ? AppColors.accent : null),
+                        onSelected: (v) => setState(() => _ordersDateRangeNonPending = v),
+                        itemBuilder: (ctx) => [
+                          PopupMenuItem<String>(
+                            value: 'all',
+                            child: Row(
+                              children: [
+                                if (_ordersDateRangeNonPending == 'all')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_ordersDateRangeNonPending == 'all') const SizedBox(width: 4),
+                                const Text('All'),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem<String>(
+                            value: 'past_30',
+                            child: Row(
+                              children: [
+                                if (_ordersDateRangeNonPending == 'past_30')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_ordersDateRangeNonPending == 'past_30') const SizedBox(width: 4),
+                                const Text('Past 30 days'),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     if (_tab.index == 2)
                       PopupMenuButton<String>(
                         tooltip: 'Completed orders date range',
                         icon: Icon(Icons.date_range, color: _completedOrdersRange == 'past_30' ? AppColors.accent : null),
                         onSelected: (v) => setState(() => _completedOrdersRange = v),
                         itemBuilder: (ctx) => [
+                          PopupMenuItem<String>(
+                            value: 'all',
+                            child: Row(
+                              children: [
+                                if (_completedOrdersRange == 'all')
+                                  Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                                if (_completedOrdersRange == 'all') const SizedBox(width: 4),
+                                const Text('All'),
+                              ],
+                            ),
+                          ),
                           PopupMenuItem<String>(
                             value: 'past_30',
                             child: Row(
@@ -8084,45 +8580,6 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                           ),
                         ],
                       ),
-                    PopupMenuButton<String>(
-                      tooltip: 'Filters',
-                      icon: Icon(Icons.filter_list, color: _filter == 'all' ? null : AppColors.accent),
-                      onSelected: (v) => setState(() => _filter = v),
-                      itemBuilder: (ctx) => [
-                        PopupMenuItem<String>(
-                          value: 'all',
-                          child: Row(
-                            children: [
-                              if (_filter == 'all') Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
-                              if (_filter == 'all') const SizedBox(width: 4),
-                              const Text('All'),
-                            ],
-                          ),
-                        ),
-                        PopupMenuItem<String>(
-                          value: 'attention',
-                          child: Row(
-                            children: [
-                              if (_filter == 'attention')
-                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
-                              if (_filter == 'attention') const SizedBox(width: 4),
-                              const Text('Needs attention'),
-                            ],
-                          ),
-                        ),
-                        PopupMenuItem<String>(
-                          value: 'payment_uploaded',
-                          child: Row(
-                            children: [
-                              if (_filter == 'payment_uploaded')
-                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
-                              if (_filter == 'payment_uploaded') const SizedBox(width: 4),
-                              const Text('With payment proof'),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
                   ],
                 ),
               ),
@@ -8297,7 +8754,10 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
       unawaited(_resolveAndEvaluateDeliveryRangeFromAddress(addressController.text.trim()));
     }
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await widget.state.loadProfile(force: true);
+      if (!widget.state.isGuestSession) {
+        await widget.state.loadProfile(force: true);
+      }
+      await widget.state.loadInquiries(force: true);
       if (!mounted) return;
       setState(_applyProfileToControllers);
       if ((mapLat == null || mapLng == null) && addressController.text.trim().isNotEmpty) {
@@ -8587,6 +9047,13 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                           padding: const EdgeInsets.only(top: 4),
                           child: Text(
                             'Points earned from completed catering & events: ${cateringCompletedLoyaltyEarnedFromHistory(widget.state.loyaltyHistory)} pts',
+                            style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'Completed catering inquiries (My Catering Inquiries): ${cateringCompletedLoyaltyFromInquiries(widget.state.inquiries)} pts',
                             style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
                           ),
                         ),
@@ -9069,7 +9536,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
     final p = widget.state.profile;
     contactPerson.text = p.fullName;
     contactNumber.text = p.contactNumber;
-    inquiryEmail.text = widget.state.userEmail ?? '';
+    inquiryEmail.text = p.contactEmail.trim().isNotEmpty
+        ? p.contactEmail.trim()
+        : (widget.state.isGuestSession ? '' : (widget.state.userEmail ?? ''));
     eventCity.addListener(_onVenueChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleConflictRefresh());
   }
@@ -11650,10 +12119,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   String menuSuggestionNote = '';
   String themeSuggestionNote = '';
   final eventTitle = TextEditingController();
+  final customerName = TextEditingController();
   final eventTypeOther = TextEditingController();
   String eventTypeChoice = 'Birthday';
   final contactPerson = TextEditingController();
   final contactNumber = TextEditingController();
+  bool _customerSameAsContact = false;
   final inquiryEmail = TextEditingController();
   final List<_InquiryEventWindow> _eventWindows = [_InquiryEventWindow()];
   final eventCity = TextEditingController();
@@ -11681,27 +12152,55 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   bool _forProcessingWindowsLoading = false;
   bool _forProcessingWindowsLoaded = false;
 
+  void _syncCustomerFromContactIfChecked() {
+    if (!_customerSameAsContact) return;
+    customerName.text = contactPerson.text;
+  }
+
+  void _resetNewEventFormKeepContactOnly() {
+    inquiryType = 'CATERING';
+    curateOwn = false;
+    selectedSetMenu = 'All Dishes';
+    selectedDishes.clear();
+    guestCount.clear();
+    paxBuffer.clear();
+    menuSuggestionNote = '';
+    themeSuggestionNote = '';
+    eventTitle.clear();
+    eventTypeOther.clear();
+    eventTypeChoice = 'Birthday';
+    customerName.clear();
+    _customerSameAsContact = false;
+    inquiryEmail.clear();
+    eventCity.clear();
+    note.clear();
+    eventSetting = 'open';
+    serviceIncluded = 'no';
+    formalityLevel = 'casual';
+    foodTastingRequested = false;
+    foodTastingDate.clear();
+    foodTastingTime.clear();
+    laborMaleController.text = '0';
+    laborFemaleController.text = '0';
+    laborManualLabelController.clear();
+    laborManualAmountController.clear();
+    travelCostController.text = '0';
+    themeCostController.text = '0';
+    additionalCostLabelController.clear();
+    additionalCostAmountController.clear();
+    menuSearchController.clear();
+    laborManualCosts.clear();
+    additionalCosts.clear();
+    _eventWindows
+      ..clear()
+      ..add(_InquiryEventWindow());
+  }
+
   @override
   void initState() {
     super.initState();
-    _restoreLocalDraft();
-    for (final c in [
-      guestCount,
-      paxBuffer,
-      eventTitle,
-      eventTypeOther,
-      contactPerson,
-      contactNumber,
-      inquiryEmail,
-      eventCity,
-      note,
-      foodTastingDate,
-      foodTastingTime,
-      themeCostController,
-      menuSearchController,
-    ]) {
-      c.addListener(_saveLocalDraftDebounced);
-    }
+    _resetNewEventFormKeepContactOnly();
+    contactPerson.addListener(_syncCustomerFromContactIfChecked);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _loadForProcessingWindowsIfNeeded();
@@ -11715,7 +12214,9 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     paxBuffer.dispose();
     _venueDebounce?.cancel();
     eventCity.removeListener(_onVenueChanged);
+    contactPerson.removeListener(_syncCustomerFromContactIfChecked);
     eventTitle.dispose();
+    customerName.dispose();
     eventTypeOther.dispose();
     contactPerson.dispose();
     contactNumber.dispose();
@@ -11733,74 +12234,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     additionalCostLabelController.dispose();
     additionalCostAmountController.dispose();
     menuSearchController.dispose();
-    _saveLocalDraftNow();
     super.dispose();
-  }
-
-  Timer? _localDraftDebounce;
-  void _saveLocalDraftDebounced() {
-    _localDraftDebounce?.cancel();
-    _localDraftDebounce = Timer(const Duration(milliseconds: 300), _saveLocalDraftNow);
-  }
-
-  Future<void> _saveLocalDraftNow() async {
-    try {
-      final p = await SharedPreferences.getInstance();
-      final payload = <String, dynamic>{
-        'inquiryType': inquiryType,
-        'eventTitle': eventTitle.text.trim(),
-        'eventTypeChoice': eventTypeChoice,
-        'eventTypeOther': eventTypeOther.text.trim(),
-        'contactPerson': contactPerson.text.trim(),
-        'contactNumber': contactNumber.text.trim(),
-        'inquiryEmail': inquiryEmail.text.trim(),
-        'eventCity': eventCity.text.trim(),
-        'note': note.text.trim(),
-        'guestCount': guestCount.text.trim(),
-        'paxBuffer': paxBuffer.text.trim(),
-        'eventSetting': eventSetting,
-        'serviceIncluded': serviceIncluded,
-        'formalityLevel': formalityLevel,
-        'foodTastingRequested': foodTastingRequested,
-        'foodTastingDate': foodTastingDate.text.trim(),
-        'foodTastingTime': foodTastingTime.text.trim(),
-        'selectedDishes': selectedDishes.toList(),
-      };
-      await p.setString(_managerNewEventDraftKey, jsonEncode(payload));
-    } catch (_) {}
-  }
-
-  Future<void> _restoreLocalDraft() async {
-    try {
-      final p = await SharedPreferences.getInstance();
-      final raw = p.getString(_managerNewEventDraftKey);
-      if (raw == null || raw.trim().isEmpty) return;
-      final m = jsonDecode(raw);
-      if (m is! Map) return;
-      inquiryType = '${m['inquiryType'] ?? inquiryType}';
-      eventTitle.text = '${m['eventTitle'] ?? ''}';
-      eventTypeChoice = '${m['eventTypeChoice'] ?? eventTypeChoice}';
-      eventTypeOther.text = '${m['eventTypeOther'] ?? ''}';
-      contactPerson.text = '${m['contactPerson'] ?? ''}';
-      contactNumber.text = '${m['contactNumber'] ?? ''}';
-      inquiryEmail.text = '${m['inquiryEmail'] ?? ''}';
-      eventCity.text = '${m['eventCity'] ?? ''}';
-      note.text = '${m['note'] ?? ''}';
-      guestCount.text = '${m['guestCount'] ?? ''}';
-      paxBuffer.text = '${m['paxBuffer'] ?? ''}';
-      eventSetting = '${m['eventSetting'] ?? eventSetting}';
-      serviceIncluded = '${m['serviceIncluded'] ?? serviceIncluded}';
-      formalityLevel = '${m['formalityLevel'] ?? formalityLevel}';
-      foodTastingRequested = m['foodTastingRequested'] == true;
-      foodTastingDate.text = '${m['foodTastingDate'] ?? ''}';
-      foodTastingTime.text = '${m['foodTastingTime'] ?? ''}';
-      final dishes = m['selectedDishes'];
-      if (dishes is List) {
-        selectedDishes
-          ..clear()
-          ..addAll(dishes.map((e) => '$e'));
-      }
-    } catch (_) {}
   }
 
   int _minPaxForCurrentInquiry() =>
@@ -12033,6 +12467,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   }
 
   String? _validateManagerNewEvent() {
+    if (customerName.text.trim().isEmpty) return 'Enter customer name.';
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
     final phone = contactNumber.text.trim();
     if (phone.isEmpty) return 'Enter contact number.';
@@ -12234,7 +12669,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         orderKind: orderKind,
         eventTitle: inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : '',
         eventType: (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
-        customerName: contactPerson.text.trim(),
+        customerName: customerName.text.trim(),
         contactPerson: contactPerson.text.trim(),
         contactNumber: contactNumber.text.trim(),
         emailAddress: inquiryEmail.text.trim(),
@@ -12285,7 +12720,6 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final additionalCostTotal = _sumCostRows(additionalCosts);
       final total = _estimatedCost();
       final downPaymentDue = total * 0.5;
-      final totalDueNow = total - downPaymentDue;
       final settingLabel = eventSetting == 'closed' ? 'Closed space' : 'Open space';
       final cateringType = inquiryType == 'CATERING' ? 'Catering' : 'Catering and Event';
 
@@ -12317,17 +12751,17 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       doc.addPage(
         pw.MultiPage(
           build: (ctx) => [
-            pw.Text('Order Summary', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            pw.Text('Order Summary before Down Payment', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
             pw.Text('Macrina\'s Kitchen and Catering', style: pw.TextStyle(fontSize: 10, color: pdf.PdfColors.grey700)),
             pw.SizedBox(height: 12),
             labelValueRow('Transaction No.', '—'),
             labelValueRow('Date/Time processed', formatDateTimeLocal(DateTime.now())),
             labelValueRow(
               'Event',
-              inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : contactPerson.text.trim(),
+              inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : customerName.text.trim(),
             ),
             labelValueRow('Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen),
-            labelValueRow('Customer', contactPerson.text.trim()),
+            labelValueRow('Customer', customerName.text.trim()),
             labelValueRow('Contact person', contactPerson.text.trim()),
             labelValueRow('Contact number', contactNumber.text.trim()),
             labelValueRow('Email address', inquiryEmail.text.trim()),
@@ -12360,8 +12794,8 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             ),
             labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
             labelValueRow('Total invoice', 'PHP ${total.toStringAsFixed(2)}'),
-            labelValueRow('Down payment (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
-            labelValueRow('Total amount due (after down payment)', 'PHP ${totalDueNow.toStringAsFixed(2)}'),
+            labelValueRow('Total Cost', 'PHP ${total.toStringAsFixed(2)}'),
+            labelValueRow('Down payment due', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
             labelValueRow('Note', note.text.trim().isEmpty ? '—' : note.text.trim()),
           ],
         ),
@@ -12453,6 +12887,30 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: customerName,
+                decoration: const InputDecoration(
+                  labelText: 'Customer',
+                  helperText: 'Required',
+                ),
+              ),
+              const SizedBox(height: 2),
+              CheckboxListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: _customerSameAsContact,
+                onChanged: (v) {
+                  setState(() {
+                    _customerSameAsContact = v ?? false;
+                    if (_customerSameAsContact) {
+                      customerName.text = contactPerson.text;
+                    }
+                  });
+                },
+                title: const Text('Same as contact person'),
+                controlAffinity: ListTileControlAffinity.leading,
               ),
               const SizedBox(height: 8),
               TextField(controller: eventTitle, decoration: const InputDecoration(labelText: 'Event title')),
@@ -13143,10 +13601,10 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                           : '';
                       final loyaltyLine = () {
                         if (r.cateringLoyaltyPointsEarned > 0) {
-                          return 'Catering loyalty: +${r.cateringLoyaltyPointsEarned} pts';
+                          return 'Catering loyalty: +${r.cateringLoyaltyPointsEarned} pts (this order)';
                         }
-                        if ((stLower == 'for_processing' || stLower == 'for_post_analysis') &&
-                            r.cateringLoyaltyEligiblePointsIfCompleted > 0) {
+                        if (r.cateringLoyaltyEligiblePointsIfCompleted > 0 &&
+                            r.status.trim().toLowerCase() != 'completed') {
                           return 'Catering loyalty if completed at this total: +${r.cateringLoyaltyEligiblePointsIfCompleted} pts';
                         }
                         return '';
@@ -13329,7 +13787,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   static const String _managerDraftDetailKeyPrefix = 'manager_draft_detail_unsaved_v1_';
   CateringEventRecord? _loadedDetailRow;
   bool _detailReady = false;
-  Timer? _localDraftDebounce;
 
   CateringEventRecord get d => _loadedDetailRow ?? widget.row;
 
@@ -13357,8 +13814,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   final menuSearchController = TextEditingController();
   final managerEventTypeOtherController = TextEditingController();
   final managerDraftEventTitleController = TextEditingController();
+  final managerCustomerNameController = TextEditingController();
+  final managerContactPersonController = TextEditingController();
+  final managerContactNumberController = TextEditingController();
+  final managerEmailController = TextEditingController();
+  final managerAddressController = TextEditingController();
   final managerGuestCountController = TextEditingController();
   final managerInquiryNoteController = TextEditingController();
+  bool _managerCustomerSameAsContact = false;
+  bool _managerHeaderShowTrx = false;
   String managerEventTypeChoice = 'Birthday';
   String managerServiceIncluded = 'no';
   String managerFormalityLevel = 'casual';
@@ -13385,6 +13849,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   final List<Map<String, dynamic>> _orderSummaryPdf1AdditionalCosts = [];
   /// Fingerprint of editable fields for back-navigation prompts.
   String _pristineManagerDetailSig = '';
+  /// After a confirmed draft [saveCurrentStage], matches [_computeManagerDetailSignature] until the form changes.
+  String _managerDraftAdvanceGateSig = '';
   final List<Map<String, dynamic>> checklistRows = [];
   final List<Map<String, dynamic>> checklistRowsOriginal = [];
   final List<Map<String, dynamic>> taskRows = [];
@@ -13560,7 +14026,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     setState(() {
       _eventWindows[idx].date = picked;
     });
-    _saveLocalDraftDebounced();
   }
 
   Future<void> _pickWindowFromTime(int idx) async {
@@ -13571,7 +14036,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     setState(() {
       _eventWindows[idx].from = picked;
     });
-    _saveLocalDraftDebounced();
   }
 
   Future<void> _pickWindowToTime(int idx) async {
@@ -13582,14 +14046,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     setState(() {
       _eventWindows[idx].to = picked;
     });
-    _saveLocalDraftDebounced();
   }
 
   void _addAnotherWindow() {
     setState(() {
       _eventWindows.add(_InquiryEventWindow());
     });
-    _saveLocalDraftDebounced();
   }
 
   void _removeWindowAt(int idx) {
@@ -13600,7 +14062,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         _eventWindows.removeAt(idx);
       }
     });
-    _saveLocalDraftDebounced();
   }
 
   List<Widget> _buildLabeledScheduleRows(List<dynamic> scheduleSlots) {
@@ -13682,6 +14143,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   Future<Uint8List> _buildOrderSummaryPdfBytes({
     required List<Map<String, dynamic>> additionalCostsForPdf,
     bool postAnalysis2Only = false,
+    _ManagerOrderSummaryPdfVariant variant = _ManagerOrderSummaryPdfVariant.beforeDownPayment,
   }) async {
     final doc = pw.Document();
     final labelBg = pdf.PdfColor.fromInt(0xFFCFCFCF);
@@ -13689,7 +14151,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final additionalCostTotal = _sumCostRows(additionalCostsForPdf);
     final processingAt = formatDateTimeLocal(d.stageEnteredAt ?? d.updatedAt);
     final eventWhen = _eventDateTimeJoinedFromRowScheduleSlots(d.scheduleSlots);
-    final settingLabel = managerEventSetting == 'closed' ? 'Closed space' : 'Open space';
 
     pw.Widget labelValueRow(String k, String v) => pw.Padding(
           padding: const pw.EdgeInsets.only(bottom: 5),
@@ -13717,9 +14178,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         );
 
     if (postAnalysis2Only) {
+      final addlPaid = d.postAnalysis['additional_costs_payment_confirmed'] == true;
       final addRows = <pw.Widget>[
         labelValueRow('Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen),
-        labelValueRow('Event setting', settingLabel),
         labelValueRow(
           'Additional costs',
           additionalCostsForPdf.isEmpty
@@ -13730,11 +14191,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   .join(' · '),
         ),
         labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+        labelValueRow(
+          'Total Cost',
+          'PHP ${(_baseFoodCost() + _laborCostComputed() + _travelCostComputed() + themeCost + additionalCostTotal).toStringAsFixed(2)}',
+        ),
       ];
       doc.addPage(
         pw.MultiPage(
           build: (ctx) => [
-            pw.Text('Order Summary', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            pw.Text(
+              'Order Summary | Additional Costs',
+              style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
+            ),
             pw.Text('Macrina\'s Kitchen and Catering', style: pw.TextStyle(fontSize: 10, color: pdf.PdfColors.grey700)),
             pw.SizedBox(height: 12),
             pw.Text('Event information', style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold)),
@@ -13745,6 +14213,17 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             labelValueRow('Contact person', d.contactPerson),
             labelValueRow('Address', d.address),
             ...addRows,
+            if (addlPaid) ...[
+              pw.SizedBox(height: 10),
+              pw.Text(
+                'PAID',
+                style: pw.TextStyle(
+                  fontSize: 14,
+                  fontWeight: pw.FontWeight.bold,
+                  color: pdf.PdfColors.green,
+                ),
+              ),
+            ],
           ],
         ),
       );
@@ -13757,13 +14236,64 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final noPaxAmount = d.guestCount * kPesosPerPax;
     final downPaymentDue = totalComputed * 0.5;
     final totalDueNow = totalComputed - downPaymentDue;
+    final downPaidStored = d.downPaymentAmount > 0 ? d.downPaymentAmount : (double.tryParse(downPaymentPaidController.text.trim()) ?? 0);
+    final downPaidLine = downPaidStored > 0 ? downPaidStored : downPaymentDue;
+    final balanceStillDue = (totalComputed - downPaidLine).clamp(0.0, double.infinity);
+    final balancePaidLine = d.fullPaymentAmount > 0 ? d.fullPaymentAmount : balanceStillDue;
     final menuLines = _menuDishNamesFromRowMenu();
     final cateringType = d.orderKind == 'catering' ? 'Catering' : 'Catering and Event';
+
+    String pdfTitle() {
+      switch (variant) {
+        case _ManagerOrderSummaryPdfVariant.beforeDownPayment:
+          return 'Order Summary before Down Payment';
+        case _ManagerOrderSummaryPdfVariant.afterDownPayment:
+          return 'Order Summary after Down Payment';
+        case _ManagerOrderSummaryPdfVariant.additionalCostsSheet:
+          return 'Order Summary | Additional Costs';
+        case _ManagerOrderSummaryPdfVariant.fullyPaid:
+          return 'Order Summary Fully Paid';
+      }
+    }
+
+    final tailRows = <pw.Widget>[];
+    switch (variant) {
+      case _ManagerOrderSummaryPdfVariant.beforeDownPayment:
+        tailRows.addAll([
+          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Down payment due', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
+        ]);
+        break;
+      case _ManagerOrderSummaryPdfVariant.afterDownPayment:
+        tailRows.addAll([
+          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Down payment paid', 'PHP ${downPaidLine.toStringAsFixed(2)}'),
+          labelValueRow('Total amount due', 'PHP ${balanceStillDue.toStringAsFixed(2)}'),
+        ]);
+        break;
+      case _ManagerOrderSummaryPdfVariant.additionalCostsSheet:
+        tailRows.addAll([
+          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Down payment due', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
+          labelValueRow('Total amount due (after down payment)', 'PHP ${totalDueNow.toStringAsFixed(2)}'),
+        ]);
+        break;
+      case _ManagerOrderSummaryPdfVariant.fullyPaid:
+        tailRows.addAll([
+          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Down payment paid', 'PHP ${downPaidLine.toStringAsFixed(2)}'),
+          labelValueRow('Balance amount paid', 'PHP ${balancePaidLine.toStringAsFixed(2)}'),
+        ]);
+        break;
+    }
 
     doc.addPage(
       pw.MultiPage(
         build: (ctx) => [
-          pw.Text('Order Summary', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+          pw.Text(pdfTitle(), style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
           pw.Text('Macrina\'s Kitchen and Catering', style: pw.TextStyle(fontSize: 10, color: pdf.PdfColors.grey700)),
           pw.SizedBox(height: 12),
           labelValueRow('Transaction No.', d.transactionNo.isEmpty ? '—' : d.transactionNo),
@@ -13792,9 +14322,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     .join(' · '),
           ),
           labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
-          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
-          labelValueRow('Down payment (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
-          labelValueRow('Total amount due (after down payment)', 'PHP ${totalDueNow.toStringAsFixed(2)}'),
+          ...tailRows,
+          if (variant == _ManagerOrderSummaryPdfVariant.fullyPaid) ...[
+            pw.SizedBox(height: 10),
+            pw.Text(
+              'PAID',
+              style: pw.TextStyle(
+                fontSize: 14,
+                fontWeight: pw.FontWeight.bold,
+                color: pdf.PdfColors.green,
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -13807,17 +14346,37 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   Future<void> _sendOrderSummaryPdfToCustomer() async {
-    final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: additionalCosts);
-    final d = _loadedDetailRow ?? widget.row;
-    final to = d.emailAddress.trim().toLowerCase();
+    final r = _loadedDetailRow ?? widget.row;
+    final isProcessing = widget.stage == 'for_processing';
+    final sub = r.processingSubstageLabel.trim().toLowerCase();
+    final isOngoingSubstage = isProcessing && sub == 'ongoing';
+    final isDownPaymentSubstage = isProcessing && sub == 'down_payment';
+    final isPost = widget.stage == 'for_post_analysis';
+    final isCompleted = widget.stage == 'completed';
+    final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+    final isOnlineInquiry = widget.stage == 'online_inquiries';
+    final totalComputed = _grandTotalComputed();
+    final isFullPaymentConfirmed = cateringFullPaymentConfirmed(r, totalComputed);
+    final pdfVariant = isCompleted || isFullPaymentConfirmed
+        ? _ManagerOrderSummaryPdfVariant.fullyPaid
+        : (isOngoingSubstage || isPost)
+            ? _ManagerOrderSummaryPdfVariant.afterDownPayment
+            : (isDownPaymentSubstage || isDraftStage || isOnlineInquiry)
+                ? _ManagerOrderSummaryPdfVariant.beforeDownPayment
+                : _ManagerOrderSummaryPdfVariant.afterDownPayment;
+    final bytes = await _buildOrderSummaryPdfBytes(
+      additionalCostsForPdf: additionalCosts,
+      variant: pdfVariant,
+    );
+    final to = r.emailAddress.trim().toLowerCase();
     if (!to.contains('@')) {
       appSnack(context, 'Customer email is missing or invalid.');
       return;
     }
     final b64 = base64Encode(bytes);
     final err = await widget.state.managerSendOrderSummaryEmail(
-      orderKind: d.orderKind,
-      id: d.id,
+      orderKind: r.orderKind,
+      id: r.id,
       customerEmail: to,
       pdfBase64: b64,
     );
@@ -13835,7 +14394,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     final snapshot = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
     final sig = _additionalCostsSignature(snapshot);
-    final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: snapshot);
+    final bytes = await _buildOrderSummaryPdfBytes(
+      additionalCostsForPdf: snapshot,
+      variant: _ManagerOrderSummaryPdfVariant.afterDownPayment,
+    );
     if (!mounted) return;
     setState(() {
       _orderSummaryPdf1AdditionalCosts
@@ -13898,84 +14460,34 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
   }
 
+  void _maybeCopyContactToCustomerForCheckbox() {
+    if (!_managerCustomerSameAsContact) return;
+    managerCustomerNameController.text = managerContactPersonController.text;
+  }
+
   @override
   void initState() {
     super.initState();
+    managerContactPersonController.addListener(_maybeCopyContactToCustomerForCheckbox);
     for (final c in [
       managerDraftEventTitleController,
+      managerCustomerNameController,
+      managerContactPersonController,
+      managerContactNumberController,
+      managerEmailController,
+      managerAddressController,
       managerEventTypeOtherController,
       managerGuestCountController,
       managerInquiryNoteController,
     ]) {
-      c.addListener(_saveLocalDraftDebounced);
+      c.addListener(() {
+        if (mounted) setState(() {});
+      });
     }
     Future.microtask(_bootstrapDetail);
   }
 
   String get _localDraftKey => '$_managerDraftDetailKeyPrefix${widget.row.id}_${widget.stage}';
-
-  void _saveLocalDraftDebounced() {
-    _localDraftDebounce?.cancel();
-    _localDraftDebounce = Timer(const Duration(milliseconds: 350), _saveLocalDraftNow);
-  }
-
-  Future<void> _saveLocalDraftNow() async {
-    final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
-    if (!isDraftStage || !_detailReady) return;
-    try {
-      final p = await SharedPreferences.getInstance();
-      await p.setString(
-        _localDraftKey,
-        jsonEncode({
-          'draft_order_kind': _draftOrderKind,
-          'event_title': managerDraftEventTitleController.text.trim(),
-          'event_type_choice': managerEventTypeChoice,
-          'event_type_other': managerEventTypeOtherController.text.trim(),
-          'guest_count': managerGuestCountController.text.trim(),
-          'inquiry_note': managerInquiryNoteController.text.trim(),
-          'event_setting': managerEventSetting,
-          'service_included': managerServiceIncluded,
-          'formality_level': managerFormalityLevel,
-          'selected_dishes': selectedDishes.toList(),
-          'schedule_slots': _scheduleSlotsPayload(),
-        }),
-      );
-    } catch (_) {}
-  }
-
-  Future<void> _restoreLocalDraftIfAny() async {
-    final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
-    if (!isDraftStage) return;
-    try {
-      final p = await SharedPreferences.getInstance();
-      final raw = p.getString(_localDraftKey);
-      if (raw == null || raw.trim().isEmpty) return;
-      final m = jsonDecode(raw);
-      if (m is! Map) return;
-      _draftOrderKind = '${m['draft_order_kind'] ?? _draftOrderKind}';
-      managerDraftEventTitleController.text = '${m['event_title'] ?? managerDraftEventTitleController.text}';
-      managerEventTypeChoice = '${m['event_type_choice'] ?? managerEventTypeChoice}';
-      managerEventTypeOtherController.text = '${m['event_type_other'] ?? managerEventTypeOtherController.text}';
-      managerGuestCountController.text = '${m['guest_count'] ?? managerGuestCountController.text}';
-      managerInquiryNoteController.text = '${m['inquiry_note'] ?? managerInquiryNoteController.text}';
-      managerEventSetting = '${m['event_setting'] ?? managerEventSetting}';
-      managerServiceIncluded = '${m['service_included'] ?? managerServiceIncluded}';
-      managerFormalityLevel = '${m['formality_level'] ?? managerFormalityLevel}';
-      final dishes = m['selected_dishes'];
-      if (dishes is List) {
-        selectedDishes
-          ..clear()
-          ..addAll(dishes.map((e) => '$e'));
-      }
-      final slots = m['schedule_slots'];
-      if (slots is List) {
-        _eventWindows
-          ..clear()
-          ..addAll(_windowsFromScheduleSlots(slots));
-        if (_eventWindows.isEmpty) _eventWindows.add(_InquiryEventWindow());
-      }
-    } catch (_) {}
-  }
 
   Future<void> _bootstrapDetail() async {
     final full = await widget.state.loadManagerCateringItem(
@@ -13985,7 +14497,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     if (!mounted) return;
     _loadedDetailRow = full ?? widget.row;
     _initControllersFromRow(_loadedDetailRow!);
-    await _restoreLocalDraftIfAny();
     setState(() => _detailReady = true);
   }
 
@@ -14024,6 +14535,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
     managerDraftEventTitleController.text =
         row.eventTitle.trim().isNotEmpty ? row.eventTitle.trim() : '${tdInit['event_title'] ?? ''}'.trim();
+    managerCustomerNameController.text = row.customerName.trim();
+    managerContactPersonController.text = row.contactPerson.trim();
+    managerContactNumberController.text = row.contactNumber.trim();
+    managerEmailController.text = row.emailAddress.trim();
+    managerAddressController.text = row.address.trim();
+    _managerCustomerSameAsContact = false;
     managerGuestCountController.text = '${row.guestCount <= 0 ? '' : row.guestCount}';
     managerInquiryNoteController.text = '${tdInit['note'] ?? ''}';
     managerEventSetting = '${tdInit['event_setting'] ?? 'open'}'.trim().isEmpty ? 'open' : tdInit['event_setting'].toString().trim();
@@ -14167,6 +14684,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
     _refreshDueAndDefaults();
     _pristineManagerDetailSig = _computeManagerDetailSignature();
+    _managerDraftAdvanceGateSig = '';
   }
 
   String _computeManagerDetailSignature() {
@@ -14202,6 +14720,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       'event_type_choice': managerEventTypeChoice,
       'event_type_other': managerEventTypeOtherController.text,
       'draft_title': managerDraftEventTitleController.text,
+      'customer_name': managerCustomerNameController.text,
+      'contact_person': managerContactPersonController.text,
+      'contact_number': managerContactNumberController.text,
+      'email': managerEmailController.text,
+      'address': managerAddressController.text,
       'guests': managerGuestCountController.text,
       'inquiry_note': managerInquiryNoteController.text,
       'draft_kind': _draftOrderKind,
@@ -14256,8 +14779,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   @override
   void dispose() {
-    _localDraftDebounce?.cancel();
-    _saveLocalDraftNow();
+    managerContactPersonController.removeListener(_maybeCopyContactToCustomerForCheckbox);
     downPaymentController.dispose();
     downPaymentPaidController.dispose();
     fullPaymentController.dispose();
@@ -14282,6 +14804,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     menuSearchController.dispose();
     managerEventTypeOtherController.dispose();
     managerDraftEventTitleController.dispose();
+    managerCustomerNameController.dispose();
+    managerContactPersonController.dispose();
+    managerContactNumberController.dispose();
+    managerEmailController.dispose();
+    managerAddressController.dispose();
     managerGuestCountController.dispose();
     managerInquiryNoteController.dispose();
     super.dispose();
@@ -14496,45 +15023,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ],
-            if (post) ...[
-              const SizedBox(height: 10),
-              Text(
-                'Order Summary PDFs',
-                style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  OutlinedButton(
-                    onPressed: _postAnalysisPdf1Bytes == null
-                        ? null
-                        : () => _openOrderSummaryPdfBytes(_postAnalysisPdf1Bytes!),
-                    child: const Text('Order Summary #1'),
-                  ),
-                  OutlinedButton(
-                    onPressed: _postAnalysisPdf2Bytes == null
-                        ? null
-                        : () => _openOrderSummaryPdfBytes(_postAnalysisPdf2Bytes!),
-                    child: _postAnalysisPdf2Bytes == null
-                        ? (_postAnalysisPdfGenerating
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Text('Order Summary #2'))
-                        : const Text('Order Summary #2'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Summary #1 reflects the initial quoted costs. Summary #2 includes event information and additional costs entered in this stage.',
-                style: TextStyle(fontSize: 12, height: 1.35, color: Colors.black.withValues(alpha: 0.72)),
-              ),
-            ],
           ],
         ),
       ),
@@ -14575,6 +15063,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final isCompleted = widget.stage == 'completed';
     final isOnlineInquiry = widget.stage == 'online_inquiries';
     final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+    final managerDraftCanAdvanceToNext =
+        !isDraftStage ||
+            (_managerDraftAdvanceGateSig.isNotEmpty &&
+                _managerDraftAdvanceGateSig == _computeManagerDetailSignature());
     final isThemeReadOnly = isProcessing || isPost || isCompleted;
     final canEditStage = !isCompleted;
     final canComplete = widget.state.isManager;
@@ -14600,28 +15092,43 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       );
       final stageLabel = widget.stage.replaceAll('_', ' ').toUpperCase();
       final generatedAt = DateTime.now().toLocal().toString();
-      String enrichChecklistItem(String item) {
-        final n = item.trim();
-        if (n.isEmpty) return item;
+      final eventWhen = _eventDateTimeJoinedFromRowScheduleSlots(row.scheduleSlots);
+
+      List<String> ingredientsForDishName(String dishName) {
+        final want = dishName.trim().toLowerCase();
+        if (want.isEmpty) return [];
+        MenuItemData? fallback;
         for (final m in widget.state.menu) {
-          if (m.name.trim() == n && m.ingredients.isNotEmpty) {
-            return '$n — ${m.ingredients.join(', ')}';
+          final n = m.name.trim().toLowerCase();
+          if (n.isEmpty) continue;
+          if (n == want && m.ingredients.isNotEmpty) {
+            return m.ingredients.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+          }
+          if (m.ingredients.isNotEmpty && (n.contains(want) || want.contains(n))) {
+            fallback = m;
           }
         }
-        return item;
+        return fallback?.ingredients.map((e) => e.trim()).where((e) => e.isNotEmpty).toList() ?? [];
       }
 
-      final rows = checklistRows
-          .map(
-            (r) => [
-              enrichChecklistItem('${r['item'] ?? ''}'),
-              '${r['description'] ?? ''}',
-              '${r['quantity'] ?? ''}',
-              '${r['cost'] ?? ''}',
-              '${r['status'] ?? 'not done'}',
-            ],
-          )
-          .toList();
+      final rows = <List<String>>[];
+      for (final cr in checklistRows) {
+        final item = '${cr['item'] ?? ''}'.trim();
+        final desc = '${cr['description'] ?? ''}'.trim();
+        final q = '${cr['quantity'] ?? ''}'.trim();
+        final c = '${cr['cost'] ?? ''}'.trim();
+        final st = '${cr['status'] ?? 'not done'}'.trim();
+        if (item.isEmpty && desc.isEmpty) continue;
+        final dish = item.isNotEmpty ? item : desc;
+        final ings = ingredientsForDishName(dish);
+        if (ings.isEmpty) {
+          rows.add([item, desc, q, c, st]);
+        } else {
+          for (final ing in ings) {
+            rows.add([ing, dish, q, c, st]);
+          }
+        }
+      }
       doc.addPage(
         pw.MultiPage(
           build: (ctx) => [
@@ -14629,6 +15136,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             pw.SizedBox(height: 6),
             pw.Text('Event: ${row.eventTitle.isEmpty ? row.customerName : row.eventTitle}'),
             pw.Text('Customer: ${row.customerName}'),
+            pw.Text('Transaction: ${row.transactionNo.trim().isEmpty ? '—' : row.transactionNo.trim()}'),
+            pw.Text('Date / time of event: ${eventWhen.isEmpty ? '—' : eventWhen}'),
             pw.Text('Stage: $stageLabel'),
             pw.Text('Generated: $generatedAt'),
             pw.SizedBox(height: 10),
@@ -14676,7 +15185,20 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       await Printing.layoutPdf(onLayout: (format) async => doc.save());
     }
     Future<void> _generateInvoicePdf() async {
-      final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: additionalCosts);
+      final _ManagerOrderSummaryPdfVariant pdfVariant;
+      if (isCompleted || isFullPaymentConfirmed) {
+        pdfVariant = _ManagerOrderSummaryPdfVariant.fullyPaid;
+      } else if (isOngoingSubstage || isPost) {
+        pdfVariant = _ManagerOrderSummaryPdfVariant.afterDownPayment;
+      } else if (isDownPaymentSubstage || isDraftStage || isOnlineInquiry) {
+        pdfVariant = _ManagerOrderSummaryPdfVariant.beforeDownPayment;
+      } else {
+        pdfVariant = _ManagerOrderSummaryPdfVariant.afterDownPayment;
+      }
+      final bytes = await _buildOrderSummaryPdfBytes(
+        additionalCostsForPdf: additionalCosts,
+        variant: pdfVariant,
+      );
       await Printing.layoutPdf(onLayout: (_) async => bytes);
     }
     Future<void> _openChecklistEditor() async {
@@ -14942,10 +15464,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (managerEventTypeChoice == 'Other' && managerEventTypeOtherController.text.trim().isEmpty) {
         return 'Describe the event type for Other.';
       }
+      if (managerCustomerNameController.text.trim().isEmpty) {
+        return 'Enter the customer name.';
+      }
       if (kind == 'event' && managerDraftEventTitleController.text.trim().isEmpty) {
         return 'Enter an event title for Catering + Event.';
       }
-      if (!isAllowedCateringAddressInCoverage(d.address)) {
+      if (!isAllowedCateringAddressInCoverage(managerAddressController.text.trim())) {
         return cateringCoverageErrorText();
       }
       final gc = int.tryParse(managerGuestCountController.text.trim());
@@ -15283,6 +15808,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               'event_title': managerDraftEventTitleController.text.trim(),
               'event_type': et,
               'formality_level': formalityOut,
+              'customer_name': managerCustomerNameController.text.trim(),
+              'contact_person': managerContactPersonController.text.trim(),
+              'contact_number': managerContactNumberController.text.trim(),
+              'email_address': managerEmailController.text.trim(),
+              'address': managerAddressController.text.trim(),
               'menu': selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
               'additional_costs': additionalCosts,
               'labor_cost': laborCostComputedNow,
@@ -15310,6 +15840,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           } catch (_) {}
           await widget.state.loadManagerCateringByStage(widget.stage, force: true);
           _pristineManagerDetailSig = _computeManagerDetailSignature();
+          _managerDraftAdvanceGateSig = _pristineManagerDetailSig;
+          if (mounted) setState(() {});
           if (popAfterSuccess && mounted) Navigator.of(context).pop();
           return true;
         }
@@ -15395,7 +15927,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         foregroundColor: const Color(0xFFFFC024),
         leading: _buildManagerHamburgerLeading(context, widget.state),
         title: Text(
-          row.eventTitle.isEmpty ? row.customerName : row.eventTitle,
+          _managerHeaderShowTrx && row.transactionNo.trim().isNotEmpty
+              ? '${cateringManagerListStatusLabelFor(row.status, row.processingSubstageLabel)} — ${row.transactionNo.trim()}'
+              : (row.eventTitle.isEmpty ? row.customerName : row.eventTitle),
           style: const TextStyle(fontWeight: FontWeight.w800),
         ),
         centerTitle: true,
@@ -15411,13 +15945,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             child: ListView(
               padding: const EdgeInsets.all(12),
               children: [
-          if (row.cateringLoyaltyPointsEarned > 0 && row.status.trim().toLowerCase() == 'completed')
+          if (row.cateringLoyaltyPointsEarned > 0)
             Card(
               color: Colors.amber.shade50,
               child: ListTile(
                 leading: const Icon(Icons.card_giftcard_outlined),
                 title: Text(
-                  'Catering loyalty applied: +${row.cateringLoyaltyPointsEarned} pts',
+                  'Catering loyalty: +${row.cateringLoyaltyPointsEarned} pts (this order)',
                   style: const TextStyle(fontWeight: FontWeight.w700),
                 ),
               ),
@@ -15452,14 +15986,48 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       controller: downPaymentController,
                       keyboardType: TextInputType.number,
                       readOnly: true,
-                      decoration: const InputDecoration(labelText: 'Downpayment amount due'),
+                      decoration: const InputDecoration(labelText: 'Down payment due'),
                     ),
                     const SizedBox(height: 8),
-                    TextField(
-                      controller: downPaymentPaidController,
-                      keyboardType: TextInputType.number,
-                      readOnly: !isProcessing || isDownPaymentConfirmed,
-                      decoration: const InputDecoration(labelText: 'Downpayment amount paid (manual input)'),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: downPaymentPaidController,
+                            keyboardType: TextInputType.number,
+                            readOnly: !isProcessing || isDownPaymentConfirmed,
+                            decoration: const InputDecoration(labelText: 'Down payment paid'),
+                          ),
+                        ),
+                        Builder(
+                          builder: (ctx) {
+                            if (_managerDownPaymentProofBytes != null) {
+                              return IconButton(
+                                tooltip: 'View down payment proof',
+                                icon: const Icon(Icons.image_outlined),
+                                onPressed: () => showProofFullScreen(
+                                  ctx,
+                                  _managerDownPaymentProofBytes!,
+                                  title: 'Down payment proof',
+                                ),
+                              );
+                            }
+                            final b = '${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim();
+                            if (b.isEmpty) return const SizedBox.shrink();
+                            try {
+                              final bytes = Uint8List.fromList(base64Decode(b));
+                              return IconButton(
+                                tooltip: 'View down payment proof',
+                                icon: const Icon(Icons.image_outlined),
+                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Down payment proof'),
+                              );
+                            } catch (_) {
+                              return const SizedBox.shrink();
+                            }
+                          },
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 10),
                     const Text('Proof of down payment', style: TextStyle(fontWeight: FontWeight.w700)),
@@ -15588,7 +16156,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ),
             ),
           if (isDownPaymentSubstage) _additionalCostsCard(draft: false, processing: true, post: false),
-          if (isPost || isCompleted)
+          if (isPost)
             Card(
               color: Colors.green.shade50,
               child: Padding(
@@ -15610,6 +16178,17 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         ),
                         Builder(
                           builder: (ctx) {
+                            if (_managerDownPaymentProofBytes != null) {
+                              return IconButton(
+                                tooltip: 'View down payment proof',
+                                icon: const Icon(Icons.image_outlined),
+                                onPressed: () => showProofFullScreen(
+                                  ctx,
+                                  _managerDownPaymentProofBytes!,
+                                  title: 'Down payment proof',
+                                ),
+                              );
+                            }
                             final b = '${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim();
                             if (b.isEmpty) return const SizedBox.shrink();
                             try {
@@ -15659,11 +16238,45 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       },
                     ),
                     const SizedBox(height: 8),
-                    TextField(
-                      controller: fullPaymentController,
-                      keyboardType: TextInputType.number,
-                      readOnly: true,
-                      decoration: const InputDecoration(labelText: 'Full payment amount'),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: fullPaymentController,
+                            keyboardType: TextInputType.number,
+                            readOnly: true,
+                            decoration: const InputDecoration(labelText: 'Full payment amount'),
+                          ),
+                        ),
+                        Builder(
+                          builder: (ctx) {
+                            if (_managerFullPaymentProofBytes != null) {
+                              return IconButton(
+                                tooltip: 'View full payment proof',
+                                icon: const Icon(Icons.image_outlined),
+                                onPressed: () => showProofFullScreen(
+                                  ctx,
+                                  _managerFullPaymentProofBytes!,
+                                  title: 'Full payment proof',
+                                ),
+                              );
+                            }
+                            final b = '${row.postAnalysis['manager_full_payment_proof_b64'] ?? ''}'.trim();
+                            if (b.isEmpty) return const SizedBox.shrink();
+                            try {
+                              final bytes = Uint8List.fromList(base64Decode(b));
+                              return IconButton(
+                                tooltip: 'View full payment proof',
+                                icon: const Icon(Icons.image_outlined),
+                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Full payment proof'),
+                              );
+                            } catch (_) {
+                              return const SizedBox.shrink();
+                            }
+                          },
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 10),
                     const Text('Proof of full payment', style: TextStyle(fontWeight: FontWeight.w700)),
@@ -15767,23 +16380,28 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 ),
                               );
                               if (ok != true || !mounted) return;
-                              final err = await widget.state.managerPatchCateringPostAnalysis(
-                                id: row.id,
-                                orderKind: row.orderKind,
-                                patch: {'manager_full_payment_confirmed': true},
-                              );
-                              if (!mounted) return;
-                              if (err != null) {
-                                appSnack(context, err);
-                                return;
+                              _showManagerBlockingProgress('Confirming full payment…');
+                              try {
+                                final err = await widget.state.managerPatchCateringPostAnalysis(
+                                  id: row.id,
+                                  orderKind: row.orderKind,
+                                  patch: {'manager_full_payment_confirmed': true},
+                                );
+                                if (!mounted) return;
+                                if (err != null) {
+                                  appSnack(context, err);
+                                  return;
+                                }
+                                final full = await widget.state.loadManagerCateringItem(
+                                  id: row.id,
+                                  orderKind: row.orderKind,
+                                );
+                                if (!mounted) return;
+                                if (full != null) setState(() => _loadedDetailRow = full);
+                                appSnack(context, 'Full payment confirmed');
+                              } finally {
+                                if (mounted) _hideManagerBlockingProgress();
                               }
-                              final full = await widget.state.loadManagerCateringItem(
-                                id: row.id,
-                                orderKind: row.orderKind,
-                              );
-                              if (!mounted) return;
-                              if (full != null) setState(() => _loadedDetailRow = full);
-                              appSnack(context, 'Full payment confirmed');
                             },
                       child: Text(isFullPaymentConfirmed ? 'FULLY PAID' : 'Confirm Full Payment'),
                     ),
@@ -15791,7 +16409,196 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
+          if (isCompleted)
+            Card(
+              color: Colors.green.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Payments', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Total Cost: PHP ${totalComputed.toStringAsFixed(2)}',
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Down payment paid: PHP ${row.downPaymentAmount.toStringAsFixed(2)}',
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        Builder(
+                          builder: (ctx) {
+                            final b = '${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim();
+                            if (b.isEmpty) return const SizedBox.shrink();
+                            try {
+                              final bytes = Uint8List.fromList(base64Decode(b));
+                              return IconButton(
+                                tooltip: 'View down payment proof',
+                                icon: const Icon(Icons.image_outlined),
+                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Down payment proof'),
+                              );
+                            } catch (_) {
+                              return const SizedBox.shrink();
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Balance payment paid: PHP ${row.fullPaymentAmount.toStringAsFixed(2)}',
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        Builder(
+                          builder: (ctx) {
+                            final b = '${row.postAnalysis['manager_full_payment_proof_b64'] ?? ''}'.trim();
+                            if (b.isEmpty) return const SizedBox.shrink();
+                            try {
+                              final bytes = Uint8List.fromList(base64Decode(b));
+                              return IconButton(
+                                tooltip: 'View full payment proof',
+                                icon: const Icon(Icons.image_outlined),
+                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Full payment proof'),
+                              );
+                            } catch (_) {
+                              return const SizedBox.shrink();
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Total amount paid: PHP ${(row.downPaymentAmount + row.fullPaymentAmount).toStringAsFixed(2)}',
+                      style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
+                    ),
+                    if (isFullPaymentConfirmed) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        'PAID',
+                        style: TextStyle(
+                          color: Colors.green.shade800,
+                          fontWeight: FontWeight.w900,
+                          fontSize: 18,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
           if (isPost) _additionalCostsCard(draft: false, processing: false, post: true),
+          if (!isDraftStage && (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted))
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      'Order summary',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 8),
+                    if (isPost) ...[
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton(
+                            onPressed: _postAnalysisPdf1Bytes == null
+                                ? null
+                                : () => _openOrderSummaryPdfBytes(_postAnalysisPdf1Bytes!),
+                            child: const Text('Order Summary #1'),
+                          ),
+                          OutlinedButton(
+                            onPressed: _postAnalysisPdf2Bytes == null
+                                ? null
+                                : () => _openOrderSummaryPdfBytes(_postAnalysisPdf2Bytes!),
+                            child: _postAnalysisPdf2Bytes == null
+                                ? (_postAnalysisPdfGenerating
+                                    ? const SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                      )
+                                    : const Text('Order Summary | Additional Costs'))
+                                : const Text('Order Summary | Additional Costs'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Summary #1 reflects the initial quoted costs. The second PDF lists supplemental additional costs for this stage.',
+                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.black.withValues(alpha: 0.72)),
+                      ),
+                    ] else if (isCompleted) ...[
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton(
+                            onPressed: () async {
+                              final pdfCosts = _orderSummaryPdf1AdditionalCosts.isNotEmpty
+                                  ? _orderSummaryPdf1AdditionalCosts.map((e) => Map<String, dynamic>.from(e)).toList()
+                                  : <Map<String, dynamic>>[];
+                              final bytes = await _buildOrderSummaryPdfBytes(
+                                additionalCostsForPdf: pdfCosts,
+                                variant: _ManagerOrderSummaryPdfVariant.fullyPaid,
+                              );
+                              await _openOrderSummaryPdfBytes(bytes);
+                            },
+                            child: const Text('Order Summary #1'),
+                          ),
+                          OutlinedButton(
+                            onPressed: () async {
+                              final bytes = await _buildOrderSummaryPdfBytes(
+                                additionalCostsForPdf: additionalCosts,
+                                postAnalysis2Only: true,
+                              );
+                              await _openOrderSummaryPdfBytes(bytes);
+                            },
+                            child: const Text('Order Summary | Additional Costs'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Summary #1 reflects additional costs when the order moved to For Full Payment. The second sheet uses current additional costs.',
+                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.black.withValues(alpha: 0.72)),
+                      ),
+                    ] else ...[
+                      OutlinedButton(
+                        onPressed: _generateInvoicePdf,
+                        child: const Text('Generate order summary PDF'),
+                      ),
+                      if (isProcessing) ...[
+                        const SizedBox(height: 8),
+                        OutlinedButton.icon(
+                          onPressed: () async {
+                            await _sendOrderSummaryPdfToCustomer();
+                          },
+                          icon: const Icon(Icons.send_outlined),
+                          label: const Text('Send order summary PDF to customer'),
+                        ),
+                      ],
+                    ],
+                  ],
+                ),
+              ),
+            ),
           if (isOngoingSubstage || isPost || isCompleted) ...[
             Card(
               child: Padding(
@@ -15862,7 +16669,20 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   const SizedBox(height: 8),
                   if (!isDraftStage) ...[
                     Text('Order type: ${row.orderKind == 'catering' ? 'Catering Only' : 'Catering + Event'}'),
-                    if (row.transactionNo.trim().isNotEmpty) Text('Transaction No.: ${row.transactionNo}'),
+                    if (row.transactionNo.trim().isNotEmpty)
+                      InkWell(
+                        onTap: () => setState(() => _managerHeaderShowTrx = !_managerHeaderShowTrx),
+                        child: Padding(
+                          padding: const EdgeInsets.only(bottom: 2),
+                          child: Text(
+                            'Transaction No.: ${row.transactionNo}',
+                            style: TextStyle(
+                              color: Theme.of(context).colorScheme.primary,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
                     Text('Event: ${row.eventTitle.trim().isEmpty ? row.customerName : row.eventTitle}'),
                     Text('Customer: ${row.customerName}'),
                     Text('Contact person: ${row.contactPerson}'),
@@ -15916,7 +16736,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onChanged: canEditStage
                           ? (v) => setState(() {
                                 _draftOrderKind = v == 'CATERING' ? 'catering' : 'event';
-                                _saveLocalDraftDebounced();
                               })
                           : null,
                     ),
@@ -15928,7 +16747,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onChanged: canEditStage
                           ? (v) => setState(() {
                                 managerEventTypeChoice = v ?? 'Other';
-                                _saveLocalDraftDebounced();
                               })
                           : null,
                     ),
@@ -15951,7 +16769,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onChanged: canEditStage
                           ? (v) => setState(() {
                                 managerEventSetting = v ?? 'open';
-                                _saveLocalDraftDebounced();
                               })
                           : null,
                     ),
@@ -15964,9 +16781,35 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onChanged: canEditStage
                           ? (v) => setState(() {
                                 managerEventSetting = v ?? 'open';
-                                _saveLocalDraftDebounced();
                               })
                           : null,
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: managerCustomerNameController,
+                      readOnly: !canEditStage,
+                      decoration: const InputDecoration(
+                        labelText: 'Customer',
+                        helperText: 'Required',
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: _managerCustomerSameAsContact,
+                      onChanged: !canEditStage
+                          ? null
+                          : (v) {
+                              setState(() {
+                                _managerCustomerSameAsContact = v ?? false;
+                                if (_managerCustomerSameAsContact) {
+                                  managerCustomerNameController.text = managerContactPersonController.text;
+                                }
+                              });
+                            },
+                      title: const Text('Same as contact person'),
+                      controlAffinity: ListTileControlAffinity.leading,
                     ),
                     const SizedBox(height: 8),
                     TextField(
@@ -15975,15 +16818,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       decoration: const InputDecoration(labelText: 'Event title'),
                     ),
                     const SizedBox(height: 8),
-                    TextFormField(
+                    TextField(
+                      controller: managerContactPersonController,
                       readOnly: !canEditStage,
-                      initialValue: row.contactPerson,
                       decoration: const InputDecoration(labelText: 'Contact person'),
                     ),
                     const SizedBox(height: 8),
-                    TextFormField(
+                    TextField(
+                      controller: managerContactNumberController,
                       readOnly: !canEditStage,
-                      initialValue: row.contactNumber,
                       keyboardType: TextInputType.phone,
                       maxLength: 11,
                       inputFormatters: [
@@ -15993,18 +16836,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       decoration: const InputDecoration(labelText: 'Contact number', counterText: ''),
                     ),
                     const SizedBox(height: 8),
-                    TextFormField(
+                    TextField(
+                      controller: managerEmailController,
                       readOnly: !canEditStage,
-                      initialValue: row.emailAddress,
                       decoration: const InputDecoration(labelText: 'Email address'),
                     ),
                     const SizedBox(height: 8),
-                    TextFormField(
+                    TextField(
+                      controller: managerAddressController,
                       readOnly: !canEditStage,
-                      initialValue: row.address,
                       decoration: const InputDecoration(labelText: 'Event venue'),
                     ),
-                    if (!isAllowedCateringAddressInCoverage(row.address))
+                    if (!isAllowedCateringAddressInCoverage(managerAddressController.text.trim()))
                       Padding(
                         padding: const EdgeInsets.only(top: 6),
                         child: Text(
@@ -16106,7 +16949,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         onSelectionChanged: canEditStage
                             ? (s) => setState(() {
                                   managerFormalityLevel = s.first;
-                                  _saveLocalDraftDebounced();
                                 })
                             : null,
                       ),
@@ -16130,7 +16972,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onChanged: canEditStage
                           ? (v) => setState(() {
                                 managerServiceIncluded = v ?? 'no';
-                                _saveLocalDraftDebounced();
                               })
                           : null,
                     ),
@@ -16143,7 +16984,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       onChanged: canEditStage
                           ? (v) => setState(() {
                                 managerServiceIncluded = v ?? 'no';
-                                _saveLocalDraftDebounced();
                               })
                           : null,
                     ),
@@ -16530,7 +17370,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ),
           ],
           if (isDraftStage) _additionalCostsCard(draft: true, processing: false, post: false),
-          if (isCompleted)
+          if (isDraftStage)
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -16538,40 +17378,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Text(
-                      'Order Summary PDFs',
+                      'Order summary',
                       style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
                     ),
                     const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        OutlinedButton(
-                          onPressed: () async {
-                            final pdfCosts = _orderSummaryPdf1AdditionalCosts.isNotEmpty
-                                ? _orderSummaryPdf1AdditionalCosts.map((e) => Map<String, dynamic>.from(e)).toList()
-                                : <Map<String, dynamic>>[];
-                            final bytes = await _buildOrderSummaryPdfBytes(additionalCostsForPdf: pdfCosts);
-                            await _openOrderSummaryPdfBytes(bytes);
-                          },
-                          child: const Text('Order Summary #1'),
-                        ),
-                        OutlinedButton(
-                          onPressed: () async {
-                            final bytes = await _buildOrderSummaryPdfBytes(
-                              additionalCostsForPdf: additionalCosts,
-                              postAnalysis2Only: true,
-                            );
-                            await _openOrderSummaryPdfBytes(bytes);
-                          },
-                          child: const Text('Order Summary #2'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Summary #1 reflects the initial quoted additional costs when the order moved to For Full Payment. Summary #2 is the supplemental sheet with current additional costs.',
-                      style: TextStyle(fontSize: 12, height: 1.35, color: Colors.black.withValues(alpha: 0.72)),
+                    OutlinedButton(
+                      onPressed: _generateInvoicePdf,
+                      child: const Text('Generate order summary PDF'),
                     ),
                   ],
                 ),
@@ -16639,50 +17452,38 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         ],
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    OutlinedButton(
-                      onPressed: () async {
-                        if (isPost) {
-                          if (_postAnalysisPdf2Bytes != null) {
-                            await _openOrderSummaryPdfBytes(_postAnalysisPdf2Bytes!);
-                            return;
-                          }
-                          if (_postAnalysisPdfGenerating) {
-                            // If #2 is still being generated, fall back to generating the latest view.
-                            await _generateInvoicePdf();
-                            return;
-                          }
-                          if (_postAnalysisPdf1Bytes != null) {
-                            await _openOrderSummaryPdfBytes(_postAnalysisPdf1Bytes!);
-                            return;
-                          }
-                        }
-                        await _generateInvoicePdf();
-                      },
-                      child: const Text('Generate Order Summary PDF'),
-                    ),
-                    if (isProcessing) ...[
+                    if (!(isDownPaymentSubstage || isOngoingSubstage || isDraftStage || isPost)) ...[
                       const SizedBox(height: 8),
-                      OutlinedButton.icon(
+                      OutlinedButton(
                         onPressed: () async {
-                          await _sendOrderSummaryPdfToCustomer();
+                          if (isPost) {
+                            if (_postAnalysisPdf2Bytes != null) {
+                              await _openOrderSummaryPdfBytes(_postAnalysisPdf2Bytes!);
+                              return;
+                            }
+                            if (_postAnalysisPdfGenerating) {
+                              await _generateInvoicePdf();
+                              return;
+                            }
+                            if (_postAnalysisPdf1Bytes != null) {
+                              await _openOrderSummaryPdfBytes(_postAnalysisPdf1Bytes!);
+                              return;
+                            }
+                          }
+                          await _generateInvoicePdf();
                         },
-                        icon: const Icon(Icons.send_outlined),
-                        label: const Text('Send Order Summary PDF to Customer'),
+                        child: const Text('Generate Order Summary PDF'),
                       ),
-                    ],
-                    if (isDraftStage || isProcessing || isPost) ...[
-                      const SizedBox(height: 8),
-                      FilledButton(
-                        onPressed: submitNext,
-                        child: Text(
-                          isDraftStage
-                              ? 'Save and Move to For Down Payment'
-                              : (isPost
-                                  ? 'Complete Order'
-                                  : (isDownPaymentSubstage ? 'Continue to On Going' : 'Submit to Next Stage')),
+                      if (isProcessing) ...[
+                        const SizedBox(height: 8),
+                        OutlinedButton.icon(
+                          onPressed: () async {
+                            await _sendOrderSummaryPdfToCustomer();
+                          },
+                          icon: const Icon(Icons.send_outlined),
+                          label: const Text('Send Order Summary PDF to Customer'),
                         ),
-                      ),
+                      ],
                     ],
                     if (isDraftStage || isProcessing || isPost) ...[
                       const SizedBox(height: 8),
@@ -16691,6 +17492,31 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           await saveCurrentStage();
                         },
                         child: Text(isDraftStage ? 'Save draft' : 'Save'),
+                      ),
+                    ],
+                    if (isDraftStage && !managerDraftCanAdvanceToNext) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        'Save and confirm your draft before moving to the next stage.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 12,
+                          height: 1.3,
+                          color: Colors.black.withValues(alpha: 0.65),
+                        ),
+                      ),
+                    ],
+                    if (isDraftStage || isProcessing || isPost) ...[
+                      const SizedBox(height: 8),
+                      FilledButton(
+                        onPressed: (isDraftStage && !managerDraftCanAdvanceToNext) ? null : submitNext,
+                        child: Text(
+                          isDraftStage
+                              ? 'Move to For Down Payment'
+                              : (isPost
+                                  ? 'Complete Order'
+                                  : (isDownPaymentSubstage ? 'Continue to On Going' : 'Submit to Next Stage')),
+                        ),
                       ),
                     ],
                   ],
@@ -17561,8 +18387,10 @@ class PosWalkInOngoingTab extends StatefulWidget {
 class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTickerProviderStateMixin {
   late TabController _walkTab;
   String _search = '';
-  String _payFilter = 'all';
-  String _walkStageDateRange = 'past_30';
+  /// Preparing tab: `all` | `cash` | `gcash`
+  String _walkPreparingFilter = 'all';
+  /// Complete / Cancelled: `all` | `past_30` | `cash` | `gcash`
+  String _walkHistoryFilter = 'all';
 
   @override
   void initState() {
@@ -17660,26 +18488,105 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                       onChanged: (v) => setState(() => _search = v),
                     ),
                   ),
-                  if (_walkTab.index == 1 || _walkTab.index == 2)
+                  if (_walkTab.index == 0)
                     PopupMenuButton<String>(
-                      tooltip: 'Date range',
-                      icon: Icon(Icons.date_range, color: _walkStageDateRange == 'past_30' ? AppColors.accent : null),
-                      onSelected: (v) => setState(() => _walkStageDateRange = v),
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(value: 'past_30', child: Text('Past 30 days')),
-                        PopupMenuItem(value: 'all', child: Text('All time')),
+                      tooltip: 'Filter',
+                      icon: Icon(
+                        Icons.filter_list,
+                        color: _walkPreparingFilter == 'all' ? null : AppColors.accent,
+                      ),
+                      onSelected: (v) => setState(() => _walkPreparingFilter = v),
+                      itemBuilder: (ctx) => [
+                        PopupMenuItem<String>(
+                          value: 'all',
+                          child: Row(
+                            children: [
+                              if (_walkPreparingFilter == 'all')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_walkPreparingFilter == 'all') const SizedBox(width: 4),
+                              const Text('All'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'cash',
+                          child: Row(
+                            children: [
+                              if (_walkPreparingFilter == 'cash')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_walkPreparingFilter == 'cash') const SizedBox(width: 4),
+                              const Text('Cash'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'gcash',
+                          child: Row(
+                            children: [
+                              if (_walkPreparingFilter == 'gcash')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_walkPreparingFilter == 'gcash') const SizedBox(width: 4),
+                              const Text('GCash'),
+                            ],
+                          ),
+                        ),
                       ],
                     ),
-                  PopupMenuButton<String>(
-                    tooltip: 'Filter',
-                    onSelected: (v) => setState(() => _payFilter = v),
-                    itemBuilder: (ctx) => const [
-                      PopupMenuItem(value: 'all', child: Text('All payments')),
-                      PopupMenuItem(value: 'gcash', child: Text('GCash')),
-                      PopupMenuItem(value: 'cash', child: Text('Cash')),
-                    ],
-                    child: const Icon(Icons.filter_list),
-                  ),
+                  if (_walkTab.index == 1 || _walkTab.index == 2)
+                    PopupMenuButton<String>(
+                      tooltip: 'Filter',
+                      icon: Icon(
+                        Icons.filter_list,
+                        color: _walkHistoryFilter == 'all' ? null : AppColors.accent,
+                      ),
+                      onSelected: (v) => setState(() => _walkHistoryFilter = v),
+                      itemBuilder: (ctx) => [
+                        PopupMenuItem<String>(
+                          value: 'all',
+                          child: Row(
+                            children: [
+                              if (_walkHistoryFilter == 'all')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_walkHistoryFilter == 'all') const SizedBox(width: 4),
+                              const Text('All'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'past_30',
+                          child: Row(
+                            children: [
+                              if (_walkHistoryFilter == 'past_30')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_walkHistoryFilter == 'past_30') const SizedBox(width: 4),
+                              const Text('Past 30 days'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'cash',
+                          child: Row(
+                            children: [
+                              if (_walkHistoryFilter == 'cash')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_walkHistoryFilter == 'cash') const SizedBox(width: 4),
+                              const Text('Cash'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'gcash',
+                          child: Row(
+                            children: [
+                              if (_walkHistoryFilter == 'gcash')
+                                Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+                              if (_walkHistoryFilter == 'gcash') const SizedBox(width: 4),
+                              const Text('GCash'),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                 ],
               ),
             ),
@@ -17731,8 +18638,10 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
     int tabIndex = 0,
   }) {
     var filtered = rows;
-    if ((tabIndex == 1 || tabIndex == 2) && _walkStageDateRange == 'past_30') {
-      filtered = filtered.where((o) => isWithinPast30Days(o.createdAt)).toList();
+    if (tabIndex == 1 || tabIndex == 2) {
+      if (_walkHistoryFilter == 'past_30') {
+        filtered = filtered.where((o) => isWithinPast30Days(o.createdAt)).toList();
+      }
     }
     final q = _search.trim().toLowerCase();
     if (q.isNotEmpty) {
@@ -17745,13 +18654,24 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
           )
           .toList();
     }
-    if (_payFilter == 'gcash') {
-      filtered = filtered.where((o) => o.paymentMode.toUpperCase().contains('GCASH')).toList();
-    } else if (_payFilter == 'cash') {
-      filtered = filtered.where((o) {
-        final pm = o.paymentMode.toUpperCase();
-        return pm.contains('CASH') && !pm.contains('GCASH');
-      }).toList();
+    if (tabIndex == 0) {
+      if (_walkPreparingFilter == 'gcash') {
+        filtered = filtered.where((o) => o.paymentMode.toUpperCase().contains('GCASH')).toList();
+      } else if (_walkPreparingFilter == 'cash') {
+        filtered = filtered.where((o) {
+          final pm = o.paymentMode.toUpperCase();
+          return pm.contains('CASH') && !pm.contains('GCASH');
+        }).toList();
+      }
+    } else {
+      if (_walkHistoryFilter == 'gcash') {
+        filtered = filtered.where((o) => o.paymentMode.toUpperCase().contains('GCASH')).toList();
+      } else if (_walkHistoryFilter == 'cash') {
+        filtered = filtered.where((o) {
+          final pm = o.paymentMode.toUpperCase();
+          return pm.contains('CASH') && !pm.contains('GCASH');
+        }).toList();
+      }
     }
     if (filtered.isEmpty) {
       return ListView(
@@ -17833,7 +18753,11 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                                   ),
                                 );
                                 if (yes != true || !context.mounted) return;
-                                final err = await widget.state.cancelWalkInOrder(o.id);
+                                final err = await withCashierBlockingProgress<String?>(
+                                  context,
+                                  'Cancelling order…',
+                                  widget.state.cancelWalkInOrder(o.id),
+                                );
                                 if (mounted && err != null) appSnack(context, err);
                               },
                               child: const Text('Cancel'),
@@ -17854,7 +18778,11 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                                   ),
                                 );
                                 if (yes != true || !context.mounted) return;
-                                final err = await widget.state.claimWalkInOrder(o.id);
+                                final err = await withCashierBlockingProgress<String?>(
+                                  context,
+                                  'Marking order complete…',
+                                  widget.state.claimWalkInOrder(o.id),
+                                );
                                 if (mounted && err != null) appSnack(context, err);
                               },
                               child: const Text('Claim'),
@@ -17892,10 +18820,14 @@ class PosOnlineOrdersTab extends StatefulWidget {
 class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTickerProviderStateMixin {
   late TabController _fulTab;
   String _search = '';
-  /// `all` | `balance_review` | `gcash` | `cash`
-  String _payFilter = 'all';
-  /// Delivered / Cancelled tabs: default past 30 days.
-  String _onlineStageDateRange = 'past_30';
+  /// Pending tab: `all` | `past_30` | `wait_payment` | `payment_insufficient` | `wait_balance`
+  String _onlinePendingFilter = 'all';
+  /// Preparing: `all` | `payment_confirmed` | `overpayment`
+  String _onlinePreparingFilter = 'all';
+  /// Delivered: `all` | `past_30` | `balance_proof` | `cash` | `gcash`
+  String _onlineDeliveredFilter = 'all';
+  /// Cancelled: `all` | `past_30`
+  String _onlineCancelledFilter = 'all';
   Timer? _pendingReminderTimer;
   final Map<int, int> _pendingAlertStage = {};
 
@@ -17913,6 +18845,19 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
     if (up.contains('CONFIRMED') || up.contains('OVERPAYMENT')) return Colors.green.shade900;
     if (up.contains('CANCEL')) return Colors.grey.shade900;
     return Colors.orange.shade900;
+  }
+
+  PopupMenuItem<String> _filterMenuRow(BuildContext ctx, String value, String label, String current) {
+    return PopupMenuItem<String>(
+      value: value,
+      child: Row(
+        children: [
+          if (current == value) Icon(Icons.check, size: 18, color: Theme.of(ctx).colorScheme.primary),
+          if (current == value) const SizedBox(width: 4),
+          Expanded(child: Text(label)),
+        ],
+      ),
+    );
   }
 
   @override
@@ -17959,55 +18904,71 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
 
   bool _isCancelledOnline(OrderData o) => o.status.toUpperCase().contains('CANCEL');
 
+  bool get _onlineFilterIconAccent {
+    switch (_fulTab.index) {
+      case 0:
+        return _onlinePendingFilter != 'all';
+      case 1:
+        return _onlinePreparingFilter != 'all';
+      case 2:
+        return false;
+      case 3:
+        return _onlineDeliveredFilter != 'all';
+      case 4:
+        return _onlineCancelledFilter != 'all';
+      default:
+        return false;
+    }
+  }
+
   List<OrderData> _forIndex(int i) {
-    final wantDate =
-        (i == 3 || i == 4) && _onlineStageDateRange == 'past_30';
+    List<OrderData> base;
     if (i == 4) {
-      return widget.state.cashierOnlineOrders
-          .where(_isCancelledOnline)
-          .where((o) {
-            final q = _search.trim().toLowerCase();
-            if (q.isEmpty) return true;
-            return o.orderNo.toLowerCase().contains(q) ||
-                (o.userEmail ?? '').toLowerCase().contains(q) ||
-                cashierCustomerLabel(o).toLowerCase().contains(q) ||
-                statusReadable(o.status).toLowerCase().contains(q);
-          })
-          .where((o) {
-            if (_payFilter == 'balance_review') return o.balanceProofPendingReview;
-            final pm = o.paymentMode.toUpperCase();
-            if (_payFilter == 'gcash') return pm.contains('GCASH');
-            if (_payFilter == 'cash') {
-              return pm.contains('CASH') && !pm.contains('GCASH');
-            }
-            return true;
-          })
-          .where((o) => !wantDate || isWithinPast30Days(o.createdAt))
+      base = widget.state.cashierOnlineOrders.where(_isCancelledOnline).toList();
+    } else {
+      final want = _stages[i];
+      base = widget.state.cashierOnlineOrders
+          .where((o) => !_isCancelledOnline(o))
+          .where((o) => o.fulfillmentStage.toUpperCase() == want)
           .toList();
     }
-    final want = _stages[i];
-    return widget.state.cashierOnlineOrders
-        .where((o) => !_isCancelledOnline(o))
-        .where((o) => o.fulfillmentStage.toUpperCase() == want)
-        .where((o) {
-          final q = _search.trim().toLowerCase();
-          if (q.isEmpty) return true;
-          return o.orderNo.toLowerCase().contains(q) ||
-              (o.userEmail ?? '').toLowerCase().contains(q) ||
-              cashierCustomerLabel(o).toLowerCase().contains(q) ||
-              statusReadable(o.status).toLowerCase().contains(q);
-        })
-        .where((o) {
-          if (_payFilter == 'balance_review') return o.balanceProofPendingReview;
-          final pm = o.paymentMode.toUpperCase();
-          if (_payFilter == 'gcash') return pm.contains('GCASH');
-          if (_payFilter == 'cash') {
-            return pm.contains('CASH') && !pm.contains('GCASH');
-          }
+    var out = base.where((o) {
+      final q = _search.trim().toLowerCase();
+      if (q.isEmpty) return true;
+      return o.orderNo.toLowerCase().contains(q) ||
+          (o.userEmail ?? '').toLowerCase().contains(q) ||
+          cashierCustomerLabel(o).toLowerCase().contains(q) ||
+          statusReadable(o.status).toLowerCase().contains(q) ||
+          statusReadableForOrder(o).toLowerCase().contains(q);
+    }).toList();
+
+    bool extra(OrderData o) {
+      switch (i) {
+        case 0:
+          return orderMatchesCashierOnlinePendingFilter(o, _onlinePendingFilter);
+        case 1:
+          return orderMatchesCashierOnlinePreparingFilter(o, _onlinePreparingFilter);
+        case 2:
           return true;
-        })
-        .where((o) => !wantDate || isWithinPast30Days(o.createdAt))
-        .toList();
+        case 3:
+          return orderMatchesCashierOnlineDeliveredFilter(o, _onlineDeliveredFilter);
+        case 4:
+          if (_onlineCancelledFilter == 'past_30') return isWithinPast30Days(o.createdAt);
+          return true;
+        default:
+          return true;
+      }
+    }
+
+    out = out.where(extra).toList();
+    if (i == 0) {
+      out.sort((a, b) {
+        final c = cashierOnlinePendingSortPriority(a).compareTo(cashierOnlinePendingSortPriority(b));
+        if (c != 0) return c;
+        return b.createdAt.compareTo(a.createdAt);
+      });
+    }
+    return out;
   }
 
   @override
@@ -18031,27 +18992,70 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                       onChanged: (v) => setState(() => _search = v),
                     ),
                   ),
-                  if (_fulTab.index == 3 || _fulTab.index == 4)
+                  if (_fulTab.index != 2)
                     PopupMenuButton<String>(
-                      tooltip: 'Date range',
-                      icon: Icon(Icons.date_range, color: _onlineStageDateRange == 'past_30' ? AppColors.accent : null),
-                      onSelected: (v) => setState(() => _onlineStageDateRange = v),
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(value: 'past_30', child: Text('Past 30 days')),
-                        PopupMenuItem(value: 'all', child: Text('All time')),
-                      ],
+                      tooltip: 'Filter',
+                      icon: Icon(
+                        Icons.filter_list,
+                        color: _onlineFilterIconAccent ? AppColors.accent : null,
+                      ),
+                      onSelected: (v) {
+                        setState(() {
+                          switch (_fulTab.index) {
+                            case 0:
+                              _onlinePendingFilter = v;
+                              break;
+                            case 1:
+                              _onlinePreparingFilter = v;
+                              break;
+                            case 3:
+                              _onlineDeliveredFilter = v;
+                              break;
+                            case 4:
+                              _onlineCancelledFilter = v;
+                              break;
+                          }
+                        });
+                      },
+                      itemBuilder: (ctx) {
+                        switch (_fulTab.index) {
+                          case 0:
+                            return [
+                              _filterMenuRow(ctx, 'all', 'All', _onlinePendingFilter),
+                              _filterMenuRow(ctx, 'past_30', 'Past 30 days', _onlinePendingFilter),
+                              _filterMenuRow(ctx, 'wait_payment', 'Waiting for Payment Confirmation', _onlinePendingFilter),
+                              _filterMenuRow(ctx, 'payment_insufficient', 'Payment Insufficient', _onlinePendingFilter),
+                              _filterMenuRow(
+                                ctx,
+                                'wait_balance',
+                                'Waiting for Balance Payment Confirmation',
+                                _onlinePendingFilter,
+                              ),
+                            ];
+                          case 1:
+                            return [
+                              _filterMenuRow(ctx, 'all', 'All', _onlinePreparingFilter),
+                              _filterMenuRow(ctx, 'payment_confirmed', 'Payment Confirmed', _onlinePreparingFilter),
+                              _filterMenuRow(ctx, 'overpayment', 'Overpayment', _onlinePreparingFilter),
+                            ];
+                          case 3:
+                            return [
+                              _filterMenuRow(ctx, 'all', 'All', _onlineDeliveredFilter),
+                              _filterMenuRow(ctx, 'past_30', 'Past 30 days', _onlineDeliveredFilter),
+                              _filterMenuRow(ctx, 'balance_proof', 'With balance proof of payment', _onlineDeliveredFilter),
+                              _filterMenuRow(ctx, 'cash', 'Cash', _onlineDeliveredFilter),
+                              _filterMenuRow(ctx, 'gcash', 'GCash', _onlineDeliveredFilter),
+                            ];
+                          case 4:
+                            return [
+                              _filterMenuRow(ctx, 'all', 'All', _onlineCancelledFilter),
+                              _filterMenuRow(ctx, 'past_30', 'Past 30 days', _onlineCancelledFilter),
+                            ];
+                          default:
+                            return const [];
+                        }
+                      },
                     ),
-                  PopupMenuButton<String>(
-                    tooltip: 'Filter',
-                    onSelected: (v) => setState(() => _payFilter = v),
-                    itemBuilder: (ctx) => const [
-                      PopupMenuItem(value: 'all', child: Text('All payments')),
-                      PopupMenuItem(value: 'balance_review', child: Text('Balance proof review')),
-                      PopupMenuItem(value: 'gcash', child: Text('GCash')),
-                      PopupMenuItem(value: 'cash', child: Text('Cash')),
-                    ],
-                    child: const Icon(Icons.filter_list),
-                  ),
                 ],
               ),
             ),
@@ -18099,6 +19103,8 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                   (st.contains('ORDER CONFIRMED') ||
                                       st.contains('OVERPAYMENT') ||
                                       fu == 'DELIVERED');
+                              final hasBalProof = (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false);
+                              final track = o.deliveryTrackingUrl.trim();
                               return Card(
                                 elevation: 2,
                                 color: Colors.white,
@@ -18120,7 +19126,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                             borderRadius: BorderRadius.circular(999),
                                           ),
                                           child: Text(
-                                            statusReadable(o.status),
+                                            statusReadableForOrder(o),
                                             maxLines: 2,
                                             overflow: TextOverflow.ellipsis,
                                             style: TextStyle(
@@ -18135,12 +19141,61 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                       Text(o.orderNo, style: const TextStyle(fontWeight: FontWeight.w700)),
                                     ],
                                   ),
-                                  subtitle: Text(
-                                    '${cashierCustomerLabel(o)}'
-                                    '${showLoyalty ? '\nLoyalty: +${o.loyaltyPointsEarned} pts' : ''}',
+                                  subtitle: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        '${cashierCustomerLabel(o)}'
+                                        '${showLoyalty ? '\nLoyalty: +${o.loyaltyPointsEarned} pts' : ''}',
+                                        style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.25),
+                                      ),
+                                      if (idx == 2 && track.isNotEmpty) ...[
+                                        const SizedBox(height: 8),
+                                        InkWell(
+                                          onTap: () async {
+                                            final u = Uri.tryParse(track);
+                                            if (u != null && await canLaunchUrl(u)) {
+                                              await launchUrl(u, mode: LaunchMode.externalApplication);
+                                            }
+                                          },
+                                          child: Text(
+                                            track,
+                                            style: TextStyle(
+                                              color: Colors.blue.shade800,
+                                              decoration: TextDecoration.underline,
+                                              fontSize: 12.5,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                      if (hasBalProof)
+                                        TextButton(
+                                          style: TextButton.styleFrom(
+                                            padding: EdgeInsets.zero,
+                                            minimumSize: Size.zero,
+                                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                          ),
+                                          onPressed: () {
+                                            try {
+                                              final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+                                              showProofFullScreen(
+                                                context,
+                                                Uint8List.fromList(bytes),
+                                                title: 'Balance payment proof',
+                                              );
+                                            } catch (_) {
+                                              appSnack(context, 'Could not display image');
+                                            }
+                                          },
+                                          child: const Text('View balance payment proof'),
+                                        ),
+                                    ],
                                   ),
-                                  isThreeLine: true,
-                                  trailing: Text('₱${o.total.toStringAsFixed(2)}'),
+                                  trailing: Text(
+                                    '₱${o.total.toStringAsFixed(2)}',
+                                    style: const TextStyle(fontWeight: FontWeight.w600),
+                                  ),
                                   onTap: () async {
                                     await Navigator.of(context).push<void>(
                                       MaterialPageRoute<void>(
@@ -18206,6 +19261,165 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
     super.dispose();
   }
 
+  Widget _buildCancelledOnlineDetail(BuildContext context, OrderData o) {
+    final pm = (o.paymentMode.isEmpty ? 'GCASH ONLY' : o.paymentMode).toUpperCase();
+    final hasSup = o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false;
+    final track = o.deliveryTrackingUrl.trim();
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.black87,
+        foregroundColor: Colors.white,
+        title: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(color: AppColors.brand, borderRadius: BorderRadius.circular(10)),
+          child: Text(
+            'Cancelled + ${o.orderNo}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AppColors.ink, fontWeight: FontWeight.w800, fontSize: 12),
+          ),
+        ),
+        centerTitle: true,
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          _OrderNoCard(displayNo: o.orderNo),
+          const SizedBox(height: 10),
+          ToggleSection(
+            title: 'ORDER SUMMARY',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: Column(
+              children: [
+                LockedField(label: 'CUSTOMER', value: cashierCustomerLabel(o)),
+                LockedField(label: 'CUSTOMER EMAIL', value: o.userEmail?.trim().isNotEmpty == true ? o.userEmail! : '—'),
+                LockedField(label: 'ORDER STATUS', value: statusReadable(o.status)),
+                LockedField(label: 'FULFILLMENT STAGE', value: o.fulfillmentStage),
+                LockedField(label: 'ORDERED AT', value: formatDateTimeLocal(o.createdAt)),
+                LockedField(label: 'SUBTOTAL / TOTAL', value: '₱${o.total.toStringAsFixed(2)}'),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          ToggleSection(
+            title: 'DELIVERY INFORMATION',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: Column(
+              children: [
+                LockedField(label: 'NAME', value: o.deliveryName.isEmpty ? '—' : o.deliveryName),
+                LockedField(label: 'CONTACT NUMBER', value: o.deliveryContact.isEmpty ? '—' : o.deliveryContact),
+                LockedField(label: 'DELIVERY ADDRESS', value: o.deliveryAddress.isEmpty ? '—' : o.deliveryAddress),
+                LockedField(label: 'TIME OF DELIVERY', value: o.deliveryTime.isEmpty ? 'NOW' : o.deliveryTime),
+                if (track.isNotEmpty) LockedField(label: 'TRACKING LINK', value: track),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          ToggleSection(
+            title: 'PAYMENT',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                LockedField(label: 'PAYMENT METHOD', value: pm),
+                LockedField(
+                  label: 'AMOUNT RECEIVED (first)',
+                  value: (o.cashierAmountReceived ?? 0).toStringAsFixed(2),
+                ),
+                if (o.cashierSecondaryAmountReceived != null && o.cashierSecondaryAmountReceived! > 0)
+                  LockedField(
+                    label: 'ADDITIONAL AMOUNT (balance)',
+                    value: o.cashierSecondaryAmountReceived!.toStringAsFixed(2),
+                  ),
+                LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
+                const SizedBox(height: 10),
+                OutlinedButton(
+                  onPressed: o.paymentProofBase64 == null || o.paymentProofBase64!.isEmpty
+                      ? null
+                      : () {
+                          try {
+                            final bytes = base64Decode(o.paymentProofBase64!);
+                            showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Proof of payment');
+                          } catch (_) {
+                            appSnack(context, 'Could not display image');
+                          }
+                        },
+                  child: const Text('VIEW PROOF OF PAYMENT'),
+                ),
+                if (hasSup) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton(
+                    onPressed: () {
+                      try {
+                        final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+                        showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
+                      } catch (_) {
+                        appSnack(context, 'Could not display image');
+                      }
+                    },
+                    child: const Text('VIEW BALANCE PAYMENT PROOF'),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          ToggleSection(
+            title: 'YOUR TRAY',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: o.lines.isEmpty
+                ? const Text('No dishes on file.')
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: o.lines
+                        .map(
+                          (l) => ListTile(
+                            dense: true,
+                            title: Text(l.itemName),
+                            subtitle: Text(l.dip.isEmpty ? '—' : '${l.dip} × ${l.dipQty}'),
+                            trailing: Text('x${l.qty}  ₱${orderLineSubtotal(l).toStringAsFixed(2)}'),
+                          ),
+                        )
+                        .toList(),
+                  ),
+          ),
+          const SizedBox(height: 10),
+          ToggleSection(
+            title: 'ORDER NOTE',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: Text(o.note.isEmpty ? '—' : o.note),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _onlineDetailHeaderLabel(OrderData o) {
+    final st = o.status.toUpperCase();
+    if (st.contains('CANCEL')) return 'Cancelled + ${o.orderNo}';
+    switch (o.fulfillmentStage.toUpperCase()) {
+      case 'PENDING_CASHIER':
+        return 'Pending';
+      case 'IN_PREPARATION':
+        return 'Preparing';
+      case 'OUT_FOR_DELIVERY':
+        return 'For Delivery';
+      case 'DELIVERED':
+        return 'Delivered + ${o.orderNo}';
+      default:
+        return 'Order';
+    }
+  }
+
   Future<bool> _confirmDialog(String title, String body) async {
     final r = await showDialog<bool>(
       context: context,
@@ -18227,6 +19441,9 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
       animation: widget.state,
       builder: (context, _) {
         final o = _currentOrder();
+        if (o.status.toUpperCase().contains('CANCEL')) {
+          return _buildCancelledOnlineDetail(context, o);
+        }
         final proofOk = o.paymentUploaded || (o.paymentProofBase64?.isNotEmpty ?? false);
         final parsed = double.tryParse(amountReceived.text.trim());
         final parsedSupp = double.tryParse(supplementalAmount.text.trim());
@@ -18257,9 +19474,13 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         backgroundColor: Colors.black87,
         foregroundColor: Colors.white,
         title: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(color: AppColors.brand, borderRadius: BorderRadius.circular(10)),
-          child: const Text('CHECKOUT', style: TextStyle(color: AppColors.ink, fontWeight: FontWeight.w800)),
+          child: Text(
+            _onlineDetailHeaderLabel(o),
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AppColors.ink, fontWeight: FontWeight.w800, fontSize: 12),
+          ),
         ),
         centerTitle: true,
       ),
@@ -18394,10 +19615,14 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
                             onPressed: insufficientAmount ? () async {
                               if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
-                              final err = await widget.state.cashierReviewOrder(
-                                orderId: o.id,
-                                action: 'insufficient',
-                                amountReceived: ar,
+                              final err = await withCashierBlockingProgress<String?>(
+                                context,
+                                'Updating payment…',
+                                widget.state.cashierReviewOrder(
+                                  orderId: o.id,
+                                  action: 'insufficient',
+                                  amountReceived: ar,
+                                ),
                               );
                               if (!context.mounted) return;
                               if (err != null) {
@@ -18414,10 +19639,14 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                             onPressed: overAmount ? () async {
                               if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
-                              final err = await widget.state.cashierReviewOrder(
-                                orderId: o.id,
-                                action: 'overpayment',
-                                amountReceived: ar,
+                              final err = await withCashierBlockingProgress<String?>(
+                                context,
+                                'Updating payment…',
+                                widget.state.cashierReviewOrder(
+                                  orderId: o.id,
+                                  action: 'overpayment',
+                                  amountReceived: ar,
+                                ),
                               );
                               if (!context.mounted) return;
                               if (err != null) {
@@ -18476,10 +19705,14 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                                   )) {
                                 return;
                               }
-                              final err = await widget.state.cashierPatchFulfillment(
-                                orderId: o.id,
-                                fulfillmentStage: 'OUT_FOR_DELIVERY',
-                                deliveryTrackingUrl: trackingUrl.text.trim(),
+                              final err = await withCashierBlockingProgress<String?>(
+                                context,
+                                'Saving tracking link…',
+                                widget.state.cashierPatchFulfillment(
+                                  orderId: o.id,
+                                  fulfillmentStage: 'OUT_FOR_DELIVERY',
+                                  deliveryTrackingUrl: trackingUrl.text.trim(),
+                                ),
                               );
                               if (!context.mounted) return;
                               if (err != null) {
@@ -18506,15 +19739,42 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        SelectableText(o.deliveryTrackingUrl.trim().isEmpty ? '—' : o.deliveryTrackingUrl.trim()),
+                        Builder(
+                          builder: (ctx) {
+                            final t = o.deliveryTrackingUrl.trim();
+                            if (t.isEmpty) return const SelectableText('—');
+                            final u = Uri.tryParse(t);
+                            if (u != null && u.hasScheme) {
+                              return InkWell(
+                                onTap: () async {
+                                  if (await canLaunchUrl(u)) {
+                                    await launchUrl(u, mode: LaunchMode.externalApplication);
+                                  }
+                                },
+                                child: Text(
+                                  t,
+                                  style: TextStyle(
+                                    color: Colors.blue.shade800,
+                                    decoration: TextDecoration.underline,
+                                  ),
+                                ),
+                              );
+                            }
+                            return SelectableText(t);
+                          },
+                        ),
                         const SizedBox(height: 10),
                         FilledButton(
                           onPressed: () async {
                             if (!await _confirmDialog('Mark delivered?', 'Mark this order as delivered?')) return;
-                            final err = await widget.state.cashierPatchFulfillment(
-                              orderId: o.id,
-                              fulfillmentStage: 'DELIVERED',
-                              deliveryTrackingUrl: o.deliveryTrackingUrl,
+                            final err = await withCashierBlockingProgress<String?>(
+                              context,
+                              'Marking delivered…',
+                              widget.state.cashierPatchFulfillment(
+                                orderId: o.id,
+                                fulfillmentStage: 'DELIVERED',
+                                deliveryTrackingUrl: o.deliveryTrackingUrl,
+                              ),
                             );
                             if (!context.mounted) return;
                             if (err != null) {
@@ -18677,10 +19937,14 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
                             onPressed: insufficientAmount ? () async {
                               if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
-                              final err = await widget.state.cashierReviewOrder(
-                                orderId: o.id,
-                                action: 'insufficient',
-                                amountReceived: ar,
+                              final err = await withCashierBlockingProgress<String?>(
+                                context,
+                                'Updating payment…',
+                                widget.state.cashierReviewOrder(
+                                  orderId: o.id,
+                                  action: 'insufficient',
+                                  amountReceived: ar,
+                                ),
                               );
                               if (!context.mounted) return;
                               if (err != null) {
@@ -18697,10 +19961,14 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                             onPressed: overAmount ? () async {
                               if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
-                              final err = await widget.state.cashierReviewOrder(
-                                orderId: o.id,
-                                action: 'overpayment',
-                                amountReceived: ar,
+                              final err = await withCashierBlockingProgress<String?>(
+                                context,
+                                'Updating payment…',
+                                widget.state.cashierReviewOrder(
+                                  orderId: o.id,
+                                  action: 'overpayment',
+                                  amountReceived: ar,
+                                ),
                               );
                               if (!context.mounted) return;
                               if (err != null) {
@@ -18767,7 +20035,11 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                     const SizedBox(height: 10),
                     OutlinedButton.icon(
                       onPressed: () async {
-                        final err = await widget.state.cashierRemindInsufficientOrder(orderId: o.id);
+                        final err = await withCashierBlockingProgress<String?>(
+                          context,
+                          'Sending follow-up…',
+                          widget.state.cashierRemindInsufficientOrder(orderId: o.id),
+                        );
                         if (!context.mounted) return;
                         appSnack(context, err ?? 'Follow-up sent to customer');
                       },
@@ -18802,10 +20074,14 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   )) {
                     return;
                   }
-                  final err = await widget.state.cashierReviewOrder(
-                    orderId: o.id,
-                    action: 'confirm',
-                    supplementalAmountReceived: suppAmt,
+                  final err = await withCashierBlockingProgress<String?>(
+                    context,
+                    'Confirming order…',
+                    widget.state.cashierReviewOrder(
+                      orderId: o.id,
+                      action: 'confirm',
+                      supplementalAmountReceived: suppAmt,
+                    ),
                   );
                   if (!context.mounted) return;
                   if (err != null) {
@@ -18846,10 +20122,14 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                         )) {
                           return;
                         }
-                        final err = await widget.state.cashierReviewOrder(
-                          orderId: o.id,
-                          action: 'confirm',
-                          amountReceived: ar,
+                        final err = await withCashierBlockingProgress<String?>(
+                          context,
+                          'Confirming order…',
+                          widget.state.cashierReviewOrder(
+                            orderId: o.id,
+                            action: 'confirm',
+                            amountReceived: ar,
+                          ),
                         );
                         if (!context.mounted) return;
                         if (err != null) {
