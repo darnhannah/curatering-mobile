@@ -121,6 +121,15 @@ export function isMailConfigured(): boolean {
   return !!(smtpUser() && smtpPass());
 }
 
+/** Resend Hobby plan is ~2 req/s; parallel signup/login/forgot hits 429. Serialize + throttle + retry. */
+let resendSendChain: Promise<void> = Promise.resolve();
+let lastResendRequestDoneAt = 0;
+const kMinMsBetweenResendRequests = 520;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function sendViaResend(
   to: string,
   subject: string,
@@ -144,18 +153,42 @@ async function sendViaResend(
       content: a.content.toString("base64"),
     }));
   }
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Resend API HTTP ${res.status}: ${errText || res.statusText}`);
-  }
+  const payload = JSON.stringify(body);
+
+  const run = async (): Promise<void> => {
+    const waitGap = kMinMsBetweenResendRequests - (Date.now() - lastResendRequestDoneAt);
+    if (waitGap > 0) await sleepMs(waitGap);
+    let lastErr: Error | null = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: payload,
+      });
+      lastResendRequestDoneAt = Date.now();
+      if (res.ok) return;
+      const errText = await res.text().catch(() => "");
+      lastErr = new Error(`Resend API HTTP ${res.status}: ${errText || res.statusText}`);
+      if (res.status === 429 || res.status === 503) {
+        const ra = res.headers.get("retry-after");
+        const sec = ra ? Number.parseFloat(ra) : NaN;
+        const backoff = Number.isFinite(sec) && sec > 0 ? Math.min(10_000, Math.ceil(sec * 1000)) : 400 * (attempt + 1);
+        await sleepMs(backoff);
+        const pad = kMinMsBetweenResendRequests - (Date.now() - lastResendRequestDoneAt);
+        if (pad > 0) await sleepMs(pad);
+        continue;
+      }
+      throw lastErr;
+    }
+    throw lastErr ?? new Error("Resend send failed after retries");
+  };
+
+  const job = resendSendChain.then(run, run);
+  resendSendChain = job.catch(() => {});
+  await job;
 }
 
 /**

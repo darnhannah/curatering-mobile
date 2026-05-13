@@ -677,6 +677,58 @@ function loyaltyPointsFor(kind: LoyaltyEarnKind, totalAmount: number): number {
   return Math.floor(totalAmount / RESTAURANT_LOYALTY_STEP_AMOUNT) * RESTAURANT_LOYALTY_STEP_POINTS;
 }
 
+async function refreshLoyaltyTotalsForUser(userEmailRaw: string): Promise<void> {
+  const email = userEmailRaw.trim().toLowerCase();
+  if (!email || email.endsWith("@guest.curatering.internal")) return;
+  const subFrom = `(
+     SELECT
+       COALESCE((
+         SELECT SUM(COALESCE(ro.points_earned, 0))::int
+         FROM restaurant_orders ro
+         LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
+         WHERE LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))) = $1
+           AND COALESCE(ro.delivery_notes, '') NOT LIKE '%Catering event loyalty%'
+       ), 0) AS r,
+       (
+         COALESCE((
+           SELECT SUM(COALESCE(points_earned, 0))::int
+           FROM event_orders
+           WHERE LOWER(TRIM(email_address)) = $1
+             AND LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+         ), 0)
+         + COALESCE((
+           SELECT SUM(COALESCE(points_earned, 0))::int
+           FROM catering_orders
+           WHERE LOWER(TRIM(email_address)) = $1
+             AND LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+         ), 0)
+       )::int AS c
+   )`;
+  try {
+    await getPool().query(
+      `UPDATE customer_profiles cp
+       SET loyalty_points_restaurant = sub.r,
+           loyalty_points_catering = sub.c,
+           loyalty_points = sub.r + sub.c,
+           updated_at = NOW()
+       FROM ${subFrom} sub
+       WHERE LOWER(cp.user_email) = $1`,
+      [email],
+    );
+    await getPool().query(
+      `UPDATE customer_accounts ca
+       SET restaurant_loyalty_points = sub.r,
+           catering_loyalty_points = sub.c,
+           updated_at = NOW()
+       FROM ${subFrom} sub
+       WHERE LOWER(ca.email) = $1`,
+      [email],
+    );
+  } catch (e) {
+    console.warn("[loyalty] refresh totals for user failed:", e instanceof Error ? e.message : e);
+  }
+}
+
 async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
   try {
     await getPool().query(
@@ -714,55 +766,87 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
     );
 
     await getPool().query(
-      `UPDATE customer_profiles cp
-       SET loyalty_points_restaurant = COALESCE(x.restaurant_points, 0),
-           loyalty_points_catering = COALESCE(x.catering_points, 0),
-           loyalty_points = COALESCE(x.restaurant_points, 0) + COALESCE(x.catering_points, 0),
-           updated_at = NOW()
-       FROM (
-         SELECT LOWER(COALESCE(ca.email, ro.customer_id::text)) AS email_key,
-                SUM(
+      `WITH agg AS (
+         SELECT email_key,
+                SUM(rp)::int AS restaurant_points,
+                SUM(cp)::int AS catering_points
+         FROM (
+           SELECT LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))) AS email_key,
                   CASE
-                    WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN 0
-                    ELSE COALESCE(ro.points_earned, 0)
-                  END
-                )::int AS restaurant_points,
-                SUM(
-                  CASE
-                    WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN COALESCE(ro.points_earned, 0)
+                    WHEN COALESCE(ro.delivery_notes, '') NOT LIKE '%Catering event loyalty%'
+                      THEN COALESCE(ro.points_earned, 0)
                     ELSE 0
-                  END
-                )::int AS catering_points
-         FROM restaurant_orders ro
-         LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
-         GROUP BY 1
-       ) x
-       WHERE LOWER(cp.user_email) = x.email_key`,
+                  END AS rp,
+                  0::int AS cp
+           FROM restaurant_orders ro
+           LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
+           WHERE NULLIF(LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))), '') IS NOT NULL
+           UNION ALL
+           SELECT LOWER(TRIM(email_address)) AS email_key,
+                  0 AS rp,
+                  COALESCE(points_earned, 0) AS cp
+           FROM event_orders
+           WHERE LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+             AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
+           UNION ALL
+           SELECT LOWER(TRIM(email_address)) AS email_key,
+                  0 AS rp,
+                  COALESCE(points_earned, 0) AS cp
+           FROM catering_orders
+           WHERE LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+             AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
+         ) t
+         WHERE email_key <> ''
+         GROUP BY email_key
+       )
+       UPDATE customer_profiles cp
+       SET loyalty_points_restaurant = COALESCE(agg.restaurant_points, 0),
+           loyalty_points_catering = COALESCE(agg.catering_points, 0),
+           loyalty_points = COALESCE(agg.restaurant_points, 0) + COALESCE(agg.catering_points, 0),
+           updated_at = NOW()
+       FROM agg
+       WHERE LOWER(cp.user_email) = agg.email_key`,
     );
     await getPool().query(
-      `UPDATE customer_accounts ca
-       SET restaurant_loyalty_points = COALESCE(x.restaurant_points, 0),
-           catering_loyalty_points = COALESCE(x.catering_points, 0),
-           updated_at = NOW()
-       FROM (
-         SELECT LOWER(COALESCE(ca.email, ro.customer_id::text)) AS email_key,
-                SUM(
+      `WITH agg AS (
+         SELECT email_key,
+                SUM(rp)::int AS restaurant_points,
+                SUM(cp)::int AS catering_points
+         FROM (
+           SELECT LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))) AS email_key,
                   CASE
-                    WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN 0
-                    ELSE COALESCE(ro.points_earned, 0)
-                  END
-                )::int AS restaurant_points,
-                SUM(
-                  CASE
-                    WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN COALESCE(ro.points_earned, 0)
+                    WHEN COALESCE(ro.delivery_notes, '') NOT LIKE '%Catering event loyalty%'
+                      THEN COALESCE(ro.points_earned, 0)
                     ELSE 0
-                  END
-                )::int AS catering_points
-         FROM restaurant_orders ro
-         LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
-         GROUP BY 1
-       ) x
-       WHERE LOWER(ca.email) = x.email_key`,
+                  END AS rp,
+                  0::int AS cp
+           FROM restaurant_orders ro
+           LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
+           WHERE NULLIF(LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))), '') IS NOT NULL
+           UNION ALL
+           SELECT LOWER(TRIM(email_address)) AS email_key,
+                  0 AS rp,
+                  COALESCE(points_earned, 0) AS cp
+           FROM event_orders
+           WHERE LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+             AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
+           UNION ALL
+           SELECT LOWER(TRIM(email_address)) AS email_key,
+                  0 AS rp,
+                  COALESCE(points_earned, 0) AS cp
+           FROM catering_orders
+           WHERE LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
+             AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
+         ) t
+         WHERE email_key <> ''
+         GROUP BY email_key
+       )
+       UPDATE customer_accounts ca
+       SET restaurant_loyalty_points = COALESCE(agg.restaurant_points, 0),
+           catering_loyalty_points = COALESCE(agg.catering_points, 0),
+           updated_at = NOW()
+       FROM agg
+       WHERE LOWER(ca.email) = agg.email_key`,
     );
   } catch (e) {
     console.warn("[db] loyalty recompute skipped:", e instanceof Error ? e.message : e);
@@ -2067,6 +2151,7 @@ app.get("/api/mobile/profile", async (req, res) => {
     return;
   }
   try {
+    await refreshLoyaltyTotalsForUser(userEmail);
     const { rows } = await getPool().query(
       `SELECT user_email, full_name, contact_number, delivery_address, delivery_map_confirmed,
               delivery_lat, delivery_lng, loyalty_points,
@@ -4673,6 +4758,78 @@ app.patch("/api/mobile/notifications/read-all", async (req, res) => {
   try {
     await getPool().query(`UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE`, [userEmail]);
     res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
+app.post("/api/mobile/order-feedback", async (req, res) => {
+  const userEmail = String(req.body?.user_email ?? "").trim().toLowerCase();
+  const kind = String(req.body?.kind ?? "").trim().toLowerCase();
+  const reference = String(req.body?.reference ?? "").trim();
+  const ratingRaw = Number(req.body?.rating ?? 5);
+  const rating = Number.isFinite(ratingRaw) ? Math.min(5, Math.max(1, Math.floor(ratingRaw))) : 5;
+  const comment = String(req.body?.comment ?? "").trim();
+  if (!userEmail || userEmail.endsWith("@guest.curatering.internal")) {
+    res.status(400).json({ error: "user_email is required" });
+    return;
+  }
+  if (!reference || (kind !== "restaurant_order" && kind !== "catering_inquiry")) {
+    res.status(400).json({ error: "kind must be restaurant_order or catering_inquiry, and reference is required" });
+    return;
+  }
+  try {
+    if (kind === "restaurant_order") {
+      const { rows } = await getPool().query(
+        `SELECT 1 FROM restaurant_orders ro
+         WHERE LOWER(TRIM(ro.user_email)) = $1
+           AND ro.order_no = $2
+           AND (
+             UPPER(COALESCE(ro.fulfillment_stage, '')) = 'DELIVERED'
+             OR UPPER(ro.status) LIKE '%COMPLETE%'
+             OR UPPER(ro.status) LIKE '%DELIVERED%'
+             OR UPPER(ro.status) LIKE '%DONE%'
+             OR UPPER(ro.status) LIKE '%CLOSED%'
+           )
+         LIMIT 1`,
+        [userEmail, reference],
+      );
+      if (!rows[0]) {
+        res.status(400).json({ error: "order not found or not completed" });
+        return;
+      }
+    } else {
+      const { rows } = await getPool().query(
+        `SELECT 1 FROM event_orders
+         WHERE id::text = $2 AND LOWER(TRIM(email_address)) = $1 AND LOWER(TRIM(status)) = 'completed'
+         UNION ALL
+         SELECT 1 FROM catering_orders
+         WHERE id::text = $2 AND LOWER(TRIM(email_address)) = $1 AND LOWER(TRIM(status)) = 'completed'
+         LIMIT 1`,
+        [userEmail, reference],
+      );
+      if (!rows[0]) {
+        res.status(400).json({ error: "inquiry not found or not completed" });
+        return;
+      }
+    }
+    await getPool().query(
+      `INSERT INTO customer_order_feedback (user_email, kind, reference, rating, comment)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (user_email, kind, reference)
+       DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = NOW()`,
+      [userEmail, kind, reference, rating, comment],
+    );
+    const msg = `Customer order feedback\nFrom: ${userEmail}\nKind: ${kind}\nRef: ${reference}\nRating: ${rating}/5\n${comment || "(no remarks)"}`;
+    await getPool().query(
+      `INSERT INTO notifications (user_id, message)
+       SELECT email, $1
+       FROM users
+       WHERE role IN ('manager', 'supervisor')`,
+      [msg],
+    );
+    res.status(201).json({ ok: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });

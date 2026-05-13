@@ -499,4 +499,20 @@ export async function initDb(): Promise<void> {
   } catch {
     // Constraint may already be correct or renamed in some deployments.
   }
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS customer_order_feedback (
+      id BIGSERIAL PRIMARY KEY,
+      user_email TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      reference TEXT NOT NULL,
+      rating INTEGER NOT NULL DEFAULT 5,
+      comment TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await p.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS customer_order_feedback_user_kind_ref_idx
+     ON customer_order_feedback (user_email, kind, reference)`,
+  );
 }
