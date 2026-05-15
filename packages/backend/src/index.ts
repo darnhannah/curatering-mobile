@@ -12,6 +12,13 @@ import {
   sendMailWithPdfRequired,
 } from "./mail.js";
 import { formatDbStartupError, getPool, initDb } from "./db.js";
+import {
+  guestReachFromRow,
+  isGuestUserEmail,
+  nextGuestCustomerId,
+  notifyRestaurantOrderCustomer,
+  sendGuestOrderProofConfirmation,
+} from "./guestNotify.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
 if (isMailConfigured()) {
@@ -517,6 +524,16 @@ async function resolveCustomerAccountByIdentity(identityRaw: string): Promise<{
   return row ?? null;
 }
 
+async function customerProfileIdForEmail(emailRaw: string): Promise<string | null> {
+  const email = emailRaw.trim().toLowerCase();
+  if (!email) return null;
+  const { rows } = await getPool().query(
+    `SELECT id FROM customer_profiles WHERE LOWER(TRIM(user_email)) = $1 LIMIT 1`,
+    [email],
+  );
+  return (rows[0] as { id: string } | undefined)?.id ?? null;
+}
+
 async function nextTransactionNo(_kind: "catering" | "event"): Promise<string> {
   void _kind;
   const { rows } = await getPool().query(
@@ -874,15 +891,7 @@ async function applyLoyaltyRewardsBestEffort(
       return;
     }
 
-    let customerId: string | null = null;
-    try {
-      const acc = await getPool().query(`SELECT id::text AS id FROM customer_accounts WHERE LOWER(email) = $1`, [
-        email,
-      ]);
-      customerId = (acc.rows[0] as { id: string } | undefined)?.id ?? null;
-    } catch {
-      customerId = null;
-    }
+    const customerId = await customerProfileIdForEmail(email);
 
     let fullName = "";
     let phone = "";
@@ -1278,18 +1287,13 @@ app.post("/api/mobile/auth/login", async (req, res) => {
 
 app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
   const identity = String(req.body?.identity ?? req.body?.email ?? "").trim().toLowerCase();
-  const channel = String(req.body?.channel ?? "email").trim().toLowerCase();
   const role = String(req.body?.role ?? "customer").trim().toLowerCase();
   if (!identity) {
-    res.status(400).json({ error: "identity is required" });
+    res.status(400).json({ error: "email is required" });
     return;
   }
-  if (!["email", "phone"].includes(channel)) {
-    res.status(400).json({ error: "channel must be email or phone" });
-    return;
-  }
-  if (role === "cashier" && channel !== "email") {
-    res.status(400).json({ error: "cashier password reset supports email only" });
+  if (!identity.includes("@")) {
+    res.status(400).json({ error: "enter a valid email address" });
     return;
   }
   if (!isMailConfigured() && !mobileDevOtpLogging) {
@@ -1302,7 +1306,6 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
   const otp = String(crypto.randomInt(100000, 1000000));
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
   let targetEmail = "";
-  let targetPhone = "";
   try {
     if (role === "cashier") {
       const { rows } = await getPool().query(`SELECT email FROM users WHERE LOWER(email) = $1 LIMIT 1`, [identity]);
@@ -1317,16 +1320,18 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
         [targetEmail, otp, expiresAt.toISOString()],
       );
     } else {
-      const account = await resolveCustomerAccountByIdentity(identity);
+      const { rows } = await getPool().query(`SELECT email FROM customer_accounts WHERE LOWER(email) = $1 LIMIT 1`, [
+        identity,
+      ]);
+      const account = rows[0] as { email: string } | undefined;
       if (!account) {
         res.status(404).json({
           error: "not_registered",
-          message: "This email or phone number is not registered.",
+          message: "This email is not registered.",
         });
         return;
       }
       targetEmail = account.email;
-      targetPhone = account.phone_number ?? "";
       await getPool().query(
         `UPDATE customer_accounts SET password_reset_otp = $2, password_reset_expires_at = $3, updated_at = NOW() WHERE email = $1`,
         [targetEmail, otp, expiresAt.toISOString()],
@@ -1337,14 +1342,9 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
     res.status(500).json({ error: "database error" });
     return;
   }
-  const otpBody =
-    channel === "phone"
-      ? `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.\n\n(You requested verification using your phone number on file; this code was sent to your registered email.)`
-      : `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.`;
+  const otpBody = `Your password reset OTP is: ${otp}\n\nIt is valid for 1 hour.`;
   if (mobileDevOtpLogging && !isMailConfigured()) {
-    console.warn(
-      `[MOBILE_DEV_OTP_LOGGING] password reset OTP for ${targetEmail} (channel=${channel}, role=${role}): ${otp}`,
-    );
+    console.warn(`[MOBILE_DEV_OTP_LOGGING] password reset OTP for ${targetEmail} (role=${role}): ${otp}`);
   } else {
     try {
       await sendMailRequired(targetEmail, "Reset your Curatering password", otpBody);
@@ -1357,19 +1357,11 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
     }
   }
   try {
-    if (channel === "phone") {
-      await logActionBestEffort(
-        "auth.reset.request_phone_channel",
-        targetEmail,
-        "Password reset OTP emailed (phone channel selected in app)",
-        { phone_number: targetPhone, otp_masked: "***" },
-      );
-    }
     await logActionBestEffort(
       "auth.reset.request",
       targetEmail,
       "Password reset requested",
-      { channel, role },
+      { channel: "email", role },
     );
   } catch (logErr) {
     console.warn("[auth] password reset logging failed (non-fatal):", logErr);
@@ -1608,7 +1600,8 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
   try {
     const { rows: orows } = await getPool().query(
       `SELECT mobile_id AS id, user_email, order_no, status, total, order_source,
-              cashier_amount_received, supplemental_payment_proof, balance_proof_pending_review
+              cashier_amount_received, supplemental_payment_proof, balance_proof_pending_review,
+              guest_contact_email, delivery_contact
        FROM restaurant_orders WHERE mobile_id = $1`,
       [id],
     );
@@ -1622,6 +1615,8 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       cashier_amount_received: string | null;
       supplemental_payment_proof: string | null;
       balance_proof_pending_review: boolean;
+      guest_contact_email: string | null;
+      delivery_contact: string | null;
     };
     const ord = orows[0] as OrdRow | undefined;
     if (!ord || ord.order_source !== "MOBILE_APP" || !ord.user_email) {
@@ -1679,12 +1674,13 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
           [id, newStatus, supplementalAmtIn, changeAmt],
         );
 
-        void sendMailSafe(String(ord.user_email), mailSubject, mailBody);
-        await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [
-          String(ord.user_email).toLowerCase(),
-          `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
-        ]);
-        await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
+        await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
+          orderNo: ord.order_no,
+          inAppMessage: `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
+        });
+        if (!isGuestUserEmail(String(ord.user_email ?? ""))) {
+          await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
+        }
         res.json({ ok: true, status: newStatus });
         return;
       }
@@ -1749,11 +1745,10 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
            WHERE mobile_id = $1`,
           [id, newStatus, supplementalAmtIn],
         );
-        void sendMailSafe(String(ord.user_email), mailSubject, mailBody);
-        await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [
-          String(ord.user_email).toLowerCase(),
-          `[${ord.order_no}] Payment update: please pay the remaining balance (total ₱${total.toFixed(2)}).`,
-        ]);
+        await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
+          orderNo: ord.order_no,
+          inAppMessage: `[${ord.order_no}] Payment update: please pay the remaining balance (total ₱${total.toFixed(2)}).`,
+        });
         res.json({ ok: true, status: newStatus });
         return;
       }
@@ -1816,12 +1811,13 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
            WHERE mobile_id = $1`,
           [id, newStatus, supplementalAmtIn, changeAmt],
         );
-        void sendMailSafe(String(ord.user_email), mailSubject, mailBody);
-        await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [
-          String(ord.user_email).toLowerCase(),
-          `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
-        ]);
-        await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
+        await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
+          orderNo: ord.order_no,
+          inAppMessage: `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
+        });
+        if (!isGuestUserEmail(String(ord.user_email ?? ""))) {
+          await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
+        }
         res.json({ ok: true, status: newStatus });
         return;
       }
@@ -1852,17 +1848,18 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       [id, newStatus, cashReceived, changeAmt, nextStage],
     );
 
-    void sendMailSafe(String(ord.user_email), mailSubject, mailBody);
-    const ue = String(ord.user_email).toLowerCase();
     let inApp = `[${ord.order_no}] Status: ${newStatus}`;
     if (action === "confirm" || (action === "overpayment" && newStatus.toUpperCase().includes("CONFIRMED"))) {
       inApp = `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`;
     } else if (action === "insufficient") {
       inApp = `[${ord.order_no}] Payment update: please pay the remaining balance (total ₱${total.toFixed(2)}).`;
     }
-    await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [ue, inApp]);
+    await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
+      orderNo: ord.order_no,
+      inAppMessage: inApp,
+    });
     const stUp = newStatus.toUpperCase();
-    if (stUp.includes("ORDER CONFIRMED") && ord.user_email) {
+    if (stUp.includes("ORDER CONFIRMED") && ord.user_email && !isGuestUserEmail(String(ord.user_email))) {
       await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
     }
     res.json({ ok: true, status: newStatus });
@@ -1886,12 +1883,21 @@ app.post("/api/mobile/pos/online-orders/:id/remind-balance", async (req, res) =>
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT user_email, order_no, total, status
+      `SELECT user_email, order_no, total, status, guest_contact_email, delivery_contact
        FROM restaurant_orders
        WHERE mobile_id = $1 AND order_source = 'MOBILE_APP'`,
       [id],
     );
-    const ord = rows[0] as { user_email: string | null; order_no: string; total: string; status: string } | undefined;
+    const ord = rows[0] as
+      | {
+          user_email: string | null;
+          order_no: string;
+          total: string;
+          status: string;
+          guest_contact_email: string | null;
+          delivery_contact: string | null;
+        }
+      | undefined;
     if (!ord || !ord.user_email) {
       res.status(404).json({ error: "online order not found" });
       return;
@@ -1908,11 +1914,10 @@ app.post("/api/mobile/pos/online-orders/:id/remind-balance", async (req, res) =>
       `Your total order amount is ₱${total.toFixed(2)} and we are still waiting for the remaining balance.\n` +
       `Please upload your additional payment proof in the app so we can continue processing your order.\n\n` +
       `Thank you.`;
-    await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [
-      String(ord.user_email).toLowerCase(),
-      `[${ord.order_no}] Please pay and upload proof for the remaining balance.`,
-    ]);
-    void sendMailSafe(String(ord.user_email), subject, body);
+    await notifyRestaurantOrderCustomer(guestReachFromRow(ord), subject, body, {
+      orderNo: ord.order_no,
+      inAppMessage: `[${ord.order_no}] Please pay and upload proof for the remaining balance.`,
+    });
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -1941,12 +1946,14 @@ app.patch("/api/mobile/pos/online-orders/:id/fulfillment", async (req, res) => {
   }
   try {
     const { rows: before } = await getPool().query(
-      `SELECT user_email, order_no
+      `SELECT user_email, order_no, guest_contact_email, delivery_contact
        FROM restaurant_orders
        WHERE mobile_id = $1 AND order_source = 'MOBILE_APP' AND user_email IS NOT NULL`,
       [id],
     );
-    const beforeRow = before[0] as { user_email: string | null; order_no: string } | undefined;
+    const beforeRow = before[0] as
+      | { user_email: string | null; order_no: string; guest_contact_email: string | null; delivery_contact: string | null }
+      | undefined;
     const { rows } = await getPool().query(
       `UPDATE restaurant_orders
        SET fulfillment_stage = $2,
@@ -1961,17 +1968,14 @@ app.patch("/api/mobile/pos/online-orders/:id/fulfillment", async (req, res) => {
       return;
     }
     if (beforeRow?.user_email) {
-      void sendMailSafe(
-        beforeRow.user_email,
-        `Order ${beforeRow.order_no} update`,
-        `Your order ${beforeRow.order_no} is now in stage: ${stage}.` +
-          (tracking ? `\nTracking link: ${tracking}` : ""),
-      );
-      await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [
-        String(beforeRow.user_email).toLowerCase(),
-        `[${beforeRow.order_no}] Fulfillment: ${stage.replace(/_/g, " ")}` +
+      const trackBody =
+        `Your order ${beforeRow.order_no} is now in stage: ${stage}.` + (tracking ? `\nTracking link: ${tracking}` : "");
+      await notifyRestaurantOrderCustomer(guestReachFromRow(beforeRow), `Order ${beforeRow.order_no} update`, trackBody, {
+        orderNo: beforeRow.order_no,
+        inAppMessage:
+          `[${beforeRow.order_no}] Fulfillment: ${stage.replace(/_/g, " ")}` +
           (tracking.length > 0 ? "\nTracking link added." : ""),
-      ]);
+      });
     }
     res.json({ ok: true });
   } catch (err) {
@@ -2494,16 +2498,31 @@ app.post("/api/mobile/orders", async (req, res) => {
     return;
   }
   const total = parsedItems.reduce((sum, i) => sum + restaurantLineSubtotal(i), 0);
+  const contactEmail = String(req.body?.contact_email ?? "").trim().toLowerCase();
+  const isGuest = isGuestUserEmail(userEmail);
+  const customerId = isGuest ? await nextGuestCustomerId() : await customerProfileIdForEmail(userEmail);
+  const guestContactEmail = isGuest && contactEmail ? contactEmail : null;
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
     const { rows } = await client.query(
       `INSERT INTO restaurant_orders
-        (user_email, order_no, note, payment_mode, delivery_name, delivery_contact, delivery_address, delivery_time, total)
+        (user_email, customer_id, guest_contact_email, order_no, note, payment_mode, delivery_name, delivery_contact, delivery_address, delivery_time, total)
        VALUES
-        ($1, 'TEMP', $2, $3, $4, $5, $6, $7, $8)
+        ($1, $2, $3, 'TEMP', $4, $5, $6, $7, $8, $9, $10)
        RETURNING mobile_id AS id`,
-      [userEmail, note, paymentMode, deliveryName, deliveryContact, deliveryAddress, deliveryTime, total],
+      [
+        userEmail,
+        customerId,
+        guestContactEmail,
+        note,
+        paymentMode,
+        deliveryName,
+        deliveryContact,
+        deliveryAddress,
+        deliveryTime,
+        total,
+      ],
     );
     const orderId = Number(rows[0].id);
     const orderNo = `Order No. ${String(orderId).padStart(6, "0")}`;
@@ -2519,15 +2538,17 @@ app.post("/api/mobile/orders", async (req, res) => {
       total,
       item_count: parsedItems.length,
     });
-    void sendMailSafe(
-      userEmail,
-      `${orderNo} — order placed`,
-      `Thank you for ordering with Macrina's Kitchen and Catering.\n\n` +
-        `Your restaurant order ${orderNo} has been placed and is awaiting payment confirmation from our team.\n` +
-        `You will be notified by email as soon as your payment has been confirmed.\n\n` +
-        `Total: ₱${total.toFixed(2)}\n\n` +
-        `Please complete payment (GCash) and upload your proof in the app if you have not already.`,
-    );
+    if (!isGuest) {
+      void sendMailSafe(
+        userEmail,
+        `${orderNo} — order placed`,
+        `Thank you for ordering with Macrina's Kitchen and Catering.\n\n` +
+          `Your restaurant order ${orderNo} has been placed and is awaiting payment confirmation from our team.\n` +
+          `You will be notified by email as soon as your payment has been confirmed.\n\n` +
+          `Total: ₱${total.toFixed(2)}\n\n` +
+          `Please complete payment (GCash) and upload your proof in the app if you have not already.`,
+      );
+    }
     res.status(201).json({ id: orderId, order_no: orderNo, total });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -2547,7 +2568,9 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
   }
   try {
     const { rows: found } = await getPool().query(
-      `SELECT mobile_id AS id, status, order_no, total, note, user_email, payment_uploaded FROM restaurant_orders WHERE mobile_id = $1`,
+      `SELECT mobile_id AS id, status, order_no, total, note, user_email, guest_contact_email, delivery_contact,
+              payment_uploaded, order_lines_snapshot
+       FROM restaurant_orders WHERE mobile_id = $1`,
       [id],
     );
     const row = found[0] as {
@@ -2557,7 +2580,10 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
       total: string;
       note: string;
       user_email: string | null;
+      guest_contact_email: string | null;
+      delivery_contact: string | null;
       payment_uploaded: boolean;
+      order_lines_snapshot: unknown;
     } | undefined;
     if (!row) {
       res.status(404).json({ error: "order not found" });
@@ -2604,12 +2630,30 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
       );
       const totalNum = Number(row.total) || 0;
       const emailTo = String(row.user_email ?? "").trim().toLowerCase();
-      if (!hadProofBefore && emailTo) {
-        void sendMailSafe(
-          emailTo,
-          `Order ${row.order_no} — checkout complete`,
-          `Your order ${row.order_no} payment proof was received.\nTotal: ₱${totalNum.toFixed(2)}\nNote: ${row.note || "(none)"}\n\nOur team will review your payment shortly.`,
-        );
+      if (!hadProofBefore) {
+        if (isGuestUserEmail(emailTo)) {
+          const guestEm = String(row.guest_contact_email ?? "").trim().toLowerCase();
+          const snap = row.order_lines_snapshot;
+          const arr = Array.isArray(snap) ? snap : [];
+          const lines = arr.map((i) => parseRestaurantOrderLine(i)).filter((x): x is ParsedRestaurantLine => x != null);
+          if (guestEm) {
+            void sendGuestOrderProofConfirmation({
+              orderNo: row.order_no,
+              guestContactEmail: guestEm,
+              deliveryContact: String(row.delivery_contact ?? ""),
+              lines,
+              total: totalNum,
+              note: row.note ?? "",
+              paymentProofBase64: paymentProof,
+            });
+          }
+        } else if (emailTo) {
+          void sendMailSafe(
+            emailTo,
+            `Order ${row.order_no} — checkout complete`,
+            `Your order ${row.order_no} payment proof was received.\nTotal: ₱${totalNum.toFixed(2)}\nNote: ${row.note || "(none)"}\n\nOur team will review your payment shortly.`,
+          );
+        }
       }
     }
     const { rows } = await getPool().query(

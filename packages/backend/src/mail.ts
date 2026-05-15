@@ -322,6 +322,49 @@ export async function sendMailRequired(to: string, subject: string, text: string
   await t.sendMail({ from, to, subject, text });
 }
 
+export type MailAttachment = { filename: string; content: Buffer; contentType?: string };
+
+/** Generic attachments (images, PDFs) — same config as [sendMailSafe]. */
+export async function sendMailWithAttachmentsSafe(
+  to: string,
+  subject: string,
+  text: string,
+  attachments: MailAttachment[],
+): Promise<void> {
+  const mapped = attachments.map((a) => ({ filename: a.filename, content: a.content }));
+  if (mailUsesResend()) {
+    try {
+      await sendViaResend(to, subject, text, mapped);
+    } catch (err) {
+      console.warn("[mail] Resend send (attachments) failed:", err);
+    }
+    return;
+  }
+  const from = smtpFrom();
+  const t = await ensureTransport();
+  if (!t || !from) {
+    console.warn(
+      "Email not configured; set RESEND_API_KEY or TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD; skipping send.",
+    );
+    return;
+  }
+  try {
+    await t.sendMail({
+      from,
+      to,
+      subject,
+      text,
+      attachments: attachments.map((a) => ({
+        filename: a.filename,
+        content: a.content,
+        contentType: a.contentType,
+      })),
+    });
+  } catch (err) {
+    console.warn("[mail] SMTP send (attachments) failed:", err);
+  }
+}
+
 /** PDF attachment (Buffer) — same mail config as [sendMailSafe]. */
 export async function sendMailWithPdfAttachment(
   to: string,

@@ -30,6 +30,7 @@ class AppBrandAssets {
   AppBrandAssets._();
   static const String logo = 'assets/images/macrinasLogo.png';
   static const String logoDashboard = 'assets/images/macrinasLogo3.png';
+  static const String logoCuratering = 'assets/images/curatering.png';
   /// Login / welcome hero (customer).
   static const String logoLogin = 'assets/images/macrinasLogo2.png';
   static const String qrCode = 'assets/images/QRCode_Curatering.jpg';
@@ -1394,13 +1395,61 @@ double cateringCompiledAdditionalCostsTotal(CateringEventRecord row) {
   return sum;
 }
 
-Future<void> openGoogleMapsForAddress(String address) async {
+Future<bool> openGoogleMapsForAddress(
+  String address, {
+  double? lat,
+  double? lng,
+}) async {
   final q = address.trim();
-  if (q.isEmpty) return;
-  final uri = Uri.parse('https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(q)}');
-  if (await canLaunchUrl(uri)) {
-    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  if (q.isEmpty) return false;
+  final encoded = Uri.encodeComponent(q);
+  final uris = <Uri>[
+    if (lat != null && lng != null)
+      Uri.parse('https://www.google.com/maps/search/?api=1&query=$lat,$lng'),
+    Uri.parse('https://www.google.com/maps/search/?api=1&query=$encoded'),
+    Uri.parse('geo:0,0?q=$encoded'),
+    Uri.parse('https://maps.google.com/maps?q=$encoded'),
+    Uri.parse('comgooglemaps://?q=$encoded'),
+  ];
+  for (final uri in uris) {
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (ok) return true;
+    } catch (_) {
+      /* try next scheme */
+    }
   }
+  return false;
+}
+
+/// Tappable venue line for manager lists and detail (opens map preview dialog).
+Widget buildEventVenueAddressLink(
+  BuildContext context,
+  String address, {
+  String prefix = 'Venue',
+  TextStyle? style,
+}) {
+  final addr = address.trim();
+  if (addr.isEmpty) {
+    return Text('$prefix: —', style: style);
+  }
+  return Wrap(
+    crossAxisAlignment: WrapCrossAlignment.center,
+    children: [
+      Text('$prefix: ', style: style),
+      InkWell(
+        onTap: () => showEventVenueMapPreview(context, addr),
+        child: Text(
+          addr,
+          style: (style ?? const TextStyle(height: 1.35)).copyWith(
+            color: Colors.blue.shade800,
+            decoration: TextDecoration.underline,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    ],
+  );
 }
 
 Future<void> showEventVenueMapPreview(BuildContext context, String address) async {
@@ -2024,6 +2073,8 @@ class AppState extends ChangeNotifier {
   bool reopenAuthAsStaff = false;
   /// After [requestAuthSignup], [AuthScreen] opens in sign-up mode.
   bool openAuthInSignupMode = false;
+  /// Guest tapped Sign Up — after account creation, require a fresh login (no auto session).
+  bool signupFromGuestPrompt = false;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
   final Set<String> _readAttentionOrderNos = <String>{};
@@ -2057,6 +2108,32 @@ class AppState extends ChangeNotifier {
   bool get hasCashierAttentionBadge => cashierOnlineOrders.any((o) => o.balanceProofPendingReview);
   List<CateringEventRecord> managerRowsForStage(String stage) =>
       List.unmodifiable(_managerCateringByStage[stage] ?? const <CateringEventRecord>[]);
+
+  int managerCateringCountForTab(int tabIdx) {
+    switch (tabIdx) {
+      case 0:
+        return managerRowsForStage('new_event').length;
+      case 1:
+        return managerRowsForStage('online_inquiries').length;
+      case 2:
+        return managerRowsForStage('for_processing').where((e) => e.processingSubstageLabel == 'down_payment').length;
+      case 3:
+        return managerRowsForStage('for_processing').where((e) => e.processingSubstageLabel == 'ongoing').length;
+      case 4:
+        return managerRowsForStage('for_post_analysis').length;
+      default:
+        return 0;
+    }
+  }
+
+  Future<void> preloadManagerDashboardCounts() async {
+    await Future.wait([
+      loadManagerCateringByStage('new_event', force: true),
+      loadManagerCateringByStage('online_inquiries', force: true),
+      loadManagerCateringByStage('for_processing', force: true),
+      loadManagerCateringByStage('for_post_analysis', force: true),
+    ]);
+  }
 
   /// Rows for the last manager tab API stage ([_managerActiveStage]).
   List<CateringEventRecord> get managerCateringRows => managerRowsForStage(_managerActiveStage);
@@ -2206,6 +2283,7 @@ class AppState extends ChangeNotifier {
     required String email,
     required String otp,
     required String password,
+    bool loginAfter = true,
   }) async {
     try {
       final res = await http
@@ -2227,6 +2305,7 @@ class AppState extends ChangeNotifier {
           return 'Signup failed (${res.statusCode})';
         }
       }
+      if (!loginAfter) return null;
       return await login(email, password);
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -2583,7 +2662,15 @@ class AppState extends ChangeNotifier {
   }
 
   void requestAuthSignup() {
+    signupFromGuestPrompt = true;
     openAuthInSignupMode = true;
+    reopenAuthAsStaff = false;
+    logout();
+  }
+
+  void returnGuestToCustomerLogin() {
+    signupFromGuestPrompt = false;
+    openAuthInSignupMode = false;
     reopenAuthAsStaff = false;
     logout();
   }
@@ -3177,6 +3264,7 @@ class AppState extends ChangeNotifier {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'user_email': userEmail,
+              if (isGuestSession) 'contact_email': profile.contactEmail.trim(),
               'note': checkoutNote,
               'delivery_name': profile.fullName,
               'delivery_contact': profile.contactNumber,
@@ -3292,6 +3380,9 @@ class AppState extends ChangeNotifier {
     checkoutNote = '';
     checkoutDeliveryTime = 'NOW';
     tray.clear();
+    if (isGuestSession) {
+      profile = ProfileData();
+    }
     notifyListeners();
     await clearPersistedCustomerDraft();
   }
@@ -4229,13 +4320,11 @@ class _AuthScreenState extends State<AuthScreen> {
   final confirmPasswordController = TextEditingController();
   final otpController = TextEditingController();
   final forgotEmailController = TextEditingController();
-  final forgotPhoneController = TextEditingController();
   final forgotOtpController = TextEditingController();
   final forgotNewPasswordController = TextEditingController();
   final forgotConfirmPasswordController = TextEditingController();
   bool signupMode = false;
   bool otpSent = false;
-  String forgotChannel = 'email';
   /// Non-null while a blocking auth action runs (login, signup OTP, etc.).
   String? busyMessage;
 
@@ -4255,7 +4344,6 @@ class _AuthScreenState extends State<AuthScreen> {
     confirmPasswordController.dispose();
     otpController.dispose();
     forgotEmailController.dispose();
-    forgotPhoneController.dispose();
     forgotOtpController.dispose();
     forgotNewPasswordController.dispose();
     forgotConfirmPasswordController.dispose();
@@ -4282,11 +4370,16 @@ class _AuthScreenState extends State<AuthScreen> {
               style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: Colors.white),
             ),
             const SizedBox(height: 30),
-            SizedBox(
-              height: 104,
-              width: 104,
-              child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
-            ),
+            if (widget.cashierMode) ...[
+              Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain),
+              const SizedBox(height: 14),
+              Image.asset(AppBrandAssets.logoCuratering, height: 44, fit: BoxFit.contain),
+            ] else
+              SizedBox(
+                height: 140,
+                width: double.infinity,
+                child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
+              ),
             const SizedBox(height: 24),
             Expanded(
               child: Container(
@@ -4353,13 +4446,29 @@ class _AuthScreenState extends State<AuthScreen> {
                                     }
                                     setState(() => busyMessage = 'Creating account...');
                                     try {
+                                      final fromGuest = widget.state.signupFromGuestPrompt;
                                       final err = await widget.state.completeSignup(
                                         email: emailController.text,
                                         otp: otpController.text,
                                         password: passwordController.text,
+                                        loginAfter: !fromGuest,
                                       );
                                       if (!mounted) return;
-                                      if (err != null) await _toast(err);
+                                      if (err != null) {
+                                        await _toast(err);
+                                        return;
+                                      }
+                                      if (fromGuest) {
+                                        widget.state.signupFromGuestPrompt = false;
+                                        setState(() {
+                                          signupMode = false;
+                                          otpSent = false;
+                                          otpController.clear();
+                                          confirmPasswordController.clear();
+                                          passwordController.clear();
+                                        });
+                                        await _toast('Account created! Please log in with your new email and password.');
+                                      }
                                     } finally {
                                       if (mounted) setState(() => busyMessage = null);
                                     }
@@ -4449,18 +4558,14 @@ class _AuthScreenState extends State<AuthScreen> {
                               ? null
                               : () async {
                                   forgotEmailController.clear();
-                                  forgotPhoneController.clear();
                                   forgotOtpController.clear();
                                   forgotNewPasswordController.clear();
                                   forgotConfirmPasswordController.clear();
-                                  setState(() => forgotChannel = 'email');
                                   await showDialog<void>(
                                     context: context,
                                     builder: (dCtx) {
                                       final step = <int>[0];
                                       String? notReg;
-                                      ThemeData channelTheme(Color seed) =>
-                                          ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: seed), useMaterial3: true);
                                       InputDecoration deco(String label) => InputDecoration(
                                             labelText: label,
                                             filled: true,
@@ -4468,25 +4573,17 @@ class _AuthScreenState extends State<AuthScreen> {
                                             border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                                           );
                                       bool emailOk(String v) => v.contains('@') && v.contains('.');
-                                      String? identityForRequest() {
-                                        if (widget.cashierMode) {
-                                          final v = forgotEmailController.text.trim().toLowerCase();
-                                          return v.isEmpty ? null : v;
-                                        }
-                                        if (forgotChannel == 'email') {
-                                          final v = forgotEmailController.text.trim().toLowerCase();
-                                          return v.isEmpty ? null : v;
-                                        }
-                                        final digits = forgotPhoneController.text.replaceAll(RegExp(r'\D'), '');
-                                        return digits.isEmpty ? null : digits;
+                                      String? emailForRequest() {
+                                        final v = forgotEmailController.text.trim().toLowerCase();
+                                        return v.isEmpty ? null : v;
                                       }
                                       return StatefulBuilder(
                                         builder: (ctx, setDialogState) {
-                                          final seed = widget.cashierMode || forgotChannel == 'email'
-                                              ? const Color(0xFF3949AB)
-                                              : const Color(0xFFE65100);
                                           return Theme(
-                                            data: channelTheme(seed),
+                                            data: ThemeData(
+                                              colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3949AB)),
+                                              useMaterial3: true,
+                                            ),
                                             child: AlertDialog(
                                               title: const Text('Forgot password'),
                                               content: SingleChildScrollView(
@@ -4495,42 +4592,11 @@ class _AuthScreenState extends State<AuthScreen> {
                                                   crossAxisAlignment: CrossAxisAlignment.stretch,
                                                   children: [
                                                     if (step[0] == 0) ...[
-                                                      if (!widget.cashierMode)
-                                                        DropdownButtonFormField<String>(
-                                                          value: forgotChannel,
-                                                          decoration: const InputDecoration(
-                                                            labelText: 'Notification channel',
-                                                            filled: true,
-                                                          ),
-                                                          items: const [
-                                                            DropdownMenuItem(value: 'email', child: Text('Email')),
-                                                            DropdownMenuItem(value: 'phone', child: Text('Phone')),
-                                                          ],
-                                                          onChanged: (v) {
-                                                            setState(() => forgotChannel = v ?? 'email');
-                                                            setDialogState(() => notReg = null);
-                                                          },
-                                                        ),
-                                                      if (!widget.cashierMode) const SizedBox(height: 12),
-                                                      if (widget.cashierMode || forgotChannel == 'email')
-                                                        TextField(
-                                                          controller: forgotEmailController,
-                                                          keyboardType: TextInputType.emailAddress,
-                                                          decoration: deco('Email'),
-                                                        ),
-                                                      if (!widget.cashierMode && forgotChannel == 'phone') ...[
-                                                        const SizedBox(height: 10),
-                                                        TextField(
-                                                          controller: forgotPhoneController,
-                                                          keyboardType: TextInputType.phone,
-                                                          maxLength: 11,
-                                                          inputFormatters: [
-                                                            FilteringTextInputFormatter.digitsOnly,
-                                                            LengthLimitingTextInputFormatter(11),
-                                                          ],
-                                                          decoration: deco('Mobile number').copyWith(counterText: ''),
-                                                        ),
-                                                      ],
+                                                      TextField(
+                                                        controller: forgotEmailController,
+                                                        keyboardType: TextInputType.emailAddress,
+                                                        decoration: deco('Email'),
+                                                      ),
                                                       if (notReg != null)
                                                         Padding(
                                                           padding: const EdgeInsets.only(top: 8),
@@ -4543,37 +4609,24 @@ class _AuthScreenState extends State<AuthScreen> {
                                                       FilledButton(
                                                         onPressed: () async {
                                                           notReg = null;
-                                                          final id = identityForRequest();
+                                                          final id = emailForRequest();
                                                           if (id == null) {
-                                                            await _toast(
-                                                              widget.cashierMode || forgotChannel == 'email'
-                                                                  ? 'Enter your email'
-                                                                  : 'Enter your phone number',
-                                                            );
+                                                            await _toast('Enter your email');
                                                             setDialogState(() {});
                                                             return;
                                                           }
-                                                          if ((widget.cashierMode || forgotChannel == 'email') &&
-                                                              !emailOk(forgotEmailController.text.trim())) {
+                                                          if (!emailOk(forgotEmailController.text.trim())) {
                                                             await _toast('Enter a valid email');
-                                                            return;
-                                                          }
-                                                          if (!widget.cashierMode &&
-                                                              forgotChannel == 'phone' &&
-                                                              id.length != 11) {
-                                                            setDialogState(() {
-                                                              notReg = 'Enter an 11-digit mobile number';
-                                                            });
                                                             return;
                                                           }
                                                           final r = await widget.state.requestPasswordReset(
                                                             identity: id,
-                                                            channel: widget.cashierMode ? 'email' : forgotChannel,
+                                                            channel: 'email',
                                                             role: widget.cashierMode ? 'cashier' : 'customer',
                                                           );
                                                           if (r.notRegistered) {
                                                             setDialogState(() {
-                                                              notReg = 'This email or phone number is not registered.';
+                                                              notReg = 'This email is not registered.';
                                                             });
                                                             return;
                                                           }
@@ -4585,11 +4638,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                                             step[0] = 1;
                                                             notReg = null;
                                                           });
-                                                          await _toast(
-                                                            widget.cashierMode || forgotChannel == 'email'
-                                                                ? 'OTP sent. Check your email.'
-                                                                : 'OTP sent to your registered email address.',
-                                                          );
+                                                          await _toast('OTP sent. Check your email.');
                                                         },
                                                         child: const Text('REQUEST RESET OTP'),
                                                       ),
@@ -4598,11 +4647,9 @@ class _AuthScreenState extends State<AuthScreen> {
                                                       Padding(
                                                         padding: const EdgeInsets.only(bottom: 8),
                                                         child: Text(
-                                                          widget.cashierMode || forgotChannel == 'email'
-                                                              ? (forgotEmailController.text.trim().isNotEmpty
-                                                                  ? "Please enter the code we've sent to your email: ${forgotEmailController.text.trim()}"
-                                                                  : "Please enter the code we've sent to your email.")
-                                                              : "Please enter the code we've sent to the email address registered for this mobile number.",
+                                                          forgotEmailController.text.trim().isNotEmpty
+                                                              ? "Please enter the code we've sent to your email: ${forgotEmailController.text.trim()}"
+                                                              : "Please enter the code we've sent to your email.",
                                                           style: const TextStyle(fontSize: 13, height: 1.35),
                                                         ),
                                                       ),
@@ -4614,16 +4661,16 @@ class _AuthScreenState extends State<AuthScreen> {
                                                       const SizedBox(height: 8),
                                                       OutlinedButton(
                                                         onPressed: () async {
-                                                          final id = identityForRequest();
+                                                          final id = emailForRequest();
                                                           if (id == null) return;
                                                           final r = await widget.state.requestPasswordReset(
                                                             identity: id,
-                                                            channel: widget.cashierMode ? 'email' : forgotChannel,
+                                                            channel: 'email',
                                                             role: widget.cashierMode ? 'cashier' : 'customer',
                                                           );
                                                           if (r.notRegistered) {
                                                             setDialogState(() {
-                                                              notReg = 'This email or phone number is not registered.';
+                                                              notReg = 'This email is not registered.';
                                                             });
                                                             return;
                                                           }
@@ -4632,18 +4679,14 @@ class _AuthScreenState extends State<AuthScreen> {
                                                             return;
                                                           }
                                                           forgotOtpController.clear();
-                                                          await _toast(
-                                                            widget.cashierMode || forgotChannel == 'email'
-                                                                ? 'OTP resent. Check your email.'
-                                                                : 'OTP resent to your registered email address.',
-                                                          );
+                                                          await _toast('OTP resent. Check your email.');
                                                         },
                                                         child: const Text('RESEND OTP'),
                                                       ),
                                                       const SizedBox(height: 12),
                                                       FilledButton(
                                                         onPressed: () async {
-                                                          final id = identityForRequest();
+                                                          final id = emailForRequest();
                                                           if (id == null) return;
                                                           final otp = forgotOtpController.text.replaceAll(RegExp(r'\D'), '').trim();
                                                           if (otp.isEmpty) {
@@ -4684,7 +4727,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                                             await _toast('Passwords do not match');
                                                             return;
                                                           }
-                                                          final id = identityForRequest();
+                                                          final id = emailForRequest();
                                                           if (id == null) return;
                                                           final otp = forgotOtpController.text.replaceAll(RegExp(r'\D'), '').trim();
                                                           if (otp.isEmpty) {
@@ -5016,6 +5059,23 @@ class AppDrawer extends StatelessWidget {
           ListTile(title: const Text('Order Now'), onTap: () => open(context, RestaurantMenuScreen(state: state))),
           ListTile(title: const Text('Inquire Catering'), onTap: () => open(context, InquiryScreen(state: state))),
           ListTile(title: const Text('Settings'), onTap: () => open(context, SettingsScreen(state: state))),
+          if (state.isGuestSession) ...[
+            const Divider(height: 28),
+            ListTile(
+              leading: const Icon(Icons.login),
+              title: const Text('Return to log in'),
+              onTap: () {
+                Navigator.pop(context);
+                state.returnGuestToCustomerLogin();
+                Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+                  MaterialPageRoute<void>(
+                    builder: (_) => AuthScreen(state: state, cashierMode: false),
+                  ),
+                  (_) => false,
+                );
+              },
+            ),
+          ],
         ],
       ),
     );
@@ -5025,6 +5085,24 @@ class AppDrawer extends StatelessWidget {
 /// Payment methods recorded in catering [postAnalysis] for manager "For processing" flows.
 const List<String> kManagerPaymentMethods = ['Cash', 'E-Wallet', 'Bank Transfer', 'Cheque'];
 
+const Color kManagerCompletedIconColor = Color(0xFF2ECC71);
+const Color kManagerSettingsIconColor = Color(0xFF424242);
+
+Widget _managerTabCountBadge(int count) {
+  if (count <= 0) return const SizedBox.shrink();
+  final label = count > 99 ? '99+' : '$count';
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
+    decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+    alignment: Alignment.center,
+    child: Text(
+      label,
+      style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w800, height: 1.1),
+    ),
+  );
+}
+
 Widget _buildManagerHamburgerLeading(BuildContext context, AppState state) {
   if (Navigator.canPop(context)) {
     return IconButton(
@@ -5032,28 +5110,10 @@ Widget _buildManagerHamburgerLeading(BuildContext context, AppState state) {
       onPressed: () => Navigator.maybePop(context),
     );
   }
-  final dot = state.unreadNotificationsCount > 0 || state.hasManagerAttentionBadge;
   return Builder(
-    builder: (ctx) => Stack(
-      clipBehavior: Clip.none,
-      children: [
-        IconButton(
-          icon: const Icon(Icons.menu, color: Color(0xFFFFC024)),
-          onPressed: () => Scaffold.of(ctx).openDrawer(),
-        ),
-        if (dot)
-          const Positioned(
-            right: 9,
-            top: 9,
-            child: SizedBox(
-              width: 10,
-              height: 10,
-              child: DecoratedBox(
-                decoration: BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-              ),
-            ),
-          ),
-      ],
+    builder: (ctx) => IconButton(
+      icon: const Icon(Icons.menu, color: Color(0xFFFFC024)),
+      onPressed: () => Scaffold.of(ctx).openDrawer(),
     ),
   );
 }
@@ -5255,13 +5315,6 @@ class CustomerDashboardScreen extends StatelessWidget {
       if (!isGuest)
         (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state), onTap: null),
       if (!isGuest) (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state), onTap: null),
-      if (isGuest)
-        (
-          title: 'Sign Up',
-          icon: Icons.person_add_outlined,
-          screen: null,
-          onTap: () => state.requestAuthSignup(),
-        ),
     ];
     final gridItems = items;
     return AppScaffold(
@@ -5278,7 +5331,7 @@ class CustomerDashboardScreen extends StatelessWidget {
             child: Column(
           crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-            Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 52, fit: BoxFit.contain)),
+            Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain)),
                 if (who.isNotEmpty) ...[
                   const SizedBox(height: 10),
                   Text(
@@ -5292,16 +5345,26 @@ class CustomerDashboardScreen extends StatelessWidget {
           ),
           if (isGuest)
             Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
-              child: Text(
-                'Create an account to earn loyalty rewards on restaurant orders and completed catering events.',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 14,
-                  height: 1.4,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.grey.shade800,
-                ),
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    'Create an account to earn loyalty rewards on restaurant orders and completed catering events.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 14,
+                      height: 1.4,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.grey.shade800,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  FilledButton(
+                    onPressed: state.requestAuthSignup,
+                    child: const Text('SIGN UP'),
+                  ),
+                ],
               ),
             ),
           Expanded(
@@ -5376,12 +5439,32 @@ class CustomerDashboardScreen extends StatelessWidget {
   }
 }
 
-class ManagerDashboardScreen extends StatelessWidget {
+class ManagerDashboardScreen extends StatefulWidget {
   const ManagerDashboardScreen({super.key, required this.state});
   final AppState state;
 
   @override
+  State<ManagerDashboardScreen> createState() => _ManagerDashboardScreenState();
+}
+
+class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.state.preloadManagerDashboardCounts();
+    });
+  }
+
+  Color _cardIconColor(int tabIdx) {
+    if (tabIdx == 5) return kManagerCompletedIconColor;
+    if (tabIdx == 6) return const Color(0xFFE92E0D);
+    return AppColors.brand;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final state = widget.state;
     final who = state.cashierDisplayName.trim().isNotEmpty
         ? state.cashierDisplayName.trim()
         : (state.userEmail ?? '').trim();
@@ -5394,7 +5477,10 @@ class ManagerDashboardScreen extends StatelessWidget {
       (title: 'Completed', icon: Icons.task_alt_outlined, tabIdx: 5),
       (title: 'Cancelled', icon: Icons.cancel_outlined, tabIdx: 6),
     ];
-    return Scaffold(
+    return AnimatedBuilder(
+      animation: state,
+      builder: (context, _) {
+        return Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
@@ -5423,7 +5509,14 @@ class ManagerDashboardScreen extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 52, fit: BoxFit.contain)),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain),
+                    const SizedBox(width: 12),
+                    Image.asset(AppBrandAssets.logoCuratering, height: 48, fit: BoxFit.contain),
+                  ],
+                ),
                 if (who.isNotEmpty) ...[
                   const SizedBox(height: 10),
                   Text(
@@ -5467,7 +5560,7 @@ class ManagerDashboardScreen extends StatelessWidget {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Icon(Icons.settings_outlined, color: AppColors.brand, size: 30),
+                                Icon(Icons.settings_outlined, color: kManagerSettingsIconColor, size: 30),
                                 Spacer(),
                                 Text('Settings', style: TextStyle(fontWeight: FontWeight.w800)),
                               ],
@@ -5477,6 +5570,8 @@ class ManagerDashboardScreen extends StatelessWidget {
                       );
                     }
                     final item = cards[index];
+                    final badgeCount = state.managerCateringCountForTab(item.tabIdx);
+                    final showBadge = item.tabIdx <= 4 && badgeCount > 0;
                     return Card(
                       color: Colors.white,
                       elevation: 2,
@@ -5492,12 +5587,23 @@ class ManagerDashboardScreen extends StatelessWidget {
                         },
                         child: Padding(
                           padding: const EdgeInsets.all(14),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                          child: Stack(
+                            clipBehavior: Clip.none,
                             children: [
-                              Icon(item.icon, color: item.tabIdx == 6 ? const Color(0xFFE92E0D) : AppColors.brand, size: 30),
-                              const Spacer(),
-                              Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(item.icon, color: _cardIconColor(item.tabIdx), size: 30),
+                                  const Spacer(),
+                                  Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                                ],
+                              ),
+                              if (showBadge)
+                                Positioned(
+                                  top: -4,
+                                  right: -4,
+                                  child: _managerTabCountBadge(badgeCount),
+                                ),
                             ],
                           ),
                         ),
@@ -5510,6 +5616,8 @@ class ManagerDashboardScreen extends StatelessWidget {
           ),
         ],
       ),
+    );
+      },
     );
   }
 }
@@ -8080,6 +8188,36 @@ class _PaymentScreenState extends State<PaymentScreen> {
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.all(12),
                     children: [
+                    if (s.isGuestSession && (proofDone || _placedOrder != null)) ...[
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFFF3CD),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: const Color(0xFFFFC107), width: 2),
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(Icons.mark_email_read_outlined, color: Colors.orange.shade900, size: 28),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                'After you submit payment proof, watch your email and text messages for payment confirmation and other order updates.',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  height: 1.4,
+                                  fontWeight: FontWeight.w800,
+                                  color: Colors.brown.shade900,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
                     _OrderNoCard(displayNo: isDraft ? null : uiOrderNo(orderForUi.orderNo)),
                     const SizedBox(height: 10),
                     if (insufficient) ...[
@@ -8451,11 +8589,43 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Text(
-                  'You will be notified for payment confirmation soon!',
-                  style: TextStyle(fontSize: 14, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 12),
+                if (state.isGuestSession) ...[
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFF3CD),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: const Color(0xFFFFC107), width: 2),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(Icons.sms_outlined, color: Colors.orange.shade900, size: 28),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'Please wait for an email or text message from us about payment confirmation, insufficient payment, and delivery updates. '
+                            'Save the contact number and email you used at checkout so you do not miss our messages.',
+                            style: TextStyle(
+                              fontSize: 14,
+                              height: 1.4,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.brown.shade900,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                ] else
+                  Text(
+                    'You will be notified for payment confirmation soon!',
+                    style: TextStyle(fontSize: 14, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
+                  ),
+                if (!state.isGuestSession) const SizedBox(height: 12),
+                if (state.isGuestSession) const SizedBox(height: 4),
                 Card(
                   child: Padding(
                     padding: const EdgeInsets.all(16),
@@ -8547,13 +8717,15 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
                   },
                   child: const Text('BACK TO MENU'),
                 ),
-                const SizedBox(height: 10),
-                OutlinedButton(
-                  onPressed: () {
-                    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => MyOrdersScreen(state: state)));
-                  },
-                  child: const Text('MY ORDERS'),
-                ),
+                if (!state.isGuestSession) ...[
+                  const SizedBox(height: 10),
+                  OutlinedButton(
+                    onPressed: () {
+                      Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => MyOrdersScreen(state: state)));
+                    },
+                    child: const Text('MY ORDERS'),
+                  ),
+                ],
               ],
             ),
           ),
@@ -10081,7 +10253,15 @@ class _EventVenueMapPreviewDialogState extends State<_EventVenueMapPreviewDialog
           onPressed: _busy
               ? null
               : () async {
-                  await openGoogleMapsForAddress(widget.address);
+                  final ok = await openGoogleMapsForAddress(
+                    widget.address,
+                    lat: _pin.latitude,
+                    lng: _pin.longitude,
+                  );
+                  if (!context.mounted) return;
+                  if (!ok) {
+                    appSnack(context, 'Could not open Google Maps on this device.');
+                  }
                 },
           icon: const Icon(Icons.open_in_new, size: 18),
           label: const Text('Open in Google Maps'),
@@ -10486,6 +10666,43 @@ class _InquiryScreenState extends State<InquiryScreen> {
     menuSearchController.dispose();
     themeNotesController.dispose();
     super.dispose();
+  }
+
+  void _resetInquiryForm() {
+    setState(() {
+      inquiryType = 'CATERING';
+      curateOwn = false;
+      _menuChoicePicked = false;
+      _attemptedSubmit = false;
+      _themeDesignChoice = '';
+      menuSuggestionNote = '';
+      themeSuggestionNote = '';
+      selectedSetMenu = 'All Dishes';
+      selectedDishes.clear();
+      eventTypeChoice = 'Birthday';
+      eventSetting = 'open';
+      serviceIncluded = 'no';
+      formalityLevel = 'casual';
+      foodTastingRequested = false;
+      _themeReferenceImagesB64.clear();
+      _eventWindows
+        ..clear()
+        ..add(_InquiryEventWindow());
+      _publicScheduleConflictCount = 0;
+    });
+    themeNotesController.clear();
+    guestCount.clear();
+    paxBuffer.clear();
+    eventTitle.clear();
+    eventTypeOther.clear();
+    contactPerson.clear();
+    contactNumber.clear();
+    inquiryEmail.clear();
+    eventCity.clear();
+    note.clear();
+    foodTastingDate.clear();
+    foodTastingTime.clear();
+    menuSearchController.clear();
   }
 
   int _minPaxForCurrentInquiry() =>
@@ -11564,6 +11781,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 return;
               }
               appSnack(context, 'Inquiry submitted');
+              if (state.isGuestSession) {
+                _resetInquiryForm();
+              }
               Navigator.of(context).pushReplacement(MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)));
             },
           ),
@@ -12379,11 +12599,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 subtitle: const Text('Describe your issue so we can help'),
                 onTap: _openHelp,
               ),
-              ListTile(
-                leading: const Icon(Icons.logout),
-                title: const Text('Log out'),
-                onTap: _confirmLogout,
-              ),
+              if (!widget.state.isGuestSession)
+                ListTile(
+                  leading: const Icon(Icons.logout),
+                  title: const Text('Log out'),
+                  onTap: _confirmLogout,
+                ),
             ],
           ),
         ),
@@ -12924,6 +13145,7 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
       widget.state.loadManagerCateringByStage(_stages[_tab.index], force: true);
     });
     widget.state.loadManagerCateringByStage(_stages[idx], force: true);
+    widget.state.preloadManagerDashboardCounts();
   }
 
   @override
@@ -12956,7 +13178,21 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
                   indicatorColor: const Color(0xFFFFC024),
                   labelColor: const Color(0xFFFFC024),
                   unselectedLabelColor: Colors.grey.shade700,
-                  tabs: _labels.map((lab) => Tab(text: lab)).toList(),
+                  tabs: List.generate(_labels.length, (i) {
+                    final count = widget.state.managerCateringCountForTab(i);
+                    return Tab(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(_labels[i]),
+                          if (i <= 4 && count > 0) ...[
+                            const SizedBox(width: 6),
+                            _managerTabCountBadge(count),
+                          ],
+                        ],
+                      ),
+                    );
+                  }),
                 ),
               ),
             ),
@@ -13735,8 +13971,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             ),
             if (inquiryType == 'CATERING AND EVENT')
               labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
-            labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCosts)),
-            labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+            if (additionalCostTotal > 0.01) ...[
+              labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCosts)),
+              labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+            ],
             labelValueRow('Labor cost', 'PHP ${laborCost.toStringAsFixed(2)}'),
             labelValueRow('Travel cost', 'PHP ${travelCost.toStringAsFixed(2)}'),
             labelValueRow('Total invoice', 'PHP ${total.toStringAsFixed(2)}'),
@@ -14565,7 +14803,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                       final whenStr = formatDateTimeLocal(entered);
                       final stLower = r.status.trim().toLowerCase();
                       final isDownPaymentCard =
-                          stLower == 'for_processing' && r.processingSubstageLabel == 'down_payment';
+                          stLower == 'for_processing' && listSubstage == 'down_payment';
                       final scheduleLine = (stLower == 'for_post_analysis' || stLower == 'completed' || isDownPaymentCard) &&
                               r.totalCost > 0
                           ? 'Total cost: ₱${r.totalCost.toStringAsFixed(2)}'
@@ -14585,13 +14823,18 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                         }
                         return '';
                       }();
-                      final subtitleLines = <String>[
-                        r.contactPerson,
-                        '${managerStageListTimestampLabel(stage)}: $whenStr',
-                        if (scheduleLine.isNotEmpty) scheduleLine,
-                        if (settingLine.isNotEmpty) settingLine,
-                        if (conflictLine.isNotEmpty) conflictLine,
-                        if (loyaltyLine.isNotEmpty) loyaltyLine,
+                      final listSubstage = stage == 'for_processing'
+                          ? (widget.processingSubstageFilter ?? r.processingSubstageLabel)
+                          : r.processingSubstageLabel;
+                      final subtitleWidgets = <Widget>[
+                        Text(r.contactPerson),
+                        Text('${managerStageListTimestampLabel(stage)}: $whenStr'),
+                        if (scheduleLine.isNotEmpty) Text(scheduleLine),
+                        if (settingLine.isNotEmpty) Text(settingLine),
+                        if (r.address.trim().isNotEmpty)
+                          buildEventVenueAddressLink(context, r.address, prefix: 'Venue'),
+                        if (conflictLine.isNotEmpty) Text(conflictLine),
+                        if (loyaltyLine.isNotEmpty) Text(loyaltyLine),
                       ];
                       return Card(
                         child: ListTile(
@@ -14614,7 +14857,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                   borderRadius: BorderRadius.circular(999),
                                 ),
                                 child: Text(
-                                  cateringManagerListStatusLabelFor(r.status, r.processingSubstageLabel),
+                                  cateringManagerListStatusLabelFor(r.status, listSubstage),
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
@@ -14626,8 +14869,11 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                               ),
                             ],
                           ),
-                          subtitle: Text(subtitleLines.join('\n')),
-                          isThreeLine: subtitleLines.length > 2,
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: subtitleWidgets,
+                          ),
+                          isThreeLine: subtitleWidgets.length > 2,
                           trailing: widget.isReadOnly
                               ? const Icon(Icons.lock_outline)
                               : Column(
@@ -14678,7 +14924,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                           return;
                                         }
                                         if (target == 'for_post_analysis') {
-                                          if (stage == 'for_processing' && r.processingSubstageLabel != 'ongoing') {
+                                          if (stage == 'for_processing' && listSubstage != 'ongoing') {
                                             appSnack(
                                               context,
                                               'Open the order and move it to On Going before advancing to For Full Payment.',
@@ -14778,11 +15024,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   String get _processingSubstageForUi {
     if (widget.stage != 'for_processing') return d.processingSubstageLabel;
-    // Prefer persisted order phase (e.g. after moving to On Going in this screen).
-    final fromRow = d.processingSubstageLabel.trim();
-    if (fromRow == 'ongoing' || fromRow == 'down_payment') return fromRow;
+    // Tab context wins so On Going list/detail never shows "For Down Payment" for ongoing work.
     final tab = widget.processingSubstage?.trim();
     if (tab == 'ongoing' || tab == 'down_payment') return tab!;
+    final fromRow = d.processingSubstageLabel.trim();
+    if (fromRow == 'ongoing' || fromRow == 'down_payment') return fromRow;
     return 'down_payment';
   }
 
@@ -14841,6 +15087,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   String _postAnalysisPdf1Signature = '';
   String _postAnalysisPdf2Signature = '';
   bool _postAnalysisPdfGenerating = false;
+  Uint8List? _additionalCostsSheetPdfBytes;
+  String _additionalCostsSheetPdfSig = '';
+  bool _additionalCostsSheetPdfGenerating = false;
   /// Additional-cost line items used for Order Summary PDF #1 (captured on entering For Full Payment, persisted on complete).
   final List<Map<String, dynamic>> _orderSummaryPdf1AdditionalCosts = [];
   /// Committed additional-cost groups per workflow tab (For Down Payment / On Going / For Full Payment).
@@ -14892,9 +15141,147 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     return '';
   }
 
+  bool get _isManagerDraftDetailStage =>
+      widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+
+  String _draftAdditionalCostsStageLabel(CateringEventRecord row) {
+    for (final label in ['Online Inquiries', 'New Event']) {
+      if (_additionalCostsGroups.any((g) => '${g['stage'] ?? ''}'.trim() == label)) return label;
+    }
+    return row.source.trim().toLowerCase().contains('online') ? 'Online Inquiries' : 'New Event';
+  }
+
+  String? _previousAdditionalCostsStageLabel(CateringEventRecord row) {
+    final current = cateringManagerDetailTabTitle(
+      row,
+      widget.stage,
+      processingSubstageOverride: widget.processingSubstage,
+    );
+    switch (current) {
+      case 'For Down Payment':
+        return _draftAdditionalCostsStageLabel(row);
+      case 'On Going':
+        return 'For Down Payment';
+      case 'For Full Payment':
+        return 'On Going';
+      default:
+        return null;
+    }
+  }
+
+  List<Map<String, dynamic>> _additionalCostsItemsForStageLabel(String stageLabel) {
+    for (final g in _additionalCostsGroups) {
+      if ('${g['stage'] ?? ''}'.trim() != stageLabel) continue;
+      final items = g['items'];
+      if (items is! List) return [];
+      return items.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+    }
+    return [];
+  }
+
+  List<Map<String, dynamic>> _previousAdditionalCostsItems(CateringEventRecord row) {
+    final label = _previousAdditionalCostsStageLabel(row);
+    if (label == null || label.isEmpty) return [];
+    return _additionalCostsItemsForStageLabel(label);
+  }
+
+  void _applyDraftLaborTravelFromRow(CateringEventRecord row) {
+    if (_isManagerDraftDetailStage) return;
+    travelCostController.text = row.travelCost.toStringAsFixed(2);
+    laborMaleController.text = '${row.postAnalysis['labor_male_count'] ?? 0}';
+    laborFemaleController.text = '${row.postAnalysis['labor_female_count'] ?? 0}';
+    laborManualCosts
+      ..clear()
+      ..addAll(_laborManualCostsFromRow(row));
+  }
+
+  List<Map<String, dynamic>> _laborManualCostsFromRow(CateringEventRecord row) {
+    final out = <Map<String, dynamic>>[];
+    final lmc = row.postAnalysis['labor_manual_costs'];
+    if (lmc is List) {
+      for (final e in lmc) {
+        if (e is! Map) continue;
+        final label = '${e['label'] ?? ''}'.trim();
+        if (label == 'Existing labor amount' || label == 'Recorded labor (balance)') continue;
+        final amount = jsonToDouble(e['amount']);
+        if (label.isEmpty && amount == 0) continue;
+        out.add({'label': label, 'amount': amount});
+      }
+    }
+    return out;
+  }
+
+  bool _hasAdditionalCostsSectionInput() => additionalCosts.isNotEmpty;
+
+  Future<void> _maybeAutoGenerateAdditionalCostsSheetPdf() async {
+    if (_isManagerDraftDetailStage) return;
+    if (!_hasAdditionalCostsSectionInput()) {
+      if (_additionalCostsSheetPdfBytes != null && mounted) {
+        setState(() {
+          _additionalCostsSheetPdfBytes = null;
+          _additionalCostsSheetPdfSig = '';
+        });
+      }
+      return;
+    }
+    final sig = _additionalCostsSignature(additionalCosts);
+    if (sig == _additionalCostsSheetPdfSig || _additionalCostsSheetPdfGenerating) return;
+    _additionalCostsSheetPdfGenerating = true;
+    try {
+      final bytes = await _buildOrderSummaryPdfBytes(
+        additionalCostsForPdf: additionalCosts,
+        postAnalysis2Only: true,
+        variant: _ManagerOrderSummaryPdfVariant.additionalCostsSheet,
+      );
+      if (!mounted) return;
+      setState(() {
+        _additionalCostsSheetPdfBytes = bytes;
+        _additionalCostsSheetPdfSig = sig;
+      });
+    } catch (_) {
+      // Preview button still works on demand.
+    } finally {
+      _additionalCostsSheetPdfGenerating = false;
+    }
+  }
+
   List<Map<String, dynamic>> _additionalCostsGroupsForOrderSummarySheet() => _additionalCostsGroups
       .where((g) => _isManagerAdditionalCostsSheetStage('${g['stage'] ?? ''}'))
       .toList();
+
+  /// Sheet PDF groups, including unsaved line items for the active workflow tab.
+  List<Map<String, dynamic>> _additionalCostsGroupsForAdditionalCostsSheetPdf() {
+    final out = _additionalCostsGroupsForOrderSummarySheet()
+        .map((g) => Map<String, dynamic>.from(g))
+        .toList();
+    final currentLabel = _additionalCostsStageLabel();
+    if (currentLabel.isEmpty || additionalCosts.isEmpty) return out;
+    final items = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
+    final entry = <String, dynamic>{
+      'stage': currentLabel,
+      'items': items,
+      'total': _sumCostRows(items),
+      'processed_at': DateTime.now().toIso8601String(),
+    };
+    final idx = out.indexWhere((g) => '${g['stage'] ?? ''}'.trim() == currentLabel);
+    if (idx >= 0) {
+      out[idx] = entry;
+    } else {
+      out.add(entry);
+    }
+    return out;
+  }
+
+  double _additionalCostsSheetPdfTotal() {
+    var sum = 0.0;
+    for (final g in _additionalCostsGroupsForAdditionalCostsSheetPdf()) {
+      final items = (g['items'] is List)
+          ? (g['items'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
+          : <Map<String, dynamic>>[];
+      sum += jsonToDouble(g['total']) > 0 ? jsonToDouble(g['total']) : _sumCostRows(items);
+    }
+    return sum;
+  }
 
   List<Map<String, dynamic>> _flattenAdditionalCostsFromGroupsList(List<Map<String, dynamic>> groups) {
     final out = <Map<String, dynamic>>[];
@@ -14958,7 +15345,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     return out;
   }
 
-  bool _hasAdditionalCostsForOrderSummaryPdf() => _sheetAdditionalCostsForOrderSummaryPdf().isNotEmpty;
+  bool _hasAdditionalCostsForOrderSummaryPdf() =>
+      _hasAdditionalCostsSectionInput() || _sheetAdditionalCostsForOrderSummaryPdf().isNotEmpty;
 
   void _snapshotAdditionalCostsForCurrentStage({bool clearWorking = false, bool refreshTimestamp = true}) {
     final label = _additionalCostsStageLabel();
@@ -15030,6 +15418,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         }
       }
       break;
+    }
+    if (!_isManagerDraftDetailStage && additionalCosts.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _maybeAutoGenerateAdditionalCostsSheetPdf();
+      });
+    }
+  }
+
+  void _onAdditionalCostsWorkingListChanged({bool post = false}) {
+    if (post) _maybeGeneratePostAnalysisPdf2IfNeeded();
+    if (!_isManagerDraftDetailStage) {
+      _maybeAutoGenerateAdditionalCostsSheetPdf();
     }
   }
 
@@ -15372,7 +15773,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     if (postAnalysis2Only) {
       final addlPaid = d.postAnalysis['additional_costs_payment_confirmed'] == true;
       final addRows = <pw.Widget>[];
-      final groups = _additionalCostsGroupsForOrderSummarySheet();
+      final groups = _additionalCostsGroupsForAdditionalCostsSheetPdf();
       for (final group in groups) {
         final items = (group['items'] is List)
             ? (group['items'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
@@ -15394,10 +15795,24 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         addRows.add(labelValueRow('Date/Time processed', processedAt));
         addRows.add(pw.SizedBox(height: 6));
       }
-      if (addRows.isEmpty) {
+      if (addRows.isEmpty && additionalCosts.isNotEmpty) {
+        final currentLabel = _additionalCostsStageLabel();
+        final stage = currentLabel.isEmpty ? 'Additional costs' : currentLabel;
+        addRows.add(
+          labelValueRow(
+            'Additional costs ($stage)',
+            additionalCosts.map((e) => '${e['label'] ?? ''}'.trim()).where((x) => x.isNotEmpty).join(' · '),
+          ),
+        );
+        addRows.add(
+          labelValueRow('Additional costs (total)', 'PHP ${_sumCostRows(additionalCosts).toStringAsFixed(2)}'),
+        );
+        addRows.add(labelValueRow('Date/Time processed', processingAt));
+        addRows.add(pw.SizedBox(height: 6));
+      } else if (addRows.isEmpty) {
         addRows.add(labelValueRow('Additional costs', '—'));
       }
-      final sheetAdditionalTotal = _sumCostRows(_sheetAdditionalCostsForOrderSummaryPdf());
+      final sheetAdditionalTotal = _additionalCostsSheetPdfTotal();
       addRows.add(
         labelValueRow(
           'Total Cost',
@@ -15528,8 +15943,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ),
           if (_includesThemeDesignInTotals)
             labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
-          labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCostsForPdf)),
-          labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+          if (variant != _ManagerOrderSummaryPdfVariant.beforeDownPayment && additionalCostTotal > 0.01) ...[
+            labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCostsForPdf)),
+            labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+          ],
           labelValueRow('Labor cost', 'PHP ${laborLine.toStringAsFixed(2)}'),
           labelValueRow('Travel cost', 'PHP ${travelLine.toStringAsFixed(2)}'),
           ...tailRows,
@@ -15562,7 +15979,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }) async {
     try {
       final List<Map<String, dynamic>> pdfCosts;
-      if (postAnalysis2Only) {
+      if (variant == _ManagerOrderSummaryPdfVariant.beforeDownPayment) {
+        pdfCosts = [];
+      } else if (postAnalysis2Only) {
         pdfCosts = _sheetAdditionalCostsForOrderSummaryPdf();
       } else {
         pdfCosts = _allAdditionalCostsForMainOrderSummaryPdf();
@@ -15598,7 +16017,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ? _ManagerOrderSummaryPdfVariant.beforeDownPayment
                 : _ManagerOrderSummaryPdfVariant.afterDownPayment;
     final bytes = await _buildOrderSummaryPdfBytes(
-      additionalCostsForPdf: additionalCosts,
+      additionalCostsForPdf:
+          pdfVariant == _ManagerOrderSummaryPdfVariant.beforeDownPayment ? [] : additionalCosts,
       variant: pdfVariant,
     );
     final to = r.emailAddress.trim().toLowerCase();
@@ -15800,22 +16220,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     travelCostController.text = row.travelCost.toStringAsFixed(2);
     laborMaleController.text = '${row.postAnalysis['labor_male_count'] ?? 0}';
     laborFemaleController.text = '${row.postAnalysis['labor_female_count'] ?? 0}';
-    final lmc = row.postAnalysis['labor_manual_costs'];
-    if (lmc is List) {
-      for (final e in lmc) {
-        if (e is! Map) continue;
-        final label = '${e['label'] ?? ''}'.trim();
-        if (label == 'Existing labor amount') continue;
-        final amount = jsonToDouble(e['amount']);
-        if (label.isEmpty && amount == 0) continue;
-        laborManualCosts.add({'label': label, 'amount': amount});
-      }
-    }
-    laborManualCosts.removeWhere((e) {
-      final label = '${e['label'] ?? ''}'.trim();
-      return label == 'Recorded labor (balance)' || label == 'Existing labor amount';
-    });
+    laborManualCosts
+      ..clear()
+      ..addAll(_laborManualCostsFromRow(row));
     _loadAdditionalCostsGroupsFromRow(row);
+    _applyDraftLaborTravelFromRow(row);
     final pdf1Saved = row.postAnalysis['order_summary_pdf1_additional_costs'];
     if (pdf1Saved is List) {
       for (final e in pdf1Saved) {
@@ -16056,7 +16465,28 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     super.dispose();
   }
 
-  Widget _laborCostCard({required bool allowLaborEdits}) {
+  Widget _laborTravelPlainTextSection(CateringEventRecord row) {
+    final male = int.tryParse(laborMaleController.text.trim()) ?? 0;
+    final female = int.tryParse(laborFemaleController.text.trim()) ?? 0;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Labor cost: ₱${_laborCostComputed().toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w600)),
+        if (male > 0) Text('Male workers: $male'),
+        if (female > 0) Text('Female workers: $female'),
+        ...laborManualCosts.map((e) {
+          final label = '${e['label'] ?? ''}'.trim();
+          return Text(
+            '${label.isEmpty ? 'Labor item' : label}: ₱${jsonToDouble(e['amount']).toStringAsFixed(2)}',
+          );
+        }),
+        const SizedBox(height: 4),
+        Text('Travel cost: ₱${_travelCostComputed().toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w600)),
+      ],
+    );
+  }
+
+  Widget _laborCostCard({required bool allowLaborEdits, required bool showTravelReadOnly}) {
     return Card(
       color: Colors.orange.shade50,
       child: Padding(
@@ -16153,14 +16583,28 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             }),
             const SizedBox(height: 8),
             Text('Computed labor cost: ₱${_laborCostComputed().toStringAsFixed(2)}'),
+            if (showTravelReadOnly) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Travel cost: ₱${_travelCostComputed().toStringAsFixed(2)}',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ],
           ],
         ),
       ),
     );
   }
 
-  Widget _additionalCostsCard({required bool draft, required bool processing, required bool post}) {
+  Widget _additionalCostsCard({
+    required bool draft,
+    required bool processing,
+    required bool post,
+    required CateringEventRecord row,
+  }) {
     final allowEdits = draft || processing || post;
+    final previousItems = draft ? <Map<String, dynamic>>[] : _previousAdditionalCostsItems(row);
+    final previousLabel = _previousAdditionalCostsStageLabel(row);
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
@@ -16168,6 +16612,22 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             const Text('Additional costs', style: TextStyle(fontWeight: FontWeight.w800)),
+            if (!draft && previousItems.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'From ${previousLabel ?? 'previous stage'}',
+                  style: TextStyle(fontWeight: FontWeight.w700, color: Colors.grey.shade800),
+                ),
+                ...previousItems.map(
+                  (e) => ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text('${e['label'] ?? ''}'.trim().isEmpty ? 'Additional cost' : '${e['label']}'),
+                    trailing: Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                  ),
+                ),
+                const Divider(height: 20),
+            ],
             const SizedBox(height: 8),
             Row(
               children: [
@@ -16201,9 +16661,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                             additionalCostAmountController.clear();
                             _refreshDueAndDefaults();
                           });
-                          if (post) {
-                            _maybeGeneratePostAnalysisPdf2IfNeeded();
-                          }
+                          _onAdditionalCostsWorkingListChanged(post: post);
                         },
                   icon: const Icon(Icons.add),
                 ),
@@ -16234,9 +16692,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                   additionalCosts[idx] = updated;
                                   _refreshDueAndDefaults();
                                 });
-                                if (post) {
-                                  _maybeGeneratePostAnalysisPdf2IfNeeded();
-                                }
+                                _onAdditionalCostsWorkingListChanged(post: post);
                               },
                         icon: const Icon(Icons.edit_outlined),
                       ),
@@ -16244,13 +16700,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         tooltip: 'Delete',
                         onPressed: !allowEdits
                             ? null
-                            : () => setState(() {
+                            : () {
+                                setState(() {
                                   additionalCosts.removeAt(idx);
                                   _refreshDueAndDefaults();
-                                  if (post) {
-                                    _maybeGeneratePostAnalysisPdf2IfNeeded();
-                                  }
-                                }),
+                                });
+                                _onAdditionalCostsWorkingListChanged(post: post);
+                              },
                         icon: const Icon(Icons.delete_outline),
                       ),
                     ],
@@ -16454,8 +16910,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final row = d;
     final isProcessing = widget.stage == 'for_processing';
     final processingSubstage = _processingSubstageForUi;
-    final isDownPaymentSubstage = isProcessing && processingSubstage == 'down_payment';
-    final isOngoingSubstage = isProcessing && processingSubstage == 'ongoing';
+    final tabSub = widget.processingSubstage?.trim();
+    final isOngoingSubstage = isProcessing &&
+        (processingSubstage == 'ongoing' || tabSub == 'ongoing');
+    final isDownPaymentSubstage =
+        isProcessing && !isOngoingSubstage && (processingSubstage == 'down_payment' || tabSub == 'down_payment');
     final isPost = widget.stage == 'for_post_analysis';
     final isCompleted = widget.stage == 'completed';
     final isOnlineInquiry = widget.stage == 'online_inquiries';
@@ -16537,6 +16996,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     Future<bool> saveCurrentStage({bool showConfirmDialog = true, bool popAfterSuccess = true}) async {
       final isProcessingHere = widget.stage == 'for_processing';
+      final isDraftStageHereEarly = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+      if (!isDraftStageHereEarly) {
+        _applyDraftLaborTravelFromRow(d);
+      }
       final laborCostComputedNow = _laborCostComputed();
       final travelNow = _travelCostComputed();
       final flatAdditionalSave = _flattenAdditionalCostsFromGroups();
@@ -17261,6 +17724,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         }
       }
       final rowSubmit = d;
+      if (!isDraftAdvance) {
+        _applyDraftLaborTravelFromRow(rowSubmit);
+      }
       _snapshotAdditionalCostsForCurrentStage(refreshTimestamp: true);
       final flatAdditionalSubmit = _flattenAdditionalCostsFromGroups();
       final downPayment = double.tryParse(downPaymentController.text.trim());
@@ -17405,6 +17871,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ? 'Order completed'
               : (advancingToFullPayment ? 'Moved to For Full Payment' : 'Moved to next stage'),
         );
+        if (advancingToFullPayment) {
+          await widget.state.loadManagerCateringByStage('for_post_analysis', force: true);
+        }
+        await widget.state.loadManagerCateringByStage('for_processing', force: true);
         await widget.state.loadManagerCateringByStage(widget.stage, force: true);
         if (mounted) Navigator.of(context).pop();
       } finally {
@@ -17999,7 +18469,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (isPost) _additionalCostsCard(draft: false, processing: false, post: true),
           if (!isDraftStage && (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted))
             Card(
               child: Padding(
@@ -18017,9 +18486,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         final showBeforeDownPayment =
                             isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted;
                         final showAfterDownPayment = isOngoingSubstage || isPost || isCompleted;
-                        final showAdditionalCosts =
-                            (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted) &&
-                                _hasAdditionalCostsForOrderSummaryPdf();
+                        final showAdditionalCosts = !isCompleted && _hasAdditionalCostsSectionInput();
                         final showFullyPaid = isPost || isCompleted;
                         return Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -18044,11 +18511,21 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                   ),
                                 if (showAdditionalCosts)
                                   OutlinedButton(
-                                    onPressed: () => _previewManagerOrderSummary(
-                                      _ManagerOrderSummaryPdfVariant.beforeDownPayment,
-                                      postAnalysis2Only: true,
+                                    onPressed: () async {
+                                      if (_additionalCostsSheetPdfBytes != null) {
+                                        await _openOrderSummaryPdfBytes(_additionalCostsSheetPdfBytes!);
+                                        return;
+                                      }
+                                      await _previewManagerOrderSummary(
+                                        _ManagerOrderSummaryPdfVariant.additionalCostsSheet,
+                                        postAnalysis2Only: true,
+                                      );
+                                    },
+                                    child: Text(
+                                      _additionalCostsSheetPdfGenerating
+                                          ? 'Generating Additional Costs…'
+                                          : 'Order Summary | Additional Costs',
                                     ),
-                                    child: const Text('Order Summary | Additional Costs'),
                                   ),
                                 if (showFullyPaid)
                                   OutlinedButton(
@@ -18113,7 +18590,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     Text('Contact person: ${row.contactPerson}'),
                     Text('Contact number: ${row.contactNumber}'),
                     Text('Email: ${row.emailAddress}'),
-                    Text('Address: ${row.address}'),
+                    buildEventVenueAddressLink(context, row.address, prefix: 'Address'),
                     if (!isAllowedCateringAddressInCoverage(row.address))
                       Text(
                         cateringCoverageErrorText(),
@@ -18123,6 +18600,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     Text('Payment method: ${row.paymentMethod}'),
                     if (row.formalityLevel.trim().isNotEmpty)
                       Text('Formality: ${row.formalityLevel}'),
+                    if (isCompleted) ...[
+                      const SizedBox(height: 8),
+                      _laborTravelPlainTextSection(row),
+                    ],
                     if (row.scheduleSlots.isNotEmpty) ...[
                       const SizedBox(height: 6),
                       if (isProcessing || isPost || isCompleted) ...[
@@ -18276,6 +18757,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           : () => showEventVenueMapPreview(context, managerAddressController.text),
                       decoration: InputDecoration(
                         labelText: 'Event venue',
+                        helperText: 'Tap the map icon or address preview to open the location',
                         suffixIcon: IconButton(
                           tooltip: 'View on map',
                           icon: const Icon(Icons.map_outlined),
@@ -18680,12 +19162,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          _laborCostCard(allowLaborEdits: canEditStage),
-          _additionalCostsCard(
-            draft: isDraftStage,
-            processing: isProcessing && !isPost,
-            post: isPost,
-          ),
+          if (!isCompleted) ...[
+            _laborCostCard(
+              allowLaborEdits: isDraftStage && canEditStage,
+              showTravelReadOnly: !isDraftStage,
+            ),
+            _additionalCostsCard(
+              draft: isDraftStage,
+              processing: isProcessing && !isPost,
+              post: isPost,
+              row: row,
+            ),
+          ],
           if (isDraftStage) ...[
             Card(
               child: Padding(
