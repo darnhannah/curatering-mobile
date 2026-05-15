@@ -465,6 +465,81 @@ export async function initDb(): Promise<void> {
     // Table/column may not exist in minimal dev DBs.
   }
 
+  // Canonical allergen labels; menu_dishes.allergens holds BIGINT[] allergen_id values.
+  try {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS menu_dishes_allergens (
+        allergen_id BIGSERIAL PRIMARY KEY,
+        allergen_name TEXT NOT NULL UNIQUE
+      );
+    `);
+    await p.query(`
+      INSERT INTO menu_dishes_allergens (allergen_name) VALUES
+        ('Milk / Dairy'),
+        ('Eggs'),
+        ('Fish'),
+        ('Shellfish / Crustaceans'),
+        ('Tree nuts'),
+        ('Peanuts'),
+        ('Wheat / Gluten'),
+        ('Soy'),
+        ('Sesame'),
+        ('Mustard'),
+        ('Celery'),
+        ('Lupin'),
+        ('Sulfites'),
+        ('Mollusks'),
+        ('Corn'),
+        ('Garlic'),
+        ('Onion'),
+        ('Coconut'),
+        ('Chocolate / Cocoa'),
+        ('Caffeine'),
+        ('Other: [manual input]')
+      ON CONFLICT (allergen_name) DO NOTHING
+    `);
+    await p.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'menu_dishes'
+            AND column_name = 'allergens'
+        ) THEN
+          ALTER TABLE public.menu_dishes
+            ADD COLUMN allergens BIGINT[] NOT NULL DEFAULT '{}'::bigint[];
+        END IF;
+      END $$;
+    `);
+    await p.query(`
+      COMMENT ON COLUMN public.menu_dishes.allergens IS
+        'Array of menu_dishes_allergens.allergen_id. Resolve display text via menu_dishes_allergens.allergen_name.'
+    `);
+  } catch {
+    // menu_dishes may be absent in minimal dev DBs.
+  }
+
+  try {
+    await p.query(`
+      CREATE OR REPLACE VIEW public.menu_dishes_with_allergen_names AS
+      SELECT
+        md.*,
+        COALESCE(
+          (
+            SELECT array_agg(ma.allergen_name ORDER BY ord)
+            FROM unnest(COALESCE(md.allergens, '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
+            INNER JOIN public.menu_dishes_allergens ma ON ma.allergen_id = t.allergen_id
+          ),
+          ARRAY[]::text[]
+        ) AS allergen_name_list
+      FROM public.menu_dishes md;
+    `);
+  } catch {
+    // View creation may fail if menu_dishes or allergens column layout differs.
+  }
+
   await p.query(`
     CREATE TABLE IF NOT EXISTS customer_signup_otp_challenges (
       email TEXT PRIMARY KEY,

@@ -1694,6 +1694,60 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
         changeAmt = Math.round((amountReceived - total) * 100) / 100;
       }
     } else if (action === "insufficient") {
+      const proof2Bal =
+        ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0;
+      const statusUpBal = String(ord.status).toUpperCase();
+      const awaitingBalanceConfirmBal =
+        statusUpBal.includes("WAITING FOR BALANCE") || statusUpBal.includes("BALANCE PAYMENT CONFIRMATION");
+      const bprBal = ord.balance_proof_pending_review as unknown;
+      const pendingReviewBal =
+        bprBal === true ||
+        bprBal === 1 ||
+        String(bprBal ?? "")
+          .trim()
+          .toLowerCase() === "t";
+      const balanceReview = proof2Bal && (pendingReviewBal || awaitingBalanceConfirmBal);
+
+      if (balanceReview) {
+        if (!Number.isFinite(supplementalAmtIn) || supplementalAmtIn < 0) {
+          res.status(400).json({ error: "supplemental_amount_received is required (balance payment amount)" });
+          return;
+        }
+        const first = Number(ord.cashier_amount_received) || 0;
+        const remaining = Math.round((total - first) * 100) / 100;
+        if (supplementalAmtIn + 1e-9 >= remaining) {
+          res.status(400).json({
+            error:
+              "Additional amount is not below the remaining balance. Use Confirm order if payment is exact or sufficient.",
+          });
+          return;
+        }
+        newStatus = "PAYMENT INSUFFICIENT - PAY REMAINDER";
+        mailSubject = `Action needed: balance payment for ${ord.order_no}`;
+        mailBody =
+          `Our team reviewed your balance payment for order ${ord.order_no}.\n\n` +
+          `The additional amount received (₱${supplementalAmtIn.toFixed(2)}) is still below the remaining balance of ₱${remaining.toFixed(2)}.\n\n` +
+          `Please pay the remaining balance and upload a new payment proof in the app under your order.`;
+        await getPool().query(
+          `UPDATE restaurant_orders
+           SET status = $2,
+               cashier_secondary_amount_received = $3,
+               supplemental_payment_proof = NULL,
+               balance_proof_pending_review = FALSE,
+               fulfillment_stage = 'PENDING_CASHIER',
+               updated_at = NOW()
+           WHERE mobile_id = $1`,
+          [id, newStatus, supplementalAmtIn],
+        );
+        void sendMailSafe(String(ord.user_email), mailSubject, mailBody);
+        await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [
+          String(ord.user_email).toLowerCase(),
+          `[${ord.order_no}] Payment update: please pay the remaining balance (total ₱${total.toFixed(2)}).`,
+        ]);
+        res.json({ ok: true, status: newStatus });
+        return;
+      }
+
       newStatus = "PAYMENT INSUFFICIENT - PAY REMAINDER";
       mailSubject = `Action needed: payment for ${ord.order_no}`;
       mailBody =
@@ -1706,6 +1760,62 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
         changeAmt = Math.round((amountReceived - total) * 100) / 100;
       }
     } else {
+      const proof2Bal =
+        ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0;
+      const statusUpBal = String(ord.status).toUpperCase();
+      const awaitingBalanceConfirmBal =
+        statusUpBal.includes("WAITING FOR BALANCE") || statusUpBal.includes("BALANCE PAYMENT CONFIRMATION");
+      const bprBal = ord.balance_proof_pending_review as unknown;
+      const pendingReviewBal =
+        bprBal === true ||
+        bprBal === 1 ||
+        String(bprBal ?? "")
+          .trim()
+          .toLowerCase() === "t";
+      const balanceReview = proof2Bal && (pendingReviewBal || awaitingBalanceConfirmBal);
+
+      if (balanceReview) {
+        if (!Number.isFinite(supplementalAmtIn) || supplementalAmtIn < 0) {
+          res.status(400).json({ error: "supplemental_amount_received is required (balance payment amount)" });
+          return;
+        }
+        const first = Number(ord.cashier_amount_received) || 0;
+        const combined = first + supplementalAmtIn;
+        if (combined - 1e-9 <= total) {
+          res.status(400).json({
+            error: "Combined payments do not exceed the order total. Use Confirm order or Insufficient payment instead.",
+          });
+          return;
+        }
+        newStatus = "ORDER CONFIRMED — OVERPAYMENT (EXCESS REFUND ON DELIVERY)";
+        changeAmt = Math.round((combined - total) * 100) / 100;
+        mailSubject = `Order ${ord.order_no} confirmed — overpayment notice`;
+        mailBody =
+          `Your order ${ord.order_no} has been confirmed.\n\n` +
+          `We detected an overpayment relative to your order total of ₱${total.toFixed(2)}. ` +
+          `The excess amount will be returned to you when your order is delivered (or per our coordinator's instructions).\n\n` +
+          `Thank you for choosing Macrina's Kitchen and Catering.`;
+        await getPool().query(
+          `UPDATE restaurant_orders
+           SET status = $2,
+               cashier_secondary_amount_received = $3,
+               cashier_change = $4,
+               balance_proof_pending_review = FALSE,
+               fulfillment_stage = 'IN_PREPARATION',
+               updated_at = NOW()
+           WHERE mobile_id = $1`,
+          [id, newStatus, supplementalAmtIn, changeAmt],
+        );
+        void sendMailSafe(String(ord.user_email), mailSubject, mailBody);
+        await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [
+          String(ord.user_email).toLowerCase(),
+          `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
+        ]);
+        await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
+        res.json({ ok: true, status: newStatus });
+        return;
+      }
+
       newStatus = "ORDER CONFIRMED — OVERPAYMENT (EXCESS REFUND ON DELIVERY)";
       mailSubject = `Order ${ord.order_no} confirmed — overpayment notice`;
       mailBody =

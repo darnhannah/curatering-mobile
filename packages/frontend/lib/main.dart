@@ -268,7 +268,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
         context: navCtx,
         barrierDismissible: false,
         builder: (ctx) => AlertDialog(
-          title: Text(o.orderNo),
+          title: Text(uiOrderNo(o.orderNo)),
           content: const Text(
             'This order is still waiting for payment confirmation after 10 minutes. '
             'Would you like to cancel it, or keep waiting? You can follow up from My Orders.',
@@ -282,7 +282,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                   builder: (confirmCtx) => AlertDialog(
                     title: const Text('Cancel order?'),
                     content: Text(
-                      'Cancel ${o.orderNo}? It will move to Cancelled orders.',
+                      'Cancel ${uiOrderNo(o.orderNo)}? It will move to Cancelled orders.',
                     ),
                     actions: [
                       TextButton(onPressed: () => Navigator.of(confirmCtx).pop(), child: const Text('No')),
@@ -295,7 +295,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                             ScaffoldMessenger.of(navCtx).showSnackBar(SnackBar(content: Text(err)));
                           } else {
                             ScaffoldMessenger.of(navCtx).showSnackBar(
-                              SnackBar(content: Text('${o.orderNo} cancelled')),
+                              SnackBar(content: Text('${uiOrderNo(o.orderNo)} cancelled')),
                             );
                           }
                         },
@@ -1232,6 +1232,18 @@ bool orderShowsDeliveryTrackingLink(OrderData o) {
   return false;
 }
 
+/// UI-only formatting for customer-facing order numbers.
+/// Backend stores values like `Order No. 000123`; mobile should show `ORD-000123`.
+String uiOrderNo(String raw) {
+  final s = raw.trim();
+  if (s.isEmpty) return '—';
+  if (s.toUpperCase().startsWith('ORD-')) return s.toUpperCase();
+  final digits = s.replaceAll(RegExp(r'\D'), '');
+  if (digits.isEmpty) return s;
+  final last6 = digits.length >= 6 ? digits.substring(digits.length - 6) : digits.padLeft(6, '0');
+  return 'ORD-$last6';
+}
+
 bool customerOrderCancelled(OrderData o) {
   final u = o.status.toUpperCase();
   return u.contains('CANCEL');
@@ -1318,6 +1330,34 @@ String cateringManagerListStatusLabelFor(String status, String processingSubstag
     return processingSubstageLabel == 'ongoing' ? 'On Going' : 'For Down Payment';
   }
   return inquiryStatusReadable(status);
+}
+
+/// Detail AppBar: tab the order is in (not generic status text).
+String cateringManagerDetailTabTitle(CateringEventRecord row, String detailStage) {
+  switch (detailStage.trim().toLowerCase()) {
+    case 'online_inquiries':
+      return 'Online Inquiries';
+    case 'new_event':
+      return 'New Event';
+    case 'for_post_analysis':
+      return 'For Full Payment';
+    case 'completed':
+      return 'Completed';
+    case 'cancelled':
+      return 'Cancelled';
+    case 'for_processing':
+      return row.processingSubstageLabel == 'ongoing' ? 'On Going' : 'For Down Payment';
+    default:
+      return cateringManagerListStatusLabelFor(row.status, row.processingSubstageLabel);
+  }
+}
+
+int paxBufferFromCateringRow(CateringEventRecord row) {
+  final td = row.themeDesign;
+  final raw = td['pax_buffer'] ?? row.postAnalysis['pax_buffer'];
+  if (raw is num) return raw.toInt().clamp(0, 999999);
+  final n = int.tryParse('$raw'.trim());
+  return (n == null || n < 0) ? 0 : n;
 }
 
 void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
@@ -4169,6 +4209,13 @@ class _AuthScreenState extends State<AuthScreen> {
                                     try {
                                       await widget.state.enterGuestCheckoutSession();
                                       if (!mounted) return;
+                                      // Ensure the user lands on the dashboard even if the root widget rebuild lags.
+                                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                                        if (!mounted) return;
+                                        Navigator.of(context).pushReplacement(
+                                          MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: widget.state)),
+                                        );
+                                      });
                                     } catch (e) {
                                       if (mounted) {
                                         appSnack(
@@ -4355,14 +4402,48 @@ class _AuthScreenState extends State<AuthScreen> {
                                                         keyboardType: TextInputType.number,
                                                         decoration: deco('OTP code'),
                                                       ),
+                                                      const SizedBox(height: 8),
+                                                      OutlinedButton(
+                                                        onPressed: () async {
+                                                          final id = identityForRequest();
+                                                          if (id == null) return;
+                                                          final r = await widget.state.requestPasswordReset(
+                                                            identity: id,
+                                                            channel: widget.cashierMode ? 'email' : forgotChannel,
+                                                            role: widget.cashierMode ? 'cashier' : 'customer',
+                                                          );
+                                                          if (r.notRegistered) {
+                                                            setDialogState(() {
+                                                              notReg = 'This email or phone number is not registered.';
+                                                            });
+                                                            return;
+                                                          }
+                                                          if (!r.ok) {
+                                                            await _toast(r.error ?? 'Could not send OTP');
+                                                            return;
+                                                          }
+                                                          forgotOtpController.clear();
+                                                          await _toast(
+                                                            widget.cashierMode || forgotChannel == 'email'
+                                                                ? 'OTP resent. Check your email.'
+                                                                : 'OTP resent to your registered email address.',
+                                                          );
+                                                        },
+                                                        child: const Text('RESEND OTP'),
+                                                      ),
                                                       const SizedBox(height: 12),
                                                       FilledButton(
                                                         onPressed: () async {
                                                           final id = identityForRequest();
                                                           if (id == null) return;
+                                                          final otp = forgotOtpController.text.replaceAll(RegExp(r'\D'), '').trim();
+                                                          if (otp.isEmpty) {
+                                                            await _toast('Enter your OTP code.');
+                                                            return;
+                                                          }
                                                           final err = await widget.state.verifyPasswordResetOtp(
                                                             identity: id,
-                                                            otp: forgotOtpController.text,
+                                                            otp: otp,
                                                             role: widget.cashierMode ? 'cashier' : 'customer',
                                                           );
                                                           if (err != null) {
@@ -4396,9 +4477,14 @@ class _AuthScreenState extends State<AuthScreen> {
                                                           }
                                                           final id = identityForRequest();
                                                           if (id == null) return;
+                                                          final otp = forgotOtpController.text.replaceAll(RegExp(r'\D'), '').trim();
+                                                          if (otp.isEmpty) {
+                                                            await _toast('Enter your OTP code.');
+                                                            return;
+                                                          }
                                                           final err = await widget.state.resetPasswordWithOtp(
                                                             identity: id,
-                                                            otp: forgotOtpController.text,
+                                                            otp: otp,
                                                             password: forgotNewPasswordController.text,
                                                             role: widget.cashierMode ? 'cashier' : 'customer',
                                                           );
@@ -4998,41 +5084,48 @@ class CustomerDashboardScreen extends StatelessWidget {
                 await Future.wait(wait);
                 await state.loadNotifications(force: true);
               },
-              child: GridView.builder(
-                physics: const AlwaysScrollableScrollPhysics(),
-                padding: const EdgeInsets.all(12),
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 2,
-                  crossAxisSpacing: 10,
-                  mainAxisSpacing: 10,
-                  childAspectRatio: 1.35,
-                ),
-                itemCount: gridItems.length,
-                itemBuilder: (context, index) {
-                  final item = gridItems[index];
-                  return Card(
-                    color: Colors.white,
-                    elevation: 2,
-                    shadowColor: Colors.black26,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(12),
-                      onTap: () {
-                        Navigator.of(context).pushReplacement(
-                          MaterialPageRoute<void>(builder: (_) => item.screen),
-                        );
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Icon(item.icon, color: AppColors.brand, size: 30),
-                            const Spacer(),
-                            Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
-                          ],
-                        ),
-                      ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final w = constraints.maxWidth;
+                  final crossAxisCount = w >= 800 ? 3 : 2;
+                  final childAspectRatio = w >= 800 ? 1.15 : 1.35;
+                  return GridView.builder(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(12),
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: crossAxisCount,
+                      crossAxisSpacing: 10,
+                      mainAxisSpacing: 10,
+                      childAspectRatio: childAspectRatio,
                     ),
+                    itemCount: gridItems.length,
+                    itemBuilder: (context, index) {
+                      final item = gridItems[index];
+                      return Card(
+                        color: Colors.white,
+                        elevation: 2,
+                        shadowColor: Colors.black26,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () {
+                            Navigator.of(context).pushReplacement(
+                              MaterialPageRoute<void>(builder: (_) => item.screen),
+                            );
+                          },
+                          child: Padding(
+                            padding: const EdgeInsets.all(14),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Icon(item.icon, color: AppColors.brand, size: 30),
+                                const Spacer(),
+                                Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
                   );
                 },
               ),
@@ -5104,66 +5197,74 @@ class ManagerDashboardScreen extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: GridView.builder(
-              padding: const EdgeInsets.all(12),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 2,
-                crossAxisSpacing: 10,
-                mainAxisSpacing: 10,
-                childAspectRatio: 1.35,
-              ),
-              itemCount: cards.length + 1,
-              itemBuilder: (context, index) {
-                if (index == cards.length) {
-                  return Card(
-                    color: Colors.white,
-                    elevation: 2,
-                    shadowColor: Colors.black26,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(12),
-                      onTap: () => Navigator.of(context).push(
-                        MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
-                      ),
-                      child: const Padding(
-                        padding: EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Icon(Icons.settings_outlined, color: AppColors.brand, size: 30),
-                            Spacer(),
-                            Text('Settings', style: TextStyle(fontWeight: FontWeight.w800)),
-                          ],
-                        ),
-                      ),
-                    ),
-                  );
-                }
-                final item = cards[index];
-                return Card(
-                  color: Colors.white,
-                  elevation: 2,
-                  shadowColor: Colors.black26,
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: () {
-                      Navigator.of(context).pushReplacement(
-                        MaterialPageRoute<void>(
-                          builder: (_) => ManagerCateringShellScreen(state: state, initialTabIndex: item.tabIdx),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final w = constraints.maxWidth;
+                // Tablet: make tiles smaller so 2 columns don't feel oversized.
+                final crossAxisCount = w >= 800 ? 3 : 2;
+                final childAspectRatio = w >= 800 ? 1.15 : 1.35;
+                return GridView.builder(
+                  padding: const EdgeInsets.all(12),
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: crossAxisCount,
+                    crossAxisSpacing: 10,
+                    mainAxisSpacing: 10,
+                    childAspectRatio: childAspectRatio,
+                  ),
+                  itemCount: cards.length + 1,
+                  itemBuilder: (context, index) {
+                    if (index == cards.length) {
+                      return Card(
+                        color: Colors.white,
+                        elevation: 2,
+                        shadowColor: Colors.black26,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
+                          ),
+                          child: const Padding(
+                            padding: EdgeInsets.all(14),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Icon(Icons.settings_outlined, color: AppColors.brand, size: 30),
+                                Spacer(),
+                                Text('Settings', style: TextStyle(fontWeight: FontWeight.w800)),
+                              ],
+                            ),
+                          ),
                         ),
                       );
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.all(14),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Icon(item.icon, color: item.tabIdx == 6 ? const Color(0xFFE92E0D) : AppColors.brand, size: 30),
-                          const Spacer(),
-                          Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
-                        ],
+                    }
+                    final item = cards[index];
+                    return Card(
+                      color: Colors.white,
+                      elevation: 2,
+                      shadowColor: Colors.black26,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () {
+                          Navigator.of(context).pushReplacement(
+                            MaterialPageRoute<void>(
+                              builder: (_) => ManagerCateringShellScreen(state: state, initialTabIndex: item.tabIdx),
+                            ),
+                          );
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.all(14),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(item.icon, color: item.tabIdx == 6 ? const Color(0xFFE92E0D) : AppColors.brand, size: 30),
+                              const Spacer(),
+                              Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                            ],
+                          ),
+                        ),
                       ),
-                    ),
-                  ),
+                    );
+                  },
                 );
               },
             ),
@@ -7398,14 +7499,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
         return;
       }
       final newOrder = result.order!;
-      await s.clearTrayPersistOnly();
       final err = await s.uploadPaymentProof(newOrder.id, file, paymentProofBase64: proofB64);
       if (!mounted) return;
       if (err != null) {
         appSnack(context, err);
         return;
       }
-      await s.clearCheckoutAfterSuccessfulOrderAndPayment();
       setState(() {
         _placedOrder = newOrder;
         uploadedFile = file;
@@ -7512,7 +7611,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
         final isDraft = widget.draftCheckout && _placedOrder == null;
         final synced = _syncedOrder(s);
         final orderForUi = isDraft ? _draftSnapshot(s) : (synced ?? _placedOrder ?? widget.order!);
-        final insufficient = !isDraft && orderForUi.status.toUpperCase().contains('INSUFFICIENT');
+        final finalOrderStatusUp = orderForUi.status.toUpperCase();
+        // Keep the balance-payment UI (additional-payment card + original proof)
+        // even after uploading the balance proof; the backend switches the status
+        // to "WAITING FOR BALANCE PAYMENT CONFIRMATION".
+        final insufficient = !isDraft &&
+            (finalOrderStatusUp.contains('INSUFFICIENT') || finalOrderStatusUp.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION'));
         final paidSoFar = orderForUi.cashierAmountReceived ?? 0;
         final remainder = (orderForUi.total - paidSoFar).clamp(0, double.infinity);
         final supplementalOk =
@@ -7550,7 +7654,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.all(12),
                     children: [
-                    _OrderNoCard(displayNo: isDraft ? null : orderForUi.orderNo),
+                    _OrderNoCard(displayNo: isDraft ? null : uiOrderNo(orderForUi.orderNo)),
                     const SizedBox(height: 10),
                     if (insufficient) ...[
                       Card(
@@ -7792,7 +7896,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
                     appSnack(context, 'Upload proof of payment first.');
                     return;
                   }
-                  final insNow = ordNow.status.toUpperCase().contains('INSUFFICIENT');
+                  final insNow = ordNow.status.toUpperCase().contains('INSUFFICIENT') ||
+                      ordNow.status.toUpperCase().contains('WAITING FOR BALANCE PAYMENT CONFIRMATION');
                   final ok = insNow
                       ? (((syncedNow?.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false) || localProofUploaded))
                       : ((syncedNow?.paymentUploaded ?? false) ||
@@ -7826,6 +7931,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
                         builder: (_) => OrderStatusScreen(state: s, order: ordNow, paymentUploaded: true),
                       ),
                     );
+                    // Requirement: navigate to the order page first, then clear tray/draft.
+                    if (widget.draftCheckout) unawaited(s.clearCheckoutAfterSuccessfulOrderAndPayment());
                   });
                 },
               ),
@@ -8063,7 +8170,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Cancel this order?'),
-        content: Text('Cancel ${o.orderNo}? It will appear under Cancelled orders.'),
+        content: Text('Cancel ${uiOrderNo(o.orderNo)}? It will appear under Cancelled orders.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes, cancel')),
@@ -8103,10 +8210,25 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
     if (up.contains('CANCEL')) return Colors.grey.shade900;
     return Colors.orange.shade900;
   }
+
+  Widget _starRatingView(int stars) {
+    final clamped = stars.clamp(1, 5);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: List.generate(5, (i) {
+        final selected = i < clamped;
+        return Icon(
+          selected ? Icons.star : Icons.star_border,
+          size: 14,
+          color: selected ? Colors.amber.shade700 : Colors.grey.shade400,
+        );
+      }),
+    );
+  }
   Future<void> _followUpOrder(OrderData o) async {
     final err = await widget.state.submitHelpRequest(
       area: 'Order Follow-up',
-      problem: 'Follow-up on pending order ${o.orderNo}',
+      problem: 'Follow-up on pending order ${uiOrderNo(o.orderNo)}',
       desiredOutcome: 'Please update this order status or next action.',
     );
     if (!mounted) return;
@@ -8171,7 +8293,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setModalState) => AlertDialog(
-            title: Text('Feedback · ${o.orderNo}'),
+            title: Text('Feedback · ${uiOrderNo(o.orderNo)}'),
             content: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -8390,7 +8512,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                 ),
                               ),
                               const SizedBox(height: 4),
-                              Text(o.orderNo),
+                              Text(uiOrderNo(o.orderNo)),
                             ],
                           ),
                           subtitle: Column(
@@ -8406,6 +8528,15 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                               ),
                               if (o.loyaltyPointsEarned > 0 && (tabIndex == 1 || tabIndex == 2) && !widget.state.isGuestSession)
                                 Text('Loyalty: +${o.loyaltyPointsEarned} pts', style: const TextStyle(fontSize: 12)),
+                              if (tabIndex == 2 && _restaurantFeedbackByOrderNo.containsKey(o.orderNo))
+                                Builder(
+                                  builder: (ctx) {
+                                    final fb = _restaurantFeedbackByOrderNo[o.orderNo];
+                                    final rawStars = fb?['stars'];
+                                    final stars = rawStars is int ? rawStars : int.tryParse('$rawStars') ?? 0;
+                                    return stars > 0 ? _starRatingView(stars) : const SizedBox.shrink();
+                                  },
+                                ),
                               Text(formatDateTimeLocal(o.createdAt), style: const TextStyle(fontSize: 12)),
                               const SizedBox(height: 4),
                               Text(
@@ -8417,11 +8548,10 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                 const SizedBox(height: 6),
                                 Builder(
                                   builder: (ctx) {
-                                    final u = Uri.tryParse(o.deliveryTrackingUrl.trim());
-                                    final ok = u != null && u.hasScheme && (u.scheme == 'http' || u.scheme == 'https');
-                                    if (ok) {
+                                    final uri = _tryBuildHttpUri(o.deliveryTrackingUrl.trim());
+                                    if (uri != null) {
                                       return InkWell(
-                                        onTap: () => launchUrl(u, mode: LaunchMode.externalApplication),
+                                        onTap: () => launchUrl(uri, mode: LaunchMode.externalApplication),
                                         child: Text(
                                           'Tracking: ${o.deliveryTrackingUrl.trim()}',
                                           style: TextStyle(
@@ -8499,15 +8629,34 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                       showDialog<void>(
                         context: context,
                         builder: (ctx) => AlertDialog(
-                          title: Text(o.orderNo),
+                          title: Text(uiOrderNo(o.orderNo)),
                           content: SingleChildScrollView(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                _detailLine('Order no.', o.orderNo),
+                                _detailLine('Order no.', uiOrderNo(o.orderNo)),
                                 _detailLine('Status', statusReadableForOrder(o)),
                                 _detailLine('Fulfillment stage', fulfillmentStageReadable(o.fulfillmentStage)),
+                                Builder(
+                                  builder: (ctx) {
+                                    final fb = _restaurantFeedbackByOrderNo[o.orderNo];
+                                    if (fb == null) return const SizedBox.shrink();
+                                    final rawStars = fb['stars'];
+                                    final stars = rawStars is int ? rawStars : int.tryParse('$rawStars') ?? 0;
+                                    final remarks = '${fb['remarks'] ?? ''}'.trim();
+                                    return Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        if (stars > 0) _starRatingView(stars),
+                                        if (remarks.isNotEmpty) ...[
+                                          const SizedBox(height: 8),
+                                          _detailLine('Remarks', remarks),
+                                        ],
+                                      ],
+                                    );
+                                  },
+                                ),
                                 if (o.loyaltyPointsEarned > 0)
                                   _detailLine('Loyalty points from this order', '+${o.loyaltyPointsEarned} pts'),
                                 _detailLine('Placed', formatDateTimeLocal(o.createdAt)),
@@ -8615,9 +8764,20 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
     );
   }
 
+  Uri? _tryBuildHttpUri(String raw) {
+    final s = raw.trim();
+    if (s.isEmpty) return null;
+    final withScheme = (s.startsWith('http://') || s.startsWith('https://')) ? s : 'https://$s';
+    final uri = Uri.tryParse(withScheme);
+    if (uri == null) return null;
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') return null;
+    return uri;
+  }
+
   Widget _detailTrackingUrl(String label, String url) {
-    final uri = Uri.tryParse(url);
-    final ok = uri != null && uri.hasScheme && (uri.scheme == 'http' || uri.scheme == 'https');
+    final uri = _tryBuildHttpUri(url);
+    final ok = uri != null;
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: Column(
@@ -9291,20 +9451,6 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                           ),
                         ),
                         const Divider(height: 16),
-                        Row(
-                          children: [
-                            const Expanded(
-                              child: Text(
-                                'Total Loyalty Points',
-                                style: TextStyle(fontWeight: FontWeight.w800),
-                              ),
-                            ),
-                            Text(
-                              '${widget.state.profile.loyaltyPoints} pts',
-                              style: const TextStyle(fontWeight: FontWeight.w900),
-                            ),
-                          ],
-                        ),
                         const SizedBox(height: 10),
                         SizedBox(
                           height: 140,
@@ -9320,7 +9466,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                                   separatorBuilder: (_, _) => const SizedBox(height: 10),
                                   itemBuilder: (context, index) {
                                     final h = widget.state.loyaltyHistory[index];
-                                    final label = h.orderNo.trim().isEmpty ? '******' : h.orderNo.trim();
+                                    final label = h.orderNo.trim().isEmpty ? '******' : uiOrderNo(h.orderNo);
                                     final src = h.source == 'catering' ? 'Catering' : 'Restaurant';
                                     return Column(
                                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -12056,7 +12202,7 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(o.orderNo),
+        title: Text(uiOrderNo(o.orderNo)),
         content: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -12150,7 +12296,7 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
                         child: ListTile(
                           title: Row(
                             children: [
-                              Expanded(child: Text(o.orderNo)),
+                              Expanded(child: Text(uiOrderNo(o.orderNo))),
                               const SizedBox(width: 6),
                               Container(
                                 constraints: const BoxConstraints(maxWidth: 180),
@@ -12709,7 +12855,11 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     if (phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone)) {
       return 'Enter a valid contact number.';
     }
-    if (inquiryEmail.text.trim().isEmpty) return 'Enter email address.';
+    final email = inquiryEmail.text.trim();
+    if (email.isEmpty) return 'Enter email address.';
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      return 'Enter a valid email address.';
+    }
     if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
     if (!isAllowedCateringAddressInCoverage(eventCity.text.trim())) {
       return cateringCoverageErrorText();
@@ -12726,8 +12876,22 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final em = w.to!.hour * 60 + w.to!.minute;
       if (em <= sm) return 'End time must be after start time for each event.';
     }
+    if (selectedSetMenu == 'All Dishes' && selectedDishes.length < 4) {
+      return 'Select at least 4 dishes for the menu.';
+    }
     if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
     if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
+    if (inquiryType == 'CATERING AND EVENT' &&
+        themeSuggestionNote.trim().isEmpty &&
+        themeCostController.text.trim().isEmpty) {
+      return 'Enter theme design notes or theme design cost for Catering + Event.';
+    }
+    if (travelCostController.text.trim().isEmpty) return 'Enter travel cost.';
+    final maleN = int.tryParse(laborMaleController.text.trim()) ?? 0;
+    final femaleN = int.tryParse(laborFemaleController.text.trim()) ?? 0;
+    if (maleN <= 0 && femaleN <= 0 && laborManualCosts.isEmpty) {
+      return 'Enter labor costing (workers and/or manual line items).';
+    }
     if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
       return 'Describe the event type for Other.';
     }
@@ -13029,7 +13193,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
             labelValueRow('Total invoice', 'PHP ${total.toStringAsFixed(2)}'),
             labelValueRow('Total Cost', 'PHP ${total.toStringAsFixed(2)}'),
-            labelValueRow('Down payment due', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
+            labelValueRow('Down payment due (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
             labelValueRow('Note', note.text.trim().isEmpty ? '—' : note.text.trim()),
           ],
         ),
@@ -13592,7 +13756,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               TextField(
                 controller: travelCostController,
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: 'Travel cost'),
+                decoration: const InputDecoration(labelText: 'Travel cost', helperText: 'Required'),
                 onChanged: (_) => setState(() {}),
               ),
             ],
@@ -14080,6 +14244,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   bool _postAnalysisPdfGenerating = false;
   /// Additional-cost line items used for Order Summary PDF #1 (captured on entering For Full Payment, persisted on complete).
   final List<Map<String, dynamic>> _orderSummaryPdf1AdditionalCosts = [];
+  /// Committed additional-cost groups per workflow tab (For Down Payment / On Going / For Full Payment).
+  final List<Map<String, dynamic>> _additionalCostsGroups = [];
   /// Fingerprint of editable fields for back-navigation prompts.
   String _pristineManagerDetailSig = '';
   /// After a confirmed draft [saveCurrentStage], matches [_computeManagerDetailSignature] until the form changes.
@@ -14108,6 +14274,144 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final minGuests = d.orderKind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
     final billable = g < minGuests ? minGuests : g;
     return billable * kPesosPerPax;
+  }
+
+  /// Guest count as entered on inquiry / new event (excludes pax buffer).
+  int _guestCountEntered(CateringEventRecord row) => row.guestCount < 0 ? 0 : row.guestCount;
+
+  int _paxBufferCount(CateringEventRecord row) => paxBufferFromCateringRow(row);
+
+  double _paxBufferCostAmount(CateringEventRecord row) => _paxBufferCount(row) * kPesosPerPax;
+
+  double _guestPaxCostAmount(CateringEventRecord row) => _guestCountEntered(row) * kPesosPerPax;
+
+  String _additionalCostsStageLabel() {
+    if (widget.stage == 'for_post_analysis') return 'For Full Payment';
+    final sub = d.processingSubstageLabel;
+    if (sub == 'ongoing') return 'On Going';
+    if (sub == 'down_payment') return 'For Down Payment';
+    return '';
+  }
+
+  List<Map<String, dynamic>> _flattenAdditionalCostsFromGroups() {
+    final out = <Map<String, dynamic>>[];
+    for (final g in _additionalCostsGroups) {
+      final items = g['items'];
+      if (items is List) {
+        for (final e in items) {
+          if (e is Map) out.add(Map<String, dynamic>.from(e));
+        }
+      }
+    }
+    for (final e in additionalCosts) {
+      out.add(Map<String, dynamic>.from(e));
+    }
+    return out;
+  }
+
+  bool _hasAdditionalCostsForOrderSummaryPdf() {
+    if (additionalCosts.isNotEmpty) return true;
+    for (final g in _additionalCostsGroups) {
+      final items = g['items'];
+      if (items is List && items.isNotEmpty) return true;
+    }
+    return false;
+  }
+
+  void _snapshotAdditionalCostsForCurrentStage({bool clearWorking = false, bool refreshTimestamp = true}) {
+    final label = _additionalCostsStageLabel();
+    if (label.isEmpty || additionalCosts.isEmpty) return;
+    final items = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
+    final idx = _additionalCostsGroups.indexWhere((g) => '${g['stage'] ?? ''}'.trim() == label);
+    final entry = <String, dynamic>{
+      'stage': label,
+      'items': items,
+      'total': _sumCostRows(items),
+      'processed_at': refreshTimestamp || idx < 0
+          ? DateTime.now().toIso8601String()
+          : '${_additionalCostsGroups[idx]['processed_at'] ?? DateTime.now().toIso8601String()}',
+    };
+    if (idx >= 0) {
+      _additionalCostsGroups[idx] = entry;
+    } else {
+      _additionalCostsGroups.add(entry);
+    }
+    if (clearWorking) additionalCosts.clear();
+  }
+
+  void _loadAdditionalCostsGroupsFromRow(CateringEventRecord row) {
+    _additionalCostsGroups.clear();
+    final saved = row.postAnalysis['additional_costs_groups'];
+    if (saved is List) {
+      for (final e in saved) {
+        if (e is! Map) continue;
+        final items = <Map<String, dynamic>>[];
+        final rawItems = e['items'];
+        if (rawItems is List) {
+          for (final it in rawItems) {
+            if (it is Map) items.add(Map<String, dynamic>.from(it));
+          }
+        }
+        if (items.isEmpty) continue;
+        _additionalCostsGroups.add({
+          'stage': '${e['stage'] ?? ''}'.trim(),
+          'items': items,
+          'total': jsonToDouble(e['total']) > 0 ? jsonToDouble(e['total']) : _sumCostRows(items),
+          'processed_at': '${e['processed_at'] ?? ''}'.trim(),
+        });
+      }
+    } else if (row.additionalCosts.isNotEmpty) {
+      final items = <Map<String, dynamic>>[];
+      for (final c in row.additionalCosts) {
+        if (c is Map) items.add(Map<String, dynamic>.from(c));
+      }
+      if (items.isNotEmpty) {
+        _additionalCostsGroups.add({
+          'stage': cateringManagerDetailTabTitle(row, widget.stage),
+          'items': items,
+          'total': _sumCostRows(items),
+          'processed_at': (row.stageEnteredAt ?? row.updatedAt).toIso8601String(),
+        });
+      }
+    }
+    additionalCosts.clear();
+    final stageLabel = cateringManagerDetailTabTitle(row, widget.stage);
+    for (final g in _additionalCostsGroups) {
+      if ('${g['stage'] ?? ''}'.trim() != stageLabel) continue;
+      final items = g['items'];
+      if (items is List) {
+        for (final it in items) {
+          if (it is Map) additionalCosts.add(Map<String, dynamic>.from(it));
+        }
+      }
+      break;
+    }
+  }
+
+  List<Map<String, dynamic>> _additionalCostsGroupsForPostAnalysis() =>
+      _additionalCostsGroups.map((g) => Map<String, dynamic>.from(g)).toList();
+
+  Widget? _paymentProofSuffixIcon(
+    BuildContext context, {
+    Uint8List? localBytes,
+    required String proofB64Key,
+    required String title,
+  }) {
+    Uint8List? bytes = localBytes;
+    if (bytes == null) {
+      final b = '${d.postAnalysis[proofB64Key] ?? ''}'.trim();
+      if (b.isEmpty) return null;
+      try {
+        bytes = Uint8List.fromList(base64Decode(b));
+      } catch (_) {
+        return null;
+      }
+    }
+    return IconButton(
+      tooltip: 'View $title',
+      icon: const Icon(Icons.image_outlined),
+      onPressed: () => showProofFullScreen(context, bytes, title: title),
+    );
   }
 
   DateTime? _parseScheduleDate(dynamic v) {
@@ -14344,7 +14648,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   double _travelCostComputed() => double.tryParse(travelCostController.text.trim()) ?? 0;
 
   double _grandTotalComputed() =>
-      _baseFoodCost() + _laborCostComputed() + _travelCostComputed() + _sumCostRows(additionalCosts) + _sumCostRows(themeDesignCosts);
+      _baseFoodCost() +
+      _laborCostComputed() +
+      _travelCostComputed() +
+      _sumCostRows(_flattenAdditionalCostsFromGroups()) +
+      _sumCostRows(themeDesignCosts);
 
   String _additionalCostsSignature(List<Map<String, dynamic>> costs) {
     final normalized = costs.map((e) => {
@@ -14412,22 +14720,49 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     if (postAnalysis2Only) {
       final addlPaid = d.postAnalysis['additional_costs_payment_confirmed'] == true;
-      final addRows = <pw.Widget>[
-        labelValueRow(
-          'Additional costs',
-          additionalCostsForPdf.isEmpty
-              ? '—'
-              : additionalCostsForPdf
-                  .map((e) => '${e['label'] ?? ''}'.trim())
-                  .where((x) => x.isNotEmpty)
-                  .join(' · '),
-        ),
-        labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+      final addRows = <pw.Widget>[];
+      final groups = _additionalCostsGroups.isNotEmpty
+          ? _additionalCostsGroups
+          : (additionalCostsForPdf.isEmpty
+              ? <Map<String, dynamic>>[]
+              : [
+                  {
+                    'stage': 'Additional costs',
+                    'items': additionalCostsForPdf,
+                    'total': additionalCostTotal,
+                    'processed_at': DateTime.now().toIso8601String(),
+                  },
+                ]);
+      for (final group in groups) {
+        final items = (group['items'] is List)
+            ? (group['items'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
+            : <Map<String, dynamic>>[];
+        if (items.isEmpty) continue;
+        final stage = '${group['stage'] ?? 'Additional costs'}'.trim();
+        final groupTotal = jsonToDouble(group['total']) > 0 ? jsonToDouble(group['total']) : _sumCostRows(items);
+        final processedRaw = '${group['processed_at'] ?? ''}'.trim();
+        final processedAt = processedRaw.isEmpty
+            ? '—'
+            : (DateTime.tryParse(processedRaw) != null ? formatDateTimeLocal(DateTime.parse(processedRaw)) : processedRaw);
+        addRows.add(
+          labelValueRow(
+            'Additional costs ($stage)',
+            items.map((e) => '${e['label'] ?? ''}'.trim()).where((x) => x.isNotEmpty).join(' · '),
+          ),
+        );
+        addRows.add(labelValueRow('Additional costs (total)', 'PHP ${groupTotal.toStringAsFixed(2)}'));
+        addRows.add(labelValueRow('Date/Time processed', processedAt));
+        addRows.add(pw.SizedBox(height: 6));
+      }
+      if (addRows.isEmpty) {
+        addRows.add(labelValueRow('Additional costs', '—'));
+      }
+      addRows.add(
         labelValueRow(
           'Total Cost',
           'PHP ${(_baseFoodCost() + _laborCostComputed() + _travelCostComputed() + themeCost + additionalCostTotal).toStringAsFixed(2)}',
         ),
-      ];
+      );
       doc.addPage(
         pw.MultiPage(
           build: (ctx) => [
@@ -14443,6 +14778,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             labelValueRow('Event', d.eventTitle.isEmpty ? d.customerName : d.eventTitle),
             labelValueRow('Customer', d.customerName),
             labelValueRow('Contact person', d.contactPerson),
+            labelValueRow('Contact number', d.contactNumber.trim().isEmpty ? '—' : d.contactNumber.trim()),
+            labelValueRow('Email address', d.emailAddress.trim().isEmpty ? '—' : d.emailAddress.trim()),
             labelValueRow('Address', d.address),
             ...addRows,
             if (addlPaid) ...[
@@ -14465,7 +14802,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final laborLine = _laborCostComputed();
     final travelLine = _travelCostComputed();
     final totalComputed = _baseFoodCost() + laborLine + travelLine + themeCost + additionalCostTotal;
-    final noPaxAmount = d.guestCount * kPesosPerPax;
+    final guestEntered = _guestCountEntered(d);
+    final paxBufferCount = _paxBufferCount(d);
+    final guestPaxAmount = _guestPaxCostAmount(d);
+    final paxBufferAmount = _paxBufferCostAmount(d);
     final downPaymentDue = totalComputed * 0.5;
     final totalDueNow = totalComputed - downPaymentDue;
     final downPaidStored = d.downPaymentAmount > 0 ? d.downPaymentAmount : (double.tryParse(downPaymentPaidController.text.trim()) ?? 0);
@@ -14492,14 +14832,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     switch (variant) {
       case _ManagerOrderSummaryPdfVariant.beforeDownPayment:
         tailRows.addAll([
-          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
-          labelValueRow('Down payment due', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
+          labelValueRow('Down payment due (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
         ]);
         break;
       case _ManagerOrderSummaryPdfVariant.afterDownPayment:
         tailRows.addAll([
-          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Down payment paid', 'PHP ${downPaidLine.toStringAsFixed(2)}'),
           labelValueRow('Total amount due', 'PHP ${balanceStillDue.toStringAsFixed(2)}'),
@@ -14507,7 +14845,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         break;
       case _ManagerOrderSummaryPdfVariant.additionalCostsSheet:
         tailRows.addAll([
-          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Down payment paid', 'PHP ${downPaidLine.toStringAsFixed(2)}'),
           labelValueRow('Total amount due', 'PHP ${totalDueNow.toStringAsFixed(2)}'),
@@ -14515,7 +14852,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         break;
       case _ManagerOrderSummaryPdfVariant.fullyPaid:
         tailRows.addAll([
-          labelValueRow('Total invoice', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Down payment paid', 'PHP ${downPaidLine.toStringAsFixed(2)}'),
           labelValueRow('Balance amount paid', 'PHP ${balancePaidLine.toStringAsFixed(2)}'),
@@ -14540,33 +14876,39 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           labelValueRow('Menu dishes', menuLines.isEmpty ? '—' : menuLines.join(', ')),
           labelValueRow(
             'No. of PAX and cost',
-            '${d.guestCount} x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${noPaxAmount.toStringAsFixed(2)}',
+            '$guestEntered x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${guestPaxAmount.toStringAsFixed(2)}',
           ),
+          if (paxBufferCount > 0)
+            labelValueRow(
+              'PAX Buffer and cost',
+              '$paxBufferCount x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${paxBufferAmount.toStringAsFixed(2)}',
+            ),
           labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
           labelValueRow('Labor cost', 'PHP ${laborLine.toStringAsFixed(2)}'),
           labelValueRow('Travel cost', 'PHP ${travelLine.toStringAsFixed(2)}'),
-          labelValueRow(
-            'Additional costs',
-            additionalCostsForPdf.isEmpty
-                ? '—'
-                : additionalCostsForPdf
-                    .map((e) => '${e['label'] ?? ''}'.trim())
-                    .where((x) => x.isNotEmpty)
-                    .join(' · '),
-          ),
-          labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+          if (additionalCostsForPdf.isNotEmpty) ...[
+            labelValueRow(
+              'Additional costs',
+              additionalCostsForPdf
+                  .map((e) => '${e['label'] ?? ''}'.trim())
+                  .where((x) => x.isNotEmpty)
+                  .join(' · '),
+            ),
+            labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
+          ],
           ...tailRows,
-          if (variant == _ManagerOrderSummaryPdfVariant.fullyPaid) ...[
-            pw.SizedBox(height: 10),
-            pw.Text(
-              'PAID',
-              style: pw.TextStyle(
-                fontSize: 14,
-                fontWeight: pw.FontWeight.bold,
-                color: pdf.PdfColors.green,
+          if (variant == _ManagerOrderSummaryPdfVariant.fullyPaid)
+            pw.Padding(
+              padding: const pw.EdgeInsets.only(top: 10),
+              child: pw.Text(
+                'PAID',
+                style: pw.TextStyle(
+                  fontSize: 14,
+                  fontWeight: pw.FontWeight.bold,
+                  color: pdf.PdfColors.green,
+                ),
               ),
             ),
-          ],
         ],
       ),
     );
@@ -14585,11 +14927,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     try {
       final List<Map<String, dynamic>> pdfCosts;
       if (postAnalysis2Only) {
-        pdfCosts = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
+        pdfCosts = _flattenAdditionalCostsFromGroups();
       } else if (variant == _ManagerOrderSummaryPdfVariant.fullyPaid && _orderSummaryPdf1AdditionalCosts.isNotEmpty) {
         pdfCosts = _orderSummaryPdf1AdditionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
       } else {
-        pdfCosts = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
+        pdfCosts = _flattenAdditionalCostsFromGroups();
       }
       final bytes = await _buildOrderSummaryPdfBytes(
         additionalCostsForPdf: pdfCosts,
@@ -14849,9 +15191,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         'amount': row.laborCost - structuredLabor - manualSum,
       });
     }
-    for (final c in row.additionalCosts) {
-      if (c is Map<String, dynamic>) additionalCosts.add(c);
-    }
+    _loadAdditionalCostsGroupsFromRow(row);
     final pdf1Saved = row.postAnalysis['order_summary_pdf1_additional_costs'];
     if (pdf1Saved is List) {
       for (final e in pdf1Saved) {
@@ -15347,7 +15687,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final canComplete = widget.state.isManager;
     final totalComputed = _grandTotalComputed();
     final displayInvoiceTotal = isProcessing
-        ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts))
+        ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(_flattenAdditionalCostsFromGroups()))
         : totalComputed;
     final scheduleConflictsForProcessing = _conflictCountWithForProcessing();
     final downPaymentDue = displayInvoiceTotal * 0.5;
@@ -15579,6 +15919,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ..clear()
             ..addAll(draft.map((e) => Map<String, dynamic>.from(e)));
         });
+        await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
       }
     }
     Future<void> _openTaskEditor() async {
@@ -15708,6 +16049,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ..clear()
             ..addAll(draft.map((e) => Map<String, dynamic>.from(e)));
         });
+        await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
       }
     }
     String? _validateDraftScheduleCoherence() {
@@ -15781,12 +16123,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           ),
         );
         if (okCont != true || !mounted) return;
+        await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+        if (!mounted) return;
+        _snapshotAdditionalCostsForCurrentStage(clearWorking: true, refreshTimestamp: true);
         _showManagerBlockingProgress('Moving to On Going…');
         try {
           final err = await widget.state.managerPatchCateringPostAnalysis(
             id: d.id,
             orderKind: d.orderKind,
-            patch: {'processing_phase': 'ongoing'},
+            patch: {
+              'processing_phase': 'ongoing',
+              'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
+            },
           );
           if (!mounted) return;
           if (err != null) {
@@ -15847,10 +16195,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         }
       }
       final rowSubmit = d;
+      _snapshotAdditionalCostsForCurrentStage(refreshTimestamp: true);
+      final flatAdditionalSubmit = _flattenAdditionalCostsFromGroups();
       final downPayment = double.tryParse(downPaymentController.text.trim());
       final downPaymentPaid = double.tryParse(downPaymentPaidController.text.trim());
       final fullPayment = double.tryParse(fullPaymentController.text.trim());
       final postAnalysis = <String, dynamic>{
+        'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
         'notes': analysisController.text.trim(),
         'task_assignment': taskAssignmentController.text.trim(),
         'task_assignment_rows': taskRows,
@@ -15883,7 +16234,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       final laborForSubmit = isProcessing ? 0.0 : laborCostComputed;
       final travelForSubmit = isProcessing ? 0.0 : _travelCostComputed();
       final invoiceTotalSubmit = isProcessing
-          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts))
+          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(flatAdditionalSubmit))
           : totalComputed;
       final themeDesign = <String, dynamic>{
         ...rowSubmit.themeDesign,
@@ -15901,13 +16252,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         {'label': 'Labor cost', 'amount': laborForSubmit},
         {'label': 'Travel cost', 'amount': travelForSubmit},
         {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
-        {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+        {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSubmit)},
       ];
+      final advancingToFullPayment =
+          widget.stage == 'for_processing' && processingSubstageEarly == 'ongoing' && target == 'for_post_analysis';
       final confirm = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Confirm submission'),
-          content: Text('Proceed to ${target == 'completed' ? 'Completed' : 'next stage'}?'),
+          title: Text(advancingToFullPayment ? 'Continue to For Full Payment' : 'Confirm submission'),
+          content: Text(
+            advancingToFullPayment
+                ? 'Save and move this order to For Full Payment?'
+                : 'Proceed to ${target == 'completed' ? 'Completed' : 'next stage'}?',
+          ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
             FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm')),
@@ -15915,6 +16272,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         ),
       );
       if (confirm != true) return;
+      if (advancingToFullPayment) {
+        _snapshotAdditionalCostsForCurrentStage(clearWorking: true, refreshTimestamp: true);
+      }
       if (target == 'for_post_analysis') {
         final dueHalf = invoiceTotalSubmit * 0.5;
         if (!cateringDownPaymentConfirmed(rowSubmit, dueHalf)) {
@@ -15930,7 +16290,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           appSnack(context, 'Full payment confirmation is required before completing this order.');
           return;
         }
-        final addlTotal = _sumCostRows(additionalCosts);
+        final addlTotal = _sumCostRows(flatAdditionalSubmit);
         if (addlTotal > 0.01 && rowSubmit.postAnalysis['additional_costs_payment_confirmed'] != true) {
           appSnack(context, 'Confirm additional costs payment before completing this order.');
           return;
@@ -15954,7 +16314,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               (isProcessing || isPost || isOnlineInquiry || widget.stage == 'new_event') ? postAnalysis : null,
           checklist: checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
           actualEventImages: actualEventImages.isEmpty ? null : actualEventImages,
-          additionalCosts: additionalCosts,
+          additionalCosts: flatAdditionalSubmit,
           laborCost: laborForSubmit,
           travelCost: travelForSubmit,
           totalCost: invoiceTotalSubmit,
@@ -15967,7 +16327,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           appSnack(context, err);
           return;
         }
-        appSnack(context, target == 'completed' ? 'Order completed' : 'Moved to next stage');
+        appSnack(
+          context,
+          target == 'completed'
+              ? 'Order completed'
+              : (advancingToFullPayment ? 'Moved to For Full Payment' : 'Moved to next stage'),
+        );
         await widget.state.loadManagerCateringByStage(widget.stage, force: true);
         if (mounted) Navigator.of(context).pop();
       } finally {
@@ -15978,8 +16343,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       final isProcessingHere = widget.stage == 'for_processing';
       final laborCostComputedNow = isProcessingHere ? 0.0 : _laborCostComputed();
       final travelNow = isProcessingHere ? 0.0 : _travelCostComputed();
+      final flatAdditionalSave = _flattenAdditionalCostsFromGroups();
       final totalNow = isProcessingHere
-          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts))
+          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(flatAdditionalSave))
           : _grandTotalComputed();
       final et =
           managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
@@ -16029,9 +16395,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           }
         }
 
+        _snapshotAdditionalCostsForCurrentStage(refreshTimestamp: true);
         final rowBase = d;
+        final flatAdditional = _flattenAdditionalCostsFromGroups();
         final postAnalysis = <String, dynamic>{
           'notes': analysisController.text.trim(),
+          'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
           'task_assignment': taskAssignmentController.text.trim(),
           'task_assignment_rows': taskRows,
           'business_cards_given': businessCardsController.text.trim(),
@@ -16089,7 +16458,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               'email_address': managerEmailController.text.trim(),
               'address': managerAddressController.text.trim(),
               'menu': selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
-              'additional_costs': additionalCosts,
+              'additional_costs': flatAdditionalSave,
               'labor_cost': laborCostComputedNow,
               'travel_cost': travelNow,
               'total_cost': totalNow,
@@ -16098,7 +16467,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 {'label': 'Labor cost', 'amount': laborCostComputedNow},
                 {'label': 'Travel cost', 'amount': travelNow},
                 {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
-                {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+                {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
               ],
               if (gc != null && gc >= 0) 'guest_count': gc,
             },
@@ -16134,7 +16503,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           fullPaymentAmount: null,
           postAnalysis: (isProcessing || isPost || isOnlineInquiry) ? postAnalysis : null,
           checklist: checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
-          additionalCosts: additionalCosts,
+          additionalCosts: flatAdditionalSave,
           laborCost: laborCostComputedNow,
           travelCost: travelNow,
           totalCost: totalNow,
@@ -16143,7 +16512,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             {'label': 'Labor cost', 'amount': laborCostComputedNow},
             {'label': 'Travel cost', 'amount': travelNow},
             {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
-            {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+            {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
           ],
           themeDesign: themeDesign,
           menu: selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
@@ -16209,7 +16578,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         leading: _buildManagerHamburgerLeading(context, widget.state),
         title: Text(
           row.transactionNo.trim().isNotEmpty
-              ? '${cateringManagerListStatusLabelFor(row.status, row.processingSubstageLabel)} — ${row.transactionNo.trim()}'
+              ? '${cateringManagerDetailTabTitle(row, widget.stage)} — ${row.transactionNo.trim()}'
               : (row.eventTitle.isEmpty ? row.customerName : row.eventTitle),
           style: const TextStyle(fontWeight: FontWeight.w800),
         ),
@@ -16237,8 +16606,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             )
-          else if (row.cateringLoyaltyEligiblePointsIfCompleted > 0 &&
-              !(isDownPaymentSubstage || isOngoingSubstage || isPost))
+          else if (row.cateringLoyaltyEligiblePointsIfCompleted > 0 && !isCompleted)
             Card(
               child: ListTile(
                 leading: Icon(Icons.stars_outlined, color: Colors.blue.shade700),
@@ -16270,45 +16638,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       decoration: const InputDecoration(labelText: 'Down payment due'),
                     ),
                     const SizedBox(height: 8),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: downPaymentPaidController,
-                            keyboardType: TextInputType.number,
-                            readOnly: !isProcessing || isDownPaymentConfirmed,
-                            decoration: const InputDecoration(labelText: 'Down payment paid'),
-                          ),
+                    TextField(
+                      controller: downPaymentPaidController,
+                      keyboardType: TextInputType.number,
+                      readOnly: !isProcessing || isDownPaymentConfirmed,
+                      decoration: InputDecoration(
+                        labelText: 'Down payment paid',
+                        suffixIcon: _paymentProofSuffixIcon(
+                          context,
+                          localBytes: _managerDownPaymentProofBytes,
+                          proofB64Key: 'manager_down_payment_proof_b64',
+                          title: 'Down payment proof',
                         ),
-                        Builder(
-                          builder: (ctx) {
-                            if (_managerDownPaymentProofBytes != null) {
-                              return IconButton(
-                                tooltip: 'View down payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(
-                                  ctx,
-                                  _managerDownPaymentProofBytes!,
-                                  title: 'Down payment proof',
-                                ),
-                              );
-                            }
-                            final b = '${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim();
-                            if (b.isEmpty) return const SizedBox.shrink();
-                            try {
-                              final bytes = Uint8List.fromList(base64Decode(b));
-                              return IconButton(
-                                tooltip: 'View down payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Down payment proof'),
-                              );
-                            } catch (_) {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        ),
-                      ],
+                      ),
                     ),
                     const SizedBox(height: 10),
                     const Text('Proof of down payment', style: TextStyle(fontWeight: FontWeight.w700)),
@@ -16436,7 +16778,34 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (isDownPaymentSubstage) _additionalCostsCard(draft: false, processing: true, post: false),
+          if (isOngoingSubstage)
+            Card(
+              color: Colors.blue.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Payments', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: downPaymentPaidController,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        labelText: 'Down payment paid',
+                        suffixIcon: _paymentProofSuffixIcon(
+                          context,
+                          localBytes: _managerDownPaymentProofBytes,
+                          proofB64Key: 'manager_down_payment_proof_b64',
+                          title: 'Down payment proof',
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (isDownPaymentSubstage || isOngoingSubstage) _additionalCostsCard(draft: false, processing: true, post: false),
           if (isPost)
             Card(
               color: Colors.green.shade50,
@@ -16447,44 +16816,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   children: [
                     const Text('Full Payment', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: downPaymentPaidController,
-                            readOnly: true,
-                            decoration: const InputDecoration(labelText: 'Down payment paid'),
-                          ),
+                    TextField(
+                      controller: downPaymentPaidController,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        labelText: 'Down payment paid',
+                        suffixIcon: _paymentProofSuffixIcon(
+                          context,
+                          localBytes: _managerDownPaymentProofBytes,
+                          proofB64Key: 'manager_down_payment_proof_b64',
+                          title: 'Down payment proof',
                         ),
-                        Builder(
-                          builder: (ctx) {
-                            if (_managerDownPaymentProofBytes != null) {
-                              return IconButton(
-                                tooltip: 'View down payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(
-                                  ctx,
-                                  _managerDownPaymentProofBytes!,
-                                  title: 'Down payment proof',
-                                ),
-                              );
-                            }
-                            final b = '${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim();
-                            if (b.isEmpty) return const SizedBox.shrink();
-                            try {
-                              final bytes = Uint8List.fromList(base64Decode(b));
-                              return IconButton(
-                                tooltip: 'View down payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Down payment proof'),
-                              );
-                            } catch (_) {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        ),
-                      ],
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Builder(
@@ -16519,45 +16862,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       },
                     ),
                     const SizedBox(height: 8),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: fullPaymentController,
-                            keyboardType: TextInputType.number,
-                            readOnly: true,
-                            decoration: const InputDecoration(labelText: 'Full payment amount'),
-                          ),
+                    TextField(
+                      controller: fullPaymentController,
+                      keyboardType: TextInputType.number,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        labelText: 'Full payment paid',
+                        suffixIcon: _paymentProofSuffixIcon(
+                          context,
+                          localBytes: _managerFullPaymentProofBytes,
+                          proofB64Key: 'manager_full_payment_proof_b64',
+                          title: 'Full payment proof',
                         ),
-                        Builder(
-                          builder: (ctx) {
-                            if (_managerFullPaymentProofBytes != null) {
-                              return IconButton(
-                                tooltip: 'View full payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(
-                                  ctx,
-                                  _managerFullPaymentProofBytes!,
-                                  title: 'Full payment proof',
-                                ),
-                              );
-                            }
-                            final b = '${row.postAnalysis['manager_full_payment_proof_b64'] ?? ''}'.trim();
-                            if (b.isEmpty) return const SizedBox.shrink();
-                            try {
-                              final bytes = Uint8List.fromList(base64Decode(b));
-                              return IconButton(
-                                tooltip: 'View full payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Full payment proof'),
-                              );
-                            } catch (_) {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        ),
-                      ],
+                      ),
                     ),
                     const SizedBox(height: 10),
                     const Text('Proof of full payment', style: TextStyle(fontWeight: FontWeight.w700)),
@@ -16705,118 +17022,61 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       style: const TextStyle(fontWeight: FontWeight.w700),
                     ),
                     const SizedBox(height: 10),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            'Down payment paid: PHP ${row.downPaymentAmount.toStringAsFixed(2)}',
-                            style: const TextStyle(fontWeight: FontWeight.w600),
-                          ),
+                    TextField(
+                      controller: downPaymentPaidController,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        labelText: 'Down payment paid',
+                        suffixIcon: _paymentProofSuffixIcon(
+                          context,
+                          localBytes: _managerDownPaymentProofBytes,
+                          proofB64Key: 'manager_down_payment_proof_b64',
+                          title: 'Down payment proof',
                         ),
-                        Builder(
-                          builder: (ctx) {
-                            final b = '${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim();
-                            if (b.isEmpty) return const SizedBox.shrink();
-                            try {
-                              final bytes = Uint8List.fromList(base64Decode(b));
-                              return IconButton(
-                                tooltip: 'View down payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Down payment proof'),
-                              );
-                            } catch (_) {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        ),
-                      ],
+                      ),
                     ),
                     const SizedBox(height: 8),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            'Balance payment paid: PHP ${row.fullPaymentAmount.toStringAsFixed(2)}',
-                            style: const TextStyle(fontWeight: FontWeight.w600),
+                    TextField(
+                      controller: fullPaymentController,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        labelText: 'Full payment paid',
+                        suffixIcon: _paymentProofSuffixIcon(
+                          context,
+                          localBytes: _managerFullPaymentProofBytes,
+                          proofB64Key: 'manager_full_payment_proof_b64',
+                          title: 'Full payment proof',
+                        ),
+                      ),
+                    ),
+                    if (_sumCostRows(_flattenAdditionalCostsFromGroups()) > 0.01) ...[
+                      const SizedBox(height: 8),
+                      TextFormField(
+                        readOnly: true,
+                        initialValue: _sumCostRows(_flattenAdditionalCostsFromGroups()).toStringAsFixed(2),
+                        decoration: InputDecoration(
+                          labelText: 'Additional costs paid',
+                          prefixText: 'PHP ',
+                          suffixIcon: _paymentProofSuffixIcon(
+                            context,
+                            localBytes: _managerAdditionalCostsProofBytes,
+                            proofB64Key: 'manager_additional_costs_proof_b64',
+                            title: 'Additional costs proof',
                           ),
                         ),
-                        Builder(
-                          builder: (ctx) {
-                            final b = '${row.postAnalysis['manager_full_payment_proof_b64'] ?? ''}'.trim();
-                            if (b.isEmpty) return const SizedBox.shrink();
-                            try {
-                              final bytes = Uint8List.fromList(base64Decode(b));
-                              return IconButton(
-                                tooltip: 'View full payment proof',
-                                icon: const Icon(Icons.image_outlined),
-                                onPressed: () => showProofFullScreen(ctx, bytes, title: 'Full payment proof'),
-                              );
-                            } catch (_) {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        ),
-                      ],
-                    ),
-                    if (_sumCostRows(additionalCosts) > 0.01) ...[
-                      const SizedBox(height: 8),
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Additional costs paid: PHP ${_sumCostRows(additionalCosts).toStringAsFixed(2)}',
-                                  style: const TextStyle(fontWeight: FontWeight.w600),
-                                ),
-                                if (row.postAnalysis['additional_costs_payment_confirmed'] == true)
-                                  Padding(
-                                    padding: const EdgeInsets.only(top: 4),
-                                    child: Text(
-                                      'PAID',
-                                      style: TextStyle(
-                                        color: Colors.green.shade800,
-                                        fontWeight: FontWeight.w900,
-                                        fontSize: 14,
-                                      ),
-                                    ),
-                                  ),
-                              ],
+                      ),
+                      if (row.postAnalysis['additional_costs_payment_confirmed'] == true)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'Additional costs: PAID',
+                            style: TextStyle(
+                              color: Colors.green.shade800,
+                              fontWeight: FontWeight.w900,
+                              fontSize: 14,
                             ),
                           ),
-                          Builder(
-                            builder: (ctx) {
-                              if (_managerAdditionalCostsProofBytes != null) {
-                                return IconButton(
-                                  tooltip: 'View additional costs payment proof',
-                                  icon: const Icon(Icons.image_outlined),
-                                  onPressed: () => showProofFullScreen(
-                                    ctx,
-                                    _managerAdditionalCostsProofBytes!,
-                                    title: 'Additional costs proof',
-                                  ),
-                                );
-                              }
-                              final b = '${row.postAnalysis['manager_additional_costs_proof_b64'] ?? ''}'.trim();
-                              if (b.isEmpty) return const SizedBox.shrink();
-                              try {
-                                final bytes = Uint8List.fromList(base64Decode(b));
-                                return IconButton(
-                                  tooltip: 'View additional costs payment proof',
-                                  icon: const Icon(Icons.image_outlined),
-                                  onPressed: () => showProofFullScreen(ctx, bytes, title: 'Additional costs proof'),
-                                );
-                              } catch (_) {
-                                return const SizedBox.shrink();
-                              }
-                            },
-                          ),
-                        ],
-                      ),
+                        ),
                     ],
                     const SizedBox(height: 8),
                     Text(
@@ -16851,118 +17111,80 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
                     ),
                     const SizedBox(height: 8),
-                    if (isPost) ...[
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.beforeDownPayment),
-                            child: const Text('Order Summary before Down Payment'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.afterDownPayment),
-                            child: const Text('Order Summary after Down Payment'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(
-                              _ManagerOrderSummaryPdfVariant.beforeDownPayment,
-                              postAnalysis2Only: true,
+                    Builder(
+                      builder: (ctx) {
+                        final showBeforeDownPayment =
+                            isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted;
+                        final showAfterDownPayment = isOngoingSubstage || isPost || isCompleted;
+                        final showAdditionalCosts =
+                            (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted) &&
+                                _hasAdditionalCostsForOrderSummaryPdf();
+                        final showFullyPaid = isPost || isCompleted;
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                if (showBeforeDownPayment)
+                                  OutlinedButton(
+                                    onPressed: () => _previewManagerOrderSummary(
+                                      _ManagerOrderSummaryPdfVariant.beforeDownPayment,
+                                    ),
+                                    child: const Text('Order Summary before Down Payment'),
+                                  ),
+                                if (showAfterDownPayment)
+                                  OutlinedButton(
+                                    onPressed: () => _previewManagerOrderSummary(
+                                      _ManagerOrderSummaryPdfVariant.afterDownPayment,
+                                    ),
+                                    child: const Text('Order Summary after Down Payment'),
+                                  ),
+                                if (showAdditionalCosts)
+                                  OutlinedButton(
+                                    onPressed: () => _previewManagerOrderSummary(
+                                      _ManagerOrderSummaryPdfVariant.beforeDownPayment,
+                                      postAnalysis2Only: true,
+                                    ),
+                                    child: const Text('Order Summary | Additional Costs'),
+                                  ),
+                                if (showFullyPaid)
+                                  OutlinedButton(
+                                    onPressed: () => _previewManagerOrderSummary(
+                                      _ManagerOrderSummaryPdfVariant.fullyPaid,
+                                    ),
+                                    child: const Text('Order Summary Fully Paid'),
+                                  ),
+                              ],
                             ),
-                            child: const Text('Order Summary | Additional Costs'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.fullyPaid),
-                            child: const Text('Order Summary Fully Paid'),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Previews use current costing on this screen. The Additional Costs sheet matches the supplemental PDF when extra line items differ from the snapshot taken at For Full Payment.',
-                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.black.withValues(alpha: 0.72)),
-                      ),
-                    ] else if (isCompleted) ...[
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.beforeDownPayment),
-                            child: const Text('Order Summary before Down Payment'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.afterDownPayment),
-                            child: const Text('Order Summary after Down Payment'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(
-                              _ManagerOrderSummaryPdfVariant.beforeDownPayment,
-                              postAnalysis2Only: true,
-                            ),
-                            child: const Text('Order Summary | Additional Costs'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.fullyPaid),
-                            child: const Text('Order Summary Fully Paid'),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'These summaries reflect saved amounts and costs for this completed order.',
-                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.black.withValues(alpha: 0.72)),
-                      ),
-                    ] else if (isOngoingSubstage) ...[
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.beforeDownPayment),
-                            child: const Text('Order Summary before Down Payment'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.afterDownPayment),
-                            child: const Text('Order Summary after Down Payment'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(
-                              _ManagerOrderSummaryPdfVariant.beforeDownPayment,
-                              postAnalysis2Only: true,
-                            ),
-                            child: const Text('Order Summary | Additional Costs'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () => _previewManagerOrderSummary(_ManagerOrderSummaryPdfVariant.fullyPaid),
-                            child: const Text('Order Summary Fully Paid'),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      OutlinedButton.icon(
-                        onPressed: () async {
-                          await _sendOrderSummaryPdfToCustomer();
-                        },
-                        icon: const Icon(Icons.send_outlined),
-                        label: const Text('Send order summary PDF to customer'),
-                      ),
-                    ] else ...[
-                      OutlinedButton(
-                        onPressed: _generateInvoicePdf,
-                        child: const Text('Generate order summary PDF'),
-                      ),
-                      if (isProcessing) ...[
-                        const SizedBox(height: 8),
-                        OutlinedButton.icon(
-                          onPressed: () async {
-                            await _sendOrderSummaryPdfToCustomer();
-                          },
-                          icon: const Icon(Icons.send_outlined),
-                          label: const Text('Send order summary PDF to customer'),
-                        ),
-                      ],
-                    ],
+                            if (isOngoingSubstage) ...[
+                              const SizedBox(height: 8),
+                              OutlinedButton.icon(
+                                onPressed: () async {
+                                  await _sendOrderSummaryPdfToCustomer();
+                                },
+                                icon: const Icon(Icons.send_outlined),
+                                label: const Text('Send order summary PDF to customer'),
+                              ),
+                            ],
+                            if (isPost || isCompleted) ...[
+                              const SizedBox(height: 8),
+                              Text(
+                                isCompleted
+                                    ? 'These summaries reflect saved amounts and costs for this completed order.'
+                                    : 'Previews use current costing on this screen. The Additional Costs sheet lists each stage where extra costs were entered.',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  height: 1.35,
+                                  color: Colors.black.withValues(alpha: 0.72),
+                                ),
+                              ),
+                            ],
+                          ],
+                        );
+                      },
+                    ),
                   ],
                 ),
               ),
@@ -16989,7 +17211,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       runSpacing: 8,
                       children: [
                         if (isOngoingSubstage)
-                          OutlinedButton(onPressed: _openChecklistEditor, child: const Text('Open Checklist Editor')),
+                          OutlinedButton(onPressed: _openChecklistEditor, child: const Text('Checklist Editor')),
                         OutlinedButton(onPressed: _generateChecklistPdf, child: const Text('Generate Checklist PDF')),
                       ],
                     ),
@@ -17018,7 +17240,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       runSpacing: 8,
                       children: [
                         if (isOngoingSubstage)
-                          OutlinedButton(onPressed: _openTaskEditor, child: const Text('Open Task Assignment Editor')),
+                          OutlinedButton(onPressed: _openTaskEditor, child: const Text('Task Assignment Editor')),
                         OutlinedButton(onPressed: _generateTaskPdf, child: const Text('Generate Task Assignment PDF')),
                       ],
                     ),
@@ -17877,7 +18099,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               ? 'Move to For Down Payment'
                               : (isPost
                                   ? 'Complete Order'
-                                  : (isDownPaymentSubstage ? 'Continue to On Going' : 'Submit to Next Stage')),
+                                  : (isDownPaymentSubstage
+                                      ? 'Continue to On Going'
+                                      : (isOngoingSubstage ? 'Continue to For Full Payment' : 'Submit to Next Stage'))),
                         ),
                       ),
                     ],
@@ -18774,7 +18998,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(o.orderNo),
+        title: Text(uiOrderNo(o.orderNo)),
         content: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -19011,6 +19235,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
           .where(
             (o) =>
                 o.orderNo.toLowerCase().contains(q) ||
+                uiOrderNo(o.orderNo).toLowerCase().contains(q) ||
                 o.posCustomerLabel.toLowerCase().contains(q) ||
                 statusReadable(o.status).toLowerCase().contains(q),
           )
@@ -19066,7 +19291,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(o.orderNo, style: const TextStyle(fontWeight: FontWeight.w700)),
+                        Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w700)),
                         const SizedBox(height: 4),
                         Text(
                           [
@@ -19104,7 +19329,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                                   context: context,
                                   builder: (ctx) => AlertDialog(
                                     title: const Text('Cancel this walk-in order?'),
-                                    content: Text('${o.orderNo} will move to Cancelled.'),
+                                    content: Text('${uiOrderNo(o.orderNo)} will move to Cancelled.'),
                                     actions: [
                                       TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
                                       FilledButton(
@@ -19131,7 +19356,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                                   builder: (ctx) => AlertDialog(
                                     title: const Text('Mark order claimed?'),
                                     content: Text(
-                                      'Confirm when ${o.orderNo} has been picked up by the customer. It will move to Complete here and appear in Order history.',
+                                      'Confirm when ${uiOrderNo(o.orderNo)} has been picked up by the customer. It will move to Complete here and appear in Order history.',
                                     ),
                                     actions: [
                                       TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
@@ -19249,10 +19474,10 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
       final st = _pendingAlertStage[o.id] ?? 0;
       if (mins >= 10 && st < 2) {
         _pendingAlertStage[o.id] = 2;
-        showStaffPosNotification('Online orders', '${o.orderNo} is still awaiting cashier action.');
+        showStaffPosNotification('Online orders', '${uiOrderNo(o.orderNo)} is still awaiting cashier action.');
       } else if (mins >= 5 && st < 1) {
         _pendingAlertStage[o.id] = 1;
-        showStaffPosNotification('Online orders', '${o.orderNo} — please review when ready.');
+        showStaffPosNotification('Online orders', '${uiOrderNo(o.orderNo)} — please review when ready.');
       }
     }
   }
@@ -19298,6 +19523,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
       final q = _search.trim().toLowerCase();
       if (q.isEmpty) return true;
       return o.orderNo.toLowerCase().contains(q) ||
+          uiOrderNo(o.orderNo).toLowerCase().contains(q) ||
           (o.userEmail ?? '').toLowerCase().contains(q) ||
           cashierCustomerLabel(o).toLowerCase().contains(q) ||
           statusReadable(o.status).toLowerCase().contains(q) ||
@@ -19500,7 +19726,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                         ),
                                       ),
                                       const SizedBox(height: 6),
-                                      Text(o.orderNo, style: const TextStyle(fontWeight: FontWeight.w700)),
+                                      Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w700)),
                                     ],
                                   ),
                                   subtitle: Column(
@@ -19635,7 +19861,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(color: AppColors.brand, borderRadius: BorderRadius.circular(10)),
           child: Text(
-            'Cancelled + ${o.orderNo}',
+            'Cancelled + ${uiOrderNo(o.orderNo)}',
             textAlign: TextAlign.center,
             style: const TextStyle(color: AppColors.ink, fontWeight: FontWeight.w800, fontSize: 12),
           ),
@@ -19645,7 +19871,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
-          _OrderNoCard(displayNo: o.orderNo),
+          _OrderNoCard(displayNo: uiOrderNo(o.orderNo)),
           const SizedBox(height: 10),
           ToggleSection(
             title: 'ORDER SUMMARY',
@@ -19767,7 +19993,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
 
   String _onlineDetailHeaderLabel(OrderData o) {
     final st = o.status.toUpperCase();
-    if (st.contains('CANCEL')) return 'Cancelled + ${o.orderNo}';
+    if (st.contains('CANCEL')) return 'Cancelled + ${uiOrderNo(o.orderNo)}';
     switch (o.fulfillmentStage.toUpperCase()) {
       case 'PENDING_CASHIER':
         return 'Pending';
@@ -19776,10 +20002,78 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
       case 'OUT_FOR_DELIVERY':
         return 'For Delivery';
       case 'DELIVERED':
-        return 'Delivered + ${o.orderNo}';
+        return 'Delivered + ${uiOrderNo(o.orderNo)}';
       default:
         return 'Order';
     }
+  }
+
+  Future<void> _submitInsufficientPayment(
+    OrderData o, {
+    required bool forBalance,
+    required double? initialAmount,
+    required double? balanceAmount,
+  }) async {
+    if (forBalance && balanceAmount == null) {
+      appSnack(context, 'Enter the additional amount received for the balance.');
+      return;
+    }
+    if (!forBalance && initialAmount == null) {
+      appSnack(context, 'Enter a valid amount.');
+      return;
+    }
+    if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
+    final err = await withCashierBlockingProgress<String?>(
+      context,
+      'Updating payment…',
+      widget.state.cashierReviewOrder(
+        orderId: o.id,
+        action: 'insufficient',
+        amountReceived: forBalance ? null : initialAmount,
+        supplementalAmountReceived: forBalance ? balanceAmount : null,
+      ),
+    );
+    if (!context.mounted) return;
+    if (err != null) {
+      appSnack(context, err);
+      return;
+    }
+    appSnack(context, 'Customer notified (insufficient payment)');
+    Navigator.pop(context);
+  }
+
+  Future<void> _submitOverpayment(
+    OrderData o, {
+    required bool forBalance,
+    required double? initialAmount,
+    required double? balanceAmount,
+  }) async {
+    if (forBalance && balanceAmount == null) {
+      appSnack(context, 'Enter the additional amount received for the balance.');
+      return;
+    }
+    if (!forBalance && initialAmount == null) {
+      appSnack(context, 'Enter a valid amount.');
+      return;
+    }
+    if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
+    final err = await withCashierBlockingProgress<String?>(
+      context,
+      'Updating payment…',
+      widget.state.cashierReviewOrder(
+        orderId: o.id,
+        action: 'overpayment',
+        amountReceived: forBalance ? null : initialAmount,
+        supplementalAmountReceived: forBalance ? balanceAmount : null,
+      ),
+    );
+    if (!context.mounted) return;
+    if (err != null) {
+      appSnack(context, err);
+      return;
+    }
+    appSnack(context, 'Customer notified (overpayment)');
+    Navigator.pop(context);
   }
 
   Future<bool> _confirmDialog(String title, String body) async {
@@ -19819,13 +20113,23 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         final statusUp = o.status.toUpperCase();
         final insufficientStatus = statusUp.contains('INSUFFICIENT');
         final hasSupProof = o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false;
-        final pendingBalReview = o.balanceProofPendingReview && hasSupProof;
+        final awaitingBalanceConfirm =
+            statusUp.contains('WAITING FOR BALANCE') || statusUp.contains('BALANCE PAYMENT CONFIRMATION');
+        final pendingBalReview = hasSupProof && (o.balanceProofPendingReview || awaitingBalanceConfirm);
         final waitingCustomerBalance = insufficientStatus && !hasSupProof && stage == 'PENDING_CASHIER';
+        final firstPaid = o.cashierAmountReceived ?? 0;
+        final balanceDue = o.total > firstPaid ? o.total - firstPaid : 0.0;
         final entered = parsed;
         final amountClassified = entered != null;
         final exactAmount = amountClassified && (entered - o.total).abs() <= 0.009;
         final insufficientAmount = amountClassified && entered + 0.009 < o.total;
         final overAmount = amountClassified && entered - o.total > 0.009;
+        final balanceClassified = parsedSupp != null;
+        final exactBalance = pendingBalReview && balanceClassified && (parsedSupp - balanceDue).abs() <= 0.009;
+        final insufficientBalance = pendingBalReview && balanceClassified && parsedSupp + 0.009 < balanceDue;
+        final overBalance = pendingBalReview && balanceClassified && parsedSupp - balanceDue > 0.009;
+        final showInsufficientBtn = pendingBalReview ? insufficientBalance : insufficientAmount;
+        final showOverBtn = pendingBalReview ? overBalance : overAmount;
 
         final paymentAtTop = stage == 'PENDING_CASHIER';
         final forDeliveryAtTop = stage == 'IN_PREPARATION';
@@ -19913,6 +20217,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             keyboardType: TextInputType.number,
                             decoration: const InputDecoration(
                               labelText: 'ADDITIONAL AMOUNT RECEIVED (balance)',
+                              helperText: 'Adjust if needed, then mark insufficient or overpayment.',
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
@@ -19932,7 +20237,10 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onChanged: (_) => setState(() {}),
                           ),
                         ],
-                        LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
+                        LockedField(
+                          label: pendingBalReview ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',
+                          value: pendingBalReview ? balanceDue.toStringAsFixed(2) : o.total.toStringAsFixed(2),
+                        ),
                         if (waitingCustomerBalance)
                           Padding(
                             padding: const EdgeInsets.only(top: 10),
@@ -19974,53 +20282,31 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             child: const Text('VIEW BALANCE PAYMENT PROOF'),
                           ),
                         ],
-                        if (!paymentLocked && !pendingBalReview && !waitingCustomerBalance) ...[
+                        if (!paymentLocked && !waitingCustomerBalance) ...[
                           const SizedBox(height: 8),
                           FilledButton(
                             style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
-                            onPressed: insufficientAmount ? () async {
-                              if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
-                              final err = await withCashierBlockingProgress<String?>(
-                                context,
-                                'Updating payment…',
-                                widget.state.cashierReviewOrder(
-                                  orderId: o.id,
-                                  action: 'insufficient',
-                                  amountReceived: ar,
-                                ),
-                              );
-                              if (!context.mounted) return;
-                              if (err != null) {
-                                appSnack(context, err);
-                                return;
-                              }
-                              appSnack(context, 'Customer notified (insufficient payment)');
-                              Navigator.pop(context);
-                            } : null,
+                            onPressed: showInsufficientBtn
+                                ? () => _submitInsufficientPayment(
+                                      o,
+                                      forBalance: pendingBalReview,
+                                      initialAmount: ar,
+                                      balanceAmount: parsedSupp,
+                                    )
+                                : null,
                             child: const Text('INSUFFICIENT PAYMENT'),
                           ),
                           const SizedBox(height: 8),
                           FilledButton(
                             style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                            onPressed: overAmount ? () async {
-                              if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
-                              final err = await withCashierBlockingProgress<String?>(
-                                context,
-                                'Updating payment…',
-                                widget.state.cashierReviewOrder(
-                                  orderId: o.id,
-                                  action: 'overpayment',
-                                  amountReceived: ar,
-                                ),
-                              );
-                              if (!context.mounted) return;
-                              if (err != null) {
-                                appSnack(context, err);
-                                return;
-                              }
-                              appSnack(context, 'Customer notified (overpayment)');
-                              Navigator.pop(context);
-                            } : null,
+                            onPressed: showOverBtn
+                                ? () => _submitOverpayment(
+                                      o,
+                                      forBalance: pendingBalReview,
+                                      initialAmount: ar,
+                                      balanceAmount: parsedSupp,
+                                    )
+                                : null,
                             child: const Text('OVERPAYMENT'),
                           ),
                         ],
@@ -20156,7 +20442,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   ),
                   const SizedBox(height: 10),
                 ],
-                _OrderNoCard(displayNo: o.orderNo),
+                _OrderNoCard(displayNo: uiOrderNo(o.orderNo)),
                 const SizedBox(height: 10),
                 ToggleSection(
                   title: 'ORDER SUMMARY',
@@ -20238,6 +20524,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             keyboardType: TextInputType.number,
                             decoration: const InputDecoration(
                               labelText: 'ADDITIONAL AMOUNT RECEIVED (balance)',
+                              helperText: 'Adjust if needed, then mark insufficient or overpayment.',
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
@@ -20257,7 +20544,10 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onChanged: (_) => setState(() {}),
                           ),
                         ],
-                        LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
+                        LockedField(
+                          label: pendingBalReview ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',
+                          value: pendingBalReview ? balanceDue.toStringAsFixed(2) : o.total.toStringAsFixed(2),
+                        ),
                         if (waitingCustomerBalance)
                           Padding(
                             padding: const EdgeInsets.only(top: 10),
@@ -20299,53 +20589,31 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             child: const Text('VIEW BALANCE PAYMENT PROOF'),
                           ),
                         ],
-                        if (!paymentLocked && !pendingBalReview && !waitingCustomerBalance) ...[
+                        if (!paymentLocked && !waitingCustomerBalance) ...[
                           const SizedBox(height: 8),
                           FilledButton(
                             style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
-                            onPressed: insufficientAmount ? () async {
-                              if (!await _confirmDialog('Insufficient payment?', 'Notify the customer that payment is short?')) return;
-                              final err = await withCashierBlockingProgress<String?>(
-                                context,
-                                'Updating payment…',
-                                widget.state.cashierReviewOrder(
-                                  orderId: o.id,
-                                  action: 'insufficient',
-                                  amountReceived: ar,
-                                ),
-                              );
-                              if (!context.mounted) return;
-                              if (err != null) {
-                                appSnack(context, err);
-                                return;
-                              }
-                              appSnack(context, 'Customer notified (insufficient payment)');
-                              Navigator.pop(context);
-                            } : null,
+                            onPressed: showInsufficientBtn
+                                ? () => _submitInsufficientPayment(
+                                      o,
+                                      forBalance: pendingBalReview,
+                                      initialAmount: ar,
+                                      balanceAmount: parsedSupp,
+                                    )
+                                : null,
                             child: const Text('INSUFFICIENT PAYMENT'),
                           ),
                           const SizedBox(height: 8),
                           FilledButton(
                             style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                            onPressed: overAmount ? () async {
-                              if (!await _confirmDialog('Overpayment?', 'Confirm order with overpayment notice?')) return;
-                              final err = await withCashierBlockingProgress<String?>(
-                                context,
-                                'Updating payment…',
-                                widget.state.cashierReviewOrder(
-                                  orderId: o.id,
-                                  action: 'overpayment',
-                                  amountReceived: ar,
-                                ),
-                              );
-                              if (!context.mounted) return;
-                              if (err != null) {
-                                appSnack(context, err);
-                                return;
-                              }
-                              appSnack(context, 'Customer notified (overpayment)');
-                              Navigator.pop(context);
-                            } : null,
+                            onPressed: showOverBtn
+                                ? () => _submitOverpayment(
+                                      o,
+                                      forBalance: pendingBalReview,
+                                      initialAmount: ar,
+                                      balanceAmount: parsedSupp,
+                                    )
+                                : null,
                             child: const Text('OVERPAYMENT'),
                           ),
                         ],
@@ -20421,44 +20689,46 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
               SummaryFooter(
                 lines: [
                   SummaryLine('First payment recorded', '₱${(o.cashierAmountReceived ?? 0).toStringAsFixed(2)}'),
+                  SummaryLine('Remaining balance due', '₱${balanceDue.toStringAsFixed(2)}'),
                   SummaryLine('Order total', '₱${o.total.toStringAsFixed(2)}', isTotal: true),
                 ],
                 actionLabel: 'CONFIRM ORDER',
-                onAction: () async {
-                  if (supplementalAmount.text.trim().isEmpty || parsedSupp == null) {
-                    appSnack(context, 'Enter the additional amount received for the balance.');
-                    return;
-                  }
-                  final suppAmt = parsedSupp;
-                  if (suppAmt < 0) return;
-                  final first = o.cashierAmountReceived ?? 0;
-                  if (first + suppAmt < o.total - 1e-9) {
-                    appSnack(context, 'First payment plus additional amount must cover the order total.');
-                    return;
-                  }
-                  if (!await _confirmDialog(
-                    'Confirm order?',
-                    'Confirm ${o.orderNo} with an additional ₱${suppAmt.toStringAsFixed(2)} recorded toward payment?',
-                  )) {
-                    return;
-                  }
-                  final err = await withCashierBlockingProgress<String?>(
-                    context,
-                    'Confirming order…',
-                    widget.state.cashierReviewOrder(
-                      orderId: o.id,
-                      action: 'confirm',
-                      supplementalAmountReceived: suppAmt,
-                    ),
-                  );
-                  if (!context.mounted) return;
-                  if (err != null) {
-                    appSnack(context, err);
-                    return;
-                  }
-                  appSnack(context, 'Order confirmed — customer notified');
-                  Navigator.pop(context);
-                },
+                onAction: exactBalance
+                    ? () async {
+                        if (supplementalAmount.text.trim().isEmpty || parsedSupp == null) {
+                          appSnack(context, 'Enter the additional amount received for the balance.');
+                          return;
+                        }
+                        final suppAmt = parsedSupp;
+                        if (suppAmt < 0) return;
+                        if ((suppAmt - balanceDue).abs() > 0.009) {
+                          appSnack(context, 'Additional amount must exactly match the remaining balance due.');
+                          return;
+                        }
+                        if (!await _confirmDialog(
+                          'Confirm order?',
+                          'Confirm ${uiOrderNo(o.orderNo)} with an additional ₱${suppAmt.toStringAsFixed(2)} recorded toward payment?',
+                        )) {
+                          return;
+                        }
+                        final err = await withCashierBlockingProgress<String?>(
+                          context,
+                          'Confirming order…',
+                          widget.state.cashierReviewOrder(
+                            orderId: o.id,
+                            action: 'confirm',
+                            supplementalAmountReceived: suppAmt,
+                          ),
+                        );
+                        if (!context.mounted) return;
+                        if (err != null) {
+                          appSnack(context, err);
+                          return;
+                        }
+                        appSnack(context, 'Order confirmed — customer notified');
+                        Navigator.pop(context);
+                      }
+                    : null,
               )
             else
               SummaryFooter(
@@ -20486,7 +20756,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                         }
                         if (!await _confirmDialog(
                           'Confirm order?',
-                          'Confirm ${o.orderNo} for ₱${o.total.toStringAsFixed(2)} and notify the customer?',
+                          'Confirm ${uiOrderNo(o.orderNo)} for ₱${o.total.toStringAsFixed(2)} and notify the customer?',
                         )) {
                           return;
                         }
