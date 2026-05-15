@@ -14407,10 +14407,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         return null;
       }
     }
+    final proofBytes = bytes!;
     return IconButton(
       tooltip: 'View $title',
       icon: const Icon(Icons.image_outlined),
-      onPressed: () => showProofFullScreen(context, bytes, title: title),
+      onPressed: () => showProofFullScreen(context, proofBytes, title: title),
     );
   }
 
@@ -15699,6 +15700,248 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         ('${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim().isNotEmpty);
     final laborCostComputed = _laborCostComputed();
     final rowMenu = normalizeCateringMenuList(row.menu);
+    String? _validateDraftScheduleCoherence() {
+      if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
+      for (final w in _eventWindows) {
+        final any = w.date != null || w.from != null || w.to != null;
+        final all = w.date != null && w.from != null && w.to != null;
+        if (any && !all) {
+          return 'Complete date, start time, and end time for each schedule row (or remove the row).';
+        }
+      }
+      final filled = _eventWindows.where((x) => x.date != null && x.from != null && x.to != null).toList();
+      for (final w in filled) {
+        final sm = w.from!.hour * 60 + w.from!.minute;
+        final em = w.to!.hour * 60 + w.to!.minute;
+        if (em <= sm) return 'End time must be after start time for each event window.';
+      }
+      return null;
+    }
+
+    String? _validateDraftReadyForNextStage() {
+      final sch = _validateDraftScheduleCoherence();
+      if (sch != null) return sch;
+      if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
+      final kind = d.orderKind;
+      final et =
+          managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
+      if (et.trim().isEmpty) return 'Choose or describe the event type.';
+      if (managerEventTypeChoice == 'Other' && managerEventTypeOtherController.text.trim().isEmpty) {
+        return 'Describe the event type for Other.';
+      }
+      if (managerCustomerNameController.text.trim().isEmpty) {
+        return 'Enter the customer name.';
+      }
+      if (kind == 'event' && managerDraftEventTitleController.text.trim().isEmpty) {
+        return 'Enter an event title for Catering + Event.';
+      }
+      if (!isAllowedCateringAddressInCoverage(managerAddressController.text.trim())) {
+        return cateringCoverageErrorText();
+      }
+      final gc = int.tryParse(managerGuestCountController.text.trim());
+      if (gc == null || gc < 1) return 'Enter a valid number of guests.';
+      final minPax = kind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
+      if (gc < minPax) return 'Minimum guests for this inquiry type is $minPax.';
+      final complete = _eventWindows.where((x) => x.date != null && x.from != null && x.to != null).toList();
+      if (complete.isEmpty) return 'Add at least one event date with start and end time.';
+      if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
+      return null;
+    }
+
+    Future<bool> saveCurrentStage({bool showConfirmDialog = true, bool popAfterSuccess = true}) async {
+      final isProcessingHere = widget.stage == 'for_processing';
+      final laborCostComputedNow = isProcessingHere ? 0.0 : _laborCostComputed();
+      final travelNow = isProcessingHere ? 0.0 : _travelCostComputed();
+      final flatAdditionalSave = _flattenAdditionalCostsFromGroups();
+      final totalNow = isProcessingHere
+          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(flatAdditionalSave))
+          : _grandTotalComputed();
+      final et =
+          managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
+
+      final isDraftStageHere = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+      if (isDraftStageHere) {
+        final verr = _validateDraftScheduleCoherence();
+        if (verr != null) {
+          appSnack(context, verr);
+          return false;
+        }
+      }
+      if (showConfirmDialog) {
+        final okSave = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: Text(isDraftStageHere ? 'Save draft' : 'Save changes'),
+            content: Text(isDraftStageHere ? 'Save this draft to the server?' : 'Save your changes to this order?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+            ],
+          ),
+        );
+        if (okSave != true) return false;
+      }
+      _showManagerBlockingProgress('Saving…');
+      try {
+        if (isDraftStageHere && _draftOrderKind != d.orderKind) {
+          final errSwitch = await widget.state.managerSwitchCateringOrderKind(
+            id: d.id,
+            fromKind: d.orderKind,
+            toKind: _draftOrderKind,
+          );
+          if (!mounted) return false;
+          if (errSwitch != null) {
+            appSnack(context, errSwitch);
+            return false;
+          }
+          final migrated = await widget.state.loadManagerCateringItem(
+            id: d.id,
+            orderKind: _draftOrderKind,
+          );
+          if (!mounted) return false;
+          if (migrated != null) {
+            setState(() => _loadedDetailRow = migrated);
+          }
+        }
+
+        _snapshotAdditionalCostsForCurrentStage(refreshTimestamp: true);
+        final rowBase = d;
+        final postAnalysis = <String, dynamic>{
+          'notes': analysisController.text.trim(),
+          'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
+          'task_assignment': taskAssignmentController.text.trim(),
+          'task_assignment_rows': taskRows,
+          'business_cards_given': businessCardsController.text.trim(),
+          'on_the_spot_inquiries': spotInquiriesController.text.trim(),
+          'complaints': complaintsController.text.trim(),
+          'most_popular_dish': popularDishController.text.trim(),
+          'most_popular_drink': popularDrinkController.text.trim(),
+          'most_popular_dessert': popularDessertController.text.trim(),
+          'labor_male_count': int.tryParse(laborMaleController.text.trim()) ?? 0,
+          'labor_female_count': int.tryParse(laborFemaleController.text.trim()) ?? 0,
+          'labor_manual_costs': laborManualCosts,
+          if (rowBase.postAnalysis['manager_down_payment_confirmed'] == true) 'manager_down_payment_confirmed': true,
+          if (rowBase.postAnalysis['manager_full_payment_confirmed'] == true) 'manager_full_payment_confirmed': true,
+          if (rowBase.postAnalysis['additional_costs_payment_confirmed'] == true)
+            'additional_costs_payment_confirmed': true,
+          if (isOnlineInquiry || widget.stage == 'new_event') 'event_type': et,
+          if (isProcessingHere) 'manager_down_payment_method': _managerDownPaymentMethod,
+          if (widget.stage == 'for_post_analysis') 'manager_full_payment_method': _managerFullPaymentMethod,
+        };
+        if (_managerDownPaymentProofBytes != null) {
+          postAnalysis['manager_down_payment_proof_b64'] = base64Encode(_managerDownPaymentProofBytes!);
+        }
+        if (_managerFullPaymentProofBytes != null) {
+          postAnalysis['manager_full_payment_proof_b64'] = base64Encode(_managerFullPaymentProofBytes!);
+        }
+        final themeDesign = <String, dynamic>{
+          ...rowBase.themeDesign,
+          'cost_items': themeDesignCosts,
+          'service_included': managerServiceIncluded,
+          'note': managerInquiryNoteController.text.trim(),
+          'event_title': managerDraftEventTitleController.text.trim(),
+          'event_type': et,
+          'event_setting': managerEventSetting,
+          'formality_level': rowBase.orderKind == 'event' ? managerFormalityLevel : '',
+        };
+
+        if (isDraftStageHere) {
+          final gc = int.tryParse(managerGuestCountController.text.trim());
+          final formalityOut = _draftOrderKind == 'event' ? managerFormalityLevel : '';
+          final err = await widget.state.managerSaveCateringDraft(
+            id: rowBase.id,
+            orderKind: rowBase.orderKind,
+            draft: {
+              'post_analysis': postAnalysis,
+              'checklist': checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
+              'theme_design': {...themeDesign, 'formality_level': formalityOut},
+              'schedule_slots': _scheduleSlotsPayload(),
+              'event_title': managerDraftEventTitleController.text.trim(),
+              'event_type': et,
+              'formality_level': formalityOut,
+              'customer_name': managerCustomerNameController.text.trim(),
+              'contact_person': managerContactPersonController.text.trim(),
+              'contact_number': managerContactNumberController.text.trim(),
+              'email_address': managerEmailController.text.trim(),
+              'address': managerAddressController.text.trim(),
+              'menu': selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
+              'additional_costs': flatAdditionalSave,
+              'labor_cost': laborCostComputedNow,
+              'travel_cost': travelNow,
+              'total_cost': totalNow,
+              'cost_breakdown': [
+                {'label': 'Base food cost', 'amount': _baseFoodCost()},
+                {'label': 'Labor cost', 'amount': laborCostComputedNow},
+                {'label': 'Travel cost', 'amount': travelNow},
+                {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+                {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
+              ],
+              if (gc != null && gc >= 0) 'guest_count': gc,
+            },
+          );
+          if (!mounted) return false;
+          if (err != null) {
+            appSnack(context, err);
+            return false;
+          }
+          appSnack(context, 'Draft saved');
+          try {
+            final p = await SharedPreferences.getInstance();
+            await p.remove(_localDraftKey);
+          } catch (_) {}
+          await widget.state.loadManagerCateringByStage(widget.stage, force: true);
+          _pristineManagerDetailSig = _computeManagerDetailSignature();
+          _managerDraftAdvanceGateSig = _pristineManagerDetailSig;
+          if (mounted) setState(() {});
+          if (popAfterSuccess && mounted) {
+            if (widget.stage != 'online_inquiries' && widget.stage != 'new_event') {
+              Navigator.of(context).pop();
+            }
+          }
+          return true;
+        }
+
+        final err = await widget.state.managerAdvanceCateringStage(
+          id: rowBase.id,
+          orderKind: rowBase.orderKind,
+          status: widget.stage,
+          downPaymentAmount: isProcessing ? (double.tryParse(downPaymentPaidController.text.trim()) ?? downPaymentDue) : null,
+          fullPaymentAmount: null,
+          postAnalysis: (isProcessing || isPost || isOnlineInquiry) ? postAnalysis : null,
+          checklist: checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
+          additionalCosts: flatAdditionalSave,
+          laborCost: laborCostComputedNow,
+          travelCost: travelNow,
+          totalCost: totalNow,
+          costBreakdown: [
+            {'label': 'Base food cost', 'amount': _baseFoodCost()},
+            {'label': 'Labor cost', 'amount': laborCostComputedNow},
+            {'label': 'Travel cost', 'amount': travelNow},
+            {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+            {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
+          ],
+          themeDesign: themeDesign,
+          menu: selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
+        );
+        if (!mounted) return false;
+        if (err != null) {
+          appSnack(context, err);
+          return false;
+        }
+        appSnack(context, 'Changes saved');
+        await widget.state.loadManagerCateringByStage(widget.stage, force: true);
+        _pristineManagerDetailSig = _computeManagerDetailSignature();
+        if (popAfterSuccess && mounted) {
+          if (widget.stage != 'online_inquiries' && widget.stage != 'new_event') {
+            Navigator.of(context).pop();
+          }
+        }
+        return true;
+      } finally {
+        if (mounted) _hideManagerBlockingProgress();
+      }
+    }
+
     Future<void> _generateChecklistPdf() async {
       final baseFont = await PdfGoogleFonts.notoSansRegular();
       final boldFont = await PdfGoogleFonts.notoSansBold();
@@ -16052,53 +16295,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
       }
     }
-    String? _validateDraftScheduleCoherence() {
-      if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
-      for (final w in _eventWindows) {
-        final any = w.date != null || w.from != null || w.to != null;
-        final all = w.date != null && w.from != null && w.to != null;
-        if (any && !all) {
-          return 'Complete date, start time, and end time for each schedule row (or remove the row).';
-        }
-      }
-      final filled = _eventWindows.where((x) => x.date != null && x.from != null && x.to != null).toList();
-      for (final w in filled) {
-        final sm = w.from!.hour * 60 + w.from!.minute;
-        final em = w.to!.hour * 60 + w.to!.minute;
-        if (em <= sm) return 'End time must be after start time for each event window.';
-      }
-      return null;
-    }
-
-    String? _validateDraftReadyForNextStage() {
-      final sch = _validateDraftScheduleCoherence();
-      if (sch != null) return sch;
-      if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
-      final kind = d.orderKind;
-      final et =
-          managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
-      if (et.trim().isEmpty) return 'Choose or describe the event type.';
-      if (managerEventTypeChoice == 'Other' && managerEventTypeOtherController.text.trim().isEmpty) {
-        return 'Describe the event type for Other.';
-      }
-      if (managerCustomerNameController.text.trim().isEmpty) {
-        return 'Enter the customer name.';
-      }
-      if (kind == 'event' && managerDraftEventTitleController.text.trim().isEmpty) {
-        return 'Enter an event title for Catering + Event.';
-      }
-      if (!isAllowedCateringAddressInCoverage(managerAddressController.text.trim())) {
-        return cateringCoverageErrorText();
-      }
-      final gc = int.tryParse(managerGuestCountController.text.trim());
-      if (gc == null || gc < 1) return 'Enter a valid number of guests.';
-      final minPax = kind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
-      if (gc < minPax) return 'Minimum guests for this inquiry type is $minPax.';
-      final complete = _eventWindows.where((x) => x.date != null && x.from != null && x.to != null).toList();
-      if (complete.isEmpty) return 'Add at least one event date with start and end time.';
-      if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
-      return null;
-    }
 
     Future<void> submitNext() async {
       final processingSubstageEarly = d.processingSubstageLabel;
@@ -16335,202 +16531,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         );
         await widget.state.loadManagerCateringByStage(widget.stage, force: true);
         if (mounted) Navigator.of(context).pop();
-      } finally {
-        if (mounted) _hideManagerBlockingProgress();
-      }
-    }
-    Future<bool> saveCurrentStage({bool showConfirmDialog = true, bool popAfterSuccess = true}) async {
-      final isProcessingHere = widget.stage == 'for_processing';
-      final laborCostComputedNow = isProcessingHere ? 0.0 : _laborCostComputed();
-      final travelNow = isProcessingHere ? 0.0 : _travelCostComputed();
-      final flatAdditionalSave = _flattenAdditionalCostsFromGroups();
-      final totalNow = isProcessingHere
-          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(flatAdditionalSave))
-          : _grandTotalComputed();
-      final et =
-          managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
-
-      final isDraftStageHere = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
-      if (isDraftStageHere) {
-        final verr = _validateDraftScheduleCoherence();
-        if (verr != null) {
-          appSnack(context, verr);
-          return false;
-        }
-      }
-      if (showConfirmDialog) {
-        final okSave = await showDialog<bool>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            title: Text(isDraftStageHere ? 'Save draft' : 'Save changes'),
-            content: Text(isDraftStageHere ? 'Save this draft to the server?' : 'Save your changes to this order?'),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
-            ],
-          ),
-        );
-        if (okSave != true) return false;
-      }
-      _showManagerBlockingProgress('Saving…');
-      try {
-        if (isDraftStageHere && _draftOrderKind != d.orderKind) {
-          final errSwitch = await widget.state.managerSwitchCateringOrderKind(
-            id: d.id,
-            fromKind: d.orderKind,
-            toKind: _draftOrderKind,
-          );
-          if (!mounted) return false;
-          if (errSwitch != null) {
-            appSnack(context, errSwitch);
-            return false;
-          }
-          final migrated = await widget.state.loadManagerCateringItem(
-            id: d.id,
-            orderKind: _draftOrderKind,
-          );
-          if (!mounted) return false;
-          if (migrated != null) {
-            setState(() => _loadedDetailRow = migrated);
-          }
-        }
-
-        _snapshotAdditionalCostsForCurrentStage(refreshTimestamp: true);
-        final rowBase = d;
-        final flatAdditional = _flattenAdditionalCostsFromGroups();
-        final postAnalysis = <String, dynamic>{
-          'notes': analysisController.text.trim(),
-          'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
-          'task_assignment': taskAssignmentController.text.trim(),
-          'task_assignment_rows': taskRows,
-          'business_cards_given': businessCardsController.text.trim(),
-          'on_the_spot_inquiries': spotInquiriesController.text.trim(),
-          'complaints': complaintsController.text.trim(),
-          'most_popular_dish': popularDishController.text.trim(),
-          'most_popular_drink': popularDrinkController.text.trim(),
-          'most_popular_dessert': popularDessertController.text.trim(),
-          'labor_male_count': int.tryParse(laborMaleController.text.trim()) ?? 0,
-          'labor_female_count': int.tryParse(laborFemaleController.text.trim()) ?? 0,
-          'labor_manual_costs': laborManualCosts,
-          if (rowBase.postAnalysis['manager_down_payment_confirmed'] == true) 'manager_down_payment_confirmed': true,
-          if (rowBase.postAnalysis['manager_full_payment_confirmed'] == true) 'manager_full_payment_confirmed': true,
-          if (rowBase.postAnalysis['additional_costs_payment_confirmed'] == true)
-            'additional_costs_payment_confirmed': true,
-          if (isOnlineInquiry || widget.stage == 'new_event') 'event_type': et,
-          if (isProcessingHere) 'manager_down_payment_method': _managerDownPaymentMethod,
-          if (widget.stage == 'for_post_analysis') 'manager_full_payment_method': _managerFullPaymentMethod,
-        };
-        if (_managerDownPaymentProofBytes != null) {
-          postAnalysis['manager_down_payment_proof_b64'] = base64Encode(_managerDownPaymentProofBytes!);
-        }
-        if (_managerFullPaymentProofBytes != null) {
-          postAnalysis['manager_full_payment_proof_b64'] = base64Encode(_managerFullPaymentProofBytes!);
-        }
-        final themeDesign = <String, dynamic>{
-          ...rowBase.themeDesign,
-          'cost_items': themeDesignCosts,
-          'service_included': managerServiceIncluded,
-          'note': managerInquiryNoteController.text.trim(),
-          'event_title': managerDraftEventTitleController.text.trim(),
-          'event_type': et,
-          'event_setting': managerEventSetting,
-          'formality_level': rowBase.orderKind == 'event' ? managerFormalityLevel : '',
-        };
-
-        if (isDraftStageHere) {
-          final gc = int.tryParse(managerGuestCountController.text.trim());
-          final formalityOut = _draftOrderKind == 'event' ? managerFormalityLevel : '';
-          final err = await widget.state.managerSaveCateringDraft(
-            id: rowBase.id,
-            orderKind: rowBase.orderKind,
-            draft: {
-              'post_analysis': postAnalysis,
-              'checklist': checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
-              'theme_design': {...themeDesign, 'formality_level': formalityOut},
-              'schedule_slots': _scheduleSlotsPayload(),
-              // Needed for event_orders so the list endpoint can populate columns for later stages.
-              'event_title': managerDraftEventTitleController.text.trim(),
-              'event_type': et,
-              'formality_level': formalityOut,
-              'customer_name': managerCustomerNameController.text.trim(),
-              'contact_person': managerContactPersonController.text.trim(),
-              'contact_number': managerContactNumberController.text.trim(),
-              'email_address': managerEmailController.text.trim(),
-              'address': managerAddressController.text.trim(),
-              'menu': selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
-              'additional_costs': flatAdditionalSave,
-              'labor_cost': laborCostComputedNow,
-              'travel_cost': travelNow,
-              'total_cost': totalNow,
-              'cost_breakdown': [
-                {'label': 'Base food cost', 'amount': _baseFoodCost()},
-                {'label': 'Labor cost', 'amount': laborCostComputedNow},
-                {'label': 'Travel cost', 'amount': travelNow},
-                {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
-                {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
-              ],
-              if (gc != null && gc >= 0) 'guest_count': gc,
-            },
-          );
-          if (!mounted) return false;
-          if (err != null) {
-            appSnack(context, err);
-            return false;
-          }
-          appSnack(context, 'Draft saved');
-          try {
-            final p = await SharedPreferences.getInstance();
-            await p.remove(_localDraftKey);
-          } catch (_) {}
-          await widget.state.loadManagerCateringByStage(widget.stage, force: true);
-          _pristineManagerDetailSig = _computeManagerDetailSignature();
-          _managerDraftAdvanceGateSig = _pristineManagerDetailSig;
-          if (mounted) setState(() {});
-          if (popAfterSuccess && mounted) {
-            if (widget.stage != 'online_inquiries' && widget.stage != 'new_event') {
-              Navigator.of(context).pop();
-            }
-          }
-          return true;
-        }
-
-        final err = await widget.state.managerAdvanceCateringStage(
-          id: rowBase.id,
-          orderKind: rowBase.orderKind,
-          status: widget.stage,
-          downPaymentAmount: isProcessing ? (double.tryParse(downPaymentPaidController.text.trim()) ?? downPaymentDue) : null,
-          // Post-analysis full payment is confirmed via [managerPatchCateringPostAnalysis] (manager only), not by setting amounts here.
-          fullPaymentAmount: null,
-          postAnalysis: (isProcessing || isPost || isOnlineInquiry) ? postAnalysis : null,
-          checklist: checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
-          additionalCosts: flatAdditionalSave,
-          laborCost: laborCostComputedNow,
-          travelCost: travelNow,
-          totalCost: totalNow,
-          costBreakdown: [
-            {'label': 'Base food cost', 'amount': _baseFoodCost()},
-            {'label': 'Labor cost', 'amount': laborCostComputedNow},
-            {'label': 'Travel cost', 'amount': travelNow},
-            {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
-            {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
-          ],
-          themeDesign: themeDesign,
-          menu: selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
-        );
-        if (!mounted) return false;
-        if (err != null) {
-          appSnack(context, err);
-          return false;
-        }
-        appSnack(context, 'Changes saved');
-        await widget.state.loadManagerCateringByStage(widget.stage, force: true);
-        _pristineManagerDetailSig = _computeManagerDetailSignature();
-        if (popAfterSuccess && mounted) {
-          if (widget.stage != 'online_inquiries' && widget.stage != 'new_event') {
-            Navigator.of(context).pop();
-          }
-        }
-        return true;
       } finally {
         if (mounted) _hideManagerBlockingProgress();
       }
