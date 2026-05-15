@@ -1231,6 +1231,14 @@ app.post("/api/mobile/auth/login", async (req, res) => {
         displayName = "Manager";
       }
       await logActionBestEffort("auth.login", email, "Staff login successful", { role });
+      const tsStaff = new Date().toISOString();
+      void sendMailSafe(
+        email,
+        "Macrina's Kitchen login notice",
+        `A cashier/staff login was completed for ${email} at ${tsStaff}. If this was not you, change your password immediately.`,
+      ).catch((mailErr) => {
+        console.warn("[mail] staff login notice email failed (login still succeeds):", mailErr);
+      });
       res.json({ ok: true, email, role, display_name: displayName });
       return;
     }
@@ -1491,11 +1499,13 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
     }
     await logActionBestEffort("auth.reset.complete", email, "Password reset completed", {});
     const ts = new Date().toISOString();
-    void sendMailSafe(
-      email,
-      "Your Curatering password was reset",
-      `The password for ${email} was successfully reset at ${ts}.\n\nIf you did not make this change, contact support immediately.`,
-    );
+    const resetSubject =
+      role === "cashier" ? "Your Macrina's Kitchen cashier password was reset" : "Your Curatering password was reset";
+    const resetBody =
+      role === "cashier"
+        ? `The cashier account password for ${email} was successfully reset at ${ts}.\n\nIf you did not make this change, contact your administrator immediately.`
+        : `The password for ${email} was successfully reset at ${ts}.\n\nIf you did not make this change, contact support immediately.`;
+    void sendMailSafe(email, resetSubject, resetBody);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -2302,28 +2312,50 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT SUBSTRING(ro.payment_reference FROM LENGTH($3::text) + 1) AS order_no,
-              COALESCE(
-                ro.points_earned,
+      `SELECT order_no, points_delta, created_at, source
+       FROM (
+         SELECT SUBSTRING(ro.payment_reference FROM LENGTH($3::text) + 1) AS order_no,
+                COALESCE(
+                  ro.points_earned,
+                  CASE
+                    WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN
+                      FLOOR(COALESCE(ro.total_amount, 0)::numeric / ${CATERING_LOYALTY_STEP_AMOUNT}::numeric)::int * ${CATERING_LOYALTY_STEP_POINTS}
+                    ELSE
+                      FLOOR(COALESCE(ro.total_amount, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
+                  END
+                ) AS points_delta,
+                ro.created_at,
                 CASE
-                  WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN
-                    FLOOR(COALESCE(ro.total_amount, 0)::numeric / ${CATERING_LOYALTY_STEP_AMOUNT}::numeric)::int * ${CATERING_LOYALTY_STEP_POINTS}
-                  ELSE
-                    FLOOR(COALESCE(ro.total_amount, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
-                END
-              ) AS points_delta,
-              ro.created_at,
-              CASE
-                WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN 'catering'
-                ELSE 'restaurant'
-              END AS source
-       FROM restaurant_orders ro
-       WHERE ro.payment_reference LIKE $2
-         AND (
-           ro.customer_id IN (SELECT id FROM customer_accounts WHERE LOWER(email) = LOWER($1))
-           OR POSITION(LOWER($1) IN LOWER(COALESCE(ro.delivery_notes, ''))) > 0
-         )
-       ORDER BY ro.created_at DESC
+                  WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN 'catering'
+                  ELSE 'restaurant'
+                END AS source
+         FROM restaurant_orders ro
+         WHERE ro.payment_reference LIKE $2
+           AND (
+             ro.customer_id IN (SELECT id FROM customer_accounts WHERE LOWER(email) = LOWER($1))
+             OR POSITION(LOWER($1) IN LOWER(COALESCE(ro.delivery_notes, ''))) > 0
+           )
+         UNION ALL
+         SELECT COALESCE(NULLIF(TRIM(eo.transaction_no), ''), 'EVT-' || eo.id::text) AS order_no,
+                COALESCE(eo.points_earned, 0) AS points_delta,
+                COALESCE(eo.stage_entered_at, eo.updated_at, eo.created_at) AS created_at,
+                'catering' AS source
+         FROM event_orders eo
+         WHERE LOWER(TRIM(eo.email_address)) = LOWER($1)
+           AND COALESCE(eo.points_earned, 0) > 0
+           AND LOWER(TRIM(eo.status)) IN ('for_post_analysis', 'completed')
+         UNION ALL
+         SELECT COALESCE(NULLIF(TRIM(co.transaction_no), ''), 'CAT-' || co.id::text) AS order_no,
+                COALESCE(co.points_earned, 0) AS points_delta,
+                COALESCE(co.stage_entered_at, co.updated_at, co.created_at) AS created_at,
+                'catering' AS source
+         FROM catering_orders co
+         WHERE LOWER(TRIM(co.email_address)) = LOWER($1)
+           AND COALESCE(co.points_earned, 0) > 0
+           AND LOWER(TRIM(co.status)) IN ('for_post_analysis', 'completed')
+       ) combined
+       WHERE points_delta > 0
+       ORDER BY created_at DESC
        LIMIT 150`,
       [userEmail, `${MOBILE_LOYALTY_PAYMENT_PREFIX}%`, MOBILE_LOYALTY_PAYMENT_PREFIX],
     );

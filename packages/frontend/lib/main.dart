@@ -814,7 +814,7 @@ String cateringCoverageErrorText() {
 
 /// Shown at top of Restaurant Menu and My Catering Inquiries for customer awareness.
 const String kCustomerOnlineOrdersAreaNotice =
-    'Online orders is available within 5 KM of our restaurant located in Taguig City. Please set your delivery address in your profile beforehand.';
+    'Online orders are available within 5 km of our restaurant in Taguig City.';
 
 const String kCustomerCateringInquiriesAreaNotice =
     'Our catering service is available in NCR, Bulacan, Cavite, Rizal, and Laguna ONLY.';
@@ -827,6 +827,12 @@ bool isWithinPast30Days(DateTime t) => DateTime.now().difference(t) <= const Dur
 /// Catering/event loyalty (matches backend `loyalty-calculation` thresholds).
 const double kCateringLoyaltyMinOrderTotal = 500;
 const int kCateringLoyaltyPointsAward = 8;
+
+/// Matches backend `loyaltyPointsFor('catering_event', total)`.
+int cateringLoyaltyPointsForOrderTotal(double totalAmount) {
+  if (!totalAmount.isFinite || totalAmount <= 0) return 0;
+  return (totalAmount / kCateringLoyaltyMinOrderTotal).floor() * kCateringLoyaltyPointsAward;
+}
 
 class AppColors {
   static const brand = Color(0xFFFFC233);
@@ -1333,7 +1339,11 @@ String cateringManagerListStatusLabelFor(String status, String processingSubstag
 }
 
 /// Detail AppBar: tab the order is in (not generic status text).
-String cateringManagerDetailTabTitle(CateringEventRecord row, String detailStage) {
+String cateringManagerDetailTabTitle(
+  CateringEventRecord row,
+  String detailStage, {
+  String? processingSubstageOverride,
+}) {
   switch (detailStage.trim().toLowerCase()) {
     case 'online_inquiries':
       return 'Online Inquiries';
@@ -1346,10 +1356,63 @@ String cateringManagerDetailTabTitle(CateringEventRecord row, String detailStage
     case 'cancelled':
       return 'Cancelled';
     case 'for_processing':
-      return row.processingSubstageLabel == 'ongoing' ? 'On Going' : 'For Down Payment';
+      final sub = (processingSubstageOverride ?? row.processingSubstageLabel).trim();
+      return sub == 'ongoing' ? 'On Going' : 'For Down Payment';
     default:
       return cateringManagerListStatusLabelFor(row.status, row.processingSubstageLabel);
   }
+}
+
+const TextStyle kManagerAppBarTitleStyle = TextStyle(fontWeight: FontWeight.w800, fontSize: 16);
+
+/// Stages whose additional costs appear on Order Summary | Additional Costs (not draft inquiries).
+const Set<String> kManagerAdditionalCostsSheetStageLabels = {
+  'For Down Payment',
+  'On Going',
+  'For Full Payment',
+};
+
+bool _isManagerAdditionalCostsSheetStage(String stageLabel) =>
+    kManagerAdditionalCostsSheetStageLabels.contains(stageLabel.trim());
+
+/// Post-draft additional costs total for payment gates (from saved groups on a row).
+double cateringCompiledAdditionalCostsTotal(CateringEventRecord row) {
+  var sum = 0.0;
+  final groups = row.postAnalysis['additional_costs_groups'];
+  if (groups is List) {
+    for (final g in groups) {
+      if (g is! Map) continue;
+      if (!_isManagerAdditionalCostsSheetStage('${g['stage'] ?? ''}')) continue;
+      final items = g['items'];
+      if (items is List) {
+        for (final e in items) {
+          if (e is Map) sum += jsonToDouble(e['amount']);
+        }
+      }
+    }
+  }
+  return sum;
+}
+
+Future<void> openGoogleMapsForAddress(String address) async {
+  final q = address.trim();
+  if (q.isEmpty) return;
+  final uri = Uri.parse('https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(q)}');
+  if (await canLaunchUrl(uri)) {
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  }
+}
+
+Future<void> showEventVenueMapPreview(BuildContext context, String address) async {
+  final q = address.trim();
+  if (q.isEmpty) {
+    appSnack(context, 'No event venue address to show.');
+    return;
+  }
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => _EventVenueMapPreviewDialog(address: q),
+  );
 }
 
 int paxBufferFromCateringRow(CateringEventRecord row) {
@@ -1414,6 +1477,110 @@ Future<T?> withCashierBlockingProgress<T>(
   } finally {
     if (context.mounted) Navigator.of(context).pop();
   }
+}
+
+/// Edit dialog for a single additional-cost line (label + amount).
+Future<Map<String, dynamic>?> promptAdditionalCostLineItem(
+  BuildContext context, {
+  String initialLabel = '',
+  double? initialAmount,
+}) async {
+  final labelCtrl = TextEditingController(text: initialLabel);
+  final amountCtrl = TextEditingController(
+    text: initialAmount != null && initialAmount > 0 ? initialAmount.toStringAsFixed(2) : '',
+  );
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (dlgCtx) => AlertDialog(
+      title: Text(initialLabel.isEmpty ? 'Add additional cost' : 'Edit additional cost'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: labelCtrl,
+            decoration: const InputDecoration(labelText: 'Label'),
+            textCapitalization: TextCapitalization.sentences,
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: amountCtrl,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Amount'),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(dlgCtx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(dlgCtx, true), child: const Text('Save')),
+      ],
+    ),
+  );
+  final label = labelCtrl.text.trim();
+  final amount = double.tryParse(amountCtrl.text.trim());
+  labelCtrl.dispose();
+  amountCtrl.dispose();
+  if (ok != true || label.isEmpty || amount == null) return null;
+  return {'label': label, 'amount': amount};
+}
+
+String additionalCostsSummaryForPdf(List<Map<String, dynamic>> costs) {
+  final labels = costs.map((e) => '${e['label'] ?? ''}'.trim()).where((x) => x.isNotEmpty);
+  if (labels.isEmpty) return '—';
+  return labels.join(' · ');
+}
+
+/// Returns true when the manager chooses to continue after an insufficient/excessive payment warning.
+Future<bool> confirmManagerPaymentAmountMismatch(
+  BuildContext context, {
+  required String paymentLabel,
+  required double amountEntered,
+  required double amountDue,
+}) async {
+  const tolerance = 0.01;
+  if ((amountEntered - amountDue).abs() <= tolerance) return true;
+  final insufficient = amountEntered < amountDue - tolerance;
+  final proceed = await showDialog<bool>(
+    context: context,
+    builder: (dlgCtx) => AlertDialog(
+      title: Text(
+        insufficient ? '$paymentLabel — insufficient payment' : '$paymentLabel — excessive payment',
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            insufficient
+                ? 'The amount entered is less than the amount due.'
+                : 'The amount entered is more than the amount due.',
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              color: insufficient ? Colors.orange.shade900 : Colors.red.shade900,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text('Amount entered', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+          Text(
+            'PHP ${amountEntered.toStringAsFixed(2)}',
+            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
+          ),
+          const SizedBox(height: 8),
+          Text('Amount due', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+          Text(
+            'PHP ${amountDue.toStringAsFixed(2)}',
+            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
+          ),
+          const SizedBox(height: 12),
+          const Text('Continue with this payment amount?'),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(dlgCtx, false), child: const Text('Go back')),
+        FilledButton(onPressed: () => Navigator.pop(dlgCtx, true), child: const Text('Continue anyway')),
+      ],
+    ),
+  );
+  return proceed == true;
 }
 
 int cashierOnlinePendingSortPriority(OrderData o) {
@@ -1709,8 +1876,7 @@ class CateringEventRecord {
     return 'down_payment';
   }
 
-  int get cateringLoyaltyEligiblePointsIfCompleted =>
-      totalCost >= kCateringLoyaltyMinOrderTotal ? kCateringLoyaltyPointsAward : 0;
+  int get cateringLoyaltyEligiblePointsIfCompleted => cateringLoyaltyPointsForOrderTotal(totalCost);
 
   factory CateringEventRecord.fromApiMap(Map<String, dynamic> m) {
     return CateringEventRecord(
@@ -1856,6 +2022,8 @@ class AppState extends ChangeNotifier {
   int authSessionKey = 0;
   /// When true, the combined app opens [AuthScreen] in staff mode after a staff session ended.
   bool reopenAuthAsStaff = false;
+  /// After [requestAuthSignup], [AuthScreen] opens in sign-up mode.
+  bool openAuthInSignupMode = false;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
   final Set<String> _readAttentionOrderNos = <String>{};
@@ -2414,6 +2582,12 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  void requestAuthSignup() {
+    openAuthInSignupMode = true;
+    reopenAuthAsStaff = false;
+    logout();
+  }
+
   void logout() {
     final persistedEmail = userEmail?.toLowerCase();
     reopenAuthAsStaff = isCashier || isManagerOrSupervisor;
@@ -2962,12 +3136,38 @@ class AppState extends ChangeNotifier {
       return SubmitOrderResult(error: 'Missing profile or empty tray');
     }
     if (isGuestSession) {
-      if (profile.fullName.trim().isEmpty || profile.contactNumber.trim().isEmpty || profile.deliveryAddress.trim().isEmpty) {
-        return SubmitOrderResult(error: 'Enter your name, contact number, and delivery address.');
+      final nameParts = profile.fullName.trim().split(RegExp(r'\s+'));
+      if (nameParts.isEmpty || nameParts.first.isEmpty) {
+        return SubmitOrderResult(error: 'Enter your first name.');
+      }
+      if (nameParts.length < 2 || nameParts.sublist(1).join(' ').trim().isEmpty) {
+        return SubmitOrderResult(error: 'Enter your last name.');
+      }
+      if (profile.contactNumber.trim().isEmpty) {
+        return SubmitOrderResult(error: 'Enter your contact number.');
+      }
+      if (profile.deliveryAddress.trim().isEmpty) {
+        return SubmitOrderResult(error: 'Enter your delivery address.');
       }
       final em = profile.contactEmail.trim();
       if (em.isEmpty || !em.contains('@') || !em.contains('.')) {
         return SubmitOrderResult(error: 'Enter a valid contact email.');
+      }
+      if (checkoutDeliveryTime.trim().isEmpty) {
+        return SubmitOrderResult(error: 'Choose a delivery time.');
+      }
+      double? km = profile.deliveryLat != null && profile.deliveryLng != null
+          ? haversineKm(
+              lat1: kRestaurantLat,
+              lng1: kRestaurantLng,
+              lat2: profile.deliveryLat!,
+              lng2: profile.deliveryLng!,
+            )
+          : await geocodeAddressDistanceKmFromRestaurant(profile.deliveryAddress.trim());
+      if (km == null || km > kDeliveryMaxDistanceKm + 0.05) {
+        return SubmitOrderResult(
+          error: 'Delivery address must be within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km of the restaurant.',
+        );
       }
     }
     try {
@@ -4040,6 +4240,15 @@ class _AuthScreenState extends State<AuthScreen> {
   String? busyMessage;
 
   @override
+  void initState() {
+    super.initState();
+    if (!widget.cashierMode && widget.state.openAuthInSignupMode) {
+      signupMode = true;
+      widget.state.openAuthInSignupMode = false;
+    }
+  }
+
+  @override
   void dispose() {
     emailController.dispose();
     passwordController.dispose();
@@ -4754,7 +4963,7 @@ class AppDrawer extends StatelessWidget {
     final isCustomer = state.userRole == 'customer';
     final drawerHeaderBg = isCustomer ? const Color(0xFF242424) : AppColors.brand;
     final drawerHeaderFg = isCustomer ? const Color(0xFFFFC024) : Colors.black;
-    final greet = state.isGuestSession && state.profile.fullName.trim().isEmpty
+    final greet = state.isGuestSession
         ? 'Guest'
         : (state.profile.fullName.trim().isNotEmpty ? state.profile.fullName.trim() : (state.userEmail ?? ''));
     final pendingAttentionExists = state.orders.isEmpty
@@ -4786,24 +4995,25 @@ class AppDrawer extends StatelessWidget {
             title: const Text('Dashboard'),
             onTap: () => open(context, CustomerDashboardScreen(state: state)),
           ),
-          if (!state.isGuestSession)
+          if (!state.isGuestSession) ...[
             ListTile(title: const Text('My Profile'), onTap: () => open(context, MyProfileScreen(state: state))),
-          ListTile(
-            title: const Text('My Orders'),
-            trailing: showAttentionDot
-                ? Container(
-                    width: 10,
-                    height: 10,
-                    decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                  )
-                : null,
-            onTap: () {
-              open(context, MyOrdersScreen(state: state));
-            },
-          ),
-          ListTile(title: const Text('My Catering Inquiries'), onTap: () => open(context, MyInquiriesScreen(state: state))),
+            ListTile(
+              title: const Text('My Orders'),
+              trailing: showAttentionDot
+                  ? Container(
+                      width: 10,
+                      height: 10,
+                      decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                    )
+                  : null,
+              onTap: () {
+                open(context, MyOrdersScreen(state: state));
+              },
+            ),
+            ListTile(title: const Text('My Catering Inquiries'), onTap: () => open(context, MyInquiriesScreen(state: state))),
+          ],
           ListTile(title: const Text('Your Tray'), onTap: () => open(context, TrayScreen(state: state))),
-          ListTile(title: const Text('Restaurant Menu'), onTap: () => open(context, RestaurantMenuScreen(state: state))),
+          ListTile(title: const Text('Order Now'), onTap: () => open(context, RestaurantMenuScreen(state: state))),
           ListTile(title: const Text('Inquire Catering'), onTap: () => open(context, InquiryScreen(state: state))),
           ListTile(title: const Text('Settings'), onTap: () => open(context, SettingsScreen(state: state))),
         ],
@@ -5031,20 +5241,29 @@ class CustomerDashboardScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final who = state.isGuestSession && state.profile.fullName.trim().isEmpty
+    final isGuest = state.isGuestSession;
+    final who = isGuest
         ? 'Guest'
         : (state.profile.fullName.trim().isNotEmpty
             ? state.profile.fullName.trim()
             : (state.userEmail ?? '').trim());
-    final items = <({String title, IconData icon, Widget screen})>[
-      (title: 'Restaurant Menu', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state)),
-      (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state)),
-      (title: 'My Orders', icon: Icons.receipt_long_outlined, screen: MyOrdersScreen(state: state)),
-      (title: 'Inquire Catering', icon: Icons.event_available_outlined, screen: InquiryScreen(state: state)),
-      (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state)),
-      (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state)),
+    final items = <({String title, IconData icon, Widget? screen, VoidCallback? onTap})>[
+      (title: 'Order Now', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state), onTap: null),
+      (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state), onTap: null),
+      if (!isGuest) (title: 'My Orders', icon: Icons.receipt_long_outlined, screen: MyOrdersScreen(state: state), onTap: null),
+      (title: 'Inquire Catering', icon: Icons.event_available_outlined, screen: InquiryScreen(state: state), onTap: null),
+      if (!isGuest)
+        (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state), onTap: null),
+      if (!isGuest) (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state), onTap: null),
+      if (isGuest)
+        (
+          title: 'Sign Up',
+          icon: Icons.person_add_outlined,
+          screen: null,
+          onTap: () => state.requestAuthSignup(),
+        ),
     ];
-    final gridItems = state.isGuestSession ? items.where((e) => e.title != 'My Profile').toList() : items;
+    final gridItems = items;
     return AppScaffold(
       state: state,
       title: 'DASHBOARD',
@@ -5065,12 +5284,26 @@ class CustomerDashboardScreen extends StatelessWidget {
                   Text(
                     'Hi, $who!',
                     style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Colors.white),
-                textAlign: TextAlign.center,
+                    textAlign: TextAlign.center,
                   ),
                 ],
               ],
             ),
           ),
+          if (isGuest)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
+              child: Text(
+                'Create an account to earn loyalty rewards on restaurant orders and completed catering events.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  height: 1.4,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey.shade800,
+                ),
+              ),
+            ),
           Expanded(
             child: RefreshIndicator(
               onRefresh: () async {
@@ -5108,8 +5341,14 @@ class CustomerDashboardScreen extends StatelessWidget {
                         child: InkWell(
                           borderRadius: BorderRadius.circular(12),
                           onTap: () {
+                            if (item.onTap != null) {
+                              item.onTap!();
+                              return;
+                            }
+                            final screen = item.screen;
+                            if (screen == null) return;
                             Navigator.of(context).pushReplacement(
-                              MaterialPageRoute<void>(builder: (_) => item.screen),
+                              MaterialPageRoute<void>(builder: (_) => screen),
                             );
                           },
                           child: Padding(
@@ -5161,7 +5400,7 @@ class ManagerDashboardScreen extends StatelessWidget {
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
         leading: _buildManagerHamburgerLeading(context, state),
-        title: const Text('DASHBOARD', style: TextStyle(fontWeight: FontWeight.w800)),
+        title: const Text('DASHBOARD', style: kManagerAppBarTitleStyle),
         centerTitle: true,
       ),
       drawer: ManagerRoleDrawer(
@@ -6981,23 +7220,47 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   String? _selectedDeliveryAddress;
   String _selectedDeliveryTime = 'NOW';
   bool _deliveryAddressOptionsLoading = true;
-  final TextEditingController _guestNameCtl = TextEditingController();
+  final TextEditingController _guestFirstNameCtl = TextEditingController();
+  final TextEditingController _guestLastNameCtl = TextEditingController();
   final TextEditingController _guestContactCtl = TextEditingController();
   final TextEditingController _guestEmailCtl = TextEditingController();
   final TextEditingController _guestDeliveryCtl = TextEditingController();
-  double? _guestDeliveryKm;
-  bool _guestDeliveryBusy = false;
+  double? _guestMapLat;
+  double? _guestMapLng;
+  double? _guestDeliveryDistanceKm;
+  bool _guestDeliveryRangeBusy = false;
+  String? _guestDeliveryRangeError;
+  final List<String> _guestAddrSuggestions = [];
   Timer? _guestGeoDebounce;
+
+  bool get _guestDeliveryOutOfRange =>
+      _guestDeliveryDistanceKm != null && _guestDeliveryDistanceKm! > kDeliveryMaxDistanceKm;
+
+  String _guestFullName() => '${_guestFirstNameCtl.text.trim()} ${_guestLastNameCtl.text.trim()}'.trim();
+
+  void _syncGuestFullName() => widget.state.updateGuestCheckoutContact(fullName: _guestFullName());
 
   @override
   void initState() {
     super.initState();
     noteController.text = widget.state.checkoutNote;
     final p = widget.state.profile;
-    _guestNameCtl.text = p.fullName;
+    final nameParts = p.fullName.trim().split(RegExp(r'\s+'));
+    _guestFirstNameCtl.text = nameParts.isNotEmpty ? nameParts.first : '';
+    _guestLastNameCtl.text = nameParts.length > 1 ? nameParts.sublist(1).join(' ') : '';
     _guestContactCtl.text = p.contactNumber;
     _guestEmailCtl.text = p.contactEmail;
     _guestDeliveryCtl.text = p.deliveryAddress;
+    _guestMapLat = p.deliveryLat;
+    _guestMapLng = p.deliveryLng;
+    if (_guestMapLat != null && _guestMapLng != null) {
+      _guestDeliveryDistanceKm = haversineKm(
+        lat1: kRestaurantLat,
+        lng1: kRestaurantLng,
+        lat2: _guestMapLat!,
+        lng2: _guestMapLng!,
+      );
+    }
     _deliveryAddresses.clear();
     _selectedDeliveryAddress = null;
     _selectedDeliveryTime = widget.state.checkoutDeliveryTime.trim().isEmpty ? 'NOW' : widget.state.checkoutDeliveryTime.trim();
@@ -7064,30 +7327,126 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     }
   }
 
-  void _debounceGuestDeliveryRange() {
-    _guestGeoDebounce?.cancel();
-    _guestGeoDebounce = Timer(const Duration(milliseconds: 450), () async {
-      final q = _guestDeliveryCtl.text.trim();
-      widget.state.updateGuestCheckoutContact(deliveryAddress: q);
-      if (q.isEmpty) {
-        if (mounted) {
-          setState(() {
-            _guestDeliveryKm = null;
-            _guestDeliveryBusy = false;
-          });
-        }
-        await _loadInRangeDeliveryAddresses();
-        return;
-      }
-      if (mounted) setState(() => _guestDeliveryBusy = true);
-      final d = await geocodeAddressDistanceKmFromRestaurant(q);
+  Future<void> _evaluateGuestDeliveryRangeFromLatLng(double lat, double lng) async {
+    final d = haversineKm(lat1: kRestaurantLat, lng1: kRestaurantLng, lat2: lat, lng2: lng);
+    if (!mounted) return;
+    setState(() {
+      _guestDeliveryDistanceKm = d;
+      _guestDeliveryRangeError = null;
+      _guestDeliveryRangeBusy = false;
+    });
+    widget.state.updateGuestCheckoutContact(deliveryLat: lat, deliveryLng: lng, deliveryMapConfirmed: true);
+  }
+
+  Future<void> _resolveGuestDeliveryRangeFromAddress(String address) async {
+    final q = address.trim();
+    widget.state.updateGuestCheckoutContact(deliveryAddress: q);
+    if (q.isEmpty) {
       if (!mounted) return;
       setState(() {
-        _guestDeliveryBusy = false;
-        _guestDeliveryKm = d;
+        _guestDeliveryDistanceKm = null;
+        _guestDeliveryRangeError = null;
+        _guestDeliveryRangeBusy = false;
       });
-      await _loadInRangeDeliveryAddresses();
+      return;
+    }
+    if (mounted) setState(() => _guestDeliveryRangeBusy = true);
+    try {
+      final uri = Uri.parse(
+        'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=1',
+      );
+      final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        if (!mounted) return;
+        setState(() {
+          _guestDeliveryRangeError = 'Could not verify delivery range yet.';
+          _guestDeliveryRangeBusy = false;
+        });
+        return;
+      }
+      final list = jsonDecode(res.body) as List<dynamic>;
+      if (list.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _guestDeliveryRangeError = 'Could not locate this address for range validation.';
+          _guestDeliveryRangeBusy = false;
+        });
+        return;
+      }
+      final m = list.first as Map<String, dynamic>;
+      final lat = jsonToDouble(m['lat']);
+      final lng = jsonToDouble(m['lon']);
+      _guestMapLat = lat;
+      _guestMapLng = lng;
+      await _evaluateGuestDeliveryRangeFromLatLng(lat, lng);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _guestDeliveryRangeError = 'Could not verify delivery range yet.';
+        _guestDeliveryRangeBusy = false;
+      });
+    }
+  }
+
+  void _suggestGuestAddress(String q) {
+    _guestGeoDebounce?.cancel();
+    final query = q.trim();
+    widget.state.updateGuestCheckoutContact(deliveryAddress: query);
+    if (query.length < 3) {
+      if (_guestAddrSuggestions.isNotEmpty && mounted) setState(() => _guestAddrSuggestions.clear());
+      return;
+    }
+    _guestGeoDebounce = Timer(const Duration(milliseconds: 280), () async {
+      unawaited(_resolveGuestDeliveryRangeFromAddress(query));
+      try {
+        final uri = Uri.parse(
+          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(query)}&format=json&limit=5',
+        );
+        final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+        if (res.statusCode != 200 || !mounted) return;
+        final body = jsonDecode(res.body);
+        if (body is! List) return;
+        final next = body
+            .whereType<Map>()
+            .map((e) => '${e['display_name'] ?? ''}'.trim())
+            .where((s) => s.isNotEmpty)
+            .take(5)
+            .toList();
+        if (!mounted) return;
+        setState(() {
+          _guestAddrSuggestions
+            ..clear()
+            ..addAll(next);
+        });
+      } catch (_) {}
     });
+  }
+
+  Future<void> _openGuestMapsDialog() async {
+    final addrHint = _guestDeliveryCtl.text.trim();
+    final r = await showDialog<MapPinResult>(
+      context: context,
+      builder: (ctx) => _MapPinPickerDialog(
+        initialSearchQuery: addrHint,
+        initialLat: _guestMapLat ?? widget.state.profile.deliveryLat,
+        initialLng: _guestMapLng ?? widget.state.profile.deliveryLng,
+      ),
+    );
+    if (r != null && mounted) {
+      setState(() {
+        _guestDeliveryCtl.text = r.address;
+        _guestMapLat = r.lat;
+        _guestMapLng = r.lng;
+        _guestAddrSuggestions.clear();
+      });
+      widget.state.updateGuestCheckoutContact(
+        deliveryAddress: r.address,
+        deliveryLat: r.lat,
+        deliveryLng: r.lng,
+        deliveryMapConfirmed: true,
+      );
+      await _evaluateGuestDeliveryRangeFromLatLng(r.lat, r.lng);
+    }
   }
 
   Future<void> _pickScheduledDelivery() async {
@@ -7111,7 +7470,8 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   void dispose() {
     _guestGeoDebounce?.cancel();
     noteController.dispose();
-    _guestNameCtl.dispose();
+    _guestFirstNameCtl.dispose();
+    _guestLastNameCtl.dispose();
     _guestContactCtl.dispose();
     _guestEmailCtl.dispose();
     _guestDeliveryCtl.dispose();
@@ -7150,15 +7510,25 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                     children: [
                       if (s.isGuestSession) ...[
                         TextField(
-                          controller: _guestNameCtl,
-                          decoration: const InputDecoration(labelText: 'NAME'),
-                          onChanged: (v) => s.updateGuestCheckoutContact(fullName: v),
+                          controller: _guestFirstNameCtl,
+                          decoration: const InputDecoration(labelText: 'FIRST NAME'),
+                          onChanged: (_) => _syncGuestFullName(),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _guestLastNameCtl,
+                          decoration: const InputDecoration(labelText: 'LAST NAME'),
+                          onChanged: (_) => _syncGuestFullName(),
                         ),
                         const SizedBox(height: 10),
                         TextField(
                           controller: _guestContactCtl,
                           keyboardType: TextInputType.phone,
                           maxLength: 11,
+                          inputFormatters: [
+                            FilteringTextInputFormatter.digitsOnly,
+                            LengthLimitingTextInputFormatter(11),
+                          ],
                           decoration: const InputDecoration(labelText: 'CONTACT NUMBER', counterText: ''),
                           onChanged: (v) => s.updateGuestCheckoutContact(contactNumber: v),
                         ),
@@ -7174,27 +7544,69 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                           controller: _guestDeliveryCtl,
                           minLines: 2,
                           maxLines: 4,
-                          decoration: const InputDecoration(
+                          onChanged: _suggestGuestAddress,
+                          decoration: InputDecoration(
                             labelText: 'DELIVERY ADDRESS',
-                            hintText: 'Within 5 km of our Taguig restaurant',
+                            hintText: 'Within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km of our Taguig restaurant',
+                            suffixIcon: IconButton(
+                              tooltip: 'Pin on map',
+                              onPressed: _openGuestMapsDialog,
+                              icon: const Icon(Icons.place_outlined),
+                            ),
                           ),
-                          onChanged: (_) => _debounceGuestDeliveryRange(),
                         ),
-                        if (_guestDeliveryBusy) const Padding(
-                          padding: EdgeInsets.only(top: 6),
-                          child: LinearProgressIndicator(minHeight: 2),
-                        ),
-                        if (_guestDeliveryKm != null)
+                        if (_guestDeliveryRangeBusy)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 6),
+                            child: LinearProgressIndicator(minHeight: 2),
+                          ),
+                        if (_guestDeliveryOutOfRange)
                           Padding(
                             padding: const EdgeInsets.only(top: 6),
                             child: Text(
-                              _guestDeliveryKm! <= kDeliveryMaxDistanceKm
-                                  ? 'Within delivery range (~${_guestDeliveryKm!.toStringAsFixed(1)} km)'
-                                  : 'Out of range (~${_guestDeliveryKm!.toStringAsFixed(1)} km; max ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km)',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: _guestDeliveryKm! <= kDeliveryMaxDistanceKm ? Colors.green.shade800 : Colors.red.shade800,
-                              ),
+                              'Out of range (~${_guestDeliveryDistanceKm!.toStringAsFixed(1)} km; max ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km)',
+                              style: TextStyle(fontSize: 12, color: Colors.red.shade800, fontWeight: FontWeight.w700),
+                            ),
+                          )
+                        else if (_guestDeliveryDistanceKm != null)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Text(
+                              'Within delivery range (~${_guestDeliveryDistanceKm!.toStringAsFixed(1)} km)',
+                              style: TextStyle(fontSize: 12, color: Colors.green.shade800, fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                        if (_guestDeliveryRangeError != null && _guestDeliveryRangeError!.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Text(
+                              _guestDeliveryRangeError!,
+                              style: TextStyle(fontSize: 12, color: Colors.red.shade800),
+                            ),
+                          ),
+                        if (_guestAddrSuggestions.isNotEmpty)
+                          Container(
+                            margin: const EdgeInsets.only(top: 6),
+                            decoration: BoxDecoration(
+                              border: Border.all(color: Colors.grey.shade300),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Column(
+                              children: _guestAddrSuggestions
+                                  .map(
+                                    (addr) => ListTile(
+                                      dense: true,
+                                      title: Text(addr, maxLines: 2, overflow: TextOverflow.ellipsis),
+                                      onTap: () {
+                                        setState(() {
+                                          _guestDeliveryCtl.text = addr;
+                                          _guestAddrSuggestions.clear();
+                                        });
+                                        unawaited(_resolveGuestDeliveryRangeFromAddress(addr));
+                                      },
+                                    ),
+                                  )
+                                  .toList(),
                             ),
                           ),
                       ] else ...[
@@ -7316,15 +7728,21 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
               }
               if (s.isGuestSession) {
                 s.updateGuestCheckoutContact(
-                  fullName: _guestNameCtl.text.trim(),
+                  fullName: _guestFullName(),
                   contactNumber: _guestContactCtl.text.trim(),
                   contactEmail: _guestEmailCtl.text.trim(),
                   deliveryAddress: _guestDeliveryCtl.text.trim(),
                 );
-                if (s.profile.fullName.trim().isEmpty ||
-                    s.profile.contactNumber.trim().isEmpty ||
-                    s.profile.deliveryAddress.trim().isEmpty) {
-                  appSnack(context, 'Enter your name, contact number, and delivery address.');
+                if (_guestFirstNameCtl.text.trim().isEmpty) {
+                  appSnack(context, 'Enter your first name.');
+                  return;
+                }
+                if (_guestLastNameCtl.text.trim().isEmpty) {
+                  appSnack(context, 'Enter your last name.');
+                  return;
+                }
+                if (s.profile.contactNumber.trim().isEmpty) {
+                  appSnack(context, 'Enter your contact number.');
                   return;
                 }
                 final em = s.profile.contactEmail.trim();
@@ -7332,8 +7750,16 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   appSnack(context, 'Enter a valid email address.');
                   return;
                 }
-                if (_guestDeliveryKm == null || _guestDeliveryKm! > kDeliveryMaxDistanceKm + 0.05) {
-                  appSnack(context, 'Delivery address must be within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km of the restaurant.');
+                if (s.profile.deliveryAddress.trim().isEmpty) {
+                  appSnack(context, 'Enter your delivery address.');
+                  return;
+                }
+                if (_selectedDeliveryTime.trim().isEmpty) {
+                  appSnack(context, 'Choose a delivery time (ASAP or schedule).');
+                  return;
+                }
+                if (_guestDeliveryDistanceKm == null || _guestDeliveryOutOfRange) {
+                  appSnack(context, 'Pin or select a delivery address within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km of the restaurant.');
                   return;
                 }
               } else {
@@ -9467,7 +9893,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                                   itemBuilder: (context, index) {
                                     final h = widget.state.loyaltyHistory[index];
                                     final label = h.orderNo.trim().isEmpty ? '******' : uiOrderNo(h.orderNo);
-                                    final src = h.source == 'catering' ? 'Catering' : 'Restaurant';
+                                    final src = h.source == 'catering' ? 'Catering / Event' : 'Restaurant';
                                     return Column(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
@@ -9544,6 +9970,125 @@ class MapPinResult {
   final String address;
   final double lat;
   final double lng;
+}
+
+class _EventVenueMapPreviewDialog extends StatefulWidget {
+  const _EventVenueMapPreviewDialog({required this.address});
+  final String address;
+
+  @override
+  State<_EventVenueMapPreviewDialog> createState() => _EventVenueMapPreviewDialogState();
+}
+
+class _EventVenueMapPreviewDialogState extends State<_EventVenueMapPreviewDialog> {
+  final MapController _mapController = MapController();
+  LatLng _pin = const LatLng(14.5995, 120.9842);
+  bool _busy = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadPin());
+  }
+
+  Future<void> _loadPin() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final uri = Uri.parse(
+        'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(widget.address)}&format=json&limit=1',
+      );
+      final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        if (mounted) setState(() => _error = 'Could not load map for this address.');
+        return;
+      }
+      final list = jsonDecode(res.body) as List<dynamic>;
+      if (list.isEmpty) {
+        if (mounted) setState(() => _error = 'Could not find this address on the map.');
+        return;
+      }
+      final m = list.first as Map<String, dynamic>;
+      final lat = jsonToDouble(m['lat']);
+      final lng = jsonToDouble(m['lon']);
+      final ll = LatLng(lat, lng);
+      if (!mounted) return;
+      setState(() => _pin = ll);
+      _mapController.move(ll, 16);
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Could not load map for this address.');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Event venue'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SelectableText(widget.address, style: const TextStyle(fontWeight: FontWeight.w600, height: 1.35)),
+            const SizedBox(height: 12),
+            if (_busy)
+              const SizedBox(height: 220, child: Center(child: CircularProgressIndicator()))
+            else if (_error != null)
+              SizedBox(
+                height: 120,
+                child: Center(child: Text(_error!, textAlign: TextAlign.center)),
+              )
+            else
+              SizedBox(
+                height: 260,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: FlutterMap(
+                    mapController: _mapController,
+                    options: MapOptions(initialCenter: _pin, initialZoom: 16),
+                    children: [
+                      TileLayer(
+                        urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                        userAgentPackageName: 'com.curatering.mobile',
+                      ),
+                      MarkerLayer(
+                        markers: [
+                          Marker(
+                            point: _pin,
+                            width: 44,
+                            height: 44,
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.location_on, color: AppColors.accent, size: 44),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
+        FilledButton.icon(
+          onPressed: _busy
+              ? null
+              : () async {
+                  await openGoogleMapsForAddress(widget.address);
+                },
+          icon: const Icon(Icons.open_in_new, size: 18),
+          label: const Text('Open in Google Maps'),
+        ),
+      ],
+    );
+  }
 }
 
 class _MapPinPickerDialog extends StatefulWidget {
@@ -12397,7 +12942,7 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
             backgroundColor: const Color(0xFF242424),
             foregroundColor: const Color(0xFFFFC024),
             leading: _buildManagerHamburgerLeading(context, widget.state),
-            title: Text((_labels[_tab.index]).toUpperCase(), style: const TextStyle(fontWeight: FontWeight.w800)),
+            title: Text((_labels[_tab.index]).toUpperCase(), style: kManagerAppBarTitleStyle),
             centerTitle: true,
             bottom: PreferredSize(
               preferredSize: const Size.fromHeight(48),
@@ -12705,7 +13250,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       ((_billableGuestCountForPricing() + _paxBufferForPricing()) * kPesosPerPax) +
       _laborCostComputed() +
       _travelCostComputed() +
-      _themeCostComputed() +
+      (inquiryType == 'CATERING AND EVENT' ? _themeCostComputed() : 0) +
       _sumCostRows(additionalCosts);
 
   String _resolvedEventType() {
@@ -12880,7 +13425,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       return 'Select at least 4 dishes for the menu.';
     }
     if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
-    if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
+    if (eventTitle.text.trim().isEmpty) return 'Enter event title.';
     if (inquiryType == 'CATERING AND EVENT' &&
         themeSuggestionNote.trim().isEmpty &&
         themeCostController.text.trim().isEmpty) {
@@ -13017,6 +13562,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         'theme_cost': _themeCostComputed(),
         'additional_costs': additionalCosts,
         'labor_manual_costs': laborManualCosts,
+        'formality_level': formalityLevel,
         if (inquiryType == 'CATERING AND EVENT') 'theme_suggestion_note': themeSuggestionNote,
       };
       final costBreakdown = <Map<String, dynamic>>[
@@ -13024,7 +13570,8 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         {'label': 'Pax buffer', 'amount': _paxBufferForPricing() * kPesosPerPax},
         {'label': 'Labor cost', 'amount': _laborCostComputed()},
         {'label': 'Travel cost', 'amount': _travelCostComputed()},
-        {'label': 'Theme design cost', 'amount': _themeCostComputed()},
+        if (inquiryType == 'CATERING AND EVENT')
+          {'label': 'Theme design cost', 'amount': _themeCostComputed()},
         {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
       ];
       final yes = await showDialog<bool>(
@@ -13037,7 +13584,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text('Type: $inquiryType'),
-                if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isNotEmpty) ...[
+                if (eventTitle.text.trim().isNotEmpty) ...[
                   const SizedBox(height: 6),
                   Text('Event: ${eventTitle.text.trim()}'),
                 ],
@@ -13063,27 +13610,36 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         ),
       );
       if (yes != true || !context.mounted) return;
-      final err = await widget.state.managerCreateNewEvent(
-        orderKind: orderKind,
-        eventTitle: inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : '',
-        eventType: (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
-        customerName: customerName.text.trim(),
-        contactPerson: contactPerson.text.trim(),
-        contactNumber: contactNumber.text.trim(),
-        emailAddress: inquiryEmail.text.trim(),
-        address: eventCity.text.trim(),
-        guestCount: guestsSaved,
-        paymentMethod: 'cash',
-        costBreakdown: costBreakdown,
-        laborMaleCount: int.tryParse(laborMaleController.text.trim()) ?? 0,
-        laborFemaleCount: int.tryParse(laborFemaleController.text.trim()) ?? 0,
-        laborManualException: _sumCostRows(laborManualCosts),
-        travelCost: _travelCostComputed(),
-        manualTotalCost: null,
-        scheduleSlots: _scheduleSlotsPayload(),
-        menu: menuPayload,
-        themeDesign: themeDesign,
-        formalityLevel: inquiryType == 'CATERING AND EVENT' ? formalityLevel : '',
+      final err = await withCashierBlockingProgress<String?>(
+        context,
+        'Saving new event…',
+        (() async {
+          final createErr = await widget.state.managerCreateNewEvent(
+            orderKind: orderKind,
+            eventTitle: eventTitle.text.trim(),
+            eventType: (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
+            customerName: customerName.text.trim(),
+            contactPerson: contactPerson.text.trim(),
+            contactNumber: contactNumber.text.trim(),
+            emailAddress: inquiryEmail.text.trim(),
+            address: eventCity.text.trim(),
+            guestCount: guestsSaved,
+            paymentMethod: 'cash',
+            costBreakdown: costBreakdown,
+            laborMaleCount: int.tryParse(laborMaleController.text.trim()) ?? 0,
+            laborFemaleCount: int.tryParse(laborFemaleController.text.trim()) ?? 0,
+            laborManualException: _sumCostRows(laborManualCosts),
+            travelCost: _travelCostComputed(),
+            manualTotalCost: null,
+            scheduleSlots: _scheduleSlotsPayload(),
+            menu: menuPayload,
+            themeDesign: themeDesign,
+            formalityLevel: formalityLevel,
+          );
+          if (createErr != null) return createErr;
+          await widget.state.loadManagerCateringByStage('new_event', force: true);
+          return null;
+        })(),
       );
       if (!context.mounted) return;
       if (err != null) {
@@ -13095,7 +13651,6 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         final p = await SharedPreferences.getInstance();
         await p.remove(_managerNewEventDraftKey);
       } catch (_) {}
-      await widget.state.loadManagerCateringByStage('new_event', force: true);
       if (context.mounted) Navigator.of(context).pop();
     }
 
@@ -13156,7 +13711,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             labelValueRow('Date/Time processed', formatDateTimeLocal(DateTime.now())),
             labelValueRow(
               'Event',
-              inquiryType == 'CATERING AND EVENT' ? eventTitle.text.trim() : customerName.text.trim(),
+              eventTitle.text.trim().isEmpty ? customerName.text.trim() : eventTitle.text.trim(),
             ),
             labelValueRow('Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen),
             labelValueRow('Customer', customerName.text.trim()),
@@ -13168,7 +13723,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             labelValueRow('Address of event', eventCity.text.trim()),
             labelValueRow('Service', serviceIncluded == 'yes' ? 'With service' : 'Without service'),
             labelValueRow('Event setting', settingLabel),
-            labelValueRow('Formality level', inquiryType == 'CATERING AND EVENT' ? formalityLevel : '—'),
+            labelValueRow('Formality level', formalityLevel),
             labelValueRow('Menu dishes', menuLines.isEmpty ? '—' : menuLines.join(', ')),
             labelValueRow(
               'No. of PAX and cost',
@@ -13178,19 +13733,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               'PAX buffer and cost',
               '$paxBufferValue x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${(paxBufferValue * kPesosPerPax).toStringAsFixed(2)}',
             ),
-            labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
+            if (inquiryType == 'CATERING AND EVENT')
+              labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
+            labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCosts)),
+            labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
             labelValueRow('Labor cost', 'PHP ${laborCost.toStringAsFixed(2)}'),
             labelValueRow('Travel cost', 'PHP ${travelCost.toStringAsFixed(2)}'),
-            labelValueRow(
-              'Additional costs',
-              additionalCosts.isEmpty
-                  ? '—'
-                  : additionalCosts
-                      .map((e) => '${e['label'] ?? ''}'.trim())
-                      .where((x) => x.isNotEmpty)
-                      .join(' · '),
-            ),
-            labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
             labelValueRow('Total invoice', 'PHP ${total.toStringAsFixed(2)}'),
             labelValueRow('Total Cost', 'PHP ${total.toStringAsFixed(2)}'),
             labelValueRow('Down payment due (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
@@ -13233,10 +13781,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             children: [
               DropdownButtonFormField<String>(
                 value: inquiryType,
-                decoration: const InputDecoration(
-                  labelText: 'Inquiry type',
-                  helperText: 'Same as Online Inquiries — Catering Only vs Catering + Event.',
-                ),
+                decoration: const InputDecoration(labelText: 'Inquiry type'),
                 items: const [
                   DropdownMenuItem(value: 'CATERING', child: Text('CATERING')),
                   DropdownMenuItem(value: 'CATERING AND EVENT', child: Text('CATERING AND EVENT')),
@@ -13246,20 +13791,18 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               const SizedBox(height: 8),
               _buildEventTypePicker(),
               const SizedBox(height: 8),
-              if (inquiryType == 'CATERING AND EVENT') ...[
-                Text('Formality level', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
-                const SizedBox(height: 6),
-                SegmentedButton<String>(
-                  segments: const [
-                    ButtonSegment(value: 'casual', label: Text('Casual')),
-                    ButtonSegment(value: 'semiformal', label: Text('Semiformal')),
-                    ButtonSegment(value: 'formal', label: Text('Formal')),
-                  ],
-                  selected: {formalityLevel},
-                  onSelectionChanged: (s) => setState(() => formalityLevel = s.first),
-                ),
-                const SizedBox(height: 12),
-              ],
+              Text('Formality level', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+              const SizedBox(height: 6),
+              SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(value: 'casual', label: Text('Casual')),
+                  ButtonSegment(value: 'semiformal', label: Text('Semiformal')),
+                  ButtonSegment(value: 'formal', label: Text('Formal')),
+                ],
+                selected: {formalityLevel},
+                onSelectionChanged: (s) => setState(() => formalityLevel = s.first),
+              ),
+              const SizedBox(height: 12),
               const Text('Event setting', style: TextStyle(fontWeight: FontWeight.w600)),
               const SizedBox(height: 6),
               Row(
@@ -13311,7 +13854,13 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 controlAffinity: ListTileControlAffinity.leading,
               ),
               const SizedBox(height: 8),
-              TextField(controller: eventTitle, decoration: const InputDecoration(labelText: 'Event title')),
+              TextField(
+                controller: eventTitle,
+                decoration: const InputDecoration(
+                  labelText: 'Event title',
+                  helperText: 'Required',
+                ),
+              ),
               const SizedBox(height: 8),
               TextField(controller: contactPerson, decoration: const InputDecoration(labelText: 'Contact person')),
               const SizedBox(height: 8),
@@ -13802,11 +14351,40 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   ),
                 ],
               ),
-              ...additionalCosts.map((e) => ListTile(
-                    dense: true,
-                    title: Text('${e['label']}'),
-                    trailing: Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
-                  )),
+              ...additionalCosts.asMap().entries.map((entry) {
+                final idx = entry.key;
+                final e = entry.value;
+                return ListTile(
+                  dense: true,
+                  title: Text('${e['label']}'),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                      IconButton(
+                        tooltip: 'Edit',
+                        onPressed: () async {
+                          final updated = await promptAdditionalCostLineItem(
+                            context,
+                            initialLabel: '${e['label'] ?? ''}'.trim(),
+                            initialAmount: jsonToDouble(e['amount']),
+                          );
+                          if (updated == null || !mounted) return;
+                          setState(() {
+                            additionalCosts[idx] = updated;
+                          });
+                        },
+                        icon: const Icon(Icons.edit_outlined, size: 20),
+                      ),
+                      IconButton(
+                        tooltip: 'Delete',
+                        onPressed: () => setState(() => additionalCosts.removeAt(idx)),
+                        icon: const Icon(Icons.delete_outline, size: 20),
+                      ),
+                    ],
+                  ),
+                );
+              }),
             ],
           ),
         ),
@@ -14122,10 +14700,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                             appSnack(context, 'Full payment confirmation is required before completing this order.');
                                             return;
                                           }
-                                          var addlSum = 0.0;
-                                          for (final e in r.additionalCosts) {
-                                            if (e is Map) addlSum += jsonToDouble(e['amount']);
-                                          }
+                                          final addlSum = cateringCompiledAdditionalCostsTotal(r);
                                           if (addlSum > 0.01 && r.postAnalysis['additional_costs_payment_confirmed'] != true) {
                                             appSnack(
                                               context,
@@ -14157,7 +14732,12 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                           onTap: () {
                             Navigator.of(context).push<void>(
                               MaterialPageRoute<void>(
-                                builder: (_) => ManagerCateringDetailScreen(state: state, row: r, stage: stage),
+                                builder: (_) => ManagerCateringDetailScreen(
+                                  state: state,
+                                  row: r,
+                                  stage: stage,
+                                  processingSubstage: widget.processingSubstageFilter,
+                                ),
                               ),
                             );
                           },
@@ -14173,10 +14753,18 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
 }
 
 class ManagerCateringDetailScreen extends StatefulWidget {
-  const ManagerCateringDetailScreen({super.key, required this.state, required this.row, required this.stage});
+  const ManagerCateringDetailScreen({
+    super.key,
+    required this.state,
+    required this.row,
+    required this.stage,
+    this.processingSubstage,
+  });
   final AppState state;
   final CateringEventRecord row;
   final String stage;
+  /// Tab context for `for_processing` (`down_payment` | `ongoing`).
+  final String? processingSubstage;
   @override
   State<ManagerCateringDetailScreen> createState() => _ManagerCateringDetailScreenState();
 }
@@ -14188,9 +14776,20 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   CateringEventRecord get d => _loadedDetailRow ?? widget.row;
 
+  String get _processingSubstageForUi {
+    if (widget.stage != 'for_processing') return d.processingSubstageLabel;
+    // Prefer persisted order phase (e.g. after moving to On Going in this screen).
+    final fromRow = d.processingSubstageLabel.trim();
+    if (fromRow == 'ongoing' || fromRow == 'down_payment') return fromRow;
+    final tab = widget.processingSubstage?.trim();
+    if (tab == 'ongoing' || tab == 'down_payment') return tab!;
+    return 'down_payment';
+  }
+
   final downPaymentController = TextEditingController();
   final downPaymentPaidController = TextEditingController();
   final fullPaymentController = TextEditingController();
+  final additionalCostsPaidController = TextEditingController();
   final analysisController = TextEditingController();
   final checklistController = TextEditingController();
   final taskAssignmentController = TextEditingController();
@@ -14287,10 +14886,60 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   String _additionalCostsStageLabel() {
     if (widget.stage == 'for_post_analysis') return 'For Full Payment';
-    final sub = d.processingSubstageLabel;
+    final sub = _processingSubstageForUi;
     if (sub == 'ongoing') return 'On Going';
     if (sub == 'down_payment') return 'For Down Payment';
     return '';
+  }
+
+  List<Map<String, dynamic>> _additionalCostsGroupsForOrderSummarySheet() => _additionalCostsGroups
+      .where((g) => _isManagerAdditionalCostsSheetStage('${g['stage'] ?? ''}'))
+      .toList();
+
+  List<Map<String, dynamic>> _flattenAdditionalCostsFromGroupsList(List<Map<String, dynamic>> groups) {
+    final out = <Map<String, dynamic>>[];
+    for (final g in groups) {
+      final items = g['items'];
+      if (items is List) {
+        for (final e in items) {
+          if (e is Map) out.add(Map<String, dynamic>.from(e));
+        }
+      }
+    }
+    return out;
+  }
+
+  List<Map<String, dynamic>> _sheetAdditionalCostsForOrderSummaryPdf() =>
+      _flattenAdditionalCostsFromGroupsList(_additionalCostsGroupsForOrderSummarySheet());
+
+  List<Map<String, dynamic>> _allAdditionalCostsForMainOrderSummaryPdf() {
+    final out = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    void addItem(Map<String, dynamic> e) {
+      final key = '${e['label'] ?? ''}|${jsonToDouble(e['amount']).toStringAsFixed(2)}';
+      if (seen.add(key)) out.add(e);
+    }
+    for (final e in _flattenAdditionalCostsFromGroups()) {
+      addItem(e);
+    }
+    for (final c in d.additionalCosts) {
+      if (c is Map) addItem(Map<String, dynamic>.from(c));
+    }
+    return out;
+  }
+
+  double _compiledPostDraftAdditionalCostsTotal({bool includeWorkingPostStage = false}) {
+    var sum = 0.0;
+    for (final g in _additionalCostsGroupsForOrderSummarySheet()) {
+      final items = (g['items'] is List)
+          ? (g['items'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
+          : <Map<String, dynamic>>[];
+      sum += jsonToDouble(g['total']) > 0 ? jsonToDouble(g['total']) : _sumCostRows(items);
+    }
+    if (includeWorkingPostStage && widget.stage == 'for_post_analysis') {
+      sum += _sumCostRows(additionalCosts);
+    }
+    return sum;
   }
 
   List<Map<String, dynamic>> _flattenAdditionalCostsFromGroups() {
@@ -14309,14 +14958,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     return out;
   }
 
-  bool _hasAdditionalCostsForOrderSummaryPdf() {
-    if (additionalCosts.isNotEmpty) return true;
-    for (final g in _additionalCostsGroups) {
-      final items = g['items'];
-      if (items is List && items.isNotEmpty) return true;
-    }
-    return false;
-  }
+  bool _hasAdditionalCostsForOrderSummaryPdf() => _sheetAdditionalCostsForOrderSummaryPdf().isNotEmpty;
 
   void _snapshotAdditionalCostsForCurrentStage({bool clearWorking = false, bool refreshTimestamp = true}) {
     final label = _additionalCostsStageLabel();
@@ -14366,8 +15008,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (c is Map) items.add(Map<String, dynamic>.from(c));
       }
       if (items.isNotEmpty) {
+        final legacyStage = row.source.trim().toLowerCase().contains('online')
+            ? 'Online Inquiries'
+            : 'New Event';
         _additionalCostsGroups.add({
-          'stage': cateringManagerDetailTabTitle(row, widget.stage),
+          'stage': legacyStage,
           'items': items,
           'total': _sumCostRows(items),
           'processed_at': (row.stageEnteredAt ?? row.updatedAt).toIso8601String(),
@@ -14375,7 +15020,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
     }
     additionalCosts.clear();
-    final stageLabel = cateringManagerDetailTabTitle(row, widget.stage);
+    final stageLabel = cateringManagerDetailTabTitle(row, widget.stage, processingSubstageOverride: widget.processingSubstage);
     for (final g in _additionalCostsGroups) {
       if ('${g['stage'] ?? ''}'.trim() != stageLabel) continue;
       final items = g['items'];
@@ -14648,12 +15293,17 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   double _travelCostComputed() => double.tryParse(travelCostController.text.trim()) ?? 0;
 
+  bool get _includesThemeDesignInTotals => d.orderKind == 'event';
+
+  double _themeDesignCostAmount() =>
+      _includesThemeDesignInTotals ? _sumCostRows(themeDesignCosts) : 0;
+
   double _grandTotalComputed() =>
       _baseFoodCost() +
       _laborCostComputed() +
       _travelCostComputed() +
       _sumCostRows(_flattenAdditionalCostsFromGroups()) +
-      _sumCostRows(themeDesignCosts);
+      _themeDesignCostAmount();
 
   String _additionalCostsSignature(List<Map<String, dynamic>> costs) {
     final normalized = costs.map((e) => {
@@ -14689,7 +15339,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }) async {
     final doc = pw.Document();
     final labelBg = pdf.PdfColor.fromInt(0xFFCFCFCF);
-    final themeCost = _sumCostRows(themeDesignCosts);
+    final themeCost = _themeDesignCostAmount();
     final additionalCostTotal = _sumCostRows(additionalCostsForPdf);
     final processingAt = formatDateTimeLocal(d.stageEnteredAt ?? d.updatedAt);
     final eventWhen = _eventDateTimeJoinedFromRowScheduleSlots(d.scheduleSlots);
@@ -14722,18 +15372,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     if (postAnalysis2Only) {
       final addlPaid = d.postAnalysis['additional_costs_payment_confirmed'] == true;
       final addRows = <pw.Widget>[];
-      final groups = _additionalCostsGroups.isNotEmpty
-          ? _additionalCostsGroups
-          : (additionalCostsForPdf.isEmpty
-              ? <Map<String, dynamic>>[]
-              : [
-                  {
-                    'stage': 'Additional costs',
-                    'items': additionalCostsForPdf,
-                    'total': additionalCostTotal,
-                    'processed_at': DateTime.now().toIso8601String(),
-                  },
-                ]);
+      final groups = _additionalCostsGroupsForOrderSummarySheet();
       for (final group in groups) {
         final items = (group['items'] is List)
             ? (group['items'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
@@ -14758,10 +15397,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (addRows.isEmpty) {
         addRows.add(labelValueRow('Additional costs', '—'));
       }
+      final sheetAdditionalTotal = _sumCostRows(_sheetAdditionalCostsForOrderSummaryPdf());
       addRows.add(
         labelValueRow(
           'Total Cost',
-          'PHP ${(_baseFoodCost() + _laborCostComputed() + _travelCostComputed() + themeCost + additionalCostTotal).toStringAsFixed(2)}',
+          'PHP ${sheetAdditionalTotal.toStringAsFixed(2)}',
         ),
       );
       doc.addPage(
@@ -14872,6 +15512,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           labelValueRow('Date/Time of Event', eventWhen.isEmpty ? '—' : eventWhen),
           labelValueRow('Customer', d.customerName),
           labelValueRow('Contact person', d.contactPerson),
+          labelValueRow('Contact number', d.contactNumber.trim().isEmpty ? '—' : d.contactNumber.trim()),
+          labelValueRow('Email address', d.emailAddress.trim().isEmpty ? '—' : d.emailAddress.trim()),
           labelValueRow('Catering type', cateringType),
           labelValueRow('Address of event', d.address),
           labelValueRow('Menu dishes', menuLines.isEmpty ? '—' : menuLines.join(', ')),
@@ -14884,19 +15526,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               'PAX Buffer and cost',
               '$paxBufferCount x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${paxBufferAmount.toStringAsFixed(2)}',
             ),
-          labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
+          if (_includesThemeDesignInTotals)
+            labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
+          labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCostsForPdf)),
+          labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
           labelValueRow('Labor cost', 'PHP ${laborLine.toStringAsFixed(2)}'),
           labelValueRow('Travel cost', 'PHP ${travelLine.toStringAsFixed(2)}'),
-          if (additionalCostsForPdf.isNotEmpty) ...[
-            labelValueRow(
-              'Additional costs',
-              additionalCostsForPdf
-                  .map((e) => '${e['label'] ?? ''}'.trim())
-                  .where((x) => x.isNotEmpty)
-                  .join(' · '),
-            ),
-            labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
-          ],
           ...tailRows,
           if (variant == _ManagerOrderSummaryPdfVariant.fullyPaid)
             pw.Padding(
@@ -14928,11 +15563,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     try {
       final List<Map<String, dynamic>> pdfCosts;
       if (postAnalysis2Only) {
-        pdfCosts = _flattenAdditionalCostsFromGroups();
-      } else if (variant == _ManagerOrderSummaryPdfVariant.fullyPaid && _orderSummaryPdf1AdditionalCosts.isNotEmpty) {
-        pdfCosts = _orderSummaryPdf1AdditionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
+        pdfCosts = _sheetAdditionalCostsForOrderSummaryPdf();
       } else {
-        pdfCosts = _flattenAdditionalCostsFromGroups();
+        pdfCosts = _allAdditionalCostsForMainOrderSummaryPdf();
       }
       final bytes = await _buildOrderSummaryPdfBytes(
         additionalCostsForPdf: pdfCosts,
@@ -14948,7 +15581,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   Future<void> _sendOrderSummaryPdfToCustomer() async {
     final r = _loadedDetailRow ?? widget.row;
     final isProcessing = widget.stage == 'for_processing';
-    final sub = r.processingSubstageLabel.trim().toLowerCase();
+    final sub = _processingSubstageForUi.trim().toLowerCase();
     final isOngoingSubstage = isProcessing && sub == 'ongoing';
     final isDownPaymentSubstage = isProcessing && sub == 'down_payment';
     final isPost = widget.stage == 'for_post_analysis';
@@ -15052,7 +15685,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   void _refreshDueAndDefaults() {
     final total = widget.stage == 'for_processing'
-        ? _baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts)
+        ? _baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(additionalCosts)
         : _grandTotalComputed();
     downPaymentController.text = (total * 0.5).toStringAsFixed(2);
     if (fullPaymentController.text.trim().isEmpty || jsonToDouble(fullPaymentController.text) <= 0) {
@@ -15126,13 +15759,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
     }
     managerServiceIncluded = '${tdInit['service_included'] ?? row.serviceIncluded ?? 'no'}' == 'yes' ? 'yes' : 'no';
-    if (row.orderKind == 'event') {
-      managerFormalityLevel =
-          row.formalityLevel.trim().isEmpty ? '${tdInit['formality_level'] ?? 'casual'}'.trim() : row.formalityLevel.trim();
-      if (!{'casual', 'semiformal', 'formal'}.contains(managerFormalityLevel)) managerFormalityLevel = 'casual';
-    } else {
-      managerFormalityLevel = 'casual';
-    }
+    managerFormalityLevel =
+        row.formalityLevel.trim().isEmpty ? '${tdInit['formality_level'] ?? 'casual'}'.trim() : row.formalityLevel.trim();
+    if (!{'casual', 'semiformal', 'formal'}.contains(managerFormalityLevel)) managerFormalityLevel = 'casual';
     managerDraftEventTitleController.text =
         row.eventTitle.trim().isNotEmpty ? row.eventTitle.trim() : '${tdInit['event_title'] ?? ''}'.trim();
     managerCustomerNameController.text = row.customerName.trim();
@@ -15182,16 +15811,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         laborManualCosts.add({'label': label, 'amount': amount});
       }
     }
-    final maleN = int.tryParse(laborMaleController.text.trim()) ?? 0;
-    final femaleN = int.tryParse(laborFemaleController.text.trim()) ?? 0;
-    final structuredLabor = (maleN < 0 ? 0 : maleN * 1000) + (femaleN < 0 ? 0 : femaleN * 500);
-    final manualSum = _sumCostRows(laborManualCosts);
-    if (row.laborCost > structuredLabor + manualSum + 0.25) {
-      laborManualCosts.add({
-        'label': 'Recorded labor (balance)',
-        'amount': row.laborCost - structuredLabor - manualSum,
-      });
-    }
+    laborManualCosts.removeWhere((e) {
+      final label = '${e['label'] ?? ''}'.trim();
+      return label == 'Recorded labor (balance)' || label == 'Existing labor amount';
+    });
     _loadAdditionalCostsGroupsFromRow(row);
     final pdf1Saved = row.postAnalysis['order_summary_pdf1_additional_costs'];
     if (pdf1Saved is List) {
@@ -15292,6 +15915,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     _managerDownPaymentMethod = normPm('${row.postAnalysis['manager_down_payment_method'] ?? 'Cash'}');
     _managerFullPaymentMethod = normPm('${row.postAnalysis['manager_full_payment_method'] ?? 'Cash'}');
+    additionalCostsPaidController.text =
+        _compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true).toStringAsFixed(2);
     if (widget.stage == 'for_post_analysis') {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!mounted) return;
@@ -15399,6 +16024,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     downPaymentController.dispose();
     downPaymentPaidController.dispose();
     fullPaymentController.dispose();
+    additionalCostsPaidController.dispose();
     analysisController.dispose();
     checklistController.dispose();
     taskAssignmentController.dispose();
@@ -15428,6 +16054,109 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     managerGuestCountController.dispose();
     managerInquiryNoteController.dispose();
     super.dispose();
+  }
+
+  Widget _laborCostCard({required bool allowLaborEdits}) {
+    return Card(
+      color: Colors.orange.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text('Labor Cost', style: TextStyle(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: laborMaleController,
+                    keyboardType: TextInputType.number,
+                    readOnly: !allowLaborEdits,
+                    decoration: const InputDecoration(labelText: 'Male workers (₱1000 each)'),
+                    onChanged: (_) => setState(_refreshDueAndDefaults),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    controller: laborFemaleController,
+                    keyboardType: TextInputType.number,
+                    readOnly: !allowLaborEdits,
+                    decoration: const InputDecoration(labelText: 'Female workers (₱500 each)'),
+                    onChanged: (_) => setState(_refreshDueAndDefaults),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: laborManualLabelController,
+                    readOnly: !allowLaborEdits,
+                    decoration: const InputDecoration(labelText: 'Labor item'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 110,
+                  child: TextField(
+                    controller: laborManualAmountController,
+                    keyboardType: TextInputType.number,
+                    readOnly: !allowLaborEdits,
+                    decoration: const InputDecoration(labelText: 'Amount'),
+                  ),
+                ),
+                IconButton(
+                  onPressed: !allowLaborEdits
+                      ? null
+                      : () {
+                          final l = laborManualLabelController.text.trim();
+                          final a = double.tryParse(laborManualAmountController.text.trim());
+                          if (l.isEmpty || a == null) return;
+                          setState(() {
+                            laborManualCosts.add({'label': l, 'amount': a});
+                            laborManualLabelController.clear();
+                            laborManualAmountController.clear();
+                            _refreshDueAndDefaults();
+                          });
+                        },
+                  icon: const Icon(Icons.add),
+                ),
+              ],
+            ),
+            ...laborManualCosts.asMap().entries.map((entry) {
+              final idx = entry.key;
+              final e = entry.value;
+              final label = '${e['label'] ?? ''}'.trim();
+              return ListTile(
+                dense: true,
+                title: Text(label.isEmpty ? 'Labor item' : label),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                    IconButton(
+                      onPressed: !allowLaborEdits
+                          ? null
+                          : () => setState(() {
+                                laborManualCosts.removeAt(idx);
+                                _refreshDueAndDefaults();
+                              }),
+                      icon: const Icon(Icons.delete_outline),
+                    ),
+                  ],
+                ),
+              );
+            }),
+            const SizedBox(height: 8),
+            Text('Computed labor cost: ₱${_laborCostComputed().toStringAsFixed(2)}'),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _additionalCostsCard({required bool draft, required bool processing, required bool post}) {
@@ -15491,6 +16220,28 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     children: [
                       Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
                       IconButton(
+                        tooltip: 'Edit',
+                        onPressed: !allowEdits
+                            ? null
+                            : () async {
+                                final updated = await promptAdditionalCostLineItem(
+                                  context,
+                                  initialLabel: '${e['label'] ?? ''}'.trim(),
+                                  initialAmount: jsonToDouble(e['amount']),
+                                );
+                                if (updated == null || !mounted) return;
+                                setState(() {
+                                  additionalCosts[idx] = updated;
+                                  _refreshDueAndDefaults();
+                                });
+                                if (post) {
+                                  _maybeGeneratePostAnalysisPdf2IfNeeded();
+                                }
+                              },
+                        icon: const Icon(Icons.edit_outlined),
+                      ),
+                      IconButton(
+                        tooltip: 'Delete',
                         onPressed: !allowEdits
                             ? null
                             : () => setState(() {
@@ -15507,7 +16258,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 );
               },
             ),
-            if (post && _sumCostRows(additionalCosts) > 0.01) ...[
+            if (post && _compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true) > 0.01) ...[
               const SizedBox(height: 12),
               Container(
                 width: double.infinity,
@@ -15524,10 +16275,26 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       'Additional Costs Payment',
                       style: TextStyle(fontWeight: FontWeight.w800, color: Colors.red.shade900),
                     ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'One combined payment for all additional costs entered in For Down Payment, On Going, and For Full Payment.',
+                      style: TextStyle(fontSize: 12, height: 1.35, color: Colors.red.shade900),
+                    ),
                     const SizedBox(height: 8),
                     Text(
-                      'PHP ${_sumCostRows(additionalCosts).toStringAsFixed(2)}',
-                      style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18, color: Colors.red.shade900),
+                      'Amount due: PHP ${_compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true).toStringAsFixed(2)}',
+                      style: TextStyle(fontWeight: FontWeight.w700, color: Colors.red.shade900),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: additionalCostsPaidController,
+                      keyboardType: TextInputType.number,
+                      readOnly: !widget.state.isManager ||
+                          (d.postAnalysis['additional_costs_payment_confirmed'] == true),
+                      decoration: const InputDecoration(
+                        labelText: 'Additional costs paid',
+                        prefixText: 'PHP ',
+                      ),
                     ),
                     const SizedBox(height: 8),
                     const Text('Proof of additional costs payment', style: TextStyle(fontWeight: FontWeight.w700)),
@@ -15589,12 +16356,25 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               _managerAdditionalCostsProofBytes == null
                           ? null
                           : () async {
+                              _snapshotAdditionalCostsForCurrentStage(clearWorking: false, refreshTimestamp: true);
+                              final addlDue =
+                                  _compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true);
+                              final addlPaid =
+                                  double.tryParse(additionalCostsPaidController.text.trim()) ?? addlDue;
+                              if (!await confirmManagerPaymentAmountMismatch(
+                                context,
+                                paymentLabel: 'Additional costs payment',
+                                amountEntered: addlPaid,
+                                amountDue: addlDue,
+                              )) {
+                                return;
+                              }
                               final ok = await showDialog<bool>(
                                 context: context,
                                 builder: (dlgCtx) => AlertDialog(
                                   title: const Text('Confirm additional costs payment'),
                                   content: Text(
-                                    'Confirm payment of PHP ${_sumCostRows(additionalCosts).toStringAsFixed(2)} for additional costs?',
+                                    'Confirm payment of PHP ${addlPaid.toStringAsFixed(2)} for all compiled additional costs (due: PHP ${addlDue.toStringAsFixed(2)})?',
                                   ),
                                   actions: [
                                     TextButton(
@@ -15616,6 +16396,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                   'additional_costs_payment_confirmed': true,
                                   'manager_additional_costs_proof_b64':
                                       base64Encode(_managerAdditionalCostsProofBytes!),
+                                  'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
                                 },
                               );
                               if (!mounted) return;
@@ -15672,7 +16453,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
     final row = d;
     final isProcessing = widget.stage == 'for_processing';
-    final processingSubstage = row.processingSubstageLabel;
+    final processingSubstage = _processingSubstageForUi;
     final isDownPaymentSubstage = isProcessing && processingSubstage == 'down_payment';
     final isOngoingSubstage = isProcessing && processingSubstage == 'ongoing';
     final isPost = widget.stage == 'for_post_analysis';
@@ -15688,7 +16469,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final canComplete = widget.state.isManager;
     final totalComputed = _grandTotalComputed();
     final displayInvoiceTotal = isProcessing
-        ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(_flattenAdditionalCostsFromGroups()))
+        ? (_baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(_flattenAdditionalCostsFromGroups()))
         : totalComputed;
     final scheduleConflictsForProcessing = _conflictCountWithForProcessing();
     final downPaymentDue = displayInvoiceTotal * 0.5;
@@ -15699,6 +16480,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final hasDownPaymentProofImage = _managerDownPaymentProofBytes != null ||
         ('${row.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim().isNotEmpty);
     final laborCostComputed = _laborCostComputed();
+    final loyaltyOrderTotal = isCompleted && row.totalCost > 0 ? row.totalCost : totalComputed;
+    final loyaltyPointsAtCurrentTotal = cateringLoyaltyPointsForOrderTotal(loyaltyOrderTotal);
+    final showCateringLoyaltySection = isCompleted || isPost || isProcessing;
     final rowMenu = normalizeCateringMenuList(row.menu);
     String? _validateDraftScheduleCoherence() {
       if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
@@ -15732,8 +16516,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (managerCustomerNameController.text.trim().isEmpty) {
         return 'Enter the customer name.';
       }
-      if (kind == 'event' && managerDraftEventTitleController.text.trim().isEmpty) {
-        return 'Enter an event title for Catering + Event.';
+      if (widget.stage == 'new_event' && managerDraftEventTitleController.text.trim().isEmpty) {
+        return 'Enter event title.';
+      }
+      if (widget.stage == 'new_event' && travelCostController.text.trim().isEmpty) {
+        return 'Enter travel cost.';
       }
       if (!isAllowedCateringAddressInCoverage(managerAddressController.text.trim())) {
         return cateringCoverageErrorText();
@@ -15750,11 +16537,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     Future<bool> saveCurrentStage({bool showConfirmDialog = true, bool popAfterSuccess = true}) async {
       final isProcessingHere = widget.stage == 'for_processing';
-      final laborCostComputedNow = isProcessingHere ? 0.0 : _laborCostComputed();
-      final travelNow = isProcessingHere ? 0.0 : _travelCostComputed();
+      final laborCostComputedNow = _laborCostComputed();
+      final travelNow = _travelCostComputed();
       final flatAdditionalSave = _flattenAdditionalCostsFromGroups();
       final totalNow = isProcessingHere
-          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(flatAdditionalSave))
+          ? (_baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(flatAdditionalSave))
           : _grandTotalComputed();
       final et =
           managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
@@ -15825,7 +16612,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           if (rowBase.postAnalysis['additional_costs_payment_confirmed'] == true)
             'additional_costs_payment_confirmed': true,
           if (isOnlineInquiry || widget.stage == 'new_event') 'event_type': et,
-          if (isProcessingHere) 'manager_down_payment_method': _managerDownPaymentMethod,
+          if (isProcessingHere) ...{
+            'manager_down_payment_method': _managerDownPaymentMethod,
+            'processing_phase': _processingSubstageForUi,
+          },
           if (widget.stage == 'for_post_analysis') 'manager_full_payment_method': _managerFullPaymentMethod,
         };
         if (_managerDownPaymentProofBytes != null) {
@@ -15842,12 +16632,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           'event_title': managerDraftEventTitleController.text.trim(),
           'event_type': et,
           'event_setting': managerEventSetting,
-          'formality_level': rowBase.orderKind == 'event' ? managerFormalityLevel : '',
+          'formality_level': (isDraftStageHere && widget.stage == 'new_event') || rowBase.orderKind == 'event'
+              ? managerFormalityLevel
+              : '',
         };
 
         if (isDraftStageHere) {
           final gc = int.tryParse(managerGuestCountController.text.trim());
-          final formalityOut = _draftOrderKind == 'event' ? managerFormalityLevel : '';
+          final formalityOut =
+              widget.stage == 'new_event' || _draftOrderKind == 'event' ? managerFormalityLevel : '';
           final err = await widget.state.managerSaveCateringDraft(
             id: rowBase.id,
             orderKind: rowBase.orderKind,
@@ -15873,7 +16666,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 {'label': 'Base food cost', 'amount': _baseFoodCost()},
                 {'label': 'Labor cost', 'amount': laborCostComputedNow},
                 {'label': 'Travel cost', 'amount': travelNow},
-                {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+                if (_includesThemeDesignInTotals)
+                  {'label': 'Theme design cost', 'amount': _themeDesignCostAmount()},
                 {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
               ],
               if (gc != null && gc >= 0) 'guest_count': gc,
@@ -15917,7 +16711,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             {'label': 'Base food cost', 'amount': _baseFoodCost()},
             {'label': 'Labor cost', 'amount': laborCostComputedNow},
             {'label': 'Travel cost', 'amount': travelNow},
-            {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+            if (_includesThemeDesignInTotals)
+              {'label': 'Theme design cost', 'amount': _themeDesignCostAmount()},
             {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
           ],
           themeDesign: themeDesign,
@@ -15929,6 +16724,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           return false;
         }
         appSnack(context, 'Changes saved');
+        final refreshed = await widget.state.loadManagerCateringItem(
+          id: rowBase.id,
+          orderKind: rowBase.orderKind,
+        );
+        if (refreshed != null && mounted) {
+          setState(() => _loadedDetailRow = refreshed);
+        }
         await widget.state.loadManagerCateringByStage(widget.stage, force: true);
         _pristineManagerDetailSig = _computeManagerDetailSignature();
         if (popAfterSuccess && mounted) {
@@ -16080,14 +16882,16 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           padding: const EdgeInsets.all(10),
                           child: Column(
                             children: [
-                              TextField(
-                                controller: TextEditingController(text: '${r['item'] ?? ''}'),
+                              TextFormField(
+                                key: ValueKey('checklist_item_$i'),
+                                initialValue: '${r['item'] ?? ''}',
                                 decoration: const InputDecoration(labelText: 'Item'),
                                 onChanged: (v) => r['item'] = v,
                               ),
                               const SizedBox(height: 6),
-                              TextField(
-                                controller: TextEditingController(text: '${r['description'] ?? ''}'),
+                              TextFormField(
+                                key: ValueKey('checklist_desc_$i'),
+                                initialValue: '${r['description'] ?? ''}',
                                 decoration: const InputDecoration(labelText: 'Description'),
                                 onChanged: (v) => r['description'] = v,
                               ),
@@ -16095,16 +16899,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               Row(
                                 children: [
                                   Expanded(
-                                    child: TextField(
-                                      controller: TextEditingController(text: '${r['quantity'] ?? ''}'),
+                                    child: TextFormField(
+                                      key: ValueKey('checklist_qty_$i'),
+                                      initialValue: '${r['quantity'] ?? ''}',
                                       decoration: const InputDecoration(labelText: 'Quantity'),
                                       onChanged: (v) => r['quantity'] = v,
                                     ),
                                   ),
                                   const SizedBox(width: 8),
                                   Expanded(
-                                    child: TextField(
-                                      controller: TextEditingController(text: '${r['cost'] ?? ''}'),
+                                    child: TextFormField(
+                                      key: ValueKey('checklist_cost_$i'),
+                                      initialValue: '${r['cost'] ?? ''}',
                                       decoration: const InputDecoration(labelText: 'Cost'),
                                       onChanged: (v) => r['cost'] = v,
                                     ),
@@ -16118,7 +16924,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                   DropdownMenuItem(value: 'not done', child: Text('not done')),
                                   DropdownMenuItem(value: 'completed', child: Text('completed')),
                                 ],
-                                onChanged: (v) => r['status'] = v ?? 'not done',
+                                onChanged: (v) => setDialogState(() => r['status'] = v ?? 'not done'),
                               ),
                               Align(
                                 alignment: Alignment.centerRight,
@@ -16163,6 +16969,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ..addAll(draft.map((e) => Map<String, dynamic>.from(e)));
         });
         await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+        if (mounted) appSnack(context, 'Checklist saved');
       }
     }
     Future<void> _openTaskEditor() async {
@@ -16186,52 +16993,51 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           padding: const EdgeInsets.all(10),
                           child: Column(
                             children: [
-                              TextField(
-                                controller: TextEditingController(text: '${r['employee'] ?? ''}'),
+                              TextFormField(
+                                key: ValueKey('task_emp_$i'),
+                                initialValue: '${r['employee'] ?? ''}',
                                 decoration: const InputDecoration(labelText: 'Employee'),
                                 onChanged: (v) => r['employee'] = v,
                               ),
                               const SizedBox(height: 6),
-                              TextField(
-                                controller: TextEditingController(text: '${r['tasks'] ?? ''}'),
+                              TextFormField(
+                                key: ValueKey('task_tasks_$i'),
+                                initialValue: '${r['tasks'] ?? ''}',
                                 decoration: const InputDecoration(labelText: 'Task'),
                                 onChanged: (v) => r['tasks'] = v,
                               ),
                               const SizedBox(height: 6),
-                              Builder(
-                                builder: (context) {
-                                  final scheduleCtrl = TextEditingController(text: '${r['schedule_of_tasks'] ?? ''}');
-                                  return TextField(
-                                    controller: scheduleCtrl,
-                                    readOnly: true,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Schedule of Task',
-                                      suffixIcon: Icon(Icons.calendar_month_outlined),
-                                    ),
-                                    onTap: () async {
-                                      DateTime initial = DateTime.now();
-                                      final existing = '${r['schedule_of_tasks'] ?? ''}'.trim();
-                                      final parsed = DateTime.tryParse(existing);
-                                      if (parsed != null) initial = parsed;
-                                      final d = await showDatePicker(
-                                        context: context,
-                                        initialDate: initial,
-                                        firstDate: DateTime(2020, 1, 1),
-                                        lastDate: DateTime(2100, 12, 31),
-                                      );
-                                      if (d == null) return;
-                                      final dateText =
-                                          '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
-                                      setDialogState(() {
-                                        r['schedule_of_tasks'] = dateText;
-                                      });
-                                    },
+                              TextFormField(
+                                key: ValueKey('task_sched_${i}_${r['schedule_of_tasks'] ?? ''}'),
+                                initialValue: '${r['schedule_of_tasks'] ?? ''}',
+                                readOnly: true,
+                                decoration: const InputDecoration(
+                                  labelText: 'Schedule of Task',
+                                  suffixIcon: Icon(Icons.calendar_month_outlined),
+                                ),
+                                onTap: () async {
+                                  DateTime initial = DateTime.now();
+                                  final existing = '${r['schedule_of_tasks'] ?? ''}'.trim();
+                                  final parsed = DateTime.tryParse(existing);
+                                  if (parsed != null) initial = parsed;
+                                  final picked = await showDatePicker(
+                                    context: context,
+                                    initialDate: initial,
+                                    firstDate: DateTime(2020, 1, 1),
+                                    lastDate: DateTime(2100, 12, 31),
                                   );
+                                  if (picked == null) return;
+                                  final dateText =
+                                      '${picked.year.toString().padLeft(4, '0')}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+                                  setDialogState(() {
+                                    r['schedule_of_tasks'] = dateText;
+                                  });
                                 },
                               ),
                               const SizedBox(height: 6),
-                              TextField(
-                                controller: TextEditingController(text: '${r['budget'] ?? ''}'),
+                              TextFormField(
+                                key: ValueKey('task_budget_$i'),
+                                initialValue: '${r['budget'] ?? ''}',
                                 decoration: const InputDecoration(labelText: 'Budget'),
                                 onChanged: (v) => r['budget'] = v,
                               ),
@@ -16242,7 +17048,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                   DropdownMenuItem(value: 'not done', child: Text('not done')),
                                   DropdownMenuItem(value: 'completed', child: Text('completed')),
                                 ],
-                                onChanged: (v) => r['status'] = v ?? 'not done',
+                                onChanged: (v) => setDialogState(() => r['status'] = v ?? 'not done'),
                               ),
                               Align(
                                 alignment: Alignment.centerRight,
@@ -16293,13 +17099,77 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ..addAll(draft.map((e) => Map<String, dynamic>.from(e)));
         });
         await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+        if (mounted) appSnack(context, 'Task assignment saved');
       }
     }
 
+    List<Widget> checklistAndTaskToolsSection({required bool allowEditors}) {
+      return [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Checklist', style: TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 8),
+                Text(
+                  allowEditors
+                      ? 'Update the checklist, save, then generate the PDF. Saved rows appear in the PDF.'
+                      : isPost
+                          ? 'Checklist from On Going. Generate a PDF export here.'
+                          : 'PDF generation is available for this record.',
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    if (allowEditors)
+                      OutlinedButton(onPressed: _openChecklistEditor, child: const Text('Checklist Editor')),
+                    OutlinedButton(onPressed: _generateChecklistPdf, child: const Text('Generate Checklist PDF')),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Task Assignment', style: TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 8),
+                Text(
+                  allowEditors
+                      ? 'Update task assignments, save, then generate the PDF. Saved rows appear in the PDF.'
+                      : isPost
+                          ? 'Task assignment from On Going. Generate a PDF export here.'
+                          : 'PDF generation is available for this record.',
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    if (allowEditors)
+                      OutlinedButton(onPressed: _openTaskEditor, child: const Text('Task Assignment Editor')),
+                    OutlinedButton(onPressed: _generateTaskPdf, child: const Text('Generate Task Assignment PDF')),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ];
+    }
+
     Future<void> submitNext() async {
-      final processingSubstageEarly = d.processingSubstageLabel;
+      final processingSubstageEarly = _processingSubstageForUi;
       if (widget.stage == 'for_processing' && processingSubstageEarly == 'down_payment') {
-        final invoiceEarly = _baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(additionalCosts);
+        final invoiceEarly = _baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(additionalCosts);
         final dueHalfEarly = invoiceEarly * 0.5;
         if (!cateringDownPaymentConfirmed(d, dueHalfEarly)) {
           appSnack(context, 'Confirm down payment with proof before continuing to On Going.');
@@ -16418,7 +17288,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           'event_type': managerEventTypeChoice == 'Other'
               ? managerEventTypeOtherController.text.trim()
               : managerEventTypeChoice,
-        if (isProcessing) 'manager_down_payment_method': _managerDownPaymentMethod,
+        if (isProcessing) ...{
+          'manager_down_payment_method': _managerDownPaymentMethod,
+          'processing_phase': _processingSubstageForUi,
+        },
         if (isPost) 'manager_full_payment_method': _managerFullPaymentMethod,
       };
       if (_managerDownPaymentProofBytes != null) {
@@ -16427,10 +17300,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (_managerFullPaymentProofBytes != null) {
         postAnalysis['manager_full_payment_proof_b64'] = base64Encode(_managerFullPaymentProofBytes!);
       }
-      final laborForSubmit = isProcessing ? 0.0 : laborCostComputed;
-      final travelForSubmit = isProcessing ? 0.0 : _travelCostComputed();
+      final laborForSubmit = laborCostComputed;
+      final travelForSubmit = _travelCostComputed();
       final invoiceTotalSubmit = isProcessing
-          ? (_baseFoodCost() + _sumCostRows(themeDesignCosts) + _sumCostRows(flatAdditionalSubmit))
+          ? (_baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(flatAdditionalSubmit))
           : totalComputed;
       final themeDesign = <String, dynamic>{
         ...rowSubmit.themeDesign,
@@ -16441,13 +17314,16 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         'event_type':
             managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice,
         'event_setting': managerEventSetting,
-        'formality_level': rowSubmit.orderKind == 'event' ? managerFormalityLevel : '',
+        'formality_level': widget.stage == 'new_event' || rowSubmit.orderKind == 'event'
+            ? managerFormalityLevel
+            : '',
       };
       final costBreakdown = <Map<String, dynamic>>[
         {'label': 'Base food cost', 'amount': _baseFoodCost()},
         {'label': 'Labor cost', 'amount': laborForSubmit},
         {'label': 'Travel cost', 'amount': travelForSubmit},
-        {'label': 'Theme design cost', 'amount': _sumCostRows(themeDesignCosts)},
+        if (_includesThemeDesignInTotals)
+          {'label': 'Theme design cost', 'amount': _themeDesignCostAmount()},
         {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSubmit)},
       ];
       final advancingToFullPayment =
@@ -16486,9 +17362,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           appSnack(context, 'Full payment confirmation is required before completing this order.');
           return;
         }
-        final addlTotal = _sumCostRows(flatAdditionalSubmit);
+        final addlTotal = cateringCompiledAdditionalCostsTotal(rowSubmit);
         if (addlTotal > 0.01 && rowSubmit.postAnalysis['additional_costs_payment_confirmed'] != true) {
-          appSnack(context, 'Confirm additional costs payment before completing this order.');
+          appSnack(context, 'Confirm compiled additional costs payment before completing this order.');
           return;
         }
       }
@@ -16578,9 +17454,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         leading: _buildManagerHamburgerLeading(context, widget.state),
         title: Text(
           row.transactionNo.trim().isNotEmpty
-              ? '${cateringManagerDetailTabTitle(row, widget.stage)} — ${row.transactionNo.trim()}'
+              ? '${cateringManagerDetailTabTitle(row, widget.stage, processingSubstageOverride: widget.processingSubstage)} — ${row.transactionNo.trim()}'
               : (row.eventTitle.isEmpty ? row.customerName : row.eventTitle),
-          style: const TextStyle(fontWeight: FontWeight.w800),
+          style: kManagerAppBarTitleStyle,
         ),
         centerTitle: true,
       ),
@@ -16595,26 +17471,42 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             child: ListView(
               padding: const EdgeInsets.all(12),
               children: [
-          if (row.cateringLoyaltyPointsEarned > 0)
+          if (showCateringLoyaltySection)
             Card(
-              color: Colors.amber.shade50,
+              color: isCompleted && row.cateringLoyaltyPointsEarned > 0
+                  ? Colors.amber.shade50
+                  : (loyaltyPointsAtCurrentTotal > 0 ? Colors.blue.shade50 : null),
               child: ListTile(
-                leading: const Icon(Icons.card_giftcard_outlined),
+                leading: Icon(
+                  isCompleted && row.cateringLoyaltyPointsEarned > 0
+                      ? Icons.card_giftcard_outlined
+                      : Icons.stars_outlined,
+                  color: isCompleted && row.cateringLoyaltyPointsEarned > 0
+                      ? null
+                      : Colors.blue.shade700,
+                ),
                 title: Text(
-                  'Catering loyalty: +${row.cateringLoyaltyPointsEarned} pts (this order)',
+                  isCompleted && row.cateringLoyaltyPointsEarned > 0
+                      ? 'Catering loyalty: +${row.cateringLoyaltyPointsEarned} pts (this order)'
+                      : isCompleted
+                          ? 'Catering loyalty'
+                          : 'Catering loyalty (current order total)',
                   style: const TextStyle(fontWeight: FontWeight.w700),
                 ),
-              ),
-            )
-          else if (row.cateringLoyaltyEligiblePointsIfCompleted > 0 && !isCompleted)
-            Card(
-              child: ListTile(
-                leading: Icon(Icons.stars_outlined, color: Colors.blue.shade700),
-                title: const Text('Catering loyalty (if completed at this total)'),
                 subtitle: Text(
-                  '+${row.cateringLoyaltyEligiblePointsIfCompleted} pts — minimum order ₱${kCateringLoyaltyMinOrderTotal.toStringAsFixed(0)}',
+                  isCompleted && row.cateringLoyaltyPointsEarned > 0
+                      ? 'Points awarded when this order was completed.'
+                      : loyaltyPointsAtCurrentTotal > 0
+                          ? '+$loyaltyPointsAtCurrentTotal pts if completed at ₱${loyaltyOrderTotal.toStringAsFixed(2)} '
+                              '(₱${kCateringLoyaltyMinOrderTotal.toStringAsFixed(0)} = $kCateringLoyaltyPointsAward pts; updates as costs change)'
+                          : 'Current total ₱${loyaltyOrderTotal.toStringAsFixed(2)} is below '
+                              '₱${kCateringLoyaltyMinOrderTotal.toStringAsFixed(0)} for catering loyalty points.',
                 ),
               ),
+            ),
+          if (isOngoingSubstage || isPost || isCompleted)
+            ...checklistAndTaskToolsSection(
+              allowEditors: isOngoingSubstage && canEditStage && widget.state.isManager,
             ),
           if (isDownPaymentSubstage)
             Card(
@@ -16731,11 +17623,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           ? null
                           : () async {
                               final paid = double.tryParse(downPaymentPaidController.text.trim()) ?? 0;
-                              if (paid < downPaymentDue * 0.99) {
-                                appSnack(
-                                  context,
-                                  'Down payment received must be at least 50% of the invoice (PHP ${downPaymentDue.toStringAsFixed(2)}).',
-                                );
+                              if (!await confirmManagerPaymentAmountMismatch(
+                                context,
+                                paymentLabel: 'Down payment',
+                                amountEntered: paid,
+                                amountDue: downPaymentDue,
+                              )) {
                                 return;
                               }
                               final ok = await showDialog<bool>(
@@ -16805,7 +17698,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (isDownPaymentSubstage || isOngoingSubstage) _additionalCostsCard(draft: false, processing: true, post: false),
           if (isPost)
             Card(
               color: Colors.green.shade50,
@@ -16865,7 +17757,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     TextField(
                       controller: fullPaymentController,
                       keyboardType: TextInputType.number,
-                      readOnly: true,
+                      readOnly: !isPost || isFullPaymentConfirmed,
                       decoration: InputDecoration(
                         labelText: 'Full payment paid',
                         suffixIcon: _paymentProofSuffixIcon(
@@ -16954,19 +17846,28 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               !hasFullPaymentProofImage)
                           ? null
                           : () async {
-                              if (_sumCostRows(additionalCosts) > 0.01 &&
+                              if (_compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true) > 0.01 &&
                                   row.postAnalysis['additional_costs_payment_confirmed'] != true) {
-                                appSnack(context, 'Confirm additional costs payment (with proof) first.');
+                                appSnack(context, 'Confirm compiled additional costs payment (with proof) first.');
                                 return;
                               }
                               final balanceDue =
                                   totalComputed - (double.tryParse(downPaymentPaidController.text.trim()) ?? 0);
+                              final fullPaid = double.tryParse(fullPaymentController.text.trim()) ?? balanceDue;
+                              if (!await confirmManagerPaymentAmountMismatch(
+                                context,
+                                paymentLabel: 'Full payment',
+                                amountEntered: fullPaid,
+                                amountDue: balanceDue,
+                              )) {
+                                return;
+                              }
                               final ok = await showDialog<bool>(
                                 context: context,
                                 builder: (dlgCtx) => AlertDialog(
                                   title: const Text('Confirm full payment'),
                                   content: Text(
-                                    'Confirm that full payment of PHP ${balanceDue.toStringAsFixed(2)} has been received?',
+                                    'Confirm that full payment of PHP ${fullPaid.toStringAsFixed(2)} has been received (balance due: PHP ${balanceDue.toStringAsFixed(2)})?',
                                   ),
                                   actions: [
                                     TextButton(onPressed: () => Navigator.pop(dlgCtx, false), child: const Text('Cancel')),
@@ -17049,11 +17950,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         ),
                       ),
                     ),
-                    if (_sumCostRows(_flattenAdditionalCostsFromGroups()) > 0.01) ...[
+                    if (_compiledPostDraftAdditionalCostsTotal() > 0.01) ...[
                       const SizedBox(height: 8),
-                      TextFormField(
+                      TextField(
                         readOnly: true,
-                        initialValue: _sumCostRows(_flattenAdditionalCostsFromGroups()).toStringAsFixed(2),
+                        controller: additionalCostsPaidController,
                         decoration: InputDecoration(
                           labelText: 'Additional costs paid',
                           prefixText: 'PHP ',
@@ -17173,7 +18074,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               Text(
                                 isCompleted
                                     ? 'These summaries reflect saved amounts and costs for this completed order.'
-                                    : 'Previews use current costing on this screen. The Additional Costs sheet lists each stage where extra costs were entered.',
+                                    : 'Previews use current costing on this screen. The Additional Costs sheet lists only costs from For Down Payment, On Going, and For Full Payment (not draft inquiries).',
                                 style: TextStyle(
                                   fontSize: 12,
                                   height: 1.35,
@@ -17189,66 +18090,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (isOngoingSubstage || isPost || isCompleted) ...[
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Text('Checklist', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 8),
-                    Text(
-                      isOngoingSubstage
-                          ? 'Open the checklist editor to update items, or generate a PDF.'
-                          : isPost
-                              ? 'Checklist reflects what was saved in On Going. Export a PDF from here.'
-                              : 'PDF generation is available in this stage. Editing is disabled.',
-                    ),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        if (isOngoingSubstage)
-                          OutlinedButton(onPressed: _openChecklistEditor, child: const Text('Checklist Editor')),
-                        OutlinedButton(onPressed: _generateChecklistPdf, child: const Text('Generate Checklist PDF')),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Text('Task Assignment', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 8),
-                    Text(
-                      isOngoingSubstage
-                          ? 'Open the task assignment editor to assign staff and schedules, or generate a PDF.'
-                          : isPost
-                              ? 'Task assignment reflects what was saved in On Going. Export a PDF from here.'
-                              : 'PDF generation is available in this stage. Editing is disabled.',
-                    ),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        if (isOngoingSubstage)
-                          OutlinedButton(onPressed: _openTaskEditor, child: const Text('Task Assignment Editor')),
-                        OutlinedButton(onPressed: _generateTaskPdf, child: const Text('Generate Task Assignment PDF')),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
           Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
@@ -17280,9 +18121,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       ),
                     Text('Guests: ${row.guestCount}'),
                     Text('Payment method: ${row.paymentMethod}'),
-                    Text('Labor cost: ₱${laborCostComputed.toStringAsFixed(2)}'),
-                    Text('Travel cost: ₱${_travelCostComputed().toStringAsFixed(2)}'),
-                    if (row.orderKind == 'event' && row.formalityLevel.trim().isNotEmpty)
+                    if (row.formalityLevel.trim().isNotEmpty)
                       Text('Formality: ${row.formalityLevel}'),
                     if (row.scheduleSlots.isNotEmpty) ...[
                       const SizedBox(height: 6),
@@ -17399,7 +18238,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     TextField(
                       controller: managerDraftEventTitleController,
                       readOnly: !canEditStage,
-                      decoration: const InputDecoration(labelText: 'Event title'),
+                      decoration: InputDecoration(
+                        labelText: 'Event title',
+                        helperText: widget.stage == 'new_event' ? 'Required' : null,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     TextField(
@@ -17429,7 +18271,17 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     TextField(
                       controller: managerAddressController,
                       readOnly: !canEditStage,
-                      decoration: const InputDecoration(labelText: 'Event venue'),
+                      onTap: canEditStage
+                          ? null
+                          : () => showEventVenueMapPreview(context, managerAddressController.text),
+                      decoration: InputDecoration(
+                        labelText: 'Event venue',
+                        suffixIcon: IconButton(
+                          tooltip: 'View on map',
+                          icon: const Icon(Icons.map_outlined),
+                          onPressed: () => showEventVenueMapPreview(context, managerAddressController.text),
+                        ),
+                      ),
                     ),
                     if (!isAllowedCateringAddressInCoverage(managerAddressController.text.trim()))
                       Padding(
@@ -17519,7 +18371,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       ],
                     ),
                     const SizedBox(height: 8),
-                    if (_draftOrderKind == 'event') ...[
+                    if (widget.stage == 'new_event') ...[
                       const SizedBox(height: 6),
                       const Text('Formality level', style: TextStyle(fontWeight: FontWeight.w600)),
                       const SizedBox(height: 6),
@@ -17828,106 +18680,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
+          _laborCostCard(allowLaborEdits: canEditStage),
+          _additionalCostsCard(
+            draft: isDraftStage,
+            processing: isProcessing && !isPost,
+            post: isPost,
+          ),
           if (isDraftStage) ...[
-            Card(
-              color: Colors.orange.shade50,
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Text('Labor Cost', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: laborMaleController,
-                            keyboardType: TextInputType.number,
-                            readOnly: !canEditStage,
-                            decoration: const InputDecoration(labelText: 'Male workers (₱1000 each)'),
-                            onChanged: (_) => setState(_refreshDueAndDefaults),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: TextField(
-                            controller: laborFemaleController,
-                            keyboardType: TextInputType.number,
-                            readOnly: !canEditStage,
-                            decoration: const InputDecoration(labelText: 'Female workers (₱500 each)'),
-                            onChanged: (_) => setState(_refreshDueAndDefaults),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: laborManualLabelController,
-                            readOnly: !canEditStage,
-                            decoration: const InputDecoration(labelText: 'Labor item'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        SizedBox(
-                          width: 110,
-                          child: TextField(
-                            controller: laborManualAmountController,
-                            keyboardType: TextInputType.number,
-                            readOnly: !canEditStage,
-                            decoration: const InputDecoration(labelText: 'Amount'),
-                          ),
-                        ),
-                        IconButton(
-                          onPressed: !canEditStage
-                              ? null
-                              : () {
-                                  final l = laborManualLabelController.text.trim();
-                                  final a = double.tryParse(laborManualAmountController.text.trim());
-                                  if (l.isEmpty || a == null) return;
-                                  setState(() {
-                                    laborManualCosts.add({'label': l, 'amount': a});
-                                    laborManualLabelController.clear();
-                                    laborManualAmountController.clear();
-                                    _refreshDueAndDefaults();
-                                  });
-                                },
-                          icon: const Icon(Icons.add),
-                        ),
-                      ],
-                    ),
-                    ...laborManualCosts.asMap().entries.map((entry) {
-                      final idx = entry.key;
-                      final e = entry.value;
-                      return ListTile(
-                        dense: true,
-                        title: Text('${e['label']}'),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
-                            IconButton(
-                              onPressed: !canEditStage
-                                  ? null
-                                  : () => setState(() {
-                                      laborManualCosts.removeAt(idx);
-                                      _refreshDueAndDefaults();
-                                    }),
-                              icon: const Icon(Icons.delete_outline),
-                            ),
-                          ],
-                        ),
-                      );
-                    }),
-                    const SizedBox(height: 8),
-                    Text('Computed labor cost: ₱${laborCostComputed.toStringAsFixed(2)}'),
-                  ],
-                ),
-              ),
-            ),
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -17953,7 +18712,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ),
             ),
           ],
-          if (isDraftStage) _additionalCostsCard(draft: true, processing: false, post: false),
           if (isDraftStage)
             Card(
               child: Padding(
