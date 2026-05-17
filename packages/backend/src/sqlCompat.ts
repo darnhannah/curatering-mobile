@@ -2,6 +2,9 @@
  * SQL fragments and row normalizers so APIs stay stable while the DB uses canonical column names.
  */
 
+/** Touch timestamp on customer_accounts (legacy updated_at was pruned). */
+export const CUSTOMER_ACCOUNT_TOUCH = `updated_pw_dt_stamp = NOW()`;
+
 /** Shared SELECT list for restaurant order API responses (legacy aliases included). */
 export const RESTAURANT_ORDER_SELECT = `
   mobile_id,
@@ -12,17 +15,17 @@ export const RESTAURANT_ORDER_SELECT = `
   COALESCE(order_id, CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END) AS order_no,
   COALESCE(order_status, 'PENDING_CASHIER') AS status,
   COALESCE(order_status, 'PENDING_CASHIER') AS fulfillment_stage,
-  COALESCE(total_cost, total, total_amount, 0) AS total,
+  COALESCE(total_cost, 0) AS total,
   total_cost,
-  COALESCE(delivery_notes, note, '') AS note,
+  COALESCE(delivery_notes, '') AS note,
   delivery_notes,
   payment_mode,
-  COALESCE(payment_uploaded_initial, payment_uploaded, FALSE) AS payment_uploaded,
+  COALESCE(payment_uploaded_initial, FALSE) AS payment_uploaded,
   payment_uploaded_initial,
-  COALESCE(payment_proof_initial, payment_proof) AS payment_proof,
+  payment_proof_initial AS payment_proof,
   payment_proof_initial,
-  COALESCE(payment_proof_balance, supplemental_payment_proof) AS supplemental_payment_proof,
-  supplemental_payment_proof,
+  payment_proof_balance AS supplemental_payment_proof,
+  payment_proof_balance,
   COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
   COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
   payment_reference_initial,
@@ -33,34 +36,50 @@ export const RESTAURANT_ORDER_SELECT = `
   COALESCE(payment_confirmed_balance, FALSE) AS payment_confirmed_balance,
   payment_confirmed_initial,
   payment_confirmed_balance,
-  COALESCE(loyalty_points_restaurant_obtained, points_earned, 0) AS loyalty_points_restaurant_obtained,
+  COALESCE(loyalty_points_restaurant_obtained, 0) AS loyalty_points_restaurant_obtained,
   loyalty_reward_restaurant_obtained,
-  delivery_name,
-  delivery_contact,
+  COALESCE(NULLIF(TRIM(full_name), ''), '') AS delivery_name,
+  COALESCE(NULLIF(TRIM(full_name), ''), '') AS full_name,
+  COALESCE(NULLIF(TRIM(contact_number), ''), '') AS delivery_contact,
+  COALESCE(NULLIF(TRIM(contact_number), ''), '') AS contact_number,
   delivery_address,
   delivery_lat,
   delivery_lng,
   delivery_time,
-  created_at,
-  updated_at,
+  COALESCE(submitted_order_dt_stamp, NOW()) AS created_at,
   submitted_order_dt_stamp,
+  COALESCE(last_updated_order_status_dt_stamp, submitted_order_dt_stamp, NOW()) AS updated_at,
   last_updated_order_status_dt_stamp,
   order_source,
-  pos_customer_label,
-  COALESCE(cashier_amount_received_initial, cashier_amount_received) AS cashier_amount_received,
+  ''::text AS pos_customer_label,
+  COALESCE(cashier_amount_received_initial, 0) AS cashier_amount_received,
   cashier_amount_received_initial,
-  COALESCE(cashier_amount_received_balance, cashier_secondary_amount_received) AS cashier_secondary_amount_received,
-  cashier_secondary_amount_received,
-  cashier_change,
+  COALESCE(cashier_amount_received_balance, 0) AS cashier_secondary_amount_received,
+  cashier_amount_received_balance,
+  0::numeric AS cashier_change,
   delivery_tracking_url,
-  COALESCE(tray_items, order_lines_snapshot, items, '[]'::jsonb) AS order_lines_snapshot,
+  COALESCE(tray_items, '[]'::jsonb) AS order_lines_snapshot,
   tray_items,
-  pos_claimed,
-  balance_proof_pending_review,
+  (upper(COALESCE(order_status, '')) LIKE '%CLAIMED%') AS pos_claimed,
+  FALSE AS balance_proof_pending_review,
   guest_contact_email,
-  customer_id,
-  COALESCE(NULLIF(TRIM(full_name), ''), NULLIF(TRIM(delivery_name), ''), '') AS full_name,
-  COALESCE(NULLIF(TRIM(contact_number), ''), NULLIF(TRIM(delivery_contact), ''), '') AS contact_number
+  customer_id
+`.trim();
+
+/** Minimal SELECT for cashier PATCH handlers (canonical columns only). */
+export const RESTAURANT_ORDER_PATCH_SELECT = `
+  mobile_id AS id,
+  user_email,
+  COALESCE(order_id, 'ORD-' || LPAD(mobile_id::text, 6, '0')) AS order_no,
+  COALESCE(order_status, 'PENDING_CASHIER') AS status,
+  COALESCE(total_cost, 0) AS total,
+  order_source,
+  cashier_amount_received_initial AS cashier_amount_received,
+  payment_proof_balance AS supplemental_payment_proof,
+  COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
+  COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
+  guest_contact_email,
+  contact_number AS delivery_contact
 `.trim();
 
 /** Cashier online queue: mobile app + web restaurant orders (not walk-in POS). */
@@ -78,10 +97,10 @@ export function restaurantLoyaltyEarnedSql(
 ): string {
   return `CASE
     WHEN LOWER(TRIM(COALESCE(user_email, ''))) LIKE '%@guest.curatering.internal' THEN 0
-    WHEN upper(COALESCE(order_status, fulfillment_stage, status, '')) LIKE '%ORDER CONFIRMED%'
-      OR upper(COALESCE(order_status, fulfillment_stage, status, '')) LIKE '%OVERPAYMENT%'
-      THEN FLOOR(COALESCE(total_cost, total, total_amount, 0)::numeric / ${restaurantStepAmount}::numeric)::int * ${restaurantStepPoints}
-    ELSE COALESCE(loyalty_points_restaurant_obtained, points_earned, 0)
+    WHEN upper(COALESCE(order_status, '')) LIKE '%ORDER CONFIRMED%'
+      OR upper(COALESCE(order_status, '')) LIKE '%OVERPAYMENT%'
+      THEN FLOOR(COALESCE(total_cost, 0)::numeric / ${restaurantStepAmount}::numeric)::int * ${restaurantStepPoints}
+    ELSE COALESCE(loyalty_points_restaurant_obtained, 0)
   END AS loyalty_points_earned`;
 }
 
@@ -151,10 +170,10 @@ export function mapProfileRowForApi(row: Record<string, unknown>): Record<string
   };
 }
 
-/** SQL to read forgot-password OTP from either column naming generation. */
+/** SQL to read forgot-password OTP (canonical columns only). */
 export const CUSTOMER_FORGOT_OTP_SELECT = `
-  COALESCE(forgot_password_otp_code, password_reset_otp) AS password_reset_otp,
-  COALESCE(forgot_password_otp_code_expiry, password_reset_expires_at) AS password_reset_expires_at
+  forgot_password_otp_code AS password_reset_otp,
+  forgot_password_otp_code_expiry AS password_reset_expires_at
 `.trim();
 
 /** Manager catering/event post-analysis JSON (stored under checklist.post_analysis). */
