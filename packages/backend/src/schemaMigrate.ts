@@ -24,21 +24,7 @@ export async function runExtendedMigrations(pool: pg.Pool): Promise<void> {
   await safeExec(pool, `ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
   await safeExec(pool, `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`);
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS customer_profiles (
-      id TEXT PRIMARY KEY,
-      user_email TEXT NOT NULL UNIQUE,
-      full_name TEXT NOT NULL DEFAULT '',
-      contact_number TEXT NOT NULL DEFAULT '',
-      delivery_address TEXT NOT NULL DEFAULT '',
-      delivery_map_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
-      delivery_lat DOUBLE PRECISION,
-      delivery_lng DOUBLE PRECISION,
-      loyalty_points INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
+  // customer_profiles is merged into customer_accounts by runSchemaNormalize(); do not recreate it here.
 
   await safeExec(
     pool,
@@ -103,21 +89,38 @@ export async function runExtendedMigrations(pool: pg.Pool): Promise<void> {
   await safeExec(
     pool,
     `
-    INSERT INTO customer_profiles (id, user_email, full_name, contact_number, delivery_address,
-      delivery_map_confirmed, delivery_lat, delivery_lng, created_at, updated_at)
+    INSERT INTO customer_accounts (
+      email, password_hash, full_name, contact_number, is_verified,
+      customer_id, primary_delivery_address, delivery_map_confirmed, delivery_lat, delivery_lng,
+      created_account_dt_stamp, updated_pw_dt_stamp
+    )
     SELECT
+      LOWER(TRIM(mp.user_email)),
+      '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy',
+      COALESCE(NULLIF(TRIM(mp.full_name), ''), ''),
+      COALESCE(NULLIF(TRIM(mp.contact_number), ''), ''),
+      TRUE,
       'CUS-' || LPAD((ROW_NUMBER() OVER (ORDER BY mp.id))::TEXT, 4, '0'),
-      mp.user_email,
-      mp.full_name,
-      mp.contact_number,
-      mp.delivery_address,
-      mp.delivery_map_confirmed,
+      COALESCE(NULLIF(TRIM(mp.delivery_address), ''), ''),
+      COALESCE(mp.delivery_map_confirmed, FALSE),
       mp.delivery_lat,
       mp.delivery_lng,
-      mp.created_at,
-      mp.updated_at
+      COALESCE(mp.created_at, NOW()),
+      COALESCE(mp.updated_at, NOW())
     FROM mobile_profiles mp
-    ON CONFLICT (user_email) DO NOTHING
+    WHERE TRIM(mp.user_email) <> ''
+      AND NOT EXISTS (
+        SELECT 1 FROM customer_accounts ca
+        WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mp.user_email))
+      )
+    ON CONFLICT (email) DO UPDATE SET
+      customer_id = COALESCE(NULLIF(TRIM(customer_accounts.customer_id), ''), EXCLUDED.customer_id),
+      full_name = COALESCE(NULLIF(TRIM(customer_accounts.full_name), ''), EXCLUDED.full_name),
+      contact_number = COALESCE(NULLIF(TRIM(customer_accounts.contact_number), ''), EXCLUDED.contact_number),
+      primary_delivery_address = COALESCE(
+        NULLIF(TRIM(customer_accounts.primary_delivery_address), ''),
+        EXCLUDED.primary_delivery_address
+      )
     `,
   );
 
@@ -191,6 +194,6 @@ export async function runExtendedMigrations(pool: pg.Pool): Promise<void> {
     `DELETE FROM mobile_users mu USING users u WHERE LOWER(mu.email) = LOWER(u.email) AND LOWER(TRIM(mu.role)) = 'cashier'`,
   );
 
-  // Drop legacy customer auth tables; the app uses customer_accounts/customer_profiles for customers.
+  // Drop legacy customer auth tables; customer data lives in customer_accounts (see runSchemaNormalize).
   await safeExec(pool, `DROP TABLE IF EXISTS mobile_users`);
 }

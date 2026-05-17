@@ -4,7 +4,9 @@
 
 /** Shared SELECT list for restaurant order API responses (legacy aliases included). */
 export const RESTAURANT_ORDER_SELECT = `
+  mobile_id,
   mobile_id AS id,
+  id AS order_uuid,
   user_email,
   COALESCE(order_id, order_no, CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END) AS order_no,
   order_id,
@@ -96,7 +98,8 @@ export function mapRestaurantOrderRowForApi(row: Record<string, unknown>): Recor
   }
   return {
     ...row,
-    id: row.id ?? row.mobile_id,
+    id: row.mobile_id ?? row.id,
+    order_uuid: row.order_uuid ?? row.id ?? null,
     order_no: orderNo,
     order_id: row.order_id ?? orderNo,
     status,
@@ -153,6 +156,22 @@ export const CUSTOMER_FORGOT_OTP_SELECT = `
   COALESCE(forgot_password_otp_code, password_reset_otp) AS password_reset_otp,
   COALESCE(forgot_password_otp_code_expiry, password_reset_expires_at) AS password_reset_expires_at
 `.trim();
+
+/** Manager catering/event post-analysis JSON (stored under checklist.post_analysis). */
+export const POST_ANALYSIS_JSON = `COALESCE(checklist->'post_analysis', '{}'::jsonb)`;
+
+/** SET clause: persist post_analysis into checklist.post_analysis. */
+export function postAnalysisPersistSet(paramRef: string): string {
+  return `checklist = jsonb_set(
+      COALESCE(checklist, '{}'::jsonb),
+      '{post_analysis}',
+      COALESCE(${paramRef}::jsonb, COALESCE(checklist->'post_analysis', '{}'::jsonb))
+    )`;
+}
+
+export function postAnalysisPersistCoalesceSet(paramRef: string): string {
+  return postAnalysisPersistSet(paramRef);
+}
 
 export function customerForgotOtpUpdateSql(): { set: string; clear: string } {
   return {

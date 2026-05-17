@@ -46,6 +46,29 @@ async function renameColumnIfExists(
   await safeExec(pool, `ALTER TABLE ${table} RENAME COLUMN ${from} TO ${to}`);
 }
 
+async function columnDataType(pool: pg.Pool, table: string, column: string): Promise<string> {
+  const { rows } = await pool.query<{ data_type: string }>(
+    `SELECT data_type
+     FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+     LIMIT 1`,
+    [table, column],
+  );
+  return String(rows[0]?.data_type ?? "text").toLowerCase();
+}
+
+function castExpressionForTarget(sourceCol: string, targetType: string): string {
+  const t = targetType.toLowerCase();
+  if (t.includes("timestamp")) return `${sourceCol}::timestamptz`;
+  if (t === "integer") return `${sourceCol}::integer`;
+  if (t === "bigint") return `${sourceCol}::bigint`;
+  if (t === "numeric" || t === "double precision" || t === "real") return `${sourceCol}::numeric`;
+  if (t === "boolean") return `${sourceCol}::boolean`;
+  if (t === "jsonb") return `${sourceCol}::jsonb`;
+  if (t === "uuid") return `${sourceCol}::uuid`;
+  return `${sourceCol}::text`;
+}
+
 async function copyColumnIfBothExist(
   pool: pg.Pool,
   table: string,
@@ -54,10 +77,16 @@ async function copyColumnIfBothExist(
 ): Promise<void> {
   if (!(await columnExists(pool, table, target))) return;
   if (!(await columnExists(pool, table, source))) return;
+  const targetType = await columnDataType(pool, table, target);
+  const sourceExpr = castExpressionForTarget(source, targetType);
+  const emptyCheck =
+    targetType.includes("timestamp") || targetType === "boolean" || targetType === "jsonb"
+      ? `${target} IS NULL`
+      : `${target} IS NULL OR TRIM(${target}::text) = ''`;
   await pool.query(
     `UPDATE ${table}
-     SET ${target} = COALESCE(NULLIF(TRIM(${target}::text), ''), ${source}::text)
-     WHERE ${target} IS NULL OR TRIM(${target}::text) = ''`,
+     SET ${target} = COALESCE(${target}, ${sourceExpr})
+     WHERE ${emptyCheck}`,
   );
 }
 
@@ -65,13 +94,16 @@ async function copyColumnIfBothExist(
 export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await normalizeAiGenerations(pool);
   await normalizeCustomerAccountsAndMergeProfiles(pool);
+  await repairRestaurantOrdersIdentity(pool);
   await normalizeRestaurantOrders(pool);
   await syncRestaurantOrdersDualWrite(pool);
   await normalizeCateringOrders(pool);
   await normalizeEventOrders(pool);
   await normalizeIdCounter(pool);
   await normalizeMenuDishes(pool);
+  await migratePostAnalysisIntoChecklistAndDrop(pool);
   await dropLegacyTables(pool);
+  console.info("[schema] normalize complete");
 }
 
 /** Keep legacy and canonical restaurant_orders columns aligned after deploys. */
@@ -185,6 +217,22 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
   }
 
   if (await tableExists(pool, "customer_profiles")) {
+    // Always prefer profile business id (CUS-****) when present.
+    await pool.query(`
+      UPDATE customer_accounts ca
+      SET customer_id = NULLIF(TRIM(cp.id), '')
+      FROM customer_profiles cp
+      WHERE LOWER(TRIM(cp.user_email)) = LOWER(TRIM(ca.email))
+        AND NULLIF(TRIM(cp.id), '') IS NOT NULL
+        AND NULLIF(TRIM(cp.id), '') ~ '^CUS-'
+        AND (
+          ca.customer_id IS NULL
+          OR TRIM(ca.customer_id) = ''
+          OR ca.customer_id !~ '^CUS-'
+          OR ca.customer_id <> cp.id
+        )
+    `);
+
     await pool.query(`
       UPDATE customer_accounts ca
       SET
@@ -248,7 +296,22 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
           SELECT 1 FROM customer_accounts ca
           WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(cp.user_email))
         )
-      ON CONFLICT (email) DO NOTHING
+      ON CONFLICT (email) DO UPDATE SET
+        customer_id = COALESCE(NULLIF(TRIM(customer_accounts.customer_id), ''), EXCLUDED.customer_id),
+        full_name = COALESCE(NULLIF(TRIM(customer_accounts.full_name), ''), EXCLUDED.full_name),
+        contact_number = COALESCE(NULLIF(TRIM(customer_accounts.contact_number), ''), EXCLUDED.contact_number),
+        primary_delivery_address = COALESCE(
+          NULLIF(TRIM(customer_accounts.primary_delivery_address), ''),
+          EXCLUDED.primary_delivery_address
+        ),
+        restaurant_loyalty_points = GREATEST(
+          COALESCE(customer_accounts.restaurant_loyalty_points, 0),
+          COALESCE(EXCLUDED.restaurant_loyalty_points, 0)
+        ),
+        catering_loyalty_points = GREATEST(
+          COALESCE(customer_accounts.catering_loyalty_points, 0),
+          COALESCE(EXCLUDED.catering_loyalty_points, 0)
+        )
     `);
   }
 
@@ -287,6 +350,114 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
     `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq ON customer_accounts (customer_id) WHERE customer_id IS NOT NULL`,
   );
   await renameColumnIfExists(pool, "customer_accounts", "phone_number", "contact_number_legacy");
+}
+
+/** Restore table PK `id`, business `order_id` (ORD-*), and FK `customer_id` (CUS-*). */
+async function repairRestaurantOrdersIdentity(pool: pg.Pool): Promise<void> {
+  if (!(await tableExists(pool, "restaurant_orders"))) return;
+
+  const hasId = await columnExists(pool, "restaurant_orders", "id");
+  const hasOrderIdCol = await columnExists(pool, "restaurant_orders", "order_id");
+  const orderIdType = hasOrderIdCol ? await columnDataType(pool, "restaurant_orders", "order_id") : "";
+
+  // Undo mistaken rename of UUID primary key `id` → `order_id`.
+  if (hasOrderIdCol && orderIdType === "uuid" && !hasId) {
+    await safeExec(pool, `ALTER TABLE restaurant_orders RENAME COLUMN order_id TO id`);
+  }
+
+  const hasIdAfter = await columnExists(pool, "restaurant_orders", "id");
+  const hasOrderIdAfter = await columnExists(pool, "restaurant_orders", "order_id");
+
+  if (hasOrderIdAfter && !hasIdAfter) {
+    const orderIdDt = await columnDataType(pool, "restaurant_orders", "order_id");
+    if (orderIdDt === "uuid" || orderIdDt === "text") {
+      await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS id UUID`);
+      await safeExec(
+        pool,
+        `UPDATE restaurant_orders
+         SET id = order_id::uuid
+         WHERE id IS NULL AND order_id IS NOT NULL AND order_id::text ~ '^[0-9a-f]{8}-'`,
+      );
+    }
+  }
+
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS id UUID`);
+  await safeExec(
+    pool,
+    `UPDATE restaurant_orders SET id = gen_random_uuid() WHERE id IS NULL`,
+  );
+
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
+
+  // If order_id still holds UUIDs from a bad migration, move them to `id` and regenerate ORD-*.
+  if (await columnExists(pool, "restaurant_orders", "order_id")) {
+    await safeExec(
+      pool,
+      `UPDATE restaurant_orders
+       SET id = COALESCE(id, order_id::uuid)
+       WHERE id IS NULL
+         AND order_id IS NOT NULL
+         AND TRIM(order_id) ~ '^[0-9a-f]{8}-'`,
+    );
+    await safeExec(
+      pool,
+      `UPDATE restaurant_orders
+       SET order_id = NULL
+       WHERE order_id IS NOT NULL AND TRIM(order_id) ~ '^[0-9a-f]{8}-'`,
+    );
+  }
+
+  await pool.query(`
+    UPDATE restaurant_orders
+    SET order_id = CASE
+      WHEN order_id IS NOT NULL AND TRIM(order_id) ~ '^ORD-' THEN order_id
+      WHEN order_no IS NOT NULL AND TRIM(order_no) ~ '^ORD-' THEN order_no
+      WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0')
+      ELSE order_id
+    END
+    WHERE order_id IS NULL OR TRIM(order_id) = '' OR order_id !~ '^ORD-'
+  `);
+
+  await pool.query(`
+    UPDATE restaurant_orders
+    SET order_no = COALESCE(NULLIF(TRIM(order_no), ''), order_id)
+    WHERE order_id IS NOT NULL
+      AND (order_no IS NULL OR TRIM(order_no) = '' OR order_no !~ '^ORD-')
+  `);
+
+  // Ensure customer_id on orders is CUS-* from customer_accounts, not account UUID.
+  if (await columnExists(pool, "restaurant_orders", "customer_id")) {
+    const custType = await columnDataType(pool, "restaurant_orders", "customer_id");
+    if (custType === "uuid") {
+      await safeExec(pool, `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id_text TEXT`);
+      await pool.query(`
+        UPDATE restaurant_orders ro
+        SET customer_id_text = ca.customer_id
+        FROM customer_accounts ca
+        WHERE ca.customer_id IS NOT NULL
+          AND ro.user_email IS NOT NULL
+          AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))
+      `);
+      await safeExec(pool, `ALTER TABLE restaurant_orders DROP COLUMN IF EXISTS customer_id`);
+      await safeExec(pool, `ALTER TABLE restaurant_orders RENAME COLUMN customer_id_text TO customer_id`);
+    } else {
+      await pool.query(`
+        UPDATE restaurant_orders ro
+        SET customer_id = ca.customer_id
+        FROM customer_accounts ca
+        WHERE ca.customer_id IS NOT NULL
+          AND ca.customer_id ~ '^CUS-'
+          AND ro.user_email IS NOT NULL
+          AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))
+          AND (
+            ro.customer_id IS NULL
+            OR TRIM(ro.customer_id::text) = ''
+            OR ro.customer_id::text !~ '^CUS-'
+            OR ro.customer_id::text = ca.id::text
+          )
+      `);
+    }
+  }
 }
 
 async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
@@ -382,23 +553,38 @@ async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
     SET customer_id = ca.customer_id
     FROM customer_accounts ca
     WHERE ca.customer_id IS NOT NULL
+      AND ca.customer_id ~ '^CUS-'
+      AND ro.user_email IS NOT NULL
+      AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))
       AND (
-        (ro.user_email IS NOT NULL AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email)))
-        OR (ro.customer_id IS NOT NULL AND ro.customer_id::text = ca.id::text)
+        ro.customer_id IS NULL
+        OR TRIM(ro.customer_id::text) = ''
+        OR ro.customer_id::text !~ '^CUS-'
       )
-      AND (ro.customer_id IS NULL OR ro.customer_id::text !~ '^CUS-')
   `);
+}
 
-  await pool.query(`
-    UPDATE restaurant_orders
-    SET order_id = CASE
-      WHEN order_id IS NOT NULL AND TRIM(order_id) ~ '^ORD-' THEN order_id
-      WHEN order_no IS NOT NULL AND TRIM(order_no) ~ '^ORD-' THEN order_no
-      WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0')
-      ELSE order_id
-    END
-    WHERE order_id IS NULL OR TRIM(order_id) = '' OR order_id !~ '^ORD-'
-  `);
+/** Copy legacy post_analysis column into checklist.post_analysis, then drop the column. */
+async function migratePostAnalysisIntoChecklistAndDrop(pool: pg.Pool): Promise<void> {
+  for (const table of ["catering_orders", "event_orders"] as const) {
+    if (!(await tableExists(pool, table))) continue;
+    if (!(await columnExists(pool, table, "post_analysis"))) continue;
+    if (await columnExists(pool, table, "checklist")) {
+      await safeExec(
+        pool,
+        `UPDATE ${table}
+         SET checklist = CASE
+           WHEN jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) = 'array' THEN
+             jsonb_build_object('items', COALESCE(checklist, '[]'::jsonb), 'post_analysis', post_analysis)
+           ELSE
+             COALESCE(checklist, '{}'::jsonb) || jsonb_build_object('post_analysis', post_analysis)
+         END
+         WHERE post_analysis IS NOT NULL
+           AND post_analysis <> '{}'::jsonb`,
+      );
+    }
+    await safeExec(pool, `ALTER TABLE ${table} DROP COLUMN IF EXISTS post_analysis`);
+  }
 }
 
 async function normalizeCateringOrders(pool: pg.Pool): Promise<void> {

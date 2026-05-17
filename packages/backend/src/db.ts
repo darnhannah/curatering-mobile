@@ -216,20 +216,9 @@ export async function initDb(): Promise<void> {
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS guest_contact_email TEXT`);
   const restaurantOrdersCustomerIdKind = await detectRestaurantOrdersCustomerIdKind(p);
   restaurantOrdersCustomerIdKindCache = restaurantOrdersCustomerIdKind;
-  await p.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'id'
-      ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'order_id'
-      ) THEN
-        ALTER TABLE restaurant_orders RENAME COLUMN id TO order_id;
-      END IF;
-    END $$
-  `);
+  // Keep web PK `id` (UUID) separate from business `order_id` (ORD-*). repairRestaurantOrdersIdentity() in schemaNormalize fixes mistaken renames.
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS id UUID`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
   try {
     await p.query(`ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_status_check`);
   } catch {
@@ -250,9 +239,9 @@ export async function initDb(): Promise<void> {
     BEGIN
       IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'order_id'
+        WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'mobile_id'
       ) THEN
-        pk_col := 'order_id';
+        pk_col := 'mobile_id';
       ELSIF EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'id'
