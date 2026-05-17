@@ -1,4 +1,5 @@
 import type pg from "pg";
+import { bumpIdCounter, formatCusId, syncCusCounterFromAccounts } from "./idCounters.js";
 
 async function columnExists(
   pool: pg.Pool,
@@ -90,6 +91,18 @@ async function copyColumnIfBothExist(
   );
 }
 
+async function forceDropColumn(pool: pg.Pool, table: string, column: string): Promise<void> {
+  if (!(await columnExists(pool, table, column))) return;
+  try {
+    await pool.query(`ALTER TABLE ${table} DROP COLUMN IF EXISTS ${column} CASCADE`);
+  } catch (err) {
+    console.warn(
+      `[schema] drop column ${table}.${column} failed:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
 async function pruneTableColumns(pool: pg.Pool, table: string, keep: ReadonlySet<string>): Promise<void> {
   if (!(await tableExists(pool, table))) return;
   const { rows } = await pool.query<{ column_name: string }>(
@@ -97,10 +110,12 @@ async function pruneTableColumns(pool: pg.Pool, table: string, keep: ReadonlySet
      WHERE table_schema = 'public' AND table_name = $1`,
     [table],
   );
-  for (const { column_name } of rows) {
-    if (!keep.has(column_name)) {
-      await dropColumnIfExists(pool, table, column_name);
-    }
+  const extras = rows.map((r) => r.column_name).filter((c) => !keep.has(c));
+  for (const column_name of extras) {
+    await forceDropColumn(pool, table, column_name);
+  }
+  if (extras.length > 0) {
+    console.info(`[schema] pruned ${extras.length} column(s) from ${table}: ${extras.join(", ")}`);
   }
 }
 
@@ -318,90 +333,73 @@ async function normalizeUsersStaffIds(pool: pg.Pool): Promise<void> {
   );
 }
 
-/** Assign unique CUS-**** ids; reassign duplicates without colliding with existing ids. */
+/** Reassign duplicate/missing CUS-**** values using `id_counters` (key CUS). */
 async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "customer_accounts"))) return;
   if (!(await columnExists(pool, "customer_accounts", "customer_id"))) return;
+  if (!(await tableExists(pool, "id_counters"))) return;
 
-  await safeExec(
-    pool,
-    `UPDATE customer_accounts
-     SET customer_id = NULLIF(TRIM(customer_id::text), '')
-     WHERE customer_id IS NOT NULL`,
-  );
+  await syncCusCounterFromAccounts(pool);
 
-  await safeExec(
-    pool,
-    `WITH max_cus AS (
-       SELECT COALESCE(MAX(
-         CASE
-           WHEN customer_id ~ '^CUS-[0-9]+$' THEN CAST(SUBSTRING(customer_id FROM 5) AS INT)
-           ELSE 0
-         END
-       ), 0) AS m
-       FROM customer_accounts
-     ),
-     ranked AS (
-       SELECT
-         email,
-         customer_id,
-         ROW_NUMBER() OVER (
-           PARTITION BY customer_id
-           ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email
-         ) AS dup_rn
-       FROM customer_accounts
-       WHERE customer_id IS NOT NULL AND customer_id <> ''
-     ),
-     to_reassign AS (
-       SELECT
-         r.email,
-         'CUS-' || LPAD((m.m + ROW_NUMBER() OVER (ORDER BY r.email))::text, 4, '0') AS new_customer_id
-       FROM ranked r
-       CROSS JOIN max_cus m
-       WHERE r.dup_rn > 1
-     )
-     UPDATE customer_accounts ca
-     SET customer_id = t.new_customer_id
-     FROM to_reassign t
-     WHERE ca.email = t.email`,
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  await safeExec(
-    pool,
-    `WITH max_cus AS (
-       SELECT COALESCE(MAX(
-         CASE
-           WHEN customer_id ~ '^CUS-[0-9]+$' THEN CAST(SUBSTRING(customer_id FROM 5) AS INT)
-           ELSE 0
-         END
-       ), 0) AS m
-       FROM customer_accounts
-     ),
-     needs AS (
-       SELECT
-         email,
-         ROW_NUMBER() OVER (
-           ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email
-         ) AS rn
+    const { rows: dupRows } = await client.query<{ email: string }>(
+      `SELECT email FROM (
+         SELECT
+           email,
+           ROW_NUMBER() OVER (
+             PARTITION BY customer_id
+             ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email
+           ) AS dup_rn
+         FROM customer_accounts
+         WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
+       ) ranked
+       WHERE dup_rn > 1
+       ORDER BY email`,
+    );
+
+    for (const { email } of dupRows) {
+      const seq = await bumpIdCounter(client, "CUS", 1);
+      await client.query(
+        `UPDATE customer_accounts SET customer_id = $1 WHERE LOWER(TRIM(email)) = LOWER(TRIM($2))`,
+        [formatCusId(seq), email],
+      );
+    }
+
+    const { rows: missingRows } = await client.query<{ email: string }>(
+      `SELECT email
        FROM customer_accounts
        WHERE customer_id IS NULL OR TRIM(customer_id::text) = ''
-     ),
-     numbered AS (
-       SELECT n.email, 'CUS-' || LPAD((m.m + n.rn)::text, 4, '0') AS new_customer_id
-       FROM needs n
-       CROSS JOIN max_cus m
-     )
-     UPDATE customer_accounts ca
-     SET customer_id = n.new_customer_id
-     FROM numbered n
-     WHERE ca.email = n.email`,
-  );
+          OR customer_id::text !~ '^CUS-[0-9]+$'
+       ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email`,
+    );
+
+    for (const { email } of missingRows) {
+      const seq = await bumpIdCounter(client, "CUS", 1);
+      await client.query(
+        `UPDATE customer_accounts SET customer_id = $1 WHERE LOWER(TRIM(email)) = LOWER(TRIM($2))`,
+        [formatCusId(seq), email],
+      );
+    }
+
+    await client.query("COMMIT");
+    if (dupRows.length > 0 || missingRows.length > 0) {
+      console.info(
+        `[schema] customer_id dedupe: reassigned ${dupRows.length} duplicate(s), filled ${missingRows.length} missing`,
+      );
+    }
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 
   await safeExec(pool, `DROP INDEX IF EXISTS customer_accounts_customer_id_uq`);
-  await safeExec(
-    pool,
-    `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq
-     ON customer_accounts (customer_id)`,
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq ON customer_accounts (customer_id)`,
   );
 }
 
@@ -752,7 +750,6 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
     await safeExec(pool, `DROP TABLE IF EXISTS customer_signup_otp_challenges CASCADE`);
   }
 
-  await dedupeCustomerAccountIds(pool);
 }
 
 /** Restore table PK `id`, business `order_id` (ORD-*), and FK `customer_id` (CUS-*). */
@@ -1124,9 +1121,10 @@ async function normalizeIdCounters(pool: pg.Pool): Promise<void> {
 
   await safeExec(pool, `DELETE FROM id_counters WHERE counter_key IN ('INQ', 'MINQ')`);
   await pool.query(`
-    INSERT INTO id_counters (counter_key, last_value) VALUES ('TR', 0), ('USR', 0)
+    INSERT INTO id_counters (counter_key, last_value) VALUES ('TR', 0), ('USR', 0), ('CUS', 0)
     ON CONFLICT (counter_key) DO NOTHING
   `);
+  await syncCusCounterFromAccounts(pool);
   await safeExec(
     pool,
     `UPDATE id_counters SET last_value = GREATEST(

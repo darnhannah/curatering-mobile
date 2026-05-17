@@ -47,6 +47,7 @@ import {
   notifyRestaurantOrderCustomer,
   sendGuestOrderProofConfirmation,
 } from "./guestNotify.js";
+import { nextCusIdFromCounter } from "./idCounters.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
 if (isMailConfigured()) {
@@ -109,10 +110,6 @@ function ensureNewEventSchemaOnce(): Promise<void> {
     // Runtime self-heal for environments that missed some migrations.
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
     await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
-    await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS points_earned INTEGER NOT NULL DEFAULT 0`);
-    await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS points_earned INTEGER NOT NULL DEFAULT 0`);
-    await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS transaction_no TEXT`);
-    await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS transaction_no TEXT`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
     await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS cost_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb`);
@@ -2112,12 +2109,26 @@ function numOrNull(v: unknown): number | null {
 }
 
 async function nextCustomerProfileRowId(): Promise<string> {
-  const { rows } = await getPool().query(
-    `SELECT COALESCE(MAX(CAST(REPLACE(customer_id, 'CUS-', '') AS INT)), 0) AS m
-     FROM customer_accounts WHERE customer_id ~ '^CUS-[0-9]+$'`,
-  );
-  const m = Number((rows[0] as { m: string }).m) || 0;
-  return `CUS-${String(m + 1).padStart(4, "0")}`;
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query<{ exists: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM id_counters WHERE counter_key = 'CUS') AS exists`,
+    );
+    if (!rows[0]?.exists) {
+      await client.query(
+        `INSERT INTO id_counters (counter_key, last_value) VALUES ('CUS', 0) ON CONFLICT DO NOTHING`,
+      );
+    }
+    const id = await nextCusIdFromCounter(client);
+    await client.query("COMMIT");
+    return id;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 async function attachOrderItems(rows: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {

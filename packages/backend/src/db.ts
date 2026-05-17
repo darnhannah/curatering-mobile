@@ -374,14 +374,12 @@ export async function initDb(): Promise<void> {
   } catch {
     // Some environments may define role constraints differently; keep startup resilient.
   }
-  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS transaction_no TEXT`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS cost_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS labor_cost NUMERIC NOT NULL DEFAULT 0`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS travel_cost NUMERIC NOT NULL DEFAULT 0`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS full_payment_due_at TIMESTAMPTZ`);
-  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS transaction_no TEXT`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS cost_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS labor_cost NUMERIC NOT NULL DEFAULT 0`);
@@ -391,21 +389,6 @@ export async function initDb(): Promise<void> {
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
-  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS points_earned INTEGER NOT NULL DEFAULT 0`);
-  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS points_earned INTEGER NOT NULL DEFAULT 0`);
-  await p.query(
-    `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS service_included TEXT NOT NULL DEFAULT ''`,
-  );
-  await p.query(`
-    UPDATE event_orders
-    SET service_included = COALESCE(
-      NULLIF(TRIM(service_included), ''),
-      NULLIF(TRIM(theme_design->>'service_included'), ''),
-      ''
-    )
-    WHERE theme_design IS NOT NULL
-      AND (service_included IS NULL OR TRIM(service_included) = '')
-  `);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ`);
   await p.query(
     `UPDATE event_orders SET stage_entered_at = updated_at WHERE stage_entered_at IS NULL`,
