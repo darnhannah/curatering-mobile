@@ -42,6 +42,21 @@ export async function bumpIdCounter(
   return Number(rows[0].last_number);
 }
 
+export async function setIdCounterLastNumber(
+  client: pg.Pool | pg.PoolClient,
+  prefix: string,
+  lastNumber: number,
+): Promise<void> {
+  await ensureIdCounterRow(client, prefix, 0);
+  await client.query(
+    `UPDATE id_counters
+     SET last_number = GREATEST(last_number, $2),
+         updated_at = NOW()
+     WHERE prefix = $1`,
+    [prefix, lastNumber],
+  );
+}
+
 export async function syncCusCounterFromAccounts(pool: pg.Pool): Promise<void> {
   await ensureIdCounterRow(pool, "CUS", 0);
   await pool.query(

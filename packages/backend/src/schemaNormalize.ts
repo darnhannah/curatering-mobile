@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { bumpIdCounter, formatCusId, syncCusCounterFromAccounts } from "./idCounters.js";
+import { formatCusId, setIdCounterLastNumber, syncCusCounterFromAccounts } from "./idCounters.js";
 
 async function columnExists(
   pool: pg.Pool,
@@ -333,63 +333,91 @@ async function normalizeUsersStaffIds(pool: pg.Pool): Promise<void> {
   );
 }
 
-/** Reassign duplicate/missing CUS-**** values using `id_counters` (key CUS). */
+/** Assign unique CUS-0001… sequentially by created_account_dt_stamp (earliest first). */
 async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "customer_accounts"))) return;
   if (!(await columnExists(pool, "customer_accounts", "customer_id"))) return;
-  if (!(await tableExists(pool, "id_counters"))) return;
 
-  await syncCusCounterFromAccounts(pool);
+  await safeExec(pool, `DROP INDEX IF EXISTS customer_accounts_customer_id_uq`);
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const { rows: dupRows } = await client.query<{ email: string }>(
-      `SELECT email FROM (
-         SELECT
-           email,
-           ROW_NUMBER() OVER (
-             PARTITION BY customer_id
-             ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email
-           ) AS dup_rn
-         FROM customer_accounts
-         WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
-       ) ranked
-       WHERE dup_rn > 1
-       ORDER BY email`,
-    );
+    await client.query(`
+      CREATE TEMP TABLE customer_id_remap ON COMMIT DROP AS
+      SELECT
+        email,
+        NULLIF(TRIM(customer_id::text), '') AS old_customer_id,
+        'CUS-' || LPAD(
+          ROW_NUMBER() OVER (
+            ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), LOWER(TRIM(email))
+          )::text,
+          4,
+          '0'
+        ) AS new_customer_id
+      FROM customer_accounts
+    `);
 
-    for (const { email } of dupRows) {
-      const seq = await bumpIdCounter(client, "CUS", 1);
-      await client.query(
-        `UPDATE customer_accounts SET customer_id = $1 WHERE LOWER(TRIM(email)) = LOWER(TRIM($2))`,
-        [formatCusId(seq), email],
-      );
+    if (await tableExists(pool, "restaurant_orders")) {
+      if (await columnExists(pool, "restaurant_orders", "customer_id")) {
+        await client.query(`
+          UPDATE restaurant_orders ro
+          SET customer_id = m.new_customer_id
+          FROM customer_id_remap m
+          WHERE ro.customer_id IS NOT NULL
+            AND TRIM(ro.customer_id::text) <> ''
+            AND ro.customer_id::text = m.old_customer_id
+        `);
+      }
+      if (await columnExists(pool, "restaurant_orders", "user_email")) {
+        await client.query(`
+          UPDATE restaurant_orders ro
+          SET customer_id = m.new_customer_id
+          FROM customer_id_remap m
+          WHERE LOWER(TRIM(COALESCE(ro.user_email, ''))) = LOWER(TRIM(m.email))
+        `);
+      }
     }
 
-    const { rows: missingRows } = await client.query<{ email: string }>(
-      `SELECT email
-       FROM customer_accounts
-       WHERE customer_id IS NULL OR TRIM(customer_id::text) = ''
-          OR customer_id::text !~ '^CUS-[0-9]+$'
-       ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email`,
-    );
+    for (const table of ["catering_orders", "event_orders"] as const) {
+      if (!(await tableExists(pool, table))) continue;
+      if (!(await columnExists(pool, table, "customer_id"))) continue;
+      await client.query(`
+        UPDATE ${table} o
+        SET customer_id = m.new_customer_id
+        FROM customer_id_remap m
+        WHERE o.customer_id IS NOT NULL
+          AND TRIM(o.customer_id::text) <> ''
+          AND o.customer_id::text = m.old_customer_id
+      `);
+      if (await columnExists(pool, table, "email_address")) {
+        await client.query(`
+          UPDATE ${table} o
+          SET customer_id = m.new_customer_id
+          FROM customer_id_remap m
+          WHERE LOWER(TRIM(COALESCE(o.email_address, ''))) = LOWER(TRIM(m.email))
+        `);
+      }
+    }
 
-    for (const { email } of missingRows) {
-      const seq = await bumpIdCounter(client, "CUS", 1);
-      await client.query(
-        `UPDATE customer_accounts SET customer_id = $1 WHERE LOWER(TRIM(email)) = LOWER(TRIM($2))`,
-        [formatCusId(seq), email],
-      );
+    const { rows: updated } = await client.query<{ n: string }>(`
+      UPDATE customer_accounts ca
+      SET customer_id = m.new_customer_id
+      FROM customer_id_remap m
+      WHERE ca.email = m.email
+      RETURNING 1 AS n
+    `);
+
+    const accountCount = Number(updated.length) || 0;
+    if (await tableExists(pool, "id_counters")) {
+      await setIdCounterLastNumber(client, "CUS", accountCount);
     }
 
     await client.query("COMMIT");
-    if (dupRows.length > 0 || missingRows.length > 0) {
-      console.info(
-        `[schema] customer_id dedupe: reassigned ${dupRows.length} duplicate(s), filled ${missingRows.length} missing`,
-      );
-    }
+    console.info(
+      `[schema] customer_id renumbered: ${accountCount} account(s) → CUS-0001 … ${formatCusId(accountCount)} by created_account_dt_stamp`,
+    );
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     throw err;
@@ -397,7 +425,6 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
     client.release();
   }
 
-  await safeExec(pool, `DROP INDEX IF EXISTS customer_accounts_customer_id_uq`);
   await pool.query(
     `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq ON customer_accounts (customer_id)`,
   );
