@@ -244,9 +244,23 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await normalizeMenuDishes(pool);
   await migratePostAnalysisIntoChecklistAndDrop(pool);
   await normalizeUsersStaffIds(pool);
-  await normalizeCanonicalBusinessIds(pool);
-  await pruneCanonicalColumns(pool);
-  await dropLegacyTables(pool);
+
+  let normalizeError: unknown;
+  try {
+    await normalizeCanonicalBusinessIds(pool);
+    await pruneCanonicalColumns(pool);
+    await dropLegacyTables(pool);
+  } catch (err) {
+    normalizeError = err;
+    console.error("[schema] normalize error (will still renumber customer_id):", err);
+  }
+
+  // Always last: legacy profile merge can copy duplicate CUS-*; assign CUS-0001… even if prune/drop failed.
+  await dedupeCustomerAccountIds(pool);
+
+  if (normalizeError) {
+    throw normalizeError;
+  }
   console.info("[schema] normalize complete");
 }
 
@@ -334,11 +348,24 @@ async function normalizeUsersStaffIds(pool: pg.Pool): Promise<void> {
 }
 
 /** Assign unique CUS-0001… sequentially by created_account_dt_stamp (earliest first). */
-async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
+export async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "customer_accounts"))) return;
   if (!(await columnExists(pool, "customer_accounts", "customer_id"))) return;
 
-  await safeExec(pool, `DROP INDEX IF EXISTS customer_accounts_customer_id_uq`);
+  const { rows: dupBefore } = await pool.query<{ customer_id: string; n: string }>(
+    `SELECT customer_id::text AS customer_id, COUNT(*)::text AS n
+     FROM customer_accounts
+     WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
+     GROUP BY customer_id
+     HAVING COUNT(*) > 1`,
+  );
+  if (dupBefore.length > 0) {
+    console.info(
+      `[schema] customer_id duplicates before renumber: ${dupBefore.map((r) => `${r.customer_id}×${r.n}`).join(", ")}`,
+    );
+  }
+
+  await pool.query(`DROP INDEX IF EXISTS customer_accounts_customer_id_uq`);
 
   const client = await pool.connect();
   try {
@@ -347,7 +374,7 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
     await client.query(`
       CREATE TEMP TABLE customer_id_remap ON COMMIT DROP AS
       SELECT
-        email,
+        LOWER(TRIM(email)) AS email_key,
         NULLIF(TRIM(customer_id::text), '') AS old_customer_id,
         'CUS-' || LPAD(
           ROW_NUMBER() OVER (
@@ -357,6 +384,7 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
           '0'
         ) AS new_customer_id
       FROM customer_accounts
+      WHERE email IS NOT NULL AND TRIM(email) <> ''
     `);
 
     if (await tableExists(pool, "restaurant_orders")) {
@@ -375,7 +403,7 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
           UPDATE restaurant_orders ro
           SET customer_id = m.new_customer_id
           FROM customer_id_remap m
-          WHERE LOWER(TRIM(COALESCE(ro.user_email, ''))) = LOWER(TRIM(m.email))
+          WHERE LOWER(TRIM(COALESCE(ro.user_email, ''))) = m.email_key
         `);
       }
     }
@@ -396,7 +424,7 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
           UPDATE ${table} o
           SET customer_id = m.new_customer_id
           FROM customer_id_remap m
-          WHERE LOWER(TRIM(COALESCE(o.email_address, ''))) = LOWER(TRIM(m.email))
+          WHERE LOWER(TRIM(COALESCE(o.email_address, ''))) = m.email_key
         `);
       }
     }
@@ -405,7 +433,7 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
       UPDATE customer_accounts ca
       SET customer_id = m.new_customer_id
       FROM customer_id_remap m
-      WHERE ca.email = m.email
+      WHERE LOWER(TRIM(ca.email)) = m.email_key
       RETURNING 1 AS n
     `);
 
@@ -420,9 +448,24 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
     );
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    console.error("[schema] customer_id renumber rolled back:", err instanceof Error ? err.message : err);
     throw err;
   } finally {
     client.release();
+  }
+
+  const { rows: dupAfter } = await pool.query<{ customer_id: string; n: string }>(
+    `SELECT customer_id::text AS customer_id, COUNT(*)::text AS n
+     FROM customer_accounts
+     WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
+     GROUP BY customer_id
+     HAVING COUNT(*) > 1`,
+  );
+  if (dupAfter.length > 0) {
+    console.error(
+      `[schema] customer_id still duplicated after renumber: ${dupAfter.map((r) => `${r.customer_id}×${r.n}`).join(", ")}`,
+    );
+    throw new Error("customer_id renumber did not remove all duplicates");
   }
 
   await pool.query(
@@ -433,8 +476,6 @@ async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
 /** Enforce unique business ids and align FKs to customer_accounts.customer_id. */
 async function normalizeCanonicalBusinessIds(pool: pg.Pool): Promise<void> {
   if (await tableExists(pool, "customer_accounts")) {
-    await dedupeCustomerAccountIds(pool);
-
     await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS id BIGSERIAL`);
     await safeExec(
       pool,
@@ -667,26 +708,12 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
   }
 
   if (await tableExists(pool, "customer_profiles")) {
-    // Always prefer profile business id (CUS-****) when present.
-    await pool.query(`
-      UPDATE customer_accounts ca
-      SET customer_id = NULLIF(TRIM(cp.id), '')
-      FROM customer_profiles cp
-      WHERE LOWER(TRIM(cp.user_email)) = LOWER(TRIM(ca.email))
-        AND NULLIF(TRIM(cp.id), '') IS NOT NULL
-        AND NULLIF(TRIM(cp.id), '') ~ '^CUS-'
-        AND (
-          ca.customer_id IS NULL
-          OR TRIM(ca.customer_id) = ''
-          OR ca.customer_id !~ '^CUS-'
-          OR ca.customer_id <> cp.id
-        )
-    `);
+    // Do not copy cp.id into customer_id — legacy profiles often share duplicate CUS-* values.
+    // dedupeCustomerAccountIds() at end of runSchemaNormalize assigns unique CUS-0001…
 
     await pool.query(`
       UPDATE customer_accounts ca
       SET
-        customer_id = COALESCE(NULLIF(TRIM(ca.customer_id), ''), NULLIF(TRIM(cp.id), '')),
         email = COALESCE(NULLIF(TRIM(ca.email), ''), LOWER(TRIM(cp.user_email))),
         full_name = COALESCE(NULLIF(TRIM(ca.full_name), ''), NULLIF(TRIM(cp.full_name), ''), ''),
         contact_number = COALESCE(NULLIF(TRIM(ca.contact_number), ''), NULLIF(TRIM(cp.contact_number), ''), ''),
@@ -730,7 +757,7 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
         COALESCE(NULLIF(TRIM(cp.full_name), ''), ''),
         COALESCE(NULLIF(TRIM(cp.contact_number), ''), ''),
         TRUE,
-        NULLIF(TRIM(cp.id), ''),
+        NULL,
         COALESCE(NULLIF(TRIM(cp.delivery_address), ''), ''),
         COALESCE(cp.delivery_map_confirmed, FALSE),
         cp.delivery_lat,
@@ -747,7 +774,6 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
           WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(cp.user_email))
         )
       ON CONFLICT (email) DO UPDATE SET
-        customer_id = COALESCE(NULLIF(TRIM(customer_accounts.customer_id), ''), EXCLUDED.customer_id),
         full_name = COALESCE(NULLIF(TRIM(customer_accounts.full_name), ''), EXCLUDED.full_name),
         contact_number = COALESCE(NULLIF(TRIM(customer_accounts.contact_number), ''), EXCLUDED.contact_number),
         primary_delivery_address = COALESCE(

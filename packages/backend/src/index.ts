@@ -5254,7 +5254,7 @@ async function seedCustomerSeedRow(): Promise<void> {
       `INSERT INTO customer_accounts (
          email, password_hash, full_name, is_verified, customer_id, contact_number, primary_delivery_address
        )
-       VALUES ($1, $2, 'CUS-0001', TRUE, 'CUS-0001', '', '')
+       VALUES ($1, $2, 'Sample Customer', TRUE, 'CUS-0001', '', '')
        ON CONFLICT (email) DO NOTHING`,
       [email, hash],
     );
