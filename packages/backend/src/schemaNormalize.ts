@@ -90,68 +90,441 @@ async function copyColumnIfBothExist(
   );
 }
 
+async function pruneTableColumns(pool: pg.Pool, table: string, keep: ReadonlySet<string>): Promise<void> {
+  if (!(await tableExists(pool, table))) return;
+  const { rows } = await pool.query<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = $1`,
+    [table],
+  );
+  for (const { column_name } of rows) {
+    if (!keep.has(column_name)) {
+      await dropColumnIfExists(pool, table, column_name);
+    }
+  }
+}
+
+const CUSTOMER_ACCOUNTS_COLUMNS = new Set([
+  "id",
+  "customer_id",
+  "email",
+  "password_hash",
+  "full_name",
+  "contact_number",
+  "is_verified",
+  "signup_otp_code",
+  "signup_otp_code_expiry",
+  "forgot_password_otp_code",
+  "forgot_password_otp_code_expiry",
+  "restaurant_loyalty_points",
+  "catering_loyalty_points",
+  "primary_delivery_address",
+  "other_delivery_addresses",
+  "delivery_map_confirmed",
+  "delivery_lat",
+  "delivery_lng",
+  "created_account_dt_stamp",
+  "updated_pw_dt_stamp",
+]);
+
+const RESTAURANT_ORDERS_COLUMNS = new Set([
+  "id",
+  "mobile_id",
+  "order_id",
+  "customer_id",
+  "full_name",
+  "contact_number",
+  "delivery_address",
+  "delivery_lat",
+  "delivery_lng",
+  "tray_items",
+  "total_cost",
+  "delivery_notes",
+  "delivery_time",
+  "payment_reference_initial",
+  "payment_reference_balance",
+  "payment_proof_initial",
+  "payment_proof_balance",
+  "payment_uploaded_initial",
+  "payment_uploaded_balance",
+  "payment_confirmed_initial",
+  "payment_confirmed_balance",
+  "order_status",
+  "loyalty_points_restaurant_obtained",
+  "loyalty_reward_restaurant_obtained",
+  "delivery_tracking_url",
+  "submitted_order_dt_stamp",
+  "last_updated_order_status_dt_stamp",
+  "order_source",
+  "cashier_amount_received_initial",
+  "cashier_amount_received_balance",
+  "user_email",
+  "guest_contact_email",
+  "payment_mode",
+  "created_at",
+  "updated_at",
+]);
+
+const CATERING_ORDERS_COLUMNS = new Set([
+  "id",
+  "catering_id",
+  "customer_id",
+  "source",
+  "status",
+  "order_type",
+  "event_title",
+  "event_type",
+  "formality_level",
+  "event_setting",
+  "customer_name",
+  "contact_person",
+  "contact_number",
+  "email_address",
+  "address",
+  "schedule_slots",
+  "guest_count",
+  "pax_buffer",
+  "menu",
+  "created_at",
+  "updated_at",
+  "stage_entered_at",
+  "down_payment_amount",
+  "down_payment_status",
+  "down_payment_proof",
+  "full_payment_amount",
+  "full_payment_status",
+  "full_payment_proof",
+  "additional_costs",
+  "total_cost",
+  "estimated_cost",
+  "labor_cost",
+  "travel_cost",
+  "cost_breakdown",
+  "loyalty_points_catering_obtained",
+  "loyalty_reward_catering_obtained",
+  "payment_method",
+  "checklist",
+  "full_payment_due_at",
+  "created_by",
+  "updated_by",
+]);
+
+const EVENT_ORDERS_COLUMNS = new Set([
+  ...[...CATERING_ORDERS_COLUMNS].filter((c) => c !== "catering_id"),
+  "event_id",
+  "theme_design",
+  "seating_plan",
+  "actual_event_images",
+]);
+
 /** Idempotent schema alignment: merge duplicates, preserve row data. */
 export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await normalizeAiGenerations(pool);
   await normalizeCustomerAccountsAndMergeProfiles(pool);
   await repairRestaurantOrdersIdentity(pool);
   await normalizeRestaurantOrders(pool);
-  await syncRestaurantOrdersDualWrite(pool);
   await normalizeCateringOrders(pool);
   await normalizeEventOrders(pool);
   await normalizeIdCounter(pool);
   await normalizeMenuDishes(pool);
   await migratePostAnalysisIntoChecklistAndDrop(pool);
+  await normalizeUsersStaffIds(pool);
+  await normalizeCanonicalBusinessIds(pool);
+  await pruneCanonicalColumns(pool);
   await dropLegacyTables(pool);
   console.info("[schema] normalize complete");
 }
 
-/** Keep legacy and canonical restaurant_orders columns aligned after deploys. */
-async function syncRestaurantOrdersDualWrite(pool: pg.Pool): Promise<void> {
-  if (!(await tableExists(pool, "restaurant_orders"))) return;
+async function dropColumnIfExists(pool: pg.Pool, table: string, column: string): Promise<void> {
+  if (!(await columnExists(pool, table, column))) return;
+  await safeExec(pool, `ALTER TABLE ${table} DROP COLUMN IF EXISTS ${column}`);
+}
+
+/** Internal PK on users.id; USR-**** lives in staff_id. */
+async function normalizeUsersStaffIds(pool: pg.Pool): Promise<void> {
+  if (!(await tableExists(pool, "users"))) return;
+
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS staff_id TEXT`);
+
   await safeExec(
     pool,
-    `UPDATE restaurant_orders SET
-       order_id = COALESCE(NULLIF(TRIM(order_id::text), ''), NULLIF(TRIM(order_no::text), '')),
-       order_no = COALESCE(NULLIF(TRIM(order_no::text), ''), NULLIF(TRIM(order_id::text), ''))
-     WHERE order_id::text IS DISTINCT FROM order_no::text
-       OR order_id IS NULL OR order_no IS NULL`,
+    `UPDATE users
+     SET staff_id = id::text
+     WHERE (staff_id IS NULL OR TRIM(staff_id) = '')
+       AND id::text ~ '^USR-'`,
   );
+
   await safeExec(
     pool,
-    `UPDATE restaurant_orders SET
-       total_cost = COALESCE(total_cost, total, total_amount),
-       total = COALESCE(total, total_cost, total_amount),
-       total_amount = COALESCE(total_amount, total_cost, total)
-     WHERE total IS DISTINCT FROM total_cost
-        OR total_cost IS DISTINCT FROM total_amount
-        OR total IS NULL OR total_cost IS NULL`,
+    `UPDATE users
+     SET id = gen_random_uuid()::text
+     WHERE id::text ~ '^USR-'`,
   );
+
   await safeExec(
     pool,
-    `UPDATE restaurant_orders SET
-       delivery_notes = COALESCE(NULLIF(TRIM(delivery_notes), ''), NULLIF(TRIM(note), '')),
-       note = COALESCE(NULLIF(TRIM(note), ''), NULLIF(TRIM(delivery_notes), ''))
-     WHERE delivery_notes IS DISTINCT FROM note`,
+    `WITH numbered AS (
+       SELECT email,
+              'USR-' || LPAD(
+                ROW_NUMBER() OVER (ORDER BY COALESCE(created_at, NOW()), email))::text,
+                4,
+                '0'
+              ) AS new_staff_id
+       FROM users
+       WHERE staff_id IS NULL OR TRIM(staff_id) = ''
+     )
+     UPDATE users u
+     SET staff_id = n.new_staff_id
+     FROM numbered n
+     WHERE u.email = n.email`,
   );
+
   await safeExec(
     pool,
-    `UPDATE restaurant_orders SET
-       order_status = COALESCE(NULLIF(TRIM(order_status), ''), NULLIF(TRIM(fulfillment_stage), ''), NULLIF(TRIM(status), '')),
-       fulfillment_stage = COALESCE(NULLIF(TRIM(fulfillment_stage), ''), NULLIF(TRIM(order_status), ''), NULLIF(TRIM(status), '')),
-       status = COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(order_status), ''), NULLIF(TRIM(fulfillment_stage), ''))
-     WHERE order_status IS DISTINCT FROM status OR fulfillment_stage IS DISTINCT FROM order_status`,
+    `WITH dups AS (
+       SELECT staff_id, MIN(email) AS keep_email
+       FROM users
+       WHERE staff_id IS NOT NULL AND TRIM(staff_id) <> ''
+       GROUP BY staff_id
+       HAVING COUNT(*) > 1
+     )
+     UPDATE users u
+     SET staff_id = NULL
+     FROM dups d
+     WHERE u.staff_id = d.staff_id AND u.email <> d.keep_email`,
   );
-  if (await columnExists(pool, "restaurant_orders", "tray_items")) {
+
+  await safeExec(
+    pool,
+    `WITH numbered AS (
+       SELECT email,
+              'USR-' || LPAD(
+                (10000 + ROW_NUMBER() OVER (ORDER BY email))::text,
+                4,
+                '0'
+              ) AS new_staff_id
+       FROM users
+       WHERE staff_id IS NULL OR TRIM(staff_id) = ''
+     )
+     UPDATE users u
+     SET staff_id = n.new_staff_id
+     FROM numbered n
+     WHERE u.email = n.email`,
+  );
+
+  await safeExec(
+    pool,
+    `CREATE UNIQUE INDEX IF NOT EXISTS users_staff_id_uq ON users (staff_id) WHERE staff_id IS NOT NULL`,
+  );
+}
+
+/** Enforce unique business ids and align FKs to customer_accounts.customer_id. */
+async function normalizeCanonicalBusinessIds(pool: pg.Pool): Promise<void> {
+  if (await tableExists(pool, "customer_accounts")) {
     await safeExec(
       pool,
-      `UPDATE restaurant_orders SET
-         tray_items = COALESCE(NULLIF(tray_items, '[]'::jsonb), order_lines_snapshot, items, '[]'::jsonb),
-         order_lines_snapshot = COALESCE(NULLIF(order_lines_snapshot, '[]'::jsonb), tray_items, items, '[]'::jsonb),
-         items = COALESCE(NULLIF(items, '[]'::jsonb), tray_items, order_lines_snapshot, '[]'::jsonb)
-       WHERE tray_items IS DISTINCT FROM order_lines_snapshot`,
+      `WITH dups AS (
+         SELECT customer_id, MIN(email) AS keep_email
+         FROM customer_accounts
+         WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
+         GROUP BY customer_id
+         HAVING COUNT(*) > 1
+       )
+       UPDATE customer_accounts ca
+       SET customer_id = NULL
+       FROM dups d
+       WHERE ca.customer_id = d.customer_id AND ca.email <> d.keep_email`,
+    );
+
+    await pool.query(`
+      WITH numbered AS (
+        SELECT email,
+               'CUS-' || LPAD(
+                 ROW_NUMBER() OVER (ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email)::text,
+                 4,
+                 '0'
+               ) AS new_customer_id
+        FROM customer_accounts
+        WHERE customer_id IS NULL OR TRIM(customer_id::text) = ''
+      )
+      UPDATE customer_accounts ca
+      SET customer_id = n.new_customer_id
+      FROM numbered n
+      WHERE ca.email = n.email
+    `);
+
+    await safeExec(
+      pool,
+      `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq
+       ON customer_accounts (customer_id) WHERE customer_id IS NOT NULL`,
+    );
+
+    await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS id BIGSERIAL`);
+    await safeExec(
+      pool,
+      `UPDATE customer_accounts SET id = nextval(pg_get_serial_sequence('customer_accounts', 'id'))
+       WHERE id IS NULL`,
+    );
+    await safeExec(pool, `ALTER TABLE customer_accounts DROP CONSTRAINT IF EXISTS customer_accounts_pkey`);
+    await safeExec(pool, `ALTER TABLE customer_accounts ADD PRIMARY KEY (id)`);
+    await safeExec(
+      pool,
+      `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_email_uq ON customer_accounts (email)`,
     );
   }
+
+  if (await tableExists(pool, "restaurant_orders")) {
+    await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
+
+    await safeExec(
+      pool,
+      `UPDATE restaurant_orders
+       SET order_id = COALESCE(NULLIF(TRIM(order_id::text), ''), NULLIF(TRIM(order_no::text), ''))
+       WHERE order_id IS NULL OR TRIM(order_id::text) = '' OR order_id::text !~ '^ORD-'`,
+    );
+
+    await safeExec(
+      pool,
+      `UPDATE restaurant_orders
+       SET order_id = 'ORD-' || LPAD(mobile_id::text, 6, '0')
+       WHERE (order_id IS NULL OR TRIM(order_id::text) = '' OR order_id::text !~ '^ORD-')
+         AND mobile_id IS NOT NULL`,
+    );
+
+    await safeExec(
+      pool,
+      `WITH dups AS (
+         SELECT order_id, MAX(mobile_id) AS keep_mobile_id
+         FROM restaurant_orders
+         WHERE order_id IS NOT NULL AND TRIM(order_id::text) <> ''
+         GROUP BY order_id
+         HAVING COUNT(*) > 1
+       )
+       UPDATE restaurant_orders ro
+       SET order_id = 'ORD-' || LPAD(ro.mobile_id::text, 6, '0')
+       FROM dups d
+       WHERE ro.order_id = d.order_id AND ro.mobile_id <> d.keep_mobile_id`,
+    );
+
+    await safeExec(
+      pool,
+      `CREATE UNIQUE INDEX IF NOT EXISTS restaurant_orders_order_id_uq
+       ON restaurant_orders (order_id) WHERE order_id IS NOT NULL AND TRIM(order_id::text) <> ''`,
+    );
+
+    if (await tableExists(pool, "customer_accounts")) {
+      await safeExec(
+        pool,
+        `UPDATE restaurant_orders ro
+         SET customer_id = ca.customer_id
+         FROM customer_accounts ca
+         WHERE ca.customer_id IS NOT NULL
+           AND ca.customer_id ~ '^CUS-'
+           AND ro.user_email IS NOT NULL
+           AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))
+           AND (
+             ro.customer_id IS NULL
+             OR TRIM(ro.customer_id::text) = ''
+             OR ro.customer_id::text !~ '^CUS-'
+           )`,
+      );
+    }
+  }
+
+  for (const table of ["catering_orders", "event_orders"] as const) {
+    if (!(await tableExists(pool, table))) continue;
+    const bizCol = table === "catering_orders" ? "catering_id" : "event_id";
+    await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${bizCol} TEXT`);
+
+    if (await columnExists(pool, table, "transaction_no")) {
+      await safeExec(
+        pool,
+        `UPDATE ${table}
+         SET ${bizCol} = COALESCE(NULLIF(TRIM(${bizCol}::text), ''), NULLIF(TRIM(transaction_no::text), ''))
+         WHERE ${bizCol} IS NULL OR TRIM(${bizCol}::text) = ''`,
+      );
+    }
+    if (await columnExists(pool, table, "inquiry_id")) {
+      await safeExec(
+        pool,
+        `UPDATE ${table}
+         SET ${bizCol} = COALESCE(NULLIF(TRIM(${bizCol}::text), ''), NULLIF(TRIM(inquiry_id::text), ''))
+         WHERE ${bizCol} IS NULL OR TRIM(${bizCol}::text) = ''`,
+      );
+    }
+
+    await safeExec(
+      pool,
+      `UPDATE ${table}
+       SET ${bizCol} = 'TR-' || LPAD(
+         COALESCE(NULLIF(REGEXP_REPLACE(${bizCol}::text, '\\D', '', 'g'), ''), id::text),
+         6,
+         '0'
+       )
+       WHERE ${bizCol} IS NULL OR TRIM(${bizCol}::text) = '' OR ${bizCol}::text !~ '^TR-'`,
+    );
+  }
+
+  await safeExec(
+    pool,
+    `WITH all_tx AS (
+       SELECT 'catering_orders'::text AS tbl, id::text AS row_id, catering_id::text AS biz_id
+       FROM catering_orders
+       WHERE catering_id IS NOT NULL AND TRIM(catering_id::text) <> ''
+       UNION ALL
+       SELECT 'event_orders', id::text, event_id::text
+       FROM event_orders
+       WHERE event_id IS NOT NULL AND TRIM(event_id::text) <> ''
+     ),
+     ranked AS (
+       SELECT tbl, row_id, biz_id,
+              ROW_NUMBER() OVER (PARTITION BY biz_id ORDER BY tbl, row_id) AS rn
+       FROM all_tx
+     )
+     UPDATE catering_orders c
+     SET catering_id = 'TR-' || LPAD(c.id::text, 6, '0')
+     FROM ranked r
+     WHERE r.tbl = 'catering_orders' AND c.id::text = r.row_id AND r.rn > 1`,
+  );
+  await safeExec(
+    pool,
+    `WITH all_tx AS (
+       SELECT 'catering_orders'::text AS tbl, id::text AS row_id, catering_id::text AS biz_id
+       FROM catering_orders
+       WHERE catering_id IS NOT NULL AND TRIM(catering_id::text) <> ''
+       UNION ALL
+       SELECT 'event_orders', id::text, event_id::text
+       FROM event_orders
+       WHERE event_id IS NOT NULL AND TRIM(event_id::text) <> ''
+     ),
+     ranked AS (
+       SELECT tbl, row_id, biz_id,
+              ROW_NUMBER() OVER (PARTITION BY biz_id ORDER BY tbl, row_id) AS rn
+       FROM all_tx
+     )
+     UPDATE event_orders e
+     SET event_id = 'TR-' || LPAD(e.id::text, 6, '0')
+     FROM ranked r
+     WHERE r.tbl = 'event_orders' AND e.id::text = r.row_id AND r.rn > 1`,
+  );
+
+  await safeExec(
+    pool,
+    `CREATE UNIQUE INDEX IF NOT EXISTS catering_orders_catering_id_uq
+     ON catering_orders (catering_id) WHERE catering_id IS NOT NULL AND TRIM(catering_id::text) <> ''`,
+  );
+  await safeExec(
+    pool,
+    `CREATE UNIQUE INDEX IF NOT EXISTS event_orders_event_id_uq
+     ON event_orders (event_id) WHERE event_id IS NOT NULL AND TRIM(event_id::text) <> ''`,
+  );
+}
+
+async function pruneCanonicalColumns(pool: pg.Pool): Promise<void> {
+  await pruneTableColumns(pool, "customer_accounts", CUSTOMER_ACCOUNTS_COLUMNS);
+  await pruneTableColumns(pool, "restaurant_orders", RESTAURANT_ORDERS_COLUMNS);
+  await pruneTableColumns(pool, "catering_orders", CATERING_ORDERS_COLUMNS);
+  await pruneTableColumns(pool, "event_orders", EVENT_ORDERS_COLUMNS);
 }
 
 async function normalizeAiGenerations(pool: pg.Pool): Promise<void> {
@@ -187,6 +560,7 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
   await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS updated_pw_dt_stamp TIMESTAMPTZ`);
 
   await copyColumnIfBothExist(pool, "customer_accounts", "contact_number", "phone_number");
+  await copyColumnIfBothExist(pool, "customer_accounts", "contact_number", "phone");
   await copyColumnIfBothExist(pool, "customer_accounts", "signup_otp_code_expiry", "signup_otp_expires_at");
   await copyColumnIfBothExist(pool, "customer_accounts", "forgot_password_otp_code", "password_reset_otp");
   await copyColumnIfBothExist(
@@ -366,7 +740,6 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
     pool,
     `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq ON customer_accounts (customer_id) WHERE customer_id IS NOT NULL`,
   );
-  await renameColumnIfExists(pool, "customer_accounts", "phone_number", "contact_number_legacy");
 }
 
 /** Restore table PK `id`, business `order_id` (ORD-*), and FK `customer_id` (CUS-*). */
@@ -508,7 +881,6 @@ async function repairRestaurantOrdersIdentityInner(pool: pg.Pool): Promise<void>
              ro.customer_id IS NULL
              OR TRIM(ro.customer_id::text) = ''
              OR ro.customer_id::text !~ '^CUS-'
-             OR ro.customer_id::text = ca.id::text
            )`,
       );
     }
@@ -617,6 +989,9 @@ async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
         OR ro.customer_id::text !~ '^CUS-'
       )
   `);
+
+  await copyColumnIfBothExist(pool, "restaurant_orders", "full_name", "delivery_name");
+  await copyColumnIfBothExist(pool, "restaurant_orders", "contact_number", "delivery_contact");
 }
 
 /** Copy legacy post_analysis column into checklist.post_analysis, then drop the column. */
@@ -644,30 +1019,65 @@ async function migratePostAnalysisIntoChecklistAndDrop(pool: pg.Pool): Promise<v
 
 async function normalizeCateringOrders(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "catering_orders"))) return;
+
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS catering_id TEXT`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS event_title TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS formality_level TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS event_setting TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS pax_buffer INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(12,2)`);
+  await pool.query(
+    `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS loyalty_points_catering_obtained INTEGER NOT NULL DEFAULT 0`,
+  );
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS loyalty_reward_catering_obtained TEXT`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS down_payment_proof TEXT`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS full_payment_proof TEXT`);
+
   await copyColumnIfBothExist(pool, "catering_orders", "catering_id", "transaction_no");
-  await pool.query(`
-    UPDATE catering_orders
-    SET catering_id = 'TR-' || LPAD(
-      COALESCE(NULLIF(REGEXP_REPLACE(catering_id, '\\D', '', 'g'), ''), id::text),
-      6, '0'
-    )
-    WHERE catering_id IS NULL OR TRIM(catering_id) = '' OR catering_id !~ '^TR-'
-  `);
+  await copyColumnIfBothExist(pool, "catering_orders", "catering_id", "inquiry_id");
+  await copyColumnIfBothExist(pool, "catering_orders", "loyalty_points_catering_obtained", "points_earned");
+  await copyColumnIfBothExist(pool, "catering_orders", "estimated_cost", "estimated_total");
+
+  if (await columnExists(pool, "catering_orders", "theme_design")) {
+    await safeExec(
+      pool,
+      `UPDATE catering_orders
+       SET
+         event_title = COALESCE(NULLIF(TRIM(event_title), ''), NULLIF(TRIM(theme_design->>'event_title'), ''), event_title),
+         event_type = COALESCE(NULLIF(TRIM(event_type), ''), NULLIF(TRIM(theme_design->>'event_type'), ''), event_type),
+         formality_level = COALESCE(
+           NULLIF(TRIM(formality_level), ''),
+           NULLIF(TRIM(theme_design->>'formality_level'), ''),
+           formality_level
+         ),
+         event_setting = COALESCE(
+           NULLIF(TRIM(event_setting), ''),
+           NULLIF(TRIM(theme_design->>'event_setting'), ''),
+           event_setting
+         )
+       WHERE theme_design IS NOT NULL AND theme_design <> '{}'::jsonb`,
+    );
+    await dropColumnIfExists(pool, "catering_orders", "theme_design");
+  }
 }
 
 async function normalizeEventOrders(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "event_orders"))) return;
+
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS event_id TEXT`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS pax_buffer INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(12,2)`);
+  await pool.query(
+    `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS loyalty_points_catering_obtained INTEGER NOT NULL DEFAULT 0`,
+  );
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS loyalty_reward_catering_obtained TEXT`);
+
   await copyColumnIfBothExist(pool, "event_orders", "event_id", "transaction_no");
-  await pool.query(`
-    UPDATE event_orders
-    SET event_id = 'TR-' || LPAD(
-      COALESCE(NULLIF(REGEXP_REPLACE(event_id, '\\D', '', 'g'), ''), id::text),
-      6, '0'
-    )
-    WHERE event_id IS NULL OR TRIM(event_id) = '' OR event_id !~ '^TR-'
-  `);
+  await copyColumnIfBothExist(pool, "event_orders", "event_id", "inquiry_id");
+  await copyColumnIfBothExist(pool, "event_orders", "loyalty_points_catering_obtained", "points_earned");
+  await copyColumnIfBothExist(pool, "event_orders", "estimated_cost", "estimated_total");
 }
 
 async function normalizeIdCounter(pool: pg.Pool): Promise<void> {
@@ -710,7 +1120,8 @@ async function normalizeIdCounter(pool: pg.Pool): Promise<void> {
     pool,
     `UPDATE id_counter SET last_value = GREATEST(
       last_value,
-      COALESCE((SELECT MAX(CAST(SUBSTRING(id FROM 5) AS INT)) FROM users WHERE id ~ '^USR-[0-9]+$'), 0)
+      COALESCE((SELECT MAX(CAST(SUBSTRING(staff_id FROM 5) AS INT)) FROM users WHERE staff_id ~ '^USR-[0-9]+$'), 0),
+      COALESCE((SELECT MAX(CAST(SUBSTRING(id FROM 5) AS INT)) FROM users WHERE id::text ~ '^USR-[0-9]+$'), 0)
     ) WHERE counter_key = 'USR'`,
   );
 }

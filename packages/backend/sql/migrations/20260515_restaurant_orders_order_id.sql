@@ -23,7 +23,7 @@ BEGIN
       AND column_name = 'customer_id' AND data_type = 'uuid'
   ) THEN
     UPDATE restaurant_orders ro
-    SET customer_id = ca.id
+    SET customer_id = ca.customer_id
     FROM customer_accounts ca
     WHERE ro.customer_id IS NULL
       AND ro.user_email IS NOT NULL

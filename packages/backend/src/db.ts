@@ -281,11 +281,7 @@ export async function initDb(): Promise<void> {
      ) AS exists`,
   );
   if (mobileOrdersTable.rows[0]?.exists) {
-    const migratedCustomerIdExpr =
-      restaurantOrdersCustomerIdKind === "uuid"
-        ? `(SELECT ca.id FROM customer_accounts ca
-            WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`
-        : `(SELECT ca.customer_id FROM customer_accounts ca
+    const migratedCustomerIdExpr = `(SELECT ca.customer_id FROM customer_accounts ca
             WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`;
     await p.query(`
       INSERT INTO restaurant_orders (
@@ -316,21 +312,29 @@ export async function initDb(): Promise<void> {
   }
 
   if (restaurantOrdersCustomerIdKind === "uuid") {
-    await p.query(`
-      UPDATE restaurant_orders ro
-      SET customer_id = ca.id
-      FROM customer_accounts ca
-      WHERE ro.customer_id IS NULL
-        AND ro.user_email IS NOT NULL
-        AND TRIM(ro.user_email) <> ''
-        AND LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email))
-    `);
-  } else if (restaurantOrdersCustomerIdKind === "text") {
+    try {
+      await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id_text TEXT`);
+      await p.query(`
+        UPDATE restaurant_orders ro
+        SET customer_id_text = ca.customer_id
+        FROM customer_accounts ca
+        WHERE ro.user_email IS NOT NULL
+          AND TRIM(ro.user_email) <> ''
+          AND ca.customer_id IS NOT NULL
+          AND LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email))
+      `);
+      await p.query(`ALTER TABLE restaurant_orders DROP COLUMN IF EXISTS customer_id`);
+      await p.query(`ALTER TABLE restaurant_orders RENAME COLUMN customer_id_text TO customer_id`);
+      restaurantOrdersCustomerIdKindCache = "text";
+    } catch (err) {
+      console.warn("[db] restaurant_orders customer_id uuid→CUS migration skipped:", err);
+    }
+  } else {
     await p.query(`
       UPDATE restaurant_orders ro
       SET customer_id = ca.customer_id
       FROM customer_accounts ca
-      WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id::text) = '')
+      WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id::text) = '' OR ro.customer_id::text !~ '^CUS-')
         AND ro.user_email IS NOT NULL
         AND TRIM(ro.user_email) <> ''
         AND ca.customer_id IS NOT NULL

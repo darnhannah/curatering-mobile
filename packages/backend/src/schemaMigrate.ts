@@ -13,6 +13,7 @@ export async function runExtendedMigrations(pool: pg.Pool): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
+      staff_id TEXT,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'cashier',
@@ -170,19 +171,21 @@ export async function runExtendedMigrations(pool: pg.Pool): Promise<void> {
       `SELECT email, password_hash, COALESCE(display_name, '') AS display_name FROM mobile_users WHERE LOWER(TRIM(role)) = 'cashier'`,
     );
     let seq = 1;
-    const idRows = await pool.query(`SELECT id FROM users WHERE id ~ '^USR-[0-9]+$'`);
-    const nums = (idRows.rows as Array<{ id: string }>)
-      .map((r) => Number(String(r.id).replace(/^USR-0*/, "") || "0"))
+    const idRows = await pool.query(
+      `SELECT COALESCE(staff_id, id) AS staff_id FROM users WHERE COALESCE(staff_id, id)::text ~ '^USR-[0-9]+$'`,
+    );
+    const nums = (idRows.rows as Array<{ staff_id: string }>)
+      .map((r) => Number(String(r.staff_id).replace(/^USR-0*/, "") || "0"))
       .filter((n) => Number.isFinite(n) && n > 0);
     seq = nums.length > 0 ? Math.max(...nums) + 1 : 1;
     for (const r of rows as Array<{ email: string; password_hash: string; display_name: string }>) {
-      const id = `USR-${String(seq).padStart(4, "0")}`;
+      const staffId = `USR-${String(seq).padStart(4, "0")}`;
       seq += 1;
       await pool.query(
-        `INSERT INTO users (id, email, password_hash, role, display_name)
-         VALUES ($1, $2, $3, 'cashier', $4)
-         ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, display_name = EXCLUDED.display_name`,
-        [id, r.email.trim().toLowerCase(), r.password_hash, r.display_name ?? ""],
+        `INSERT INTO users (id, staff_id, email, password_hash, role, display_name)
+         VALUES (gen_random_uuid()::text, $1, $2, $3, 'cashier', $4)
+         ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, display_name = EXCLUDED.display_name, staff_id = COALESCE(users.staff_id, EXCLUDED.staff_id)`,
+        [staffId, r.email.trim().toLowerCase(), r.password_hash, r.display_name ?? ""],
       );
     }
   } catch {

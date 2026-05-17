@@ -8,10 +8,10 @@ export const RESTAURANT_ORDER_SELECT = `
   mobile_id AS id,
   id AS order_uuid,
   user_email,
-  COALESCE(order_id, order_no, CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END) AS order_no,
-  order_id,
-  COALESCE(order_status, fulfillment_stage, status, 'PENDING_CASHIER') AS status,
-  COALESCE(order_status, fulfillment_stage, status, 'PENDING_CASHIER') AS fulfillment_stage,
+  COALESCE(order_id, CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END) AS order_id,
+  COALESCE(order_id, CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END) AS order_no,
+  COALESCE(order_status, 'PENDING_CASHIER') AS status,
+  COALESCE(order_status, 'PENDING_CASHIER') AS fulfillment_stage,
   COALESCE(total_cost, total, total_amount, 0) AS total,
   total_cost,
   COALESCE(delivery_notes, note, '') AS note,
@@ -160,6 +160,12 @@ export const CUSTOMER_FORGOT_OTP_SELECT = `
 /** Manager catering/event post-analysis JSON (stored under checklist.post_analysis). */
 export const POST_ANALYSIS_JSON = `COALESCE(checklist->'post_analysis', '{}'::jsonb)`;
 
+/** Business transaction id TR-****** (catering_orders.catering_id). */
+export const CATERING_TRANSACTION_ID = `COALESCE(NULLIF(TRIM(catering_id::text), ''), '')`;
+
+/** Business transaction id TR-****** (event_orders.event_id). */
+export const EVENT_TRANSACTION_ID = `COALESCE(NULLIF(TRIM(event_id::text), ''), '')`;
+
 /** SET clause: persist post_analysis into checklist.post_analysis. */
 export function postAnalysisPersistSet(paramRef: string): string {
   return `checklist = jsonb_set(
@@ -177,14 +183,9 @@ export function customerForgotOtpUpdateSql(): { set: string; clear: string } {
   return {
     set: `forgot_password_otp_code = $2,
           forgot_password_otp_code_expiry = $3,
-          password_reset_otp = $2,
-          password_reset_expires_at = $3,
-          updated_at = NOW()`,
+          updated_pw_dt_stamp = NOW()`,
     clear: `forgot_password_otp_code = NULL,
             forgot_password_otp_code_expiry = NULL,
-            password_reset_otp = NULL,
-            password_reset_expires_at = NULL,
-            updated_pw_dt_stamp = NOW(),
-            updated_at = NOW()`,
+            updated_pw_dt_stamp = NOW()`,
   };
 }

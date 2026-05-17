@@ -19,7 +19,9 @@ import {
 } from "./db.js";
 import {
   CASHIER_ONLINE_ORDER_WHERE,
+  CATERING_TRANSACTION_ID,
   CUSTOMER_FORGOT_OTP_SELECT,
+  EVENT_TRANSACTION_ID,
   POST_ANALYSIS_JSON,
   RESTAURANT_ORDER_SELECT,
   customerForgotOtpUpdateSql,
@@ -572,31 +574,20 @@ async function customerProfileIdForEmail(emailRaw: string): Promise<string | nul
   return customerBusinessIdForEmail(emailRaw);
 }
 
-/** Resolves `restaurant_orders.customer_id` (account UUID or CUS-**** depending on column type). */
+/** Resolves `restaurant_orders.customer_id` (CUS-**** from customer_accounts). */
 async function restaurantOrderCustomerIdForCheckout(userEmail: string, isGuest: boolean): Promise<string | null> {
-  const kind = getRestaurantOrdersCustomerIdKind();
-  if (isGuest) {
-    return kind === "uuid" ? null : await nextGuestCustomerId();
-  }
-  const email = userEmail.trim().toLowerCase();
-  if (kind === "uuid") {
-    const { rows } = await getPool().query(
-      `SELECT id::text AS id FROM customer_accounts WHERE LOWER(TRIM(email)) = $1 LIMIT 1`,
-      [email],
-    );
-    return (rows[0] as { id: string } | undefined)?.id ?? null;
-  }
-  return customerBusinessIdForEmail(email);
+  if (isGuest) return await nextGuestCustomerId();
+  return customerBusinessIdForEmail(userEmail.trim().toLowerCase());
 }
 
 async function nextTransactionNo(_kind: "catering" | "event"): Promise<string> {
   void _kind;
   const { rows } = await getPool().query(
-    `SELECT COALESCE(MAX(CAST(SUBSTRING(transaction_no FROM 4) AS INT)), 0) AS m
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(biz_id FROM 4) AS INT)), 0) AS m
      FROM (
-       SELECT transaction_no FROM catering_orders WHERE transaction_no ~ '^TR-[0-9]+$'
+       SELECT catering_id AS biz_id FROM catering_orders WHERE catering_id ~ '^TR-[0-9]+$'
        UNION ALL
-       SELECT transaction_no FROM event_orders WHERE transaction_no ~ '^TR-[0-9]+$'
+       SELECT event_id FROM event_orders WHERE event_id ~ '^TR-[0-9]+$'
      ) u`,
   );
   const n = Number((rows[0] as { m: string | number }).m) || 0;
@@ -2174,7 +2165,7 @@ async function finalizeRestaurantOrderAfterInsert(
   if (fields.customerId) {
     const { rows: ca } = await client.query(
       `SELECT full_name, contact_number FROM customer_accounts
-       WHERE customer_id = $1 OR id::text = $1
+       WHERE customer_id = $1
        LIMIT 1`,
       [fields.customerId],
     );
@@ -2187,7 +2178,6 @@ async function finalizeRestaurantOrderAfterInsert(
   await client.query(
     `UPDATE restaurant_orders SET
        order_no = $1,
-       order_id = $1,
        total = $2,
        total_cost = $2,
        total_amount = $2,
@@ -2472,7 +2462,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
              OR POSITION(LOWER($1) IN LOWER(COALESCE(ro.delivery_notes, ro.note, ''))) > 0
            )
          UNION ALL
-         SELECT COALESCE(NULLIF(TRIM(eo.transaction_no), ''), 'EVT-' || eo.id::text) AS order_no,
+         SELECT COALESCE(NULLIF(TRIM(${EVENT_TRANSACTION_ID}), ''), 'EVT-' || eo.id::text) AS order_no,
                 COALESCE(eo.points_earned, 0) AS points_delta,
                 COALESCE(eo.stage_entered_at, eo.updated_at, eo.created_at) AS created_at,
                 'catering' AS source
@@ -2481,7 +2471,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
            AND COALESCE(eo.points_earned, 0) > 0
            AND LOWER(TRIM(eo.status)) IN ('for_post_analysis', 'completed')
          UNION ALL
-         SELECT COALESCE(NULLIF(TRIM(co.transaction_no), ''), 'CAT-' || co.id::text) AS order_no,
+         SELECT COALESCE(NULLIF(TRIM(${CATERING_TRANSACTION_ID}), ''), 'CAT-' || co.id::text) AS order_no,
                 COALESCE(co.points_earned, 0) AS points_delta,
                 COALESCE(co.stage_entered_at, co.updated_at, co.created_at) AS created_at,
                 'catering' AS source
@@ -2819,8 +2809,9 @@ app.patch("/api/mobile/inquiries/:id/cancel-customer", async (req, res) => {
   try {
     await client.query("BEGIN");
     const tryCancel = async (table: "catering_orders" | "event_orders") => {
+      const txCol = table === "catering_orders" ? "catering_id" : "event_id";
       const { rows } = await client.query(
-        `SELECT id::text AS id, status, COALESCE(NULLIF(TRIM(transaction_no), ''), CONCAT('TRX-', id::text)) AS tx
+        `SELECT id::text AS id, status, COALESCE(NULLIF(TRIM(${txCol}::text), ''), CONCAT('TRX-', id::text)) AS tx
          FROM ${table}
          WHERE id::text = $1
            AND (LOWER(TRIM(email_address)) = $2 OR LOWER(TRIM(COALESCE(customer_id::text, ''))) = $2)
@@ -3461,7 +3452,7 @@ app.get("/api/mobile/inquiries", async (req, res) => {
       `SELECT * FROM (
          SELECT id::text AS id,
               ('INQ-' || UPPER(SUBSTRING(id::text, 1, 8))) AS inquiry_no,
-              COALESCE(NULLIF(TRIM(COALESCE(transaction_no::text, '')), ''), '') AS transaction_no,
+              ${EVENT_TRANSACTION_ID} AS transaction_no,
               'CATERING AND EVENT' AS inquiry_type,
               COALESCE(event_title, '') AS event_title,
               COALESCE(event_type, '') AS event_type,
@@ -3502,7 +3493,7 @@ app.get("/api/mobile/inquiries", async (req, res) => {
          UNION ALL
          SELECT id::text AS id,
                 ('INQ-' || UPPER(SUBSTRING(id::text, 1, 8))) AS inquiry_no,
-                COALESCE(NULLIF(TRIM(COALESCE(transaction_no::text, '')), ''), '') AS transaction_no,
+                ${CATERING_TRANSACTION_ID} AS transaction_no,
                 'CATERING' AS inquiry_type,
                 '' AS event_title,
                 '' AS event_type,
@@ -3533,9 +3524,9 @@ app.get("/api/mobile/inquiries", async (req, res) => {
                 END AS loyalty_points_earned,
                 status, created_at,
                 address AS event_city,
-                COALESCE(NULLIF(TRIM(theme_design->>'event_setting'), ''), '') AS event_setting,
+                COALESCE(NULLIF(TRIM(event_setting), ''), '') AS event_setting,
                 '' AS service_included,
-                '' AS formality_level,
+                COALESCE(NULLIF(TRIM(formality_level), ''), '') AS formality_level,
                 FALSE AS food_tasting_requested
          FROM catering_orders
          WHERE LOWER(TRIM(COALESCE(customer_id::text, ''))) = $1
@@ -3676,15 +3667,6 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     const costBreakdown = Array.isArray(req.body?.cost_breakdown) ? req.body.cost_breakdown : [];
     const laborCost = toNum(req.body?.labor_cost, 0);
     const travelCost = toNum(req.body?.travel_cost, 0);
-    const themeDesignCatering = JSON.stringify({
-      inquiry_type: inquiryType,
-      event_title: eventTitle.trim(),
-      event_type: eventType.trim(),
-      service_included: serviceIncluded,
-      formality_level: formalityLevel.trim(),
-      note: note.trim(),
-      event_setting: eventSetting,
-    });
     const themeDesignEvent = JSON.stringify({
       inquiry_type: inquiryType,
       service_included: serviceIncluded,
@@ -3694,15 +3676,15 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     const sql = cateringOnly
       ? `INSERT INTO catering_orders
          (source, status, order_type, customer_name, contact_person, contact_number, email_address,
-          schedule_slots, address, guest_count, menu, theme_design, checklist,
-          total_cost, customer_id, transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
+          schedule_slots, address, guest_count, menu, event_title, event_type, formality_level, event_setting, checklist,
+          total_cost, customer_id, catering_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
          VALUES
-         ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15, $16::jsonb, $17, $18, $19)
+         ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19::jsonb, $20, $21, $22)
          RETURNING id::text`
       : `INSERT INTO event_orders
          (source, status, order_type, event_title, event_type, formality_level, customer_name, contact_person, contact_number,
           email_address, schedule_slots, address, guest_count, menu, theme_design, checklist,
-          total_cost, customer_id, transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
+          total_cost, customer_id, event_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
          VALUES
          ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16, $17, $18, $19::jsonb, $20, $21, $22)
          RETURNING id::text`;
@@ -3716,10 +3698,13 @@ app.post("/api/mobile/inquiries", async (req, res) => {
           eventCity,
           guestCount,
           menuJson,
-          themeDesignCatering,
+          eventTitle.trim(),
+          eventType.trim(),
+          formalityLevel.trim(),
+          eventSetting,
           JSON.stringify({
             items: autoChecklist,
-            post_analysis: { note, inquiry_type: inquiryType },
+            post_analysis: { note, inquiry_type: inquiryType, service_included: serviceIncluded },
           }),
           estimatedTotal + laborCost + travelCost,
           userEmail,
@@ -3816,7 +3801,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
               down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
                 total_cost, created_at, updated_at, stage_entered_at, event_title, event_type, formality_level, actual_event_images,
                 COALESCE(theme_design->>'service_included', '') AS service_included,
-                transaction_no, payment_method,
+                ${EVENT_TRANSACTION_ID} AS transaction_no, payment_method,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(cost_breakdown, '[]'::jsonb) END AS cost_breakdown,
                 labor_cost, travel_cost, additional_costs, full_payment_due_at,
                 COALESCE(NULLIF(TRIM(theme_design->>'event_setting'), ''), '') AS event_setting,
@@ -3841,7 +3826,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                     ))
                   END
                 ) AS schedule_preview,
-                COALESCE(points_earned, 0) AS points_earned,
+                COALESCE(loyalty_points_catering_obtained, 0) AS points_earned,
                 (CASE
                   WHEN jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) = 'array' THEN COALESCE(jsonb_array_length(checklist::jsonb), 0)
                   ELSE 0
@@ -3857,20 +3842,20 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                   ELSE COALESCE(schedule_slots, '[]'::jsonb)
                 END AS schedule_slots, address, guest_count,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(menu, '[]'::jsonb) END AS menu,
-                CASE WHEN $2::boolean THEN '{}'::jsonb ELSE COALESCE(theme_design, '{}'::jsonb) END AS theme_design,
+                '{}'::jsonb AS theme_design,
                 CASE WHEN ($2::boolean AND $1::text NOT IN ('for_post_analysis')) THEN '{}'::jsonb ELSE ${POST_ANALYSIS_JSON} END AS post_analysis,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(checklist, '[]'::jsonb) END AS checklist,
                 down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
                 total_cost, created_at, updated_at, stage_entered_at,
-                COALESCE(theme_design->>'event_title','') AS event_title,
-                COALESCE(theme_design->>'event_type','') AS event_type,
-                COALESCE(theme_design->>'formality_level','') AS formality_level,
+                COALESCE(event_title, '') AS event_title,
+                COALESCE(event_type, '') AS event_type,
+                COALESCE(formality_level, '') AS formality_level,
                 '[]'::jsonb AS actual_event_images,
-                COALESCE(theme_design->>'service_included', '') AS service_included,
-                transaction_no, payment_method,
+                COALESCE(event_setting, '') AS service_included,
+                ${CATERING_TRANSACTION_ID} AS transaction_no, payment_method,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(cost_breakdown, '[]'::jsonb) END AS cost_breakdown,
                 labor_cost, travel_cost, additional_costs, full_payment_due_at,
-                COALESCE(NULLIF(TRIM(theme_design->>'event_setting'), ''), '') AS event_setting,
+                COALESCE(NULLIF(TRIM(event_setting), ''), '') AS event_setting,
                 (
                   CASE
                     WHEN schedule_slots IS NULL THEN ''
@@ -3956,22 +3941,22 @@ app.post("/api/mobile/pos/catering/item", async (req, res) => {
              down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
              total_cost, created_at, updated_at, stage_entered_at, event_title, event_type, formality_level, actual_event_images,
              COALESCE(theme_design->>'service_included', '') AS service_included,
-             transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
-             COALESCE(points_earned, 0) AS points_earned
+             ${EVENT_TRANSACTION_ID} AS transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
+             COALESCE(loyalty_points_catering_obtained, 0) AS points_earned
       FROM event_orders WHERE id::text = $1`;
     const fullSelectCatering = `
       SELECT 'catering'::text AS order_kind,
              id::text, source, status, order_type, customer_name, contact_person, contact_number, email_address,
-             schedule_slots, address, guest_count, menu, theme_design, ${POST_ANALYSIS_JSON} AS post_analysis, checklist,
+             schedule_slots, address, guest_count, menu, ${POST_ANALYSIS_JSON} AS post_analysis, checklist,
              down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
              total_cost, created_at, updated_at, stage_entered_at,
-             COALESCE(theme_design->>'event_title','') AS event_title,
-             COALESCE(theme_design->>'event_type','') AS event_type,
-             COALESCE(theme_design->>'formality_level','') AS formality_level,
+             COALESCE(event_title, '') AS event_title,
+             COALESCE(event_type, '') AS event_type,
+             COALESCE(formality_level, '') AS formality_level,
              '[]'::jsonb AS actual_event_images,
-             COALESCE(theme_design->>'service_included', '') AS service_included,
-             transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
-             COALESCE(points_earned, 0) AS points_earned
+             COALESCE(event_setting, '') AS service_included,
+             ${CATERING_TRANSACTION_ID} AS transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
+             COALESCE(loyalty_points_catering_obtained, 0) AS points_earned
       FROM catering_orders WHERE id::text = $1`;
     const { rows } = await getPool().query(orderKind === "event" ? fullSelectEvent : fullSelectCatering, [id]);
     if (rows.length === 0) {
@@ -4103,15 +4088,15 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
       orderKind === "catering"
         ? `INSERT INTO catering_orders
            (source, status, order_type, customer_name, contact_person, contact_number, email_address,
-            schedule_slots, address, guest_count, menu, theme_design, checklist,
-            total_cost, created_by, updated_by, customer_id, transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
+            schedule_slots, address, guest_count, menu, event_setting, checklist,
+            total_cost, created_by, updated_by, customer_id, catering_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
            VALUES
-           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $15, NULLIF($16, ''), $17, $18, $19::jsonb, $20, $21, $22)
+           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $15, NULLIF($16, ''), $17, $18, $19::jsonb, $20, $21, $22)
            RETURNING id::text`
         : `INSERT INTO event_orders
            (source, status, order_type, customer_name, contact_person, contact_number, email_address,
             schedule_slots, address, guest_count, menu, theme_design, event_title, event_type, formality_level, checklist,
-            total_cost, created_by, updated_by, customer_id, transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
+            total_cost, created_by, updated_by, customer_id, event_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
            VALUES
            ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17, $18, $19, NULLIF($20, ''), $21, $22, $23::jsonb, $24, $25, $26)
            RETURNING id::text`;
@@ -4129,7 +4114,7 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
             payload.address,
             payload.guest_count,
             menuJson,
-            themeJson,
+            String((themeDesign as Record<string, unknown>)?.event_setting ?? "").trim(),
             JSON.stringify(autoChecklist),
             payload.total_cost,
             payload.created_by,
@@ -4216,8 +4201,9 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
   const actualEventImages = Array.isArray(req.body?.actual_event_images) ? req.body.actual_event_images : null;
   try {
     const table = orderKind === "catering" ? "catering_orders" : "event_orders";
+    const txSelect = orderKind === "catering" ? CATERING_TRANSACTION_ID : EVENT_TRANSACTION_ID;
     const { rows: beforeRows } = await getPool().query(
-      `SELECT checklist, ${POST_ANALYSIS_JSON} AS post_analysis, menu, email_address, transaction_no, total_cost, customer_id, schedule_slots, status FROM ${table} WHERE id::text = $1`,
+      `SELECT checklist, ${POST_ANALYSIS_JSON} AS post_analysis, menu, email_address, ${txSelect} AS transaction_no, total_cost, customer_id, schedule_slots, status FROM ${table} WHERE id::text = $1`,
       [id],
     );
     const before = beforeRows[0] as
@@ -4290,6 +4276,8 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
         : mergedPost;
     const bumpStageEnteredAt = before.status !== nextStatus;
     const checklistPayload = packChecklistWithPost(checklistToSave, postToSave, before.checklist);
+    const themeClause =
+      orderKind === "event" ? "theme_design = COALESCE($12::jsonb, theme_design)," : "";
     const { rows } = await getPool().query(
       `UPDATE ${table}
        SET status = $2,
@@ -4305,11 +4293,11 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
            travel_cost = COALESCE($9, travel_cost),
            total_cost = COALESCE($10, total_cost),
            cost_breakdown = COALESCE($11::jsonb, cost_breakdown),
-           theme_design = COALESCE($12::jsonb, theme_design),
+           ${themeClause}
            menu = COALESCE($13::jsonb, menu),
            stage_entered_at = CASE WHEN $14::boolean THEN NOW() ELSE stage_entered_at END
        WHERE id::text = $1
-       RETURNING id::text, email_address, transaction_no, total_cost`,
+       RETURNING id::text, email_address, ${txSelect} AS transaction_no, total_cost`,
       [
         id,
         nextStatus,
@@ -4626,19 +4614,22 @@ app.post("/api/mobile/pos/catering/:id/switch-order-kind", async (req, res) => {
           down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
           total_cost, created_at, updated_at, stage_entered_at,
           event_title, event_type, formality_level, actual_event_images,
-          transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
+          event_id, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
           created_by, updated_by, customer_id
         )
         SELECT
           c.id, c.source, c.status, c.order_type, c.customer_name, c.contact_person, c.contact_number, c.email_address,
-          c.schedule_slots, c.address, c.guest_count, c.menu, c.theme_design, c.checklist,
+          c.schedule_slots, c.address, c.guest_count, c.menu, jsonb_build_object(
+            'event_setting', COALESCE(NULLIF(TRIM(c.event_setting), ''), ''),
+            'service_included', COALESCE(NULLIF(TRIM(c.event_setting), ''), '')
+          ), c.checklist,
           c.down_payment_amount, c.down_payment_status, c.full_payment_amount, c.full_payment_status,
           c.total_cost, c.created_at, c.updated_at, c.stage_entered_at,
-          COALESCE(NULLIF(TRIM(c.theme_design->>'event_title'), ''), NULLIF(TRIM(c.customer_name), ''), 'Untitled'),
-          COALESCE(NULLIF(TRIM(c.theme_design->>'event_type'), ''), 'General'),
-          COALESCE(NULLIF(TRIM(c.theme_design->>'formality_level'), ''), 'casual'),
+          COALESCE(NULLIF(TRIM(c.event_title), ''), NULLIF(TRIM(c.customer_name), ''), 'Untitled'),
+          COALESCE(NULLIF(TRIM(c.event_type), ''), 'General'),
+          COALESCE(NULLIF(TRIM(c.formality_level), ''), 'casual'),
           '[]'::jsonb,
-          c.transaction_no, c.payment_method, c.cost_breakdown, c.labor_cost, c.travel_cost, c.additional_costs, c.full_payment_due_at,
+          c.catering_id, c.payment_method, c.cost_breakdown, c.labor_cost, c.travel_cost, c.additional_costs, c.full_payment_due_at,
           c.created_by, c.updated_by, c.customer_id
         FROM catering_orders c
         WHERE c.id::text = $1`,
@@ -4658,35 +4649,23 @@ app.post("/api/mobile/pos/catering/:id/switch-order-kind", async (req, res) => {
       await client.query(
         `INSERT INTO catering_orders (
           id, source, status, order_type, customer_name, contact_person, contact_number, email_address,
-          schedule_slots, address, guest_count, menu, theme_design, checklist,
+          schedule_slots, address, guest_count, menu, event_title, event_type, formality_level, event_setting, checklist,
           down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
           total_cost, created_at, updated_at, stage_entered_at,
-          transaction_no, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
+          catering_id, payment_method, cost_breakdown, labor_cost, travel_cost, additional_costs, full_payment_due_at,
           created_by, updated_by, customer_id
         )
         SELECT
           e.id, e.source, e.status, e.order_type, e.customer_name, e.contact_person, e.contact_number, e.email_address,
           e.schedule_slots, e.address, e.guest_count, e.menu,
-          jsonb_set(
-            jsonb_set(
-              jsonb_set(
-                COALESCE(e.theme_design, '{}'::jsonb),
-                '{event_title}',
-                to_jsonb(COALESCE(NULLIF(TRIM(e.event_title), ''), '')),
-                true
-              ),
-              '{event_type}',
-              to_jsonb(COALESCE(NULLIF(TRIM(e.event_type), ''), '')),
-              true
-            ),
-            '{formality_level}',
-            to_jsonb(COALESCE(NULLIF(TRIM(e.formality_level), ''), 'casual')),
-            true
-          ),
+          COALESCE(NULLIF(TRIM(e.event_title), ''), ''),
+          COALESCE(NULLIF(TRIM(e.event_type), ''), ''),
+          COALESCE(NULLIF(TRIM(e.formality_level), ''), 'casual'),
+          COALESCE(NULLIF(TRIM(e.theme_design->>'event_setting'), ''), ''),
           e.checklist,
           e.down_payment_amount, e.down_payment_status, e.full_payment_amount, e.full_payment_status,
           e.total_cost, e.created_at, e.updated_at, e.stage_entered_at,
-          e.transaction_no, e.payment_method, e.cost_breakdown, e.labor_cost, e.travel_cost, e.additional_costs, e.full_payment_due_at,
+          e.event_id, e.payment_method, e.cost_breakdown, e.labor_cost, e.travel_cost, e.additional_costs, e.full_payment_due_at,
           e.created_by, e.updated_by, e.customer_id
         FROM event_orders e
         WHERE e.id::text = $1`,
@@ -4770,9 +4749,10 @@ app.get("/api/mobile/pos/catering/:id/invoice-preview", async (req, res) => {
   const id = String(req.params.id ?? "").trim();
   const orderKind = String(req.query.order_kind ?? "event").trim().toLowerCase();
   const table = orderKind === "catering" ? "catering_orders" : "event_orders";
+  const txSelect = orderKind === "catering" ? CATERING_TRANSACTION_ID : EVENT_TRANSACTION_ID;
   try {
     const { rows } = await getPool().query(
-      `SELECT id::text, transaction_no, customer_name, event_title, guest_count, total_cost, down_payment_amount, full_payment_amount,
+      `SELECT id::text, ${txSelect} AS transaction_no, customer_name, event_title, guest_count, total_cost, down_payment_amount, full_payment_amount,
               cost_breakdown, labor_cost, travel_cost, additional_costs, menu, checklist, payment_method
        FROM ${table}
        WHERE id::text = $1`,
@@ -5226,8 +5206,9 @@ async function seedCashierAccount(): Promise<void> {
     const { rows } = await pool.query(`SELECT id FROM users WHERE email = $1`, [email]);
     if (!rows[0]) {
       await pool.query(
-        `INSERT INTO users (id, email, password_hash, role, pos_role, full_name) VALUES ('USR-0001', $1, $2, 'cashier', 'cashier', $3)
-         ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, full_name = EXCLUDED.full_name, role = 'cashier', pos_role = 'cashier'`,
+        `INSERT INTO users (id, staff_id, email, password_hash, role, pos_role, full_name)
+         VALUES (gen_random_uuid()::text, 'USR-0001', $1, $2, 'cashier', 'cashier', $3)
+         ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, full_name = EXCLUDED.full_name, role = 'cashier', pos_role = 'cashier', staff_id = COALESCE(users.staff_id, EXCLUDED.staff_id)`,
         [email, hash, displayName],
       );
       console.log("[db] seeded cashier (users):", email);
@@ -5249,21 +5230,23 @@ async function seedManagerSupervisorAccounts(): Promise<void> {
   const managerHash = await bcrypt.hash("manager123", 10);
   const supervisorHash = await bcrypt.hash("supervisor321", 10);
   await pool.query(
-    `INSERT INTO users (id, email, password_hash, role, full_name, pos_role)
-     VALUES ('USR-0002', 'manager@curatering.com', $1, 'manager', 'Manager Sample', 'manager')
+    `INSERT INTO users (id, staff_id, email, password_hash, role, full_name, pos_role)
+     VALUES (gen_random_uuid()::text, 'USR-0002', 'manager@curatering.com', $1, 'manager', 'Manager Sample', 'manager')
      ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash,
        full_name = EXCLUDED.full_name,
        role = EXCLUDED.role,
-       pos_role = EXCLUDED.pos_role`,
+       pos_role = EXCLUDED.pos_role,
+       staff_id = COALESCE(users.staff_id, EXCLUDED.staff_id)`,
     [managerHash],
   );
   await pool.query(
-    `INSERT INTO users (id, email, password_hash, role, full_name, pos_role)
-     VALUES ('USR-0003', 'supervisor@curatering.com', $1, 'supervisor', 'Supervisor Sample', 'supervisor')
+    `INSERT INTO users (id, staff_id, email, password_hash, role, full_name, pos_role)
+     VALUES (gen_random_uuid()::text, 'USR-0003', 'supervisor@curatering.com', $1, 'supervisor', 'Supervisor Sample', 'supervisor')
      ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash,
        full_name = EXCLUDED.full_name,
        role = EXCLUDED.role,
-       pos_role = EXCLUDED.pos_role`,
+       pos_role = EXCLUDED.pos_role,
+       staff_id = COALESCE(users.staff_id, EXCLUDED.staff_id)`,
     [supervisorHash],
   );
 }
