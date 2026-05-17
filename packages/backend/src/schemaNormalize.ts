@@ -1090,70 +1090,95 @@ async function normalizeEventOrders(pool: pg.Pool): Promise<void> {
   await copyColumnIfBothExist(pool, "event_orders", "estimated_cost", "estimated_total");
 }
 
-/** Use existing `id_counters` table; drop legacy INQ/MINQ keys and ensure TR/USR only. */
+/** `id_counters` in production: prefix (PK) + last_number + updated_at. */
 async function normalizeIdCounters(pool: pg.Pool): Promise<void> {
-  const hasPlural = await tableExists(pool, "id_counters");
-  const hasSingular = await tableExists(pool, "id_counter");
+  await safeExec(pool, `DROP TABLE IF EXISTS id_counter`);
 
-  if (!hasPlural && hasSingular) {
-    await safeExec(pool, `ALTER TABLE id_counter RENAME TO id_counters`);
-  } else if (!hasPlural && !hasSingular) {
+  if (!(await tableExists(pool, "id_counters"))) {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS id_counters (
-        counter_key TEXT PRIMARY KEY,
-        last_value INTEGER NOT NULL DEFAULT 0
+      CREATE TABLE id_counters (
+        prefix text NOT NULL,
+        last_number integer NOT NULL DEFAULT 0,
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT id_counters_pkey PRIMARY KEY (prefix)
       )
     `);
+  } else if (!(await columnExists(pool, "id_counters", "prefix"))) {
+    console.warn("[schema] id_counters exists but has no prefix column; skipping counter normalize");
+    return;
   }
 
-  if (hasPlural && hasSingular) {
-    await safeExec(
-      pool,
-      `INSERT INTO id_counters (counter_key, last_value)
-       SELECT counter_key, last_value FROM id_counter
-       ON CONFLICT (counter_key) DO UPDATE
-       SET last_value = GREATEST(id_counters.last_value, EXCLUDED.last_value)`,
-    );
-    await safeExec(pool, `DROP TABLE IF EXISTS id_counter`);
-  }
+  const deleted = await pool.query(`DELETE FROM id_counters WHERE prefix IN ('INQ', 'MINQ')`);
+  console.info(`[schema] id_counters: removed ${deleted.rowCount ?? 0} legacy INQ/MINQ row(s)`);
 
-  if (!(await tableExists(pool, "id_counters"))) return;
-
-  await safeExec(pool, `DELETE FROM id_counters WHERE counter_key IN ('INQ', 'MINQ')`);
   await pool.query(`
-    INSERT INTO id_counters (counter_key, last_value) VALUES ('TR', 0), ('USR', 0), ('CUS', 0)
-    ON CONFLICT (counter_key) DO NOTHING
+    INSERT INTO id_counters (prefix, last_number) VALUES ('TR', 0), ('USR', 0), ('CUS', 0)
+    ON CONFLICT (prefix) DO NOTHING
   `);
+
   await syncCusCounterFromAccounts(pool);
-  await safeExec(
-    pool,
-    `UPDATE id_counters SET last_value = GREATEST(
-      last_value,
-      COALESCE((
-        SELECT MAX(CAST(SUBSTRING(catering_id FROM 4) AS INT))
-        FROM catering_orders WHERE catering_id ~ '^TR-[0-9]+$'
-      ), 0),
-      COALESCE((
-        SELECT MAX(CAST(SUBSTRING(event_id FROM 4) AS INT))
-        FROM event_orders WHERE event_id ~ '^TR-[0-9]+$'
-      ), 0),
-      COALESCE((
-        SELECT MAX(CAST(SUBSTRING(transaction_no FROM 4) AS INT))
-        FROM catering_orders WHERE transaction_no ~ '^TR-[0-9]+$'
-      ), 0),
-      COALESCE((
-        SELECT MAX(CAST(SUBSTRING(transaction_no FROM 4) AS INT))
-        FROM event_orders WHERE transaction_no ~ '^TR-[0-9]+$'
-      ), 0)
-    ) WHERE counter_key = 'TR'`,
+
+  const trParts: string[] = [];
+  if (await tableExists(pool, "catering_orders")) {
+    if (await columnExists(pool, "catering_orders", "catering_id")) {
+      trParts.push(
+        `COALESCE((SELECT MAX(CAST(SUBSTRING(catering_id FROM 4) AS INT)) FROM catering_orders WHERE catering_id ~ '^TR-[0-9]+$'), 0)`,
+      );
+    }
+    if (await columnExists(pool, "catering_orders", "transaction_no")) {
+      trParts.push(
+        `COALESCE((SELECT MAX(CAST(SUBSTRING(transaction_no FROM 4) AS INT)) FROM catering_orders WHERE transaction_no ~ '^TR-[0-9]+$'), 0)`,
+      );
+    }
+  }
+  if (await tableExists(pool, "event_orders")) {
+    if (await columnExists(pool, "event_orders", "event_id")) {
+      trParts.push(
+        `COALESCE((SELECT MAX(CAST(SUBSTRING(event_id FROM 4) AS INT)) FROM event_orders WHERE event_id ~ '^TR-[0-9]+$'), 0)`,
+      );
+    }
+    if (await columnExists(pool, "event_orders", "transaction_no")) {
+      trParts.push(
+        `COALESCE((SELECT MAX(CAST(SUBSTRING(transaction_no FROM 4) AS INT)) FROM event_orders WHERE transaction_no ~ '^TR-[0-9]+$'), 0)`,
+      );
+    }
+  }
+  if (trParts.length > 0) {
+    await pool.query(
+      `UPDATE id_counters
+       SET last_number = GREATEST(last_number, ${trParts.join(", ")}),
+           updated_at = NOW()
+       WHERE prefix = 'TR'`,
+    );
+  }
+
+  if (await tableExists(pool, "users")) {
+    const usrParts: string[] = [];
+    if (await columnExists(pool, "users", "staff_id")) {
+      usrParts.push(
+        `COALESCE((SELECT MAX(CAST(SUBSTRING(staff_id FROM 5) AS INT)) FROM users WHERE staff_id ~ '^USR-[0-9]+$'), 0)`,
+      );
+    }
+    if (await columnExists(pool, "users", "id")) {
+      usrParts.push(
+        `COALESCE((SELECT MAX(CAST(SUBSTRING(id::text FROM 5) AS INT)) FROM users WHERE id::text ~ '^USR-[0-9]+$'), 0)`,
+      );
+    }
+    if (usrParts.length > 0) {
+      await pool.query(
+        `UPDATE id_counters
+         SET last_number = GREATEST(last_number, ${usrParts.join(", ")}),
+             updated_at = NOW()
+         WHERE prefix = 'USR'`,
+      );
+    }
+  }
+
+  const { rows } = await pool.query<{ prefix: string; last_number: number }>(
+    `SELECT prefix, last_number FROM id_counters ORDER BY prefix`,
   );
-  await safeExec(
-    pool,
-    `UPDATE id_counters SET last_value = GREATEST(
-      last_value,
-      COALESCE((SELECT MAX(CAST(SUBSTRING(staff_id FROM 5) AS INT)) FROM users WHERE staff_id ~ '^USR-[0-9]+$'), 0),
-      COALESCE((SELECT MAX(CAST(SUBSTRING(id FROM 5) AS INT)) FROM users WHERE id::text ~ '^USR-[0-9]+$'), 0)
-    ) WHERE counter_key = 'USR'`,
+  console.info(
+    `[schema] id_counters: ${rows.map((r) => `${r.prefix}=${r.last_number}`).join(", ") || "(empty)"}`,
   );
 }
 

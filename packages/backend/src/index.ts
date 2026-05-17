@@ -47,7 +47,7 @@ import {
   notifyRestaurantOrderCustomer,
   sendGuestOrderProofConfirmation,
 } from "./guestNotify.js";
-import { nextCusIdFromCounter } from "./idCounters.js";
+import { ensureIdCounterRow, nextCusIdFromCounter, nextTrIdFromCounter } from "./idCounters.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
 if (isMailConfigured()) {
@@ -579,16 +579,19 @@ async function restaurantOrderCustomerIdForCheckout(userEmail: string, isGuest: 
 
 async function nextTransactionNo(_kind: "catering" | "event"): Promise<string> {
   void _kind;
-  const { rows } = await getPool().query(
-    `SELECT COALESCE(MAX(CAST(SUBSTRING(biz_id FROM 4) AS INT)), 0) AS m
-     FROM (
-       SELECT catering_id AS biz_id FROM catering_orders WHERE catering_id ~ '^TR-[0-9]+$'
-       UNION ALL
-       SELECT event_id FROM event_orders WHERE event_id ~ '^TR-[0-9]+$'
-     ) u`,
-  );
-  const n = Number((rows[0] as { m: string | number }).m) || 0;
-  return `TR-${String(n + 1).padStart(6, "0")}`;
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    await ensureIdCounterRow(client, "TR", 0);
+    const id = await nextTrIdFromCounter(client);
+    await client.query("COMMIT");
+    return id;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 type ChecklistItem = {
@@ -2112,14 +2115,7 @@ async function nextCustomerProfileRowId(): Promise<string> {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
-    const { rows } = await client.query<{ exists: boolean }>(
-      `SELECT EXISTS (SELECT 1 FROM id_counters WHERE counter_key = 'CUS') AS exists`,
-    );
-    if (!rows[0]?.exists) {
-      await client.query(
-        `INSERT INTO id_counters (counter_key, last_value) VALUES ('CUS', 0) ON CONFLICT DO NOTHING`,
-      );
-    }
+    await ensureIdCounterRow(client, "CUS", 0);
     const id = await nextCusIdFromCounter(client);
     await client.query("COMMIT");
     return id;
