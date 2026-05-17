@@ -1685,11 +1685,10 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
 
         await getPool().query(
           `UPDATE restaurant_orders
-           SET status = $2,
-               cashier_secondary_amount_received = $3,
-               cashier_change = $4,
-               balance_proof_pending_review = FALSE,
-               fulfillment_stage = 'IN_PREPARATION',
+           SET order_status = $2,
+               cashier_amount_received_balance = $3,
+               payment_confirmed_balance = TRUE,
+               last_updated_order_status_dt_stamp = NOW(),
                updated_at = NOW()
            WHERE mobile_id = $1`,
           [id, newStatus, supplementalAmtIn, changeAmt],
@@ -1758,11 +1757,11 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
           `Please pay the remaining balance and upload a new payment proof in the app under your order.`;
         await getPool().query(
           `UPDATE restaurant_orders
-           SET status = $2,
-               cashier_secondary_amount_received = $3,
-               supplemental_payment_proof = NULL,
-               balance_proof_pending_review = FALSE,
-               fulfillment_stage = 'PENDING_CASHIER',
+           SET order_status = $2,
+               cashier_amount_received_balance = $3,
+               payment_proof_balance = NULL,
+               payment_uploaded_balance = FALSE,
+               last_updated_order_status_dt_stamp = NOW(),
                updated_at = NOW()
            WHERE mobile_id = $1`,
           [id, newStatus, supplementalAmtIn],
@@ -1825,11 +1824,10 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
           `Thank you for choosing Macrina's Kitchen and Catering.`;
         await getPool().query(
           `UPDATE restaurant_orders
-           SET status = $2,
-               cashier_secondary_amount_received = $3,
-               cashier_change = $4,
-               balance_proof_pending_review = FALSE,
-               fulfillment_stage = 'IN_PREPARATION',
+           SET order_status = $2,
+               cashier_amount_received_balance = $3,
+               payment_confirmed_balance = TRUE,
+               last_updated_order_status_dt_stamp = NOW(),
                updated_at = NOW()
            WHERE mobile_id = $1`,
           [id, newStatus, supplementalAmtIn, changeAmt],
@@ -1858,17 +1856,14 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       }
     }
 
-    const nextStage =
-      action === "insufficient" ? "PENDING_CASHIER" : "IN_PREPARATION";
     await getPool().query(
       `UPDATE restaurant_orders
-       SET status = $2,
-           cashier_amount_received = COALESCE($3, cashier_amount_received),
-           cashier_change = COALESCE($4, cashier_change),
-           fulfillment_stage = $5,
+       SET order_status = $2,
+           cashier_amount_received_initial = COALESCE($3, cashier_amount_received_initial),
+           last_updated_order_status_dt_stamp = NOW(),
            updated_at = NOW()
        WHERE mobile_id = $1`,
-      [id, newStatus, cashReceived, changeAmt, nextStage],
+      [id, newStatus, cashReceived],
     );
 
     let inApp = `[${ord.order_no}] Status: ${newStatus}`;
@@ -2067,11 +2062,12 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
     await client.query("BEGIN");
     const { rows } = await client.query(
       `INSERT INTO restaurant_orders
-        (user_email, order_no, note, payment_mode, payment_uploaded, payment_proof, delivery_name, delivery_contact, delivery_address, delivery_time, total,
-         order_source, pos_customer_label, cashier_amount_received, cashier_change, status, fulfillment_stage)
+        (user_email, order_id, delivery_notes, payment_mode, payment_uploaded_initial, payment_proof_initial,
+         full_name, contact_number, delivery_address, delivery_time, total_cost,
+         order_source, pos_customer_label, cashier_amount_received_initial, order_status)
        VALUES
         (NULL, 'TEMP', $1, $2, $3, $4, '', '', '', 'NOW', $5,
-         'POS', $6, $7, $8, 'ORDER CONFIRMED', 'IN_PREPARATION')
+         'POS', $6, $7, 'ORDER CONFIRMED')
        RETURNING mobile_id AS id`,
       [
         note,
@@ -2081,7 +2077,6 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
         total,
         customerLabel,
         !Number.isNaN(amountReceived) ? amountReceived : null,
-        changeDue,
       ],
     );
     const orderId = Number(rows[0].id);
@@ -2184,24 +2179,15 @@ async function finalizeRestaurantOrderAfterInsert(
   }
   await client.query(
     `UPDATE restaurant_orders SET
-       order_no = $1,
-       total = $2,
+       order_id = $1,
        total_cost = $2,
-       total_amount = $2,
-       note = $3,
        delivery_notes = $3,
-       delivery_name = $4,
-       delivery_contact = $5,
-       contact_number = $5,
        full_name = $4,
+       contact_number = $5,
        delivery_address = $6,
        delivery_time = $7,
        tray_items = $8::jsonb,
-       order_lines_snapshot = $8::jsonb,
-       items = $8::jsonb,
-       order_status = COALESCE(NULLIF(TRIM(order_status), ''), NULLIF(TRIM(status), ''), 'WAITING FOR ORDER CONFIRMATION'),
-       status = COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(order_status), ''), 'WAITING FOR ORDER CONFIRMATION'),
-       fulfillment_stage = COALESCE(NULLIF(TRIM(fulfillment_stage), ''), 'PENDING_CASHIER'),
+       order_status = COALESCE(NULLIF(TRIM(order_status), ''), 'WAITING FOR ORDER CONFIRMATION'),
        submitted_order_dt_stamp = COALESCE(submitted_order_dt_stamp, NOW()),
        last_updated_order_status_dt_stamp = NOW(),
        updated_at = NOW()
@@ -2339,9 +2325,9 @@ app.patch("/api/mobile/pos/walkin-orders/:id/cancel", async (req, res) => {
   try {
     const { rows } = await getPool().query(
       `UPDATE restaurant_orders
-       SET status = 'CANCELLED BY CASHIER', updated_at = NOW()
-       WHERE mobile_id = $1 AND order_source = 'POS' AND pos_claimed = FALSE
-         AND upper(COALESCE(status, '')) NOT LIKE '%CANCEL%'
+       SET order_status = 'CANCELLED BY CASHIER', updated_at = NOW()
+       WHERE mobile_id = $1 AND order_source = 'POS'
+         AND upper(COALESCE(order_status, '')) NOT LIKE '%CANCEL%'
        RETURNING mobile_id AS id`,
       [id],
     );
@@ -2621,7 +2607,8 @@ app.post("/api/mobile/orders", async (req, res) => {
     await client.query("BEGIN");
     const { rows } = await client.query(
       `INSERT INTO restaurant_orders
-        (user_email, customer_id, guest_contact_email, order_no, note, payment_mode, delivery_name, delivery_contact, delivery_address, delivery_time, total)
+        (user_email, customer_id, guest_contact_email, order_id, delivery_notes, payment_mode,
+         full_name, contact_number, delivery_address, delivery_time, total_cost)
        VALUES
         ($1, $2, $3, 'TEMP', $4, $5, $6, $7, $8, $9, $10)
        RETURNING mobile_id AS id`,
@@ -2901,7 +2888,7 @@ app.patch("/api/mobile/orders/:id/cancel-customer", async (req, res) => {
       res.status(400).json({ error: "This order can no longer be cancelled from the app." });
       return;
     }
-    await getPool().query(`UPDATE restaurant_orders SET status = $2, updated_at = NOW() WHERE mobile_id = $1`, [
+    await getPool().query(`UPDATE restaurant_orders SET order_status = $2, updated_at = NOW() WHERE mobile_id = $1`, [
       id,
       "CANCELLED BY CUSTOMER",
     ]);

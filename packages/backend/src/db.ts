@@ -26,6 +26,21 @@ export function getRestaurantOrdersCustomerIdKind(): RestaurantOrdersCustomerIdK
   return restaurantOrdersCustomerIdKindCache;
 }
 
+async function columnExists(
+  client: pg.Pool | pg.PoolClient,
+  table: string,
+  column: string,
+): Promise<boolean> {
+  const { rows } = await client.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+     ) AS exists`,
+    [table, column],
+  );
+  return rows[0]?.exists === true;
+}
+
 export async function detectRestaurantOrdersCustomerIdKind(
   client: pg.Pool | pg.PoolClient = getPool(),
 ): Promise<RestaurantOrdersCustomerIdKind> {
@@ -200,7 +215,7 @@ export async function initDb(): Promise<void> {
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT NOT NULL DEFAULT ''`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_amount_received NUMERIC(12,2)`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_change NUMERIC(12,2)`);
-  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS fulfillment_stage TEXT NOT NULL DEFAULT 'PENDING_CASHIER'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_status TEXT`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_tracking_url TEXT NOT NULL DEFAULT ''`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_lines_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_claimed BOOLEAN NOT NULL DEFAULT FALSE`);
@@ -224,7 +239,20 @@ export async function initDb(): Promise<void> {
   } catch {
     // Constraint may not exist in all environments.
   }
-  await p.query(`ALTER TABLE restaurant_orders ALTER COLUMN status SET DEFAULT 'WAITING FOR ORDER CONFIRMATION'`);
+  if (await columnExists(p, "restaurant_orders", "status")) {
+    await p.query(`
+      UPDATE restaurant_orders
+      SET order_status = COALESCE(NULLIF(TRIM(order_status), ''), status)
+      WHERE order_status IS NULL OR TRIM(order_status) = ''
+    `);
+  }
+  try {
+    await p.query(
+      `ALTER TABLE restaurant_orders ALTER COLUMN order_status SET DEFAULT 'WAITING FOR ORDER CONFIRMATION'`,
+    );
+  } catch {
+    // Column may not exist yet in minimal dev DBs.
+  }
   // Some migrated datasets contain duplicate order numbers (ex: ORD-0001).
   // Keep the newest row's value and clear older duplicates so unique index creation succeeds.
   await p.query(`
@@ -285,21 +313,18 @@ export async function initDb(): Promise<void> {
             WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`;
     await p.query(`
       INSERT INTO restaurant_orders (
-        mobile_id, user_email, customer_id, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
-        delivery_name, delivery_contact, delivery_address, delivery_time, total, total_amount,
-        order_source, pos_customer_label, cashier_amount_received, cashier_change, fulfillment_stage,
-        delivery_tracking_url, order_lines_snapshot, pos_claimed, supplemental_payment_proof,
-        cashier_secondary_amount_received, balance_proof_pending_review, created_at, updated_at, items
+        mobile_id, user_email, customer_id, order_id, order_status, delivery_notes, payment_mode,
+        payment_uploaded_initial, payment_proof_initial, full_name, contact_number, delivery_address,
+        delivery_time, total_cost, order_source, pos_customer_label, cashier_amount_received_initial,
+        delivery_tracking_url, tray_items, created_at, updated_at
       )
       SELECT
         mo.id, mo.user_email,
         ${migratedCustomerIdExpr},
         mo.order_no, mo.status, mo.note, mo.payment_mode, mo.payment_uploaded, mo.payment_proof,
-        mo.delivery_name, mo.delivery_contact, mo.delivery_address, mo.delivery_time, COALESCE(mo.total, 0), COALESCE(mo.total, 0),
-        mo.order_source, mo.pos_customer_label, mo.cashier_amount_received, mo.cashier_change, mo.fulfillment_stage,
-        mo.delivery_tracking_url, COALESCE(mo.order_lines_snapshot, '[]'::jsonb), mo.pos_claimed, mo.supplemental_payment_proof,
-        mo.cashier_secondary_amount_received, COALESCE(mo.balance_proof_pending_review, FALSE), mo.created_at, mo.updated_at,
-        COALESCE(mo.order_lines_snapshot, '[]'::jsonb)
+        mo.delivery_name, mo.delivery_contact, mo.delivery_address, mo.delivery_time, COALESCE(mo.total, 0),
+        mo.order_source, mo.pos_customer_label, mo.cashier_amount_received,
+        mo.delivery_tracking_url, COALESCE(mo.order_lines_snapshot, '[]'::jsonb), mo.created_at, mo.updated_at
       FROM mobile_orders mo
       WHERE NOT EXISTS (
         SELECT 1 FROM restaurant_orders ro
@@ -344,19 +369,19 @@ export async function initDb(): Promise<void> {
 
   await p.query(`
     UPDATE restaurant_orders
-    SET fulfillment_stage = 'IN_PREPARATION'
-    WHERE fulfillment_stage = 'PENDING_CASHIER'
+    SET order_status = 'IN_PREPARATION'
+    WHERE COALESCE(order_status, '') = 'PENDING_CASHIER'
       AND order_source = 'POS'
   `);
   await p.query(`
     UPDATE restaurant_orders
-    SET fulfillment_stage = 'IN_PREPARATION'
-    WHERE fulfillment_stage = 'PENDING_CASHIER'
+    SET order_status = 'IN_PREPARATION'
+    WHERE COALESCE(order_status, '') = 'PENDING_CASHIER'
       AND order_source = 'MOBILE_APP'
       AND user_email IS NOT NULL
       AND (
-        upper(status) LIKE '%ORDER CONFIRMED%'
-        OR upper(status) LIKE '%OVERPAYMENT%'
+        upper(COALESCE(order_status, '')) LIKE '%ORDER CONFIRMED%'
+        OR upper(COALESCE(order_status, '')) LIKE '%OVERPAYMENT%'
       )
   `);
 
