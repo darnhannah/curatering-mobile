@@ -21,6 +21,18 @@ export const RESTAURANT_ORDER_SELECT = `
   payment_proof_initial,
   COALESCE(payment_proof_balance, supplemental_payment_proof) AS supplemental_payment_proof,
   supplemental_payment_proof,
+  COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
+  COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
+  payment_reference_initial,
+  payment_reference_balance,
+  COALESCE(payment_uploaded_balance, FALSE) AS payment_uploaded_balance,
+  payment_uploaded_balance,
+  COALESCE(payment_confirmed_initial, FALSE) AS payment_confirmed_initial,
+  COALESCE(payment_confirmed_balance, FALSE) AS payment_confirmed_balance,
+  payment_confirmed_initial,
+  payment_confirmed_balance,
+  COALESCE(loyalty_points_restaurant_obtained, points_earned, 0) AS loyalty_points_restaurant_obtained,
+  loyalty_reward_restaurant_obtained,
   delivery_name,
   delivery_contact,
   delivery_address,
@@ -45,8 +57,17 @@ export const RESTAURANT_ORDER_SELECT = `
   balance_proof_pending_review,
   guest_contact_email,
   customer_id,
-  full_name,
-  contact_number
+  COALESCE(NULLIF(TRIM(full_name), ''), NULLIF(TRIM(delivery_name), ''), '') AS full_name,
+  COALESCE(NULLIF(TRIM(contact_number), ''), NULLIF(TRIM(delivery_contact), ''), '') AS contact_number
+`.trim();
+
+/** Cashier online queue: mobile app + web restaurant orders (not walk-in POS). */
+export const CASHIER_ONLINE_ORDER_WHERE = `
+  mo.order_source <> 'POS'
+  AND (
+    (mo.user_email IS NOT NULL AND TRIM(mo.user_email) <> '')
+    OR (mo.guest_contact_email IS NOT NULL AND TRIM(mo.guest_contact_email) <> '')
+  )
 `.trim();
 
 export function restaurantLoyaltyEarnedSql(
@@ -89,7 +110,16 @@ export function mapRestaurantOrderRowForApi(row: Record<string, unknown>): Recor
     payment_proof: row.payment_proof ?? row.payment_proof_initial ?? null,
     supplemental_payment_proof:
       row.supplemental_payment_proof ?? row.payment_proof_balance ?? null,
+    payment_reference_initial: String(row.payment_reference_initial ?? "").trim(),
+    payment_reference_balance: String(row.payment_reference_balance ?? "").trim(),
+    payment_confirmed_initial: row.payment_confirmed_initial ?? false,
+    payment_confirmed_balance: row.payment_confirmed_balance ?? false,
+    payment_uploaded_balance: row.payment_uploaded_balance ?? false,
     loyalty_points_earned: row.loyalty_points_earned ?? row.loyalty_points_restaurant_obtained ?? 0,
+    loyalty_points_restaurant_obtained: row.loyalty_points_restaurant_obtained ?? row.loyalty_points_earned ?? 0,
+    loyalty_reward_restaurant_obtained: row.loyalty_reward_restaurant_obtained ?? null,
+    full_name: row.full_name ?? row.delivery_name ?? "",
+    contact_number: row.contact_number ?? row.delivery_contact ?? "",
     items,
     order_lines_snapshot: snap,
     tray_items: snap,

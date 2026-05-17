@@ -319,6 +319,17 @@ async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
   await copyColumnIfBothExist(pool, "restaurant_orders", "payment_proof_initial", "payment_proof");
   await copyColumnIfBothExist(pool, "restaurant_orders", "payment_proof_balance", "supplemental_payment_proof");
   await copyColumnIfBothExist(pool, "restaurant_orders", "payment_uploaded_initial", "payment_uploaded");
+  if (await columnExists(pool, "restaurant_orders", "payment_reference")) {
+    await safeExec(
+      pool,
+      `UPDATE restaurant_orders
+       SET payment_reference_initial = COALESCE(NULLIF(TRIM(payment_reference_initial), ''), payment_reference)
+       WHERE (payment_reference_initial IS NULL OR TRIM(payment_reference_initial) = '')
+         AND payment_reference IS NOT NULL
+         AND TRIM(payment_reference) <> ''
+         AND payment_reference NOT LIKE 'curatering-mobile:%'`,
+    );
+  }
   await copyColumnIfBothExist(pool, "restaurant_orders", "loyalty_points_restaurant_obtained", "points_earned");
   await copyColumnIfBothExist(pool, "restaurant_orders", "submitted_order_dt_stamp", "created_at");
   await copyColumnIfBothExist(pool, "restaurant_orders", "last_updated_order_status_dt_stamp", "updated_at");

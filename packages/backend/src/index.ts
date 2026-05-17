@@ -18,6 +18,7 @@ import {
   initDb,
 } from "./db.js";
 import {
+  CASHIER_ONLINE_ORDER_WHERE,
   CUSTOMER_FORGOT_OTP_SELECT,
   RESTAURANT_ORDER_SELECT,
   customerForgotOtpUpdateSql,
@@ -25,6 +26,17 @@ import {
   mapRestaurantOrderRowForApi,
   restaurantLoyaltyEarnedSql,
 } from "./sqlCompat.js";
+
+function isCashierOnlineRestaurantOrder(row: {
+  order_source?: string | null;
+  user_email?: string | null;
+  guest_contact_email?: string | null;
+}): boolean {
+  if (String(row.order_source ?? "").trim().toUpperCase() === "POS") return false;
+  const email = String(row.user_email ?? "").trim();
+  const guest = String(row.guest_contact_email ?? "").trim();
+  return email.length > 0 || guest.length > 0;
+}
 import {
   guestReachFromRow,
   isGuestUserEmail,
@@ -1529,21 +1541,13 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT mo.mobile_id AS id, mo.user_email, mo.order_no, mo.status, mo.note, mo.payment_mode, mo.payment_uploaded, mo.payment_proof,
-              mo.delivery_name, mo.delivery_contact, mo.delivery_address, mo.delivery_time, mo.total, mo.created_at,
-              mo.order_source, mo.pos_customer_label, mo.cashier_amount_received, mo.cashier_change,
-              mo.fulfillment_stage, mo.delivery_tracking_url, mo.order_lines_snapshot,
-              mo.supplemental_payment_proof, mo.cashier_secondary_amount_received, mo.balance_proof_pending_review,
-              COALESCE(NULLIF(TRIM(cp.full_name), ''), NULLIF(TRIM(mo.delivery_name), ''), mo.user_email) AS customer_display_name,
-              CASE
-                WHEN upper(mo.status) LIKE '%ORDER CONFIRMED%' OR upper(mo.status) LIKE '%OVERPAYMENT%'
-                  THEN FLOOR(COALESCE(mo.total, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
-                ELSE 0
-              END AS loyalty_points_earned
+      `SELECT ${RESTAURANT_ORDER_SELECT},
+              COALESCE(NULLIF(TRIM(cp.full_name), ''), NULLIF(TRIM(mo.full_name), ''), NULLIF(TRIM(mo.delivery_name), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
+              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders mo
        LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
-       WHERE mo.order_source = 'MOBILE_APP' AND mo.user_email IS NOT NULL
-       ORDER BY mo.created_at DESC`,
+       WHERE ${CASHIER_ONLINE_ORDER_WHERE}
+       ORDER BY COALESCE(mo.submitted_order_dt_stamp, mo.created_at) DESC`,
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
     res.json(out);
@@ -1574,9 +1578,17 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
   }
   try {
     const { rows: orows } = await getPool().query(
-      `SELECT mobile_id AS id, user_email, order_no, status, total, order_source,
-              cashier_amount_received, supplemental_payment_proof, balance_proof_pending_review,
-              guest_contact_email, delivery_contact
+      `SELECT mobile_id AS id, user_email, order_no,
+              COALESCE(order_status, status) AS status,
+              COALESCE(total_cost, total, 0) AS total,
+              order_source,
+              COALESCE(cashier_amount_received_initial, cashier_amount_received) AS cashier_amount_received,
+              COALESCE(payment_proof_balance, supplemental_payment_proof) AS supplemental_payment_proof,
+              COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
+              COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
+              balance_proof_pending_review,
+              guest_contact_email,
+              COALESCE(contact_number, delivery_contact) AS delivery_contact
        FROM restaurant_orders WHERE mobile_id = $1`,
       [id],
     );
@@ -1589,12 +1601,14 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       order_source: string;
       cashier_amount_received: string | null;
       supplemental_payment_proof: string | null;
+      payment_reference_balance: string | null;
+      payment_reference_initial: string | null;
       balance_proof_pending_review: boolean;
       guest_contact_email: string | null;
       delivery_contact: string | null;
     };
     const ord = orows[0] as OrdRow | undefined;
-    if (!ord || ord.order_source !== "MOBILE_APP" || !ord.user_email) {
+    if (!ord || !isCashierOnlineRestaurantOrder(ord)) {
       res.status(404).json({ error: "online order not found" });
       return;
     }
@@ -1607,7 +1621,8 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
 
     if (action === "confirm") {
       const proof2 =
-        ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0;
+        (ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0) ||
+        String((ord as { payment_reference_balance?: string }).payment_reference_balance ?? "").trim().length > 0;
       const bpr = ord.balance_proof_pending_review as unknown;
       const pendingReview =
         bpr === true ||
@@ -1662,7 +1677,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
 
       if (statusUp.includes("INSUFFICIENT") && !proof2) {
         res.status(400).json({
-          error: "Customer must upload balance payment proof before you can confirm.",
+          error: "Customer must provide balance payment proof or reference before you can confirm.",
         });
         return;
       }
@@ -1676,7 +1691,8 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       }
     } else if (action === "insufficient") {
       const proof2Bal =
-        ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0;
+        (ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0) ||
+        String(ord.payment_reference_balance ?? "").trim().length > 0;
       const statusUpBal = String(ord.status).toUpperCase();
       const awaitingBalanceConfirmBal =
         statusUpBal.includes("WAITING FOR BALANCE") || statusUpBal.includes("BALANCE PAYMENT CONFIRMATION");
@@ -1741,7 +1757,8 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       }
     } else {
       const proof2Bal =
-        ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0;
+        (ord.supplemental_payment_proof != null && String(ord.supplemental_payment_proof).trim().length > 0) ||
+        String(ord.payment_reference_balance ?? "").trim().length > 0;
       const statusUpBal = String(ord.status).toUpperCase();
       const awaitingBalanceConfirmBal =
         statusUpBal.includes("WAITING FOR BALANCE") || statusUpBal.includes("BALANCE PAYMENT CONFIRMATION");
@@ -1858,9 +1875,11 @@ app.post("/api/mobile/pos/online-orders/:id/remind-balance", async (req, res) =>
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT user_email, order_no, total, status, guest_contact_email, delivery_contact
+      `SELECT user_email, order_no, total,
+              COALESCE(order_status, status) AS status,
+              guest_contact_email, delivery_contact, order_source
        FROM restaurant_orders
-       WHERE mobile_id = $1 AND order_source = 'MOBILE_APP'`,
+       WHERE mobile_id = $1`,
       [id],
     );
     const ord = rows[0] as
@@ -1871,9 +1890,10 @@ app.post("/api/mobile/pos/online-orders/:id/remind-balance", async (req, res) =>
           status: string;
           guest_contact_email: string | null;
           delivery_contact: string | null;
+          order_source: string;
         }
       | undefined;
-    if (!ord || !ord.user_email) {
+    if (!ord || !isCashierOnlineRestaurantOrder(ord)) {
       res.status(404).json({ error: "online order not found" });
       return;
     }
@@ -1921,20 +1941,32 @@ app.patch("/api/mobile/pos/online-orders/:id/fulfillment", async (req, res) => {
   }
   try {
     const { rows: before } = await getPool().query(
-      `SELECT user_email, order_no, guest_contact_email, delivery_contact
+      `SELECT user_email, order_no, guest_contact_email, delivery_contact, order_source
        FROM restaurant_orders
-       WHERE mobile_id = $1 AND order_source = 'MOBILE_APP' AND user_email IS NOT NULL`,
+       WHERE mobile_id = $1`,
       [id],
     );
     const beforeRow = before[0] as
-      | { user_email: string | null; order_no: string; guest_contact_email: string | null; delivery_contact: string | null }
+      | {
+          user_email: string | null;
+          order_no: string;
+          guest_contact_email: string | null;
+          delivery_contact: string | null;
+          order_source: string;
+        }
       | undefined;
+    if (!beforeRow || !isCashierOnlineRestaurantOrder(beforeRow)) {
+      res.status(404).json({ error: "online order not found" });
+      return;
+    }
     const { rows } = await getPool().query(
       `UPDATE restaurant_orders
        SET fulfillment_stage = $2,
+           order_status = COALESCE(NULLIF(TRIM(order_status), ''), $2),
            delivery_tracking_url = $3,
+           last_updated_order_status_dt_stamp = NOW(),
            updated_at = NOW()
-       WHERE mobile_id = $1 AND order_source = 'MOBILE_APP' AND user_email IS NOT NULL
+       WHERE mobile_id = $1 AND order_source <> 'POS'
        RETURNING mobile_id AS id`,
       [id, stage, tracking],
     );

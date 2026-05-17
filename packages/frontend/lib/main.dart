@@ -1132,6 +1132,11 @@ class OrderData {
     this.balanceProofPendingReview = false,
     this.customerDisplayName,
     this.loyaltyPointsEarned = 0,
+    this.paymentReferenceInitial,
+    this.paymentReferenceBalance,
+    this.guestContactEmail,
+    this.orderFullName,
+    this.orderContactNumber,
   });
 
   final int id;
@@ -1168,6 +1173,101 @@ class OrderData {
   final String? customerDisplayName;
   /// Points earned for this order once confirmed (floor of total); from API `loyalty_points_earned`.
   final int loyaltyPointsEarned;
+  /// GCash / bank reference entered on web checkout (not an image).
+  final String? paymentReferenceInitial;
+  final String? paymentReferenceBalance;
+  final String? guestContactEmail;
+  /// Canonical name on the order row (`full_name`), when set by web or checkout.
+  final String? orderFullName;
+  final String? orderContactNumber;
+}
+
+bool looksLikeBase64ImageProof(String? raw) {
+  final s = raw?.trim();
+  if (s == null || s.isEmpty) return false;
+  if (s.startsWith('data:image')) return true;
+  if (s.length < 120) return false;
+  try {
+    base64Decode(s.length > 256 ? s.substring(0, 256) : s);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+String? orderPaymentReferenceInitial(OrderData o) {
+  final r = o.paymentReferenceInitial?.trim();
+  if (r != null && r.isNotEmpty) return r;
+  final p = o.paymentProofBase64?.trim();
+  if (p != null && p.isNotEmpty && !looksLikeBase64ImageProof(p)) return p;
+  return null;
+}
+
+String? orderPaymentReferenceBalance(OrderData o) {
+  final r = o.paymentReferenceBalance?.trim();
+  if (r != null && r.isNotEmpty) return r;
+  final p = o.supplementalPaymentProofBase64?.trim();
+  if (p != null && p.isNotEmpty && !looksLikeBase64ImageProof(p)) return p;
+  return null;
+}
+
+bool orderHasInitialPaymentProofImage(OrderData o) => looksLikeBase64ImageProof(o.paymentProofBase64);
+
+bool orderHasBalancePaymentProofImage(OrderData o) => looksLikeBase64ImageProof(o.supplementalPaymentProofBase64);
+
+bool orderHasPaymentOnFile(OrderData o) =>
+    o.paymentUploaded || orderPaymentReferenceInitial(o) != null || orderHasInitialPaymentProofImage(o);
+
+List<Widget> cashierPaymentProofAndReferenceSection(
+  BuildContext context,
+  OrderData o, {
+  bool includeBalance = true,
+}) {
+  final widgets = <Widget>[];
+  final initRef = orderPaymentReferenceInitial(o);
+  if (initRef != null) {
+    widgets.add(LockedField(label: 'PAYMENT REFERENCE (full)', value: initRef));
+    widgets.add(const SizedBox(height: 8));
+  }
+  if (includeBalance) {
+    final balRef = orderPaymentReferenceBalance(o);
+    if (balRef != null) {
+      widgets.add(LockedField(label: 'PAYMENT REFERENCE (balance)', value: balRef));
+      widgets.add(const SizedBox(height: 8));
+    }
+  }
+  if (orderHasInitialPaymentProofImage(o)) {
+    widgets.add(
+      OutlinedButton(
+        onPressed: () {
+          try {
+            final bytes = base64Decode(o.paymentProofBase64!.trim());
+            showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Proof of payment');
+          } catch (_) {
+            appSnack(context, 'Could not display image');
+          }
+        },
+        child: const Text('VIEW PROOF OF PAYMENT'),
+      ),
+    );
+  }
+  if (includeBalance && orderHasBalancePaymentProofImage(o)) {
+    if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 8));
+    widgets.add(
+      OutlinedButton(
+        onPressed: () {
+          try {
+            final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+            showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
+          } catch (_) {
+            appSnack(context, 'Could not display image');
+          }
+        },
+        child: const Text('VIEW BALANCE PAYMENT PROOF'),
+      ),
+    );
+  }
+  return widgets;
 }
 
 OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> lines) {
@@ -1175,6 +1275,11 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
   final proofStr = proofRaw != null ? '$proofRaw'.trim() : '';
   final supRaw = map['supplemental_payment_proof'];
   final supStr = supRaw != null ? '$supRaw'.trim() : '';
+  final refInit = '${map['payment_reference_initial'] ?? ''}'.trim();
+  final refBal = '${map['payment_reference_balance'] ?? ''}'.trim();
+  final guestEm = '${map['guest_contact_email'] ?? ''}'.trim();
+  final fullName = '${map['full_name'] ?? ''}'.trim();
+  final contactNum = '${map['contact_number'] ?? ''}'.trim();
   return OrderData(
     id: jsonToInt(map['id']),
     orderNo: '${map['order_no']}',
@@ -1209,14 +1314,23 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
       return s.isEmpty ? null : s;
     }(),
     loyaltyPointsEarned: jsonToInt(map['loyalty_points_earned']),
+    paymentReferenceInitial: refInit.isEmpty ? null : refInit,
+    paymentReferenceBalance: refBal.isEmpty ? null : refBal,
+    guestContactEmail: guestEm.isEmpty ? null : guestEm,
+    orderFullName: fullName.isEmpty ? null : fullName,
+    orderContactNumber: contactNum.isEmpty ? null : contactNum,
   );
 }
 
 String cashierCustomerLabel(OrderData o) {
   final n = o.customerDisplayName?.trim();
   if (n != null && n.isNotEmpty) return n;
+  final fn = o.orderFullName?.trim();
+  if (fn != null && fn.isNotEmpty) return fn;
   final dn = o.deliveryName.trim();
   if (dn.isNotEmpty) return dn;
+  final guest = o.guestContactEmail?.trim();
+  if (guest != null && guest.isNotEmpty) return guest;
   return o.userEmail ?? '—';
 }
 
@@ -1301,7 +1415,9 @@ String statusReadable(String status) {
 
 String statusReadableForOrder(OrderData o) {
   final up = o.status.toUpperCase();
-  final hasBalanceProof = (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false) || o.balanceProofPendingReview;
+  final hasBalanceProof = orderPaymentReferenceBalance(o) != null ||
+      orderHasBalancePaymentProofImage(o) ||
+      o.balanceProofPendingReview;
   if (hasBalanceProof && up.contains('WAITING FOR PAYMENT CONFIRMATION')) {
     return 'WAITING FOR BALANCE PAYMENT CONFIRMATION';
   }
@@ -9284,21 +9400,27 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                   ),
                                   _detailLine(
                                     'Balance proof uploaded',
-                                    (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false) ? 'Yes' : 'Not yet — open Balance payment',
+                                    (orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o))
+                                        ? 'Yes'
+                                        : 'Not yet — open Balance payment',
                                   ),
                                 ],
                                 const SizedBox(height: 8),
                                 Text(
-                                  'Payment proof uploaded: ${o.paymentUploaded ? 'Yes' : 'No'}',
+                                  'Payment on file: ${orderHasPaymentOnFile(o) ? 'Yes' : 'No'}',
                                   style: const TextStyle(height: 1.35),
                                 ),
-                                if (o.paymentProofBase64 != null && o.paymentProofBase64!.trim().isNotEmpty) ...[
+                                if (orderPaymentReferenceInitial(o) != null)
+                                  _detailLine('Payment reference', orderPaymentReferenceInitial(o)!),
+                                if (orderPaymentReferenceBalance(o) != null)
+                                  _detailLine('Balance payment reference', orderPaymentReferenceBalance(o)!),
+                                if (orderHasInitialPaymentProofImage(o)) ...[
                                   const SizedBox(height: 12),
                                   const Text('Payment proof', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
                                   const SizedBox(height: 8),
                                   ..._buildProofPreview(o.paymentProofBase64!),
                                 ],
-                                if (o.supplementalPaymentProofBase64 != null && o.supplementalPaymentProofBase64!.trim().isNotEmpty) ...[
+                                if (orderHasBalancePaymentProofImage(o)) ...[
                                   const SizedBox(height: 12),
                                   const Text('Additional payment proof', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
                                   const SizedBox(height: 8),
@@ -20937,7 +21059,8 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                   (st.contains('ORDER CONFIRMED') ||
                                       st.contains('OVERPAYMENT') ||
                                       fu == 'DELIVERED');
-                              final hasBalProof = (o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false);
+                              final hasBalProof =
+                                  orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o);
                               final track = o.deliveryTrackingUrl.trim();
                               return Card(
                                 elevation: 2,
@@ -21003,26 +21126,38 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                           ),
                                         ),
                                       ],
-                                      if (hasBalProof)
-                                        TextButton(
-                                          style: TextButton.styleFrom(
-                                            padding: EdgeInsets.zero,
-                                            minimumSize: Size.zero,
-                                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                      if (hasBalProof) ...[
+                                        if (orderPaymentReferenceBalance(o) != null)
+                                          Text(
+                                            'Balance ref: ${orderPaymentReferenceBalance(o)}',
+                                            style: TextStyle(fontSize: 12, color: Colors.grey.shade800),
                                           ),
-                                          onPressed: () {
-                                            try {
-                                              final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
-                                              showProofFullScreen(
-                                                context,
-                                                Uint8List.fromList(bytes),
-                                                title: 'Balance payment proof',
-                                              );
-                                            } catch (_) {
-                                              appSnack(context, 'Could not display image');
-                                            }
-                                          },
-                                          child: const Text('View balance payment proof'),
+                                        if (orderHasBalancePaymentProofImage(o))
+                                          TextButton(
+                                            style: TextButton.styleFrom(
+                                              padding: EdgeInsets.zero,
+                                              minimumSize: Size.zero,
+                                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                            ),
+                                            onPressed: () {
+                                              try {
+                                                final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+                                                showProofFullScreen(
+                                                  context,
+                                                  Uint8List.fromList(bytes),
+                                                  title: 'Balance payment proof',
+                                                );
+                                              } catch (_) {
+                                                appSnack(context, 'Could not display image');
+                                              }
+                                            },
+                                            child: const Text('View balance payment proof'),
+                                          ),
+                                      ],
+                                      if (orderPaymentReferenceInitial(o) != null)
+                                        Text(
+                                          'Payment ref: ${orderPaymentReferenceInitial(o)}',
+                                          style: TextStyle(fontSize: 12, color: Colors.grey.shade800),
                                         ),
                                     ],
                                   ),
@@ -21097,7 +21232,6 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
 
   Widget _buildCancelledOnlineDetail(BuildContext context, OrderData o) {
     final pm = (o.paymentMode.isEmpty ? 'GCASH ONLY' : o.paymentMode).toUpperCase();
-    final hasSup = o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false;
     final track = o.deliveryTrackingUrl.trim();
     return Scaffold(
       appBar: AppBar(
@@ -21172,33 +21306,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   ),
                 LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
                 const SizedBox(height: 10),
-                OutlinedButton(
-                  onPressed: o.paymentProofBase64 == null || o.paymentProofBase64!.isEmpty
-                      ? null
-                      : () {
-                          try {
-                            final bytes = base64Decode(o.paymentProofBase64!);
-                            showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Proof of payment');
-                          } catch (_) {
-                            appSnack(context, 'Could not display image');
-                          }
-                        },
-                  child: const Text('VIEW PROOF OF PAYMENT'),
-                ),
-                if (hasSup) ...[
-                  const SizedBox(height: 8),
-                  OutlinedButton(
-                    onPressed: () {
-                      try {
-                        final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
-                        showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
-                      } catch (_) {
-                        appSnack(context, 'Could not display image');
-                      }
-                    },
-                    child: const Text('VIEW BALANCE PAYMENT PROOF'),
-                  ),
-                ],
+                ...cashierPaymentProofAndReferenceSection(context, o),
               ],
             ),
           ),
@@ -21346,7 +21454,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         if (o.status.toUpperCase().contains('CANCEL')) {
           return _buildCancelledOnlineDetail(context, o);
         }
-        final proofOk = o.paymentUploaded || (o.paymentProofBase64?.isNotEmpty ?? false);
+        final proofOk = orderHasPaymentOnFile(o);
         final parsed = double.tryParse(amountReceived.text.trim());
         final parsedSupp = double.tryParse(supplementalAmount.text.trim());
         final ar = parsed;
@@ -21358,7 +21466,8 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         final trackingReadOnly = o.deliveryTrackingUrl.trim().isNotEmpty;
         final statusUp = o.status.toUpperCase();
         final insufficientStatus = statusUp.contains('INSUFFICIENT');
-        final hasSupProof = o.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false;
+        final hasSupProof =
+            orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o);
         final awaitingBalanceConfirm =
             statusUp.contains('WAITING FOR BALANCE') || statusUp.contains('BALANCE PAYMENT CONFIRMATION');
         final pendingBalReview = hasSupProof && (o.balanceProofPendingReview || awaitingBalanceConfirm);
@@ -21501,33 +21610,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
                         const SizedBox(height: 10),
-                        OutlinedButton(
-                          onPressed: o.paymentProofBase64 == null || o.paymentProofBase64!.isEmpty
-                              ? null
-                              : () {
-                                  try {
-                                    final bytes = base64Decode(o.paymentProofBase64!);
-                                    showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Proof of payment');
-                                  } catch (_) {
-                                    appSnack(context, 'Could not display image');
-                                  }
-                                },
-                          child: const Text('VIEW PROOF OF PAYMENT'),
-                        ),
-                        if (hasSupProof) ...[
-                          const SizedBox(height: 8),
-                          OutlinedButton(
-                            onPressed: () {
-                              try {
-                                final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
-                                showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
-                              } catch (_) {
-                                appSnack(context, 'Could not display image');
-                              }
-                            },
-                            child: const Text('VIEW BALANCE PAYMENT PROOF'),
-                          ),
-                        ],
+                        ...cashierPaymentProofAndReferenceSection(context, o),
                         if (!paymentLocked && !waitingCustomerBalance) ...[
                           const SizedBox(height: 8),
                           FilledButton(
@@ -21808,33 +21891,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
                         const SizedBox(height: 10),
-                        OutlinedButton(
-                          onPressed: o.paymentProofBase64 == null || o.paymentProofBase64!.isEmpty
-                              ? null
-                              : () {
-                                  try {
-                                    final bytes = base64Decode(o.paymentProofBase64!);
-                                    showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Proof of payment');
-                                  } catch (_) {
-                                    appSnack(context, 'Could not display image');
-                                  }
-                                },
-                          child: const Text('VIEW PROOF OF PAYMENT'),
-                        ),
-                        if (hasSupProof) ...[
-                          const SizedBox(height: 8),
-                          OutlinedButton(
-                            onPressed: () {
-                              try {
-                                final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
-                                showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
-                              } catch (_) {
-                                appSnack(context, 'Could not display image');
-                              }
-                            },
-                            child: const Text('VIEW BALANCE PAYMENT PROOF'),
-                          ),
-                        ],
+                        ...cashierPaymentProofAndReferenceSection(context, o),
                         if (!paymentLocked && !waitingCustomerBalance) ...[
                           const SizedBox(height: 8),
                           FilledButton(
