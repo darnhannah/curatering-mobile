@@ -112,9 +112,9 @@ async function syncRestaurantOrdersDualWrite(pool: pg.Pool): Promise<void> {
   await safeExec(
     pool,
     `UPDATE restaurant_orders SET
-       order_id = COALESCE(NULLIF(TRIM(order_id), ''), NULLIF(TRIM(order_no), '')),
-       order_no = COALESCE(NULLIF(TRIM(order_no), ''), NULLIF(TRIM(order_id), ''))
-     WHERE order_id IS DISTINCT FROM order_no
+       order_id = COALESCE(NULLIF(TRIM(order_id::text), ''), NULLIF(TRIM(order_no::text), '')),
+       order_no = COALESCE(NULLIF(TRIM(order_no::text), ''), NULLIF(TRIM(order_id::text), ''))
+     WHERE order_id::text IS DISTINCT FROM order_no::text
        OR order_id IS NULL OR order_no IS NULL`,
   );
   await safeExec(
@@ -327,6 +327,23 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
     await safeExec(pool, `DROP TABLE IF EXISTS customer_signup_otp_challenges CASCADE`);
   }
 
+  // Resolve duplicate CUS-* ids before unique index (keep oldest account per id).
+  await safeExec(
+    pool,
+    `WITH dups AS (
+       SELECT customer_id, MIN(email) AS keep_email
+       FROM customer_accounts
+       WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
+       GROUP BY customer_id
+       HAVING COUNT(*) > 1
+     )
+     UPDATE customer_accounts ca
+     SET customer_id = NULL
+     FROM dups d
+     WHERE ca.customer_id = d.customer_id
+       AND ca.email <> d.keep_email`,
+  );
+
   await pool.query(`
     WITH numbered AS (
       SELECT
@@ -337,7 +354,7 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
           '0'
         ) AS new_customer_id
       FROM customer_accounts
-      WHERE customer_id IS NULL OR TRIM(customer_id) = ''
+      WHERE customer_id IS NULL OR TRIM(customer_id::text) = ''
     )
     UPDATE customer_accounts ca
     SET customer_id = n.new_customer_id
@@ -355,6 +372,17 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
 /** Restore table PK `id`, business `order_id` (ORD-*), and FK `customer_id` (CUS-*). */
 async function repairRestaurantOrdersIdentity(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "restaurant_orders"))) return;
+  try {
+    await repairRestaurantOrdersIdentityInner(pool);
+  } catch (err) {
+    console.warn(
+      "[schema] repairRestaurantOrdersIdentity skipped:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+async function repairRestaurantOrdersIdentityInner(pool: pg.Pool): Promise<void> {
 
   const hasId = await columnExists(pool, "restaurant_orders", "id");
   const hasOrderIdCol = await columnExists(pool, "restaurant_orders", "order_id");
@@ -389,7 +417,24 @@ async function repairRestaurantOrdersIdentity(pool: pg.Pool): Promise<void> {
 
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
 
-  // If order_id still holds UUIDs from a bad migration, move them to `id` and regenerate ORD-*.
+  if (await columnExists(pool, "restaurant_orders", "order_id")) {
+    const orderIdDtNow = await columnDataType(pool, "restaurant_orders", "order_id");
+    if (orderIdDtNow === "uuid") {
+      // Move UUIDs into `id` before converting order_id to business TEXT (ORD-*).
+      await safeExec(
+        pool,
+        `UPDATE restaurant_orders
+         SET id = COALESCE(id, order_id)
+         WHERE id IS NULL AND order_id IS NOT NULL`,
+      );
+      await safeExec(
+        pool,
+        `ALTER TABLE restaurant_orders ALTER COLUMN order_id TYPE TEXT USING order_id::text`,
+      );
+    }
+  }
+
+  // If order_id still holds UUID strings from a bad migration, move them to `id` and clear.
   if (await columnExists(pool, "restaurant_orders", "order_id")) {
     await safeExec(
       pool,
@@ -397,65 +442,75 @@ async function repairRestaurantOrdersIdentity(pool: pg.Pool): Promise<void> {
        SET id = COALESCE(id, order_id::uuid)
        WHERE id IS NULL
          AND order_id IS NOT NULL
-         AND TRIM(order_id) ~ '^[0-9a-f]{8}-'`,
+         AND TRIM(order_id::text) ~ '^[0-9a-f]{8}-'`,
     );
     await safeExec(
       pool,
       `UPDATE restaurant_orders
        SET order_id = NULL
-       WHERE order_id IS NOT NULL AND TRIM(order_id) ~ '^[0-9a-f]{8}-'`,
+       WHERE order_id IS NOT NULL AND TRIM(order_id::text) ~ '^[0-9a-f]{8}-'`,
     );
   }
 
-  await pool.query(`
-    UPDATE restaurant_orders
-    SET order_id = CASE
-      WHEN order_id IS NOT NULL AND TRIM(order_id) ~ '^ORD-' THEN order_id
-      WHEN order_no IS NOT NULL AND TRIM(order_no) ~ '^ORD-' THEN order_no
-      WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0')
-      ELSE order_id
-    END
-    WHERE order_id IS NULL OR TRIM(order_id) = '' OR order_id !~ '^ORD-'
-  `);
+  await safeExec(
+    pool,
+    `UPDATE restaurant_orders
+     SET order_id = CASE
+       WHEN order_id IS NOT NULL AND TRIM(order_id::text) ~ '^ORD-' THEN order_id::text
+       WHEN order_no IS NOT NULL AND TRIM(order_no::text) ~ '^ORD-' THEN order_no::text
+       WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0')
+       ELSE order_id::text
+     END
+     WHERE order_id IS NULL
+        OR TRIM(order_id::text) = ''
+        OR order_id::text !~ '^ORD-'`,
+  );
 
-  await pool.query(`
-    UPDATE restaurant_orders
-    SET order_no = COALESCE(NULLIF(TRIM(order_no), ''), order_id)
-    WHERE order_id IS NOT NULL
-      AND (order_no IS NULL OR TRIM(order_no) = '' OR order_no !~ '^ORD-')
-  `);
+  await safeExec(
+    pool,
+    `UPDATE restaurant_orders
+     SET order_no = COALESCE(NULLIF(TRIM(order_no::text), ''), order_id::text)
+     WHERE order_id IS NOT NULL
+       AND (
+         order_no IS NULL
+         OR TRIM(order_no::text) = ''
+         OR order_no::text !~ '^ORD-'
+       )`,
+  );
 
   // Ensure customer_id on orders is CUS-* from customer_accounts, not account UUID.
   if (await columnExists(pool, "restaurant_orders", "customer_id")) {
     const custType = await columnDataType(pool, "restaurant_orders", "customer_id");
     if (custType === "uuid") {
       await safeExec(pool, `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id_text TEXT`);
-      await pool.query(`
-        UPDATE restaurant_orders ro
-        SET customer_id_text = ca.customer_id
-        FROM customer_accounts ca
-        WHERE ca.customer_id IS NOT NULL
-          AND ro.user_email IS NOT NULL
-          AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))
-      `);
+      await safeExec(
+        pool,
+        `UPDATE restaurant_orders ro
+         SET customer_id_text = ca.customer_id
+         FROM customer_accounts ca
+         WHERE ca.customer_id IS NOT NULL
+           AND ro.user_email IS NOT NULL
+           AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))`,
+      );
       await safeExec(pool, `ALTER TABLE restaurant_orders DROP COLUMN IF EXISTS customer_id`);
       await safeExec(pool, `ALTER TABLE restaurant_orders RENAME COLUMN customer_id_text TO customer_id`);
     } else {
-      await pool.query(`
-        UPDATE restaurant_orders ro
-        SET customer_id = ca.customer_id
-        FROM customer_accounts ca
-        WHERE ca.customer_id IS NOT NULL
-          AND ca.customer_id ~ '^CUS-'
-          AND ro.user_email IS NOT NULL
-          AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))
-          AND (
-            ro.customer_id IS NULL
-            OR TRIM(ro.customer_id::text) = ''
-            OR ro.customer_id::text !~ '^CUS-'
-            OR ro.customer_id::text = ca.id::text
-          )
-      `);
+      await safeExec(
+        pool,
+        `UPDATE restaurant_orders ro
+         SET customer_id = ca.customer_id
+         FROM customer_accounts ca
+         WHERE ca.customer_id IS NOT NULL
+           AND ca.customer_id ~ '^CUS-'
+           AND ro.user_email IS NOT NULL
+           AND LOWER(TRIM(ro.user_email)) = LOWER(TRIM(ca.email))
+           AND (
+             ro.customer_id IS NULL
+             OR TRIM(ro.customer_id::text) = ''
+             OR ro.customer_id::text !~ '^CUS-'
+             OR ro.customer_id::text = ca.id::text
+           )`,
+      );
     }
   }
 }
