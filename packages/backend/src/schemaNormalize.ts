@@ -245,24 +245,10 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await migratePostAnalysisIntoChecklistAndDrop(pool);
   await normalizeUsersStaffIds(pool);
 
-  let normalizeError: unknown;
-  try {
-    await normalizeCanonicalBusinessIds(pool);
-    // Renumber before prune so legacy columns like created_at remain available as fallbacks.
-    await dedupeCustomerAccountIds(pool);
-    await pruneCanonicalColumns(pool);
-    await dropLegacyTables(pool);
-  } catch (err) {
-    normalizeError = err;
-    console.error("[schema] normalize error:", err);
-  }
-
-  // Safety pass after prune (uses only columns that still exist).
+  await normalizeCanonicalBusinessIds(pool);
   await dedupeCustomerAccountIds(pool);
-
-  if (normalizeError) {
-    throw normalizeError;
-  }
+  await pruneCanonicalColumns(pool);
+  await dropLegacyTables(pool);
   console.info("[schema] normalize complete");
 }
 
@@ -379,17 +365,24 @@ export async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
      GROUP BY customer_id
      HAVING COUNT(*) > 1`,
   );
-  if (dupBefore.length > 0) {
-    console.info(
-      `[schema] customer_id duplicates before renumber: ${dupBefore.map((r) => `${r.customer_id}×${r.n}`).join(", ")}`,
+  if (dupBefore.length === 0) {
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq ON customer_accounts (customer_id)`,
     );
+    return;
   }
+
+  console.info(
+    `[schema] customer_id duplicates before renumber: ${dupBefore.map((r) => `${r.customer_id}×${r.n}`).join(", ")}`,
+  );
 
   await pool.query(`DROP INDEX IF EXISTS customer_accounts_customer_id_uq`);
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Pooled connections reuse sessions; drop leftover temp table from a prior pass on this connection.
+    await client.query(`DROP TABLE IF EXISTS customer_id_remap`);
 
     await client.query(`
       CREATE TEMP TABLE customer_id_remap AS
@@ -471,6 +464,7 @@ export async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
     console.error("[schema] customer_id renumber rolled back:", err instanceof Error ? err.message : err);
     throw err;
   } finally {
+    await client.query(`DROP TABLE IF EXISTS customer_id_remap`).catch(() => {});
     client.release();
   }
 
