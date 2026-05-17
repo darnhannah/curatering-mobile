@@ -248,14 +248,16 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   let normalizeError: unknown;
   try {
     await normalizeCanonicalBusinessIds(pool);
+    // Renumber before prune so legacy columns like created_at remain available as fallbacks.
+    await dedupeCustomerAccountIds(pool);
     await pruneCanonicalColumns(pool);
     await dropLegacyTables(pool);
   } catch (err) {
     normalizeError = err;
-    console.error("[schema] normalize error (will still renumber customer_id):", err);
+    console.error("[schema] normalize error:", err);
   }
 
-  // Always last: legacy profile merge can copy duplicate CUS-*; assign CUS-0001… even if prune/drop failed.
+  // Safety pass after prune (uses only columns that still exist).
   await dedupeCustomerAccountIds(pool);
 
   if (normalizeError) {
@@ -347,10 +349,28 @@ async function normalizeUsersStaffIds(pool: pg.Pool): Promise<void> {
   );
 }
 
+/** Sort key for customer renumber — only references columns that still exist (created_at may be pruned). */
+async function customerAccountSortKeySql(pool: pg.Pool): Promise<string> {
+  const hasStamp = await columnExists(pool, "customer_accounts", "created_account_dt_stamp");
+  const hasCreatedAt = await columnExists(pool, "customer_accounts", "created_at");
+  if (hasStamp && hasCreatedAt) {
+    return "COALESCE(created_account_dt_stamp, created_at, NOW())";
+  }
+  if (hasStamp) {
+    return "COALESCE(created_account_dt_stamp, NOW())";
+  }
+  if (hasCreatedAt) {
+    return "COALESCE(created_at, NOW())";
+  }
+  return "NOW()";
+}
+
 /** Assign unique CUS-0001… sequentially by created_account_dt_stamp (earliest first). */
 export async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "customer_accounts"))) return;
   if (!(await columnExists(pool, "customer_accounts", "customer_id"))) return;
+
+  const sortKey = await customerAccountSortKeySql(pool);
 
   const { rows: dupBefore } = await pool.query<{ customer_id: string; n: string }>(
     `SELECT customer_id::text AS customer_id, COUNT(*)::text AS n
@@ -372,13 +392,13 @@ export async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
     await client.query("BEGIN");
 
     await client.query(`
-      CREATE TEMP TABLE customer_id_remap ON COMMIT DROP AS
+      CREATE TEMP TABLE customer_id_remap AS
       SELECT
         LOWER(TRIM(email)) AS email_key,
         NULLIF(TRIM(customer_id::text), '') AS old_customer_id,
         'CUS-' || LPAD(
           ROW_NUMBER() OVER (
-            ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), LOWER(TRIM(email))
+            ORDER BY ${sortKey}, LOWER(TRIM(email))
           )::text,
           4,
           '0'
@@ -709,7 +729,14 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
 
   if (await tableExists(pool, "customer_profiles")) {
     // Do not copy cp.id into customer_id — legacy profiles often share duplicate CUS-* values.
-    // dedupeCustomerAccountIds() at end of runSchemaNormalize assigns unique CUS-0001…
+    // dedupeCustomerAccountIds() assigns unique CUS-0001…
+
+    const createdStampExpr = (await columnExists(pool, "customer_accounts", "created_at"))
+      ? "COALESCE(ca.created_account_dt_stamp, cp.created_at, ca.created_at)"
+      : "COALESCE(ca.created_account_dt_stamp, cp.created_at)";
+    const updatedStampExpr = (await columnExists(pool, "customer_accounts", "updated_at"))
+      ? "COALESCE(ca.updated_pw_dt_stamp, cp.updated_at, ca.updated_at)"
+      : "COALESCE(ca.updated_pw_dt_stamp, cp.updated_at)";
 
     await pool.query(`
       UPDATE customer_accounts ca
@@ -738,8 +765,8 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
           COALESCE(ca.catering_loyalty_points, 0),
           COALESCE(cp.loyalty_points_catering, 0)
         ),
-        created_account_dt_stamp = COALESCE(ca.created_account_dt_stamp, cp.created_at, ca.created_at),
-        updated_pw_dt_stamp = COALESCE(ca.updated_pw_dt_stamp, cp.updated_at, ca.updated_at)
+        created_account_dt_stamp = ${createdStampExpr},
+        updated_pw_dt_stamp = ${updatedStampExpr}
       FROM customer_profiles cp
       WHERE LOWER(TRIM(cp.user_email)) = LOWER(TRIM(COALESCE(ca.email, '')))
     `);

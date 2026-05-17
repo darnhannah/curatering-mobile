@@ -5,13 +5,13 @@ BEGIN;
 
 DROP INDEX IF EXISTS customer_accounts_customer_id_uq;
 
-CREATE TEMP TABLE customer_id_remap ON COMMIT DROP AS
+CREATE TEMP TABLE customer_id_remap AS
 SELECT
   LOWER(TRIM(email)) AS email_key,
   NULLIF(TRIM(customer_id::text), '') AS old_customer_id,
   'CUS-' || LPAD(
     ROW_NUMBER() OVER (
-      ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), LOWER(TRIM(email))
+      ORDER BY COALESCE(created_account_dt_stamp, NOW()), LOWER(TRIM(email))
     )::text,
     4,
     '0'
