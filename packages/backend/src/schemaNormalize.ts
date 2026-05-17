@@ -225,7 +225,7 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await normalizeRestaurantOrders(pool);
   await normalizeCateringOrders(pool);
   await normalizeEventOrders(pool);
-  await normalizeIdCounter(pool);
+  await normalizeIdCounters(pool);
   await normalizeMenuDishes(pool);
   await migratePostAnalysisIntoChecklistAndDrop(pool);
   await normalizeUsersStaffIds(pool);
@@ -318,46 +318,97 @@ async function normalizeUsersStaffIds(pool: pg.Pool): Promise<void> {
   );
 }
 
+/** Assign unique CUS-**** ids; reassign duplicates without colliding with existing ids. */
+async function dedupeCustomerAccountIds(pool: pg.Pool): Promise<void> {
+  if (!(await tableExists(pool, "customer_accounts"))) return;
+  if (!(await columnExists(pool, "customer_accounts", "customer_id"))) return;
+
+  await safeExec(
+    pool,
+    `UPDATE customer_accounts
+     SET customer_id = NULLIF(TRIM(customer_id::text), '')
+     WHERE customer_id IS NOT NULL`,
+  );
+
+  await safeExec(
+    pool,
+    `WITH max_cus AS (
+       SELECT COALESCE(MAX(
+         CASE
+           WHEN customer_id ~ '^CUS-[0-9]+$' THEN CAST(SUBSTRING(customer_id FROM 5) AS INT)
+           ELSE 0
+         END
+       ), 0) AS m
+       FROM customer_accounts
+     ),
+     ranked AS (
+       SELECT
+         email,
+         customer_id,
+         ROW_NUMBER() OVER (
+           PARTITION BY customer_id
+           ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email
+         ) AS dup_rn
+       FROM customer_accounts
+       WHERE customer_id IS NOT NULL AND customer_id <> ''
+     ),
+     to_reassign AS (
+       SELECT
+         r.email,
+         'CUS-' || LPAD((m.m + ROW_NUMBER() OVER (ORDER BY r.email))::text, 4, '0') AS new_customer_id
+       FROM ranked r
+       CROSS JOIN max_cus m
+       WHERE r.dup_rn > 1
+     )
+     UPDATE customer_accounts ca
+     SET customer_id = t.new_customer_id
+     FROM to_reassign t
+     WHERE ca.email = t.email`,
+  );
+
+  await safeExec(
+    pool,
+    `WITH max_cus AS (
+       SELECT COALESCE(MAX(
+         CASE
+           WHEN customer_id ~ '^CUS-[0-9]+$' THEN CAST(SUBSTRING(customer_id FROM 5) AS INT)
+           ELSE 0
+         END
+       ), 0) AS m
+       FROM customer_accounts
+     ),
+     needs AS (
+       SELECT
+         email,
+         ROW_NUMBER() OVER (
+           ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email
+         ) AS rn
+       FROM customer_accounts
+       WHERE customer_id IS NULL OR TRIM(customer_id::text) = ''
+     ),
+     numbered AS (
+       SELECT n.email, 'CUS-' || LPAD((m.m + n.rn)::text, 4, '0') AS new_customer_id
+       FROM needs n
+       CROSS JOIN max_cus m
+     )
+     UPDATE customer_accounts ca
+     SET customer_id = n.new_customer_id
+     FROM numbered n
+     WHERE ca.email = n.email`,
+  );
+
+  await safeExec(pool, `DROP INDEX IF EXISTS customer_accounts_customer_id_uq`);
+  await safeExec(
+    pool,
+    `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq
+     ON customer_accounts (customer_id)`,
+  );
+}
+
 /** Enforce unique business ids and align FKs to customer_accounts.customer_id. */
 async function normalizeCanonicalBusinessIds(pool: pg.Pool): Promise<void> {
   if (await tableExists(pool, "customer_accounts")) {
-    await safeExec(
-      pool,
-      `WITH dups AS (
-         SELECT customer_id, MIN(email) AS keep_email
-         FROM customer_accounts
-         WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
-         GROUP BY customer_id
-         HAVING COUNT(*) > 1
-       )
-       UPDATE customer_accounts ca
-       SET customer_id = NULL
-       FROM dups d
-       WHERE ca.customer_id = d.customer_id AND ca.email <> d.keep_email`,
-    );
-
-    await pool.query(`
-      WITH numbered AS (
-        SELECT email,
-               'CUS-' || LPAD(
-                 ROW_NUMBER() OVER (ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email)::text,
-                 4,
-                 '0'
-               ) AS new_customer_id
-        FROM customer_accounts
-        WHERE customer_id IS NULL OR TRIM(customer_id::text) = ''
-      )
-      UPDATE customer_accounts ca
-      SET customer_id = n.new_customer_id
-      FROM numbered n
-      WHERE ca.email = n.email
-    `);
-
-    await safeExec(
-      pool,
-      `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq
-       ON customer_accounts (customer_id) WHERE customer_id IS NOT NULL`,
-    );
+    await dedupeCustomerAccountIds(pool);
 
     await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS id BIGSERIAL`);
     await safeExec(
@@ -701,45 +752,7 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
     await safeExec(pool, `DROP TABLE IF EXISTS customer_signup_otp_challenges CASCADE`);
   }
 
-  // Resolve duplicate CUS-* ids before unique index (keep oldest account per id).
-  await safeExec(
-    pool,
-    `WITH dups AS (
-       SELECT customer_id, MIN(email) AS keep_email
-       FROM customer_accounts
-       WHERE customer_id IS NOT NULL AND TRIM(customer_id::text) <> ''
-       GROUP BY customer_id
-       HAVING COUNT(*) > 1
-     )
-     UPDATE customer_accounts ca
-     SET customer_id = NULL
-     FROM dups d
-     WHERE ca.customer_id = d.customer_id
-       AND ca.email <> d.keep_email`,
-  );
-
-  await pool.query(`
-    WITH numbered AS (
-      SELECT
-        email,
-        'CUS-' || LPAD(
-          ROW_NUMBER() OVER (ORDER BY COALESCE(created_account_dt_stamp, created_at, NOW()), email)::text,
-          4,
-          '0'
-        ) AS new_customer_id
-      FROM customer_accounts
-      WHERE customer_id IS NULL OR TRIM(customer_id::text) = ''
-    )
-    UPDATE customer_accounts ca
-    SET customer_id = n.new_customer_id
-    FROM numbered n
-    WHERE ca.email = n.email
-  `);
-
-  await safeExec(
-    pool,
-    `CREATE UNIQUE INDEX IF NOT EXISTS customer_accounts_customer_id_uq ON customer_accounts (customer_id) WHERE customer_id IS NOT NULL`,
-  );
+  await dedupeCustomerAccountIds(pool);
 }
 
 /** Restore table PK `id`, business `order_id` (ORD-*), and FK `customer_id` (CUS-*). */
@@ -1080,23 +1093,43 @@ async function normalizeEventOrders(pool: pg.Pool): Promise<void> {
   await copyColumnIfBothExist(pool, "event_orders", "estimated_cost", "estimated_total");
 }
 
-async function normalizeIdCounter(pool: pg.Pool): Promise<void> {
-  if (!(await tableExists(pool, "id_counter"))) {
+/** Use existing `id_counters` table; drop legacy INQ/MINQ keys and ensure TR/USR only. */
+async function normalizeIdCounters(pool: pg.Pool): Promise<void> {
+  const hasPlural = await tableExists(pool, "id_counters");
+  const hasSingular = await tableExists(pool, "id_counter");
+
+  if (!hasPlural && hasSingular) {
+    await safeExec(pool, `ALTER TABLE id_counter RENAME TO id_counters`);
+  } else if (!hasPlural && !hasSingular) {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS id_counter (
+      CREATE TABLE IF NOT EXISTS id_counters (
         counter_key TEXT PRIMARY KEY,
         last_value INTEGER NOT NULL DEFAULT 0
       )
     `);
   }
-  await safeExec(pool, `DELETE FROM id_counter WHERE counter_key IN ('INQ', 'MINQ')`);
+
+  if (hasPlural && hasSingular) {
+    await safeExec(
+      pool,
+      `INSERT INTO id_counters (counter_key, last_value)
+       SELECT counter_key, last_value FROM id_counter
+       ON CONFLICT (counter_key) DO UPDATE
+       SET last_value = GREATEST(id_counters.last_value, EXCLUDED.last_value)`,
+    );
+    await safeExec(pool, `DROP TABLE IF EXISTS id_counter`);
+  }
+
+  if (!(await tableExists(pool, "id_counters"))) return;
+
+  await safeExec(pool, `DELETE FROM id_counters WHERE counter_key IN ('INQ', 'MINQ')`);
   await pool.query(`
-    INSERT INTO id_counter (counter_key, last_value) VALUES ('TR', 0), ('USR', 0)
+    INSERT INTO id_counters (counter_key, last_value) VALUES ('TR', 0), ('USR', 0)
     ON CONFLICT (counter_key) DO NOTHING
   `);
   await safeExec(
     pool,
-    `UPDATE id_counter SET last_value = GREATEST(
+    `UPDATE id_counters SET last_value = GREATEST(
       last_value,
       COALESCE((
         SELECT MAX(CAST(SUBSTRING(catering_id FROM 4) AS INT))
@@ -1118,7 +1151,7 @@ async function normalizeIdCounter(pool: pg.Pool): Promise<void> {
   );
   await safeExec(
     pool,
-    `UPDATE id_counter SET last_value = GREATEST(
+    `UPDATE id_counters SET last_value = GREATEST(
       last_value,
       COALESCE((SELECT MAX(CAST(SUBSTRING(staff_id FROM 5) AS INT)) FROM users WHERE staff_id ~ '^USR-[0-9]+$'), 0),
       COALESCE((SELECT MAX(CAST(SUBSTRING(id FROM 5) AS INT)) FROM users WHERE id::text ~ '^USR-[0-9]+$'), 0)
