@@ -296,8 +296,8 @@ export async function initDb(): Promise<void> {
       restaurantOrdersCustomerIdKind === "uuid"
         ? `(SELECT ca.id FROM customer_accounts ca
             WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`
-        : `(SELECT cp.id FROM customer_profiles cp
-            WHERE LOWER(TRIM(cp.user_email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`;
+        : `(SELECT ca.customer_id FROM customer_accounts ca
+            WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`;
     await p.query(`
       INSERT INTO restaurant_orders (
         mobile_id, user_email, customer_id, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
@@ -339,12 +339,13 @@ export async function initDb(): Promise<void> {
   } else if (restaurantOrdersCustomerIdKind === "text") {
     await p.query(`
       UPDATE restaurant_orders ro
-      SET customer_id = cp.id
-      FROM customer_profiles cp
+      SET customer_id = ca.customer_id
+      FROM customer_accounts ca
       WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id::text) = '')
         AND ro.user_email IS NOT NULL
         AND TRIM(ro.user_email) <> ''
-        AND LOWER(TRIM(cp.user_email)) = LOWER(TRIM(ro.user_email))
+        AND ca.customer_id IS NOT NULL
+        AND LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email))
     `);
   }
 

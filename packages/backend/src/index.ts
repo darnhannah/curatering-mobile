@@ -18,6 +18,14 @@ import {
   initDb,
 } from "./db.js";
 import {
+  CUSTOMER_FORGOT_OTP_SELECT,
+  RESTAURANT_ORDER_SELECT,
+  customerForgotOtpUpdateSql,
+  mapProfileRowForApi,
+  mapRestaurantOrderRowForApi,
+  restaurantLoyaltyEarnedSql,
+} from "./sqlCompat.js";
+import {
   guestReachFromRow,
   isGuestUserEmail,
   nextGuestCustomerId,
@@ -551,13 +559,21 @@ async function customerProfileIdForEmail(emailRaw: string): Promise<string | nul
   return customerBusinessIdForEmail(emailRaw);
 }
 
-/** Resolves `restaurant_orders.customer_id` (CUS-**** when column is text). */
+/** Resolves `restaurant_orders.customer_id` (account UUID or CUS-**** depending on column type). */
 async function restaurantOrderCustomerIdForCheckout(userEmail: string, isGuest: boolean): Promise<string | null> {
   const kind = getRestaurantOrdersCustomerIdKind();
   if (isGuest) {
     return kind === "uuid" ? null : await nextGuestCustomerId();
   }
-  return customerBusinessIdForEmail(userEmail);
+  const email = userEmail.trim().toLowerCase();
+  if (kind === "uuid") {
+    const { rows } = await getPool().query(
+      `SELECT id::text AS id FROM customer_accounts WHERE LOWER(TRIM(email)) = $1 LIMIT 1`,
+      [email],
+    );
+    return (rows[0] as { id: string } | undefined)?.id ?? null;
+  }
+  return customerBusinessIdForEmail(email);
 }
 
 async function nextTransactionNo(_kind: "catering" | "event"): Promise<string> {
@@ -1291,8 +1307,9 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
         return;
       }
       targetEmail = account.email;
+      const otpSql = customerForgotOtpUpdateSql();
       await getPool().query(
-        `UPDATE customer_accounts SET password_reset_otp = $2, password_reset_expires_at = $3, updated_at = NOW() WHERE email = $1`,
+        `UPDATE customer_accounts SET ${otpSql.set} WHERE email = $1`,
         [targetEmail, otp, expiresAt.toISOString()],
       );
     }
@@ -1359,7 +1376,7 @@ app.post("/api/mobile/auth/check-password-reset-otp", async (req, res) => {
       if (account) {
         email = account.email;
         const { rows } = await getPool().query(
-          `SELECT password_reset_otp, password_reset_expires_at FROM customer_accounts WHERE email = $1`,
+          `SELECT ${CUSTOMER_FORGOT_OTP_SELECT} FROM customer_accounts WHERE email = $1`,
           [email],
         );
         row = rows[0] as { password_reset_otp: string | null; password_reset_expires_at: Date | null } | undefined;
@@ -1413,7 +1430,7 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
       if (account) {
         email = account.email;
         const { rows } = await getPool().query(
-          `SELECT password_reset_otp, password_reset_expires_at FROM customer_accounts WHERE email = $1`,
+          `SELECT ${CUSTOMER_FORGOT_OTP_SELECT} FROM customer_accounts WHERE email = $1`,
           [email],
         );
         row = rows[0] as { password_reset_otp: string | null; password_reset_expires_at: Date | null } | undefined;
@@ -1441,10 +1458,9 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
         [email, hash],
       );
     } else {
+      const otpSql = customerForgotOtpUpdateSql();
       await getPool().query(
-        `UPDATE customer_accounts
-         SET password_hash = $2, password_reset_otp = NULL, password_reset_expires_at = NULL, updated_at = NOW()
-         WHERE email = $1`,
+        `UPDATE customer_accounts SET password_hash = $2, ${otpSql.clear} WHERE email = $1`,
         [email, hash],
       );
     }
@@ -2006,12 +2022,15 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
       ],
     );
     const orderId = Number(rows[0].id);
-    const orderNo = `Order No. ${String(orderId).padStart(6, "0")}`;
-    await client.query("UPDATE restaurant_orders SET order_no = $1 WHERE mobile_id = $2", [orderNo, orderId]);
-    await client.query(`UPDATE restaurant_orders SET order_lines_snapshot = $2::jsonb, items = $2::jsonb WHERE mobile_id = $1`, [
-      orderId,
-      JSON.stringify(parsedItems),
-    ]);
+    const orderNo = await finalizeRestaurantOrderAfterInsert(client, orderId, parsedItems, {
+      note,
+      total,
+      deliveryName: "",
+      deliveryContact: "",
+      deliveryAddress: "",
+      deliveryTime: "NOW",
+      customerId: null,
+    });
     await client.query("COMMIT");
     res.status(201).json({ id: orderId, order_no: orderNo, total, change: changeDue });
   } catch (err) {
@@ -2039,11 +2058,12 @@ async function nextCustomerProfileRowId(): Promise<string> {
 }
 
 async function attachOrderItems(rows: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
-  type LineOut = { item_name: string; dip: string; qty: number; price: number };
+  type LineOut = { item_name: string; dip: string; dip_qty: number; qty: number; price: number };
   return rows.map((row) => {
+    const mapped = mapRestaurantOrderRowForApi(row);
     let items: LineOut[] = [];
-    if (row.order_lines_snapshot != null) {
-      const snap = row.order_lines_snapshot as unknown;
+    const snap = mapped.order_lines_snapshot;
+    if (snap != null) {
       const arr = Array.isArray(snap) ? snap : [];
       items = arr.map((it: Record<string, unknown>) => ({
         item_name: String(it.item_name ?? ""),
@@ -2054,11 +2074,82 @@ async function attachOrderItems(rows: Array<Record<string, unknown>>): Promise<A
       }));
     }
     return {
-      ...row,
+      ...mapped,
       items,
-      total: Number(row.total),
+      total: Number(mapped.total),
     };
   });
+}
+
+async function finalizeRestaurantOrderAfterInsert(
+  client: import("pg").PoolClient,
+  orderId: number,
+  parsedItems: ParsedRestaurantLine[],
+  fields: {
+    note: string;
+    total: number;
+    deliveryName: string;
+    deliveryContact: string;
+    deliveryAddress: string;
+    deliveryTime: string;
+    customerId: string | null;
+  },
+): Promise<string> {
+  const orderNo = `ORD-${String(orderId).padStart(6, "0")}`;
+  const itemsJson = JSON.stringify(parsedItems);
+  let fullName = fields.deliveryName;
+  let contactNumber = fields.deliveryContact;
+  if (fields.customerId) {
+    const { rows: ca } = await client.query(
+      `SELECT full_name, contact_number FROM customer_accounts
+       WHERE customer_id = $1 OR id::text = $1
+       LIMIT 1`,
+      [fields.customerId],
+    );
+    const c = ca[0] as { full_name: string; contact_number: string } | undefined;
+    if (c) {
+      if (String(c.full_name ?? "").trim()) fullName = String(c.full_name).trim();
+      if (String(c.contact_number ?? "").trim()) contactNumber = String(c.contact_number).trim();
+    }
+  }
+  await client.query(
+    `UPDATE restaurant_orders SET
+       order_no = $1,
+       order_id = $1,
+       total = $2,
+       total_cost = $2,
+       total_amount = $2,
+       note = $3,
+       delivery_notes = $3,
+       delivery_name = $4,
+       delivery_contact = $5,
+       contact_number = $5,
+       full_name = $4,
+       delivery_address = $6,
+       delivery_time = $7,
+       tray_items = $8::jsonb,
+       order_lines_snapshot = $8::jsonb,
+       items = $8::jsonb,
+       order_status = COALESCE(NULLIF(TRIM(order_status), ''), NULLIF(TRIM(status), ''), 'WAITING FOR ORDER CONFIRMATION'),
+       status = COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(order_status), ''), 'WAITING FOR ORDER CONFIRMATION'),
+       fulfillment_stage = COALESCE(NULLIF(TRIM(fulfillment_stage), ''), 'PENDING_CASHIER'),
+       submitted_order_dt_stamp = COALESCE(submitted_order_dt_stamp, NOW()),
+       last_updated_order_status_dt_stamp = NOW(),
+       updated_at = NOW()
+     WHERE mobile_id = $9`,
+    [
+      orderNo,
+      fields.total,
+      fields.note,
+      fullName,
+      contactNumber,
+      fields.deliveryAddress,
+      fields.deliveryTime,
+      itemsJson,
+      orderId,
+    ],
+  );
+  return orderNo;
 }
 
 /** Recent POS / online orders for cashier history screen — completed only (delivered online or claimed walk-in). */
@@ -2263,7 +2354,7 @@ app.get("/api/mobile/profile", async (req, res) => {
       });
       return;
     }
-    res.json(rows[0]);
+    res.json(mapProfileRowForApi(rows[0] as Record<string, unknown>));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
@@ -2298,8 +2389,15 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
          FROM restaurant_orders ro
          WHERE ro.payment_reference LIKE $2
            AND (
-             ro.customer_id IN (SELECT id FROM customer_accounts WHERE LOWER(email) = LOWER($1))
-             OR POSITION(LOWER($1) IN LOWER(COALESCE(ro.delivery_notes, ''))) > 0
+             LOWER(TRIM(COALESCE(ro.user_email, ''))) = LOWER($1)
+             OR ro.customer_id IN (
+               SELECT customer_id FROM customer_accounts
+               WHERE LOWER(TRIM(email)) = LOWER($1) AND customer_id IS NOT NULL
+             )
+             OR ro.customer_id::text IN (
+               SELECT id::text FROM customer_accounts WHERE LOWER(TRIM(email)) = LOWER($1)
+             )
+             OR POSITION(LOWER($1) IN LOWER(COALESCE(ro.delivery_notes, ro.note, ''))) > 0
            )
          UNION ALL
          SELECT COALESCE(NULLIF(TRIM(eo.transaction_no), ''), 'EVT-' || eo.id::text) AS order_no,
@@ -2406,43 +2504,15 @@ app.get("/api/mobile/orders", async (req, res) => {
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT mobile_id AS id, user_email, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
-              delivery_name, delivery_contact, delivery_address, delivery_time, total, created_at,
-              order_source, pos_customer_label, cashier_amount_received, cashier_change,
-              fulfillment_stage, delivery_tracking_url, order_lines_snapshot,
-              supplemental_payment_proof, cashier_secondary_amount_received, balance_proof_pending_review,
-              CASE
-                WHEN LOWER(TRIM(COALESCE(user_email, ''))) LIKE '%@guest.curatering.internal' THEN 0
-                WHEN upper(status) LIKE '%ORDER CONFIRMED%' OR upper(status) LIKE '%OVERPAYMENT%'
-                  THEN FLOOR(COALESCE(total, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
-                ELSE 0
-              END AS loyalty_points_earned
+      `SELECT ${RESTAURANT_ORDER_SELECT},
+              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders
        WHERE user_email = $1
-       ORDER BY created_at DESC`,
+       ORDER BY COALESCE(submitted_order_dt_stamp, created_at) DESC`,
       [userEmail],
     );
-    type LineOut = { item_name: string; dip: string; qty: number; price: number };
-    res.json(
-      rows.map((row) => {
-        let items: LineOut[] = [];
-        const snap = (row as { order_lines_snapshot?: unknown }).order_lines_snapshot;
-        if (snap != null) {
-          const arr = Array.isArray(snap) ? snap : [];
-          items = arr.map((it: Record<string, unknown>) => ({
-            item_name: String(it.item_name ?? ""),
-            dip: String(it.dip ?? ""),
-            qty: Number(it.qty ?? 0),
-            price: Number(it.price ?? 0),
-          }));
-        }
-        return {
-          ...row,
-          items,
-          total: Number((row as { total: unknown }).total),
-        };
-      }),
-    );
+    const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
+    res.json(out);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
@@ -2500,12 +2570,15 @@ app.post("/api/mobile/orders", async (req, res) => {
       ],
     );
     const orderId = Number(rows[0].id);
-    const orderNo = `Order No. ${String(orderId).padStart(6, "0")}`;
-    await client.query("UPDATE restaurant_orders SET order_no = $1 WHERE mobile_id = $2", [orderNo, orderId]);
-    await client.query(`UPDATE restaurant_orders SET order_lines_snapshot = $2::jsonb, items = $2::jsonb WHERE mobile_id = $1`, [
-      orderId,
-      JSON.stringify(parsedItems),
-    ]);
+    const orderNo = await finalizeRestaurantOrderAfterInsert(client, orderId, parsedItems, {
+      note,
+      total,
+      deliveryName,
+      deliveryContact,
+      deliveryAddress,
+      deliveryTime,
+      customerId,
+    });
     await client.query("COMMIT");
     // Loyalty is awarded when the cashier confirms the order (see online-orders review), not on submit.
     void logActionBestEffort("order.submit", userEmail, `Order submitted: ${orderNo}`, {
@@ -2543,8 +2616,15 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
   }
   try {
     const { rows: found } = await getPool().query(
-      `SELECT mobile_id AS id, status, order_no, total, note, user_email, guest_contact_email, delivery_contact,
-              payment_uploaded, order_lines_snapshot
+      `SELECT mobile_id AS id,
+              COALESCE(order_status, status) AS status,
+              COALESCE(order_id, order_no) AS order_no,
+              COALESCE(total_cost, total, 0) AS total,
+              COALESCE(delivery_notes, note, '') AS note,
+              user_email, guest_contact_email,
+              COALESCE(contact_number, delivery_contact) AS delivery_contact,
+              COALESCE(payment_uploaded_initial, payment_uploaded, FALSE) AS payment_uploaded,
+              COALESCE(tray_items, order_lines_snapshot, '[]'::jsonb) AS order_lines_snapshot
        FROM restaurant_orders WHERE mobile_id = $1`,
       [id],
     );
@@ -2570,9 +2650,13 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
       await getPool().query(
         `UPDATE restaurant_orders
          SET supplemental_payment_proof = $2,
+             payment_proof_balance = $2,
              balance_proof_pending_review = TRUE,
              status = 'WAITING FOR BALANCE PAYMENT CONFIRMATION',
+             order_status = 'WAITING FOR BALANCE PAYMENT CONFIRMATION',
              payment_uploaded = TRUE,
+             payment_uploaded_balance = TRUE,
+             last_updated_order_status_dt_stamp = NOW(),
              updated_at = NOW()
          WHERE mobile_id = $1`,
         [id, paymentProof],
@@ -2599,7 +2683,11 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
     } else {
       await getPool().query(
         `UPDATE restaurant_orders
-         SET payment_uploaded = TRUE, payment_proof = $2, updated_at = NOW()
+         SET payment_uploaded = TRUE,
+             payment_uploaded_initial = TRUE,
+             payment_proof = $2,
+             payment_proof_initial = $2,
+             updated_at = NOW()
          WHERE mobile_id = $1`,
         [id, paymentProof],
       );

@@ -66,11 +66,60 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await normalizeAiGenerations(pool);
   await normalizeCustomerAccountsAndMergeProfiles(pool);
   await normalizeRestaurantOrders(pool);
+  await syncRestaurantOrdersDualWrite(pool);
   await normalizeCateringOrders(pool);
   await normalizeEventOrders(pool);
   await normalizeIdCounter(pool);
   await normalizeMenuDishes(pool);
   await dropLegacyTables(pool);
+}
+
+/** Keep legacy and canonical restaurant_orders columns aligned after deploys. */
+async function syncRestaurantOrdersDualWrite(pool: pg.Pool): Promise<void> {
+  if (!(await tableExists(pool, "restaurant_orders"))) return;
+  await safeExec(
+    pool,
+    `UPDATE restaurant_orders SET
+       order_id = COALESCE(NULLIF(TRIM(order_id), ''), NULLIF(TRIM(order_no), '')),
+       order_no = COALESCE(NULLIF(TRIM(order_no), ''), NULLIF(TRIM(order_id), ''))
+     WHERE order_id IS DISTINCT FROM order_no
+       OR order_id IS NULL OR order_no IS NULL`,
+  );
+  await safeExec(
+    pool,
+    `UPDATE restaurant_orders SET
+       total_cost = COALESCE(total_cost, total, total_amount),
+       total = COALESCE(total, total_cost, total_amount),
+       total_amount = COALESCE(total_amount, total_cost, total)
+     WHERE total IS DISTINCT FROM total_cost
+        OR total_cost IS DISTINCT FROM total_amount
+        OR total IS NULL OR total_cost IS NULL`,
+  );
+  await safeExec(
+    pool,
+    `UPDATE restaurant_orders SET
+       delivery_notes = COALESCE(NULLIF(TRIM(delivery_notes), ''), NULLIF(TRIM(note), '')),
+       note = COALESCE(NULLIF(TRIM(note), ''), NULLIF(TRIM(delivery_notes), ''))
+     WHERE delivery_notes IS DISTINCT FROM note`,
+  );
+  await safeExec(
+    pool,
+    `UPDATE restaurant_orders SET
+       order_status = COALESCE(NULLIF(TRIM(order_status), ''), NULLIF(TRIM(fulfillment_stage), ''), NULLIF(TRIM(status), '')),
+       fulfillment_stage = COALESCE(NULLIF(TRIM(fulfillment_stage), ''), NULLIF(TRIM(order_status), ''), NULLIF(TRIM(status), '')),
+       status = COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(order_status), ''), NULLIF(TRIM(fulfillment_stage), ''))
+     WHERE order_status IS DISTINCT FROM status OR fulfillment_stage IS DISTINCT FROM order_status`,
+  );
+  if (await columnExists(pool, "restaurant_orders", "tray_items")) {
+    await safeExec(
+      pool,
+      `UPDATE restaurant_orders SET
+         tray_items = COALESCE(NULLIF(tray_items, '[]'::jsonb), order_lines_snapshot, items, '[]'::jsonb),
+         order_lines_snapshot = COALESCE(NULLIF(order_lines_snapshot, '[]'::jsonb), tray_items, items, '[]'::jsonb),
+         items = COALESCE(NULLIF(items, '[]'::jsonb), tray_items, order_lines_snapshot, '[]'::jsonb)
+       WHERE tray_items IS DISTINCT FROM order_lines_snapshot`,
+    );
+  }
 }
 
 async function normalizeAiGenerations(pool: pg.Pool): Promise<void> {
