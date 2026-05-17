@@ -11,7 +11,12 @@ import {
   sendMailWithPdfAttachment,
   sendMailWithPdfRequired,
 } from "./mail.js";
-import { formatDbStartupError, getPool, initDb } from "./db.js";
+import {
+  formatDbStartupError,
+  getPool,
+  getRestaurantOrdersCustomerIdKind,
+  initDb,
+} from "./db.js";
 import {
   guestReachFromRow,
   isGuestUserEmail,
@@ -534,6 +539,32 @@ async function customerProfileIdForEmail(emailRaw: string): Promise<string | nul
   return (rows[0] as { id: string } | undefined)?.id ?? null;
 }
 
+async function customerAccountIdForEmail(emailRaw: string): Promise<string | null> {
+  const email = emailRaw.trim().toLowerCase();
+  if (!email) return null;
+  try {
+    const { rows } = await getPool().query(
+      `SELECT id::text AS id FROM customer_accounts WHERE LOWER(TRIM(email)) = $1 LIMIT 1`,
+      [email],
+    );
+    return (rows[0] as { id: string } | undefined)?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolves `restaurant_orders.customer_id` for checkout (UUID account id or legacy CUS-/GUEST- text). */
+async function restaurantOrderCustomerIdForCheckout(userEmail: string, isGuest: boolean): Promise<string | null> {
+  const kind = getRestaurantOrdersCustomerIdKind();
+  if (isGuest) {
+    return kind === "uuid" ? null : await nextGuestCustomerId();
+  }
+  if (kind === "uuid") {
+    return (await customerAccountIdForEmail(userEmail)) ?? (await customerProfileIdForEmail(userEmail));
+  }
+  return customerProfileIdForEmail(userEmail);
+}
+
 async function nextTransactionNo(_kind: "catering" | "event"): Promise<string> {
   void _kind;
   const { rows } = await getPool().query(
@@ -891,7 +922,11 @@ async function applyLoyaltyRewardsBestEffort(
       return;
     }
 
-    const customerId = await customerProfileIdForEmail(email);
+    const customerId =
+      getRestaurantOrdersCustomerIdKind() === "uuid"
+        ? await customerAccountIdForEmail(email)
+        : await customerProfileIdForEmail(email);
+    if (!customerId) return;
 
     let fullName = "";
     let phone = "";
@@ -2500,7 +2535,7 @@ app.post("/api/mobile/orders", async (req, res) => {
   const total = parsedItems.reduce((sum, i) => sum + restaurantLineSubtotal(i), 0);
   const contactEmail = String(req.body?.contact_email ?? "").trim().toLowerCase();
   const isGuest = isGuestUserEmail(userEmail);
-  const customerId = isGuest ? await nextGuestCustomerId() : await customerProfileIdForEmail(userEmail);
+  const customerId = await restaurantOrderCustomerIdForCheckout(userEmail, isGuest);
   const guestContactEmail = isGuest && contactEmail ? contactEmail : null;
   const client = await getPool().connect();
   try {

@@ -1,4 +1,4 @@
-import { getPool } from "./db.js";
+import { getPool, getRestaurantOrdersCustomerIdKind } from "./db.js";
 import { sendMailSafe, sendMailWithAttachmentsSafe } from "./mail.js";
 import { sendSmsSafe } from "./sms.js";
 
@@ -7,9 +7,12 @@ export function isGuestUserEmail(email: string): boolean {
 }
 
 export async function nextGuestCustomerId(): Promise<string> {
+  if (getRestaurantOrdersCustomerIdKind() === "uuid") {
+    throw new Error("nextGuestCustomerId is not used when restaurant_orders.customer_id is UUID");
+  }
   const { rows } = await getPool().query(
-    `SELECT COALESCE(MAX(CAST(REPLACE(customer_id, 'GUEST-', '') AS INT)), 0) AS m
-     FROM restaurant_orders WHERE customer_id ~ '^GUEST-[0-9]+$'`,
+    `SELECT COALESCE(MAX(CAST(REPLACE(customer_id::text, 'GUEST-', '') AS INT)), 0) AS m
+     FROM restaurant_orders WHERE customer_id::text ~ '^GUEST-[0-9]+$'`,
   );
   const m = Number((rows[0] as { m: string }).m) || 0;
   return `GUEST-${String(m + 1).padStart(4, "0")}`;

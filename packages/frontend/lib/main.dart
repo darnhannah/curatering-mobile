@@ -14802,6 +14802,9 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                       final entered = r.stageEnteredAt ?? r.updatedAt;
                       final whenStr = formatDateTimeLocal(entered);
                       final stLower = r.status.trim().toLowerCase();
+                      final listSubstage = stage == 'for_processing'
+                          ? (widget.processingSubstageFilter ?? r.processingSubstageLabel)
+                          : r.processingSubstageLabel;
                       final isDownPaymentCard =
                           stLower == 'for_processing' && listSubstage == 'down_payment';
                       final scheduleLine = (stLower == 'for_post_analysis' || stLower == 'completed' || isDownPaymentCard) &&
@@ -14823,9 +14826,6 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                         }
                         return '';
                       }();
-                      final listSubstage = stage == 'for_processing'
-                          ? (widget.processingSubstageFilter ?? r.processingSubstageLabel)
-                          : r.processingSubstageLabel;
                       final subtitleWidgets = <Widget>[
                         Text(r.contactPerson),
                         Text('${managerStageListTimestampLabel(stage)}: $whenStr'),

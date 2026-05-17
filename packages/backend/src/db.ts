@@ -16,6 +16,32 @@ export function formatDbStartupError(err: unknown): string {
 
 let pool: pg.Pool | null = null;
 
+/** How `restaurant_orders.customer_id` is stored (set during [initDb]). */
+export type RestaurantOrdersCustomerIdKind = "uuid" | "text" | "absent";
+
+let restaurantOrdersCustomerIdKindCache: RestaurantOrdersCustomerIdKind = "text";
+
+export function getRestaurantOrdersCustomerIdKind(): RestaurantOrdersCustomerIdKind {
+  return restaurantOrdersCustomerIdKindCache;
+}
+
+export async function detectRestaurantOrdersCustomerIdKind(
+  client: pg.Pool | pg.PoolClient = getPool(),
+): Promise<RestaurantOrdersCustomerIdKind> {
+  const { rows } = await client.query<{ data_type: string }>(
+    `SELECT data_type
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'restaurant_orders'
+       AND column_name = 'customer_id'
+     LIMIT 1`,
+  );
+  if (rows.length === 0) return "absent";
+  const dt = String(rows[0]?.data_type ?? "").toLowerCase();
+  if (dt === "uuid") return "uuid";
+  return "text";
+}
+
 function rawDatabaseUrl(): string {
   const url = process.env.DATABASE_URL?.trim();
   if (!url) {
@@ -189,8 +215,13 @@ export async function initDb(): Promise<void> {
   await p.query(
     `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS balance_proof_pending_review BOOLEAN NOT NULL DEFAULT FALSE`,
   );
-  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id TEXT`);
+  const customerIdKindBefore = await detectRestaurantOrdersCustomerIdKind(p);
+  if (customerIdKindBefore === "absent") {
+    await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id TEXT`);
+  }
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS guest_contact_email TEXT`);
+  const restaurantOrdersCustomerIdKind = await detectRestaurantOrdersCustomerIdKind(p);
+  restaurantOrdersCustomerIdKindCache = restaurantOrdersCustomerIdKind;
   await p.query(`
     DO $$
     BEGIN
@@ -267,6 +298,12 @@ export async function initDb(): Promise<void> {
      ) AS exists`,
   );
   if (mobileOrdersTable.rows[0]?.exists) {
+    const migratedCustomerIdExpr =
+      restaurantOrdersCustomerIdKind === "uuid"
+        ? `(SELECT ca.id FROM customer_accounts ca
+            WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`
+        : `(SELECT cp.id FROM customer_profiles cp
+            WHERE LOWER(TRIM(cp.user_email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`;
     await p.query(`
       INSERT INTO restaurant_orders (
         mobile_id, user_email, customer_id, order_no, status, note, payment_mode, payment_uploaded, payment_proof,
@@ -277,7 +314,7 @@ export async function initDb(): Promise<void> {
       )
       SELECT
         mo.id, mo.user_email,
-        (SELECT cp.id FROM customer_profiles cp WHERE LOWER(TRIM(cp.user_email)) = LOWER(TRIM(mo.user_email)) LIMIT 1),
+        ${migratedCustomerIdExpr},
         mo.order_no, mo.status, mo.note, mo.payment_mode, mo.payment_uploaded, mo.payment_proof,
         mo.delivery_name, mo.delivery_contact, mo.delivery_address, mo.delivery_time, COALESCE(mo.total, 0), COALESCE(mo.total, 0),
         mo.order_source, mo.pos_customer_label, mo.cashier_amount_received, mo.cashier_change, mo.fulfillment_stage,
@@ -295,15 +332,27 @@ export async function initDb(): Promise<void> {
     await p.query(`DROP TABLE mobile_orders CASCADE`);
   }
 
-  await p.query(`
-    UPDATE restaurant_orders ro
-    SET customer_id = cp.id
-    FROM customer_profiles cp
-    WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id) = '')
-      AND ro.user_email IS NOT NULL
-      AND TRIM(ro.user_email) <> ''
-      AND LOWER(TRIM(cp.user_email)) = LOWER(TRIM(ro.user_email))
-  `);
+  if (restaurantOrdersCustomerIdKind === "uuid") {
+    await p.query(`
+      UPDATE restaurant_orders ro
+      SET customer_id = ca.id
+      FROM customer_accounts ca
+      WHERE ro.customer_id IS NULL
+        AND ro.user_email IS NOT NULL
+        AND TRIM(ro.user_email) <> ''
+        AND LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email))
+    `);
+  } else if (restaurantOrdersCustomerIdKind === "text") {
+    await p.query(`
+      UPDATE restaurant_orders ro
+      SET customer_id = cp.id
+      FROM customer_profiles cp
+      WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id::text) = '')
+        AND ro.user_email IS NOT NULL
+        AND TRIM(ro.user_email) <> ''
+        AND LOWER(TRIM(cp.user_email)) = LOWER(TRIM(ro.user_email))
+    `);
+  }
 
   await p.query(`
     UPDATE restaurant_orders

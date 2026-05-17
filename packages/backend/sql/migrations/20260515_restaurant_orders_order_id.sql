@@ -14,15 +14,45 @@ BEGIN
   END IF;
 END $$;
 
-ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id TEXT;
+-- Only add TEXT customer_id when the column does not exist (production may already use UUID).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'customer_id'
+  ) THEN
+    ALTER TABLE restaurant_orders ADD COLUMN customer_id TEXT;
+  END IF;
+END $$;
 
-UPDATE restaurant_orders ro
-SET customer_id = cp.id
-FROM customer_profiles cp
-WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id) = '')
-  AND ro.user_email IS NOT NULL
-  AND TRIM(ro.user_email) <> ''
-  AND LOWER(TRIM(cp.user_email)) = LOWER(TRIM(ro.user_email));
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'restaurant_orders'
+      AND column_name = 'customer_id' AND data_type = 'uuid'
+  ) THEN
+    UPDATE restaurant_orders ro
+    SET customer_id = ca.id
+    FROM customer_accounts ca
+    WHERE ro.customer_id IS NULL
+      AND ro.user_email IS NOT NULL
+      AND TRIM(ro.user_email) <> ''
+      AND LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email));
+  ELSIF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'restaurant_orders'
+      AND column_name = 'customer_id' AND data_type IN ('text', 'character varying')
+  ) THEN
+    UPDATE restaurant_orders ro
+    SET customer_id = cp.id
+    FROM customer_profiles cp
+    WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id::text) = '')
+      AND ro.user_email IS NOT NULL
+      AND TRIM(ro.user_email) <> ''
+      AND LOWER(TRIM(cp.user_email)) = LOWER(TRIM(ro.user_email));
+  END IF;
+END $$;
 
 DROP TRIGGER IF EXISTS trg_sync_mobile_orders_into_restaurant_orders ON mobile_orders;
 DROP FUNCTION IF EXISTS sync_mobile_orders_into_restaurant_orders();
