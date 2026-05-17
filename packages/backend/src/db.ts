@@ -1,4 +1,5 @@
 import pg from "pg";
+import { runSchemaNormalize } from "./schemaNormalize.js";
 
 const { Pool } = pg;
 
@@ -117,13 +118,6 @@ export function getPool(): pg.Pool {
 /** Ensure app tables exist (safe to call on every startup). */
 export async function initDb(): Promise<void> {
   const p = getPool();
-  await p.query(`
-    CREATE TABLE IF NOT EXISTS items (
-      id BIGSERIAL PRIMARY KEY,
-      title TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
   await p.query(`
     CREATE TABLE IF NOT EXISTS mobile_users (
       id BIGSERIAL PRIMARY KEY,
@@ -372,32 +366,6 @@ export async function initDb(): Promise<void> {
       )
   `);
 
-  await p.query(
-    `ALTER TABLE customer_profiles ADD COLUMN IF NOT EXISTS delivery_map_confirmed BOOLEAN NOT NULL DEFAULT FALSE`,
-  );
-  await p.query(`ALTER TABLE customer_profiles ADD COLUMN IF NOT EXISTS delivery_lat DOUBLE PRECISION`);
-  await p.query(`ALTER TABLE customer_profiles ADD COLUMN IF NOT EXISTS delivery_lng DOUBLE PRECISION`);
-  await p.query(
-    `ALTER TABLE customer_profiles ADD COLUMN IF NOT EXISTS loyalty_points INTEGER NOT NULL DEFAULT 0`,
-  );
-  await p.query(
-    `ALTER TABLE customer_profiles ADD COLUMN IF NOT EXISTS loyalty_points_restaurant INTEGER`,
-  );
-  await p.query(
-    `ALTER TABLE customer_profiles ADD COLUMN IF NOT EXISTS loyalty_points_catering INTEGER`,
-  );
-  await p.query(`ALTER TABLE customer_profiles ADD COLUMN IF NOT EXISTS delivery_addresses JSONB`);
-  await p.query(`
-    UPDATE customer_profiles
-    SET loyalty_points_restaurant = COALESCE(loyalty_points_restaurant, loyalty_points),
-        loyalty_points_catering = COALESCE(loyalty_points_catering, 0)
-    WHERE loyalty_points_restaurant IS NULL OR loyalty_points_catering IS NULL
-  `);
-  await p.query(`
-    UPDATE customer_profiles
-    SET delivery_addresses = COALESCE(delivery_addresses, '[]'::jsonb)
-    WHERE delivery_addresses IS NULL
-  `);
   await p.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pos_role TEXT NOT NULL DEFAULT ''`);
   await p.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_otp TEXT`);
   await p.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ`);
@@ -540,15 +508,6 @@ export async function initDb(): Promise<void> {
   }
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS customer_signup_otp_challenges (
-      email TEXT PRIMARY KEY,
-      otp_code TEXT NOT NULL,
-      otp_expires_at TIMESTAMPTZ NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await p.query(`
     CREATE TABLE IF NOT EXISTS customer_tray_drafts (
       user_email TEXT PRIMARY KEY,
       tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -589,4 +548,7 @@ export async function initDb(): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS customer_order_feedback_user_kind_ref_idx
      ON customer_order_feedback (user_email, kind, reference)`,
   );
+
+  await runSchemaNormalize(p);
+  restaurantOrdersCustomerIdKindCache = await detectRestaurantOrdersCustomerIdKind(p);
 }

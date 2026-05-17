@@ -529,40 +529,35 @@ async function resolveCustomerAccountByIdentity(identityRaw: string): Promise<{
   return row ?? null;
 }
 
-async function customerProfileIdForEmail(emailRaw: string): Promise<string | null> {
-  const email = emailRaw.trim().toLowerCase();
-  if (!email) return null;
-  const { rows } = await getPool().query(
-    `SELECT id FROM customer_profiles WHERE LOWER(TRIM(user_email)) = $1 LIMIT 1`,
-    [email],
-  );
-  return (rows[0] as { id: string } | undefined)?.id ?? null;
-}
-
-async function customerAccountIdForEmail(emailRaw: string): Promise<string | null> {
+async function customerBusinessIdForEmail(emailRaw: string): Promise<string | null> {
   const email = emailRaw.trim().toLowerCase();
   if (!email) return null;
   try {
     const { rows } = await getPool().query(
-      `SELECT id::text AS id FROM customer_accounts WHERE LOWER(TRIM(email)) = $1 LIMIT 1`,
+      `SELECT NULLIF(TRIM(customer_id), '') AS customer_id
+       FROM customer_accounts
+       WHERE LOWER(TRIM(email)) = $1
+       LIMIT 1`,
       [email],
     );
-    return (rows[0] as { id: string } | undefined)?.id ?? null;
+    return (rows[0] as { customer_id: string | null } | undefined)?.customer_id ?? null;
   } catch {
     return null;
   }
 }
 
-/** Resolves `restaurant_orders.customer_id` for checkout (UUID account id or legacy CUS-/GUEST- text). */
+/** @deprecated Use [customerBusinessIdForEmail]. */
+async function customerProfileIdForEmail(emailRaw: string): Promise<string | null> {
+  return customerBusinessIdForEmail(emailRaw);
+}
+
+/** Resolves `restaurant_orders.customer_id` (CUS-**** when column is text). */
 async function restaurantOrderCustomerIdForCheckout(userEmail: string, isGuest: boolean): Promise<string | null> {
   const kind = getRestaurantOrdersCustomerIdKind();
   if (isGuest) {
     return kind === "uuid" ? null : await nextGuestCustomerId();
   }
-  if (kind === "uuid") {
-    return (await customerAccountIdForEmail(userEmail)) ?? (await customerProfileIdForEmail(userEmail));
-  }
-  return customerProfileIdForEmail(userEmail);
+  return customerBusinessIdForEmail(userEmail);
 }
 
 async function nextTransactionNo(_kind: "catering" | "event"): Promise<string> {
@@ -733,8 +728,11 @@ async function refreshLoyaltyTotalsForUser(userEmailRaw: string): Promise<void> 
        COALESCE((
          SELECT SUM(COALESCE(ro.points_earned, 0))::int
          FROM restaurant_orders ro
-         LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
-         WHERE LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))) = $1
+         LEFT JOIN customer_accounts ca ON (
+           ca.customer_id = ro.customer_id::text
+           OR LOWER(TRIM(ca.email)) = LOWER(TRIM(COALESCE(ro.user_email, '')))
+         )
+         WHERE LOWER(TRIM(COALESCE(ca.email, ro.user_email, ''))) = $1
            AND COALESCE(ro.delivery_notes, '') NOT LIKE '%Catering event loyalty%'
        ), 0) AS r,
        (
@@ -753,16 +751,6 @@ async function refreshLoyaltyTotalsForUser(userEmailRaw: string): Promise<void> 
        )::int AS c
    )`;
   try {
-    await getPool().query(
-      `UPDATE customer_profiles cp
-       SET loyalty_points_restaurant = sub.r,
-           loyalty_points_catering = sub.c,
-           loyalty_points = sub.r + sub.c,
-           updated_at = NOW()
-       FROM ${subFrom} sub
-       WHERE LOWER(cp.user_email) = $1`,
-      [email],
-    );
     await getPool().query(
       `UPDATE customer_accounts ca
        SET restaurant_loyalty_points = sub.r,
@@ -819,7 +807,7 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
                 SUM(rp)::int AS restaurant_points,
                 SUM(cp)::int AS catering_points
          FROM (
-           SELECT LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))) AS email_key,
+           SELECT LOWER(TRIM(COALESCE(ca.email, ro.user_email, ''))) AS email_key,
                   CASE
                     WHEN COALESCE(ro.delivery_notes, '') NOT LIKE '%Catering event loyalty%'
                       THEN COALESCE(ro.points_earned, 0)
@@ -827,50 +815,11 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
                   END AS rp,
                   0::int AS cp
            FROM restaurant_orders ro
-           LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
-           WHERE NULLIF(LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))), '') IS NOT NULL
-           UNION ALL
-           SELECT LOWER(TRIM(email_address)) AS email_key,
-                  0 AS rp,
-                  COALESCE(points_earned, 0) AS cp
-           FROM event_orders
-           WHERE LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
-             AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
-           UNION ALL
-           SELECT LOWER(TRIM(email_address)) AS email_key,
-                  0 AS rp,
-                  COALESCE(points_earned, 0) AS cp
-           FROM catering_orders
-           WHERE LOWER(TRIM(status)) IN ('for_post_analysis', 'completed')
-             AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
-         ) t
-         WHERE email_key <> ''
-         GROUP BY email_key
-       )
-       UPDATE customer_profiles cp
-       SET loyalty_points_restaurant = COALESCE(agg.restaurant_points, 0),
-           loyalty_points_catering = COALESCE(agg.catering_points, 0),
-           loyalty_points = COALESCE(agg.restaurant_points, 0) + COALESCE(agg.catering_points, 0),
-           updated_at = NOW()
-       FROM agg
-       WHERE LOWER(cp.user_email) = agg.email_key`,
-    );
-    await getPool().query(
-      `WITH agg AS (
-         SELECT email_key,
-                SUM(rp)::int AS restaurant_points,
-                SUM(cp)::int AS catering_points
-         FROM (
-           SELECT LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))) AS email_key,
-                  CASE
-                    WHEN COALESCE(ro.delivery_notes, '') NOT LIKE '%Catering event loyalty%'
-                      THEN COALESCE(ro.points_earned, 0)
-                    ELSE 0
-                  END AS rp,
-                  0::int AS cp
-           FROM restaurant_orders ro
-           LEFT JOIN customer_accounts ca ON ca.id = ro.customer_id
-           WHERE NULLIF(LOWER(TRIM(COALESCE(ca.email::text, ro.customer_id::text, ro.user_email, ''))), '') IS NOT NULL
+           LEFT JOIN customer_accounts ca ON (
+             ca.customer_id = ro.customer_id::text
+             OR LOWER(TRIM(ca.email)) = LOWER(TRIM(COALESCE(ro.user_email, '')))
+           )
+           WHERE NULLIF(LOWER(TRIM(COALESCE(ca.email, ro.user_email, ''))), '') IS NOT NULL
            UNION ALL
            SELECT LOWER(TRIM(email_address)) AS email_key,
                   0 AS rp,
@@ -922,17 +871,14 @@ async function applyLoyaltyRewardsBestEffort(
       return;
     }
 
-    const customerId =
-      getRestaurantOrdersCustomerIdKind() === "uuid"
-        ? await customerAccountIdForEmail(email)
-        : await customerProfileIdForEmail(email);
+    const customerId = await customerBusinessIdForEmail(email);
     if (!customerId) return;
 
     let fullName = "";
     let phone = "";
     try {
       const prof = await getPool().query(
-        `SELECT full_name, contact_number FROM customer_profiles WHERE LOWER(user_email) = $1`,
+        `SELECT full_name, contact_number FROM customer_accounts WHERE LOWER(TRIM(email)) = $1`,
         [email],
       );
       const p = prof.rows[0] as { full_name: string; contact_number: string } | undefined;
@@ -965,11 +911,10 @@ async function applyLoyaltyRewardsBestEffort(
 
     if (kind === "catering_event") {
       await getPool().query(
-        `UPDATE customer_profiles
-         SET loyalty_points = COALESCE(loyalty_points, 0) + $2,
-             loyalty_points_catering = COALESCE(loyalty_points_catering, 0) + $2,
+        `UPDATE customer_accounts
+         SET catering_loyalty_points = COALESCE(catering_loyalty_points, 0) + $2,
              updated_at = NOW()
-         WHERE LOWER(user_email) = LOWER($1)`,
+         WHERE LOWER(TRIM(email)) = LOWER($1)`,
         [email, pointsEarned],
       );
       await getPool().query(
@@ -981,11 +926,10 @@ async function applyLoyaltyRewardsBestEffort(
       );
     } else {
       await getPool().query(
-        `UPDATE customer_profiles
-         SET loyalty_points = COALESCE(loyalty_points, 0) + $2,
-             loyalty_points_restaurant = COALESCE(loyalty_points_restaurant, 0) + $2,
+        `UPDATE customer_accounts
+         SET restaurant_loyalty_points = COALESCE(restaurant_loyalty_points, 0) + $2,
              updated_at = NOW()
-         WHERE LOWER(user_email) = LOWER($1)`,
+         WHERE LOWER(TRIM(email)) = LOWER($1)`,
         [email, pointsEarned],
       );
       await getPool().query(
@@ -1037,34 +981,11 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/api/items", async (_req, res) => {
-  try {
-    const { rows } = await getPool().query(
-      "SELECT id, title, created_at FROM items ORDER BY id DESC",
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    const msg = err instanceof Error ? err.message : "database error";
-    res.status(500).json({ error: msg || "database error" });
-  }
+  res.json([]);
 });
 
-app.post("/api/items", async (req, res) => {
-  const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
-  if (!title) {
-    res.status(400).json({ error: "title is required" });
-    return;
-  }
-  try {
-    const { rows } = await getPool().query(
-      "INSERT INTO items (title) VALUES ($1) RETURNING id, title, created_at",
-      [title],
-    );
-    res.status(201).json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "database error" });
-  }
+app.post("/api/items", async (_req, res) => {
+  res.status(410).json({ error: "items table removed; use restaurant_orders tray_items instead" });
 });
 
 app.get("/api/mobile/menu", async (_req, res) => {
@@ -1153,12 +1074,12 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
       await getPool().query("DELETE FROM customer_accounts WHERE email = $1 AND is_verified = FALSE", [email]);
     }
     await getPool().query(
-      `INSERT INTO customer_signup_otp_challenges (email, otp_code, otp_expires_at)
-       VALUES ($1, $2, $3)
+      `INSERT INTO customer_accounts (email, password_hash, full_name, is_verified, signup_otp_code, signup_otp_code_expiry, updated_at)
+       VALUES ($1, '', '', FALSE, $2, $3, NOW())
        ON CONFLICT (email) DO UPDATE SET
-         otp_code = EXCLUDED.otp_code,
-         otp_expires_at = EXCLUDED.otp_expires_at,
-         created_at = NOW()`,
+         signup_otp_code = EXCLUDED.signup_otp_code,
+         signup_otp_code_expiry = EXCLUDED.signup_otp_code_expiry,
+         updated_at = NOW()`,
       [email, code, expiresAt.toISOString()],
     );
     await logActionBestEffort("auth.signup.request_otp", email, "Signup OTP requested", {
@@ -1200,7 +1121,9 @@ app.post("/api/mobile/auth/signup/complete", async (req, res) => {
   }
   try {
     const { rows } = await getPool().query(
-      "SELECT otp_code, otp_expires_at FROM customer_signup_otp_challenges WHERE email = $1",
+      `SELECT signup_otp_code AS otp_code,
+              COALESCE(signup_otp_code_expiry, signup_otp_expires_at) AS otp_expires_at
+       FROM customer_accounts WHERE email = $1`,
       [email],
     );
     const row = rows[0] as { otp_code: string | null; otp_expires_at: Date | null } | undefined;
@@ -1218,15 +1141,16 @@ app.post("/api/mobile/auth/signup/complete", async (req, res) => {
       return;
     }
     const hash = await bcrypt.hash(password, 10);
-    await getPool().query("DELETE FROM customer_signup_otp_challenges WHERE email = $1", [email]);
     await getPool().query(
-      `INSERT INTO customer_accounts (email, full_name, password_hash, is_verified, updated_at)
-       VALUES ($1, '', $2, TRUE, NOW())
+      `INSERT INTO customer_accounts (email, full_name, password_hash, is_verified, updated_at, created_account_dt_stamp)
+       VALUES ($1, '', $2, TRUE, NOW(), NOW())
        ON CONFLICT (email) DO UPDATE SET
          password_hash = EXCLUDED.password_hash,
          is_verified = TRUE,
          signup_otp_code = NULL,
+         signup_otp_code_expiry = NULL,
          signup_otp_expires_at = NULL,
+         updated_pw_dt_stamp = NOW(),
          updated_at = NOW()`,
       [email, hash],
     );
@@ -1601,7 +1525,7 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
                 ELSE 0
               END AS loyalty_points_earned
        FROM restaurant_orders mo
-       LEFT JOIN customer_profiles cp ON LOWER(TRIM(cp.user_email)) = LOWER(TRIM(mo.user_email))
+       LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
        WHERE mo.order_source = 'MOBILE_APP' AND mo.user_email IS NOT NULL
        ORDER BY mo.created_at DESC`,
     );
@@ -2107,8 +2031,8 @@ function numOrNull(v: unknown): number | null {
 
 async function nextCustomerProfileRowId(): Promise<string> {
   const { rows } = await getPool().query(
-    `SELECT COALESCE(MAX(CAST(REPLACE(id, 'CUS-', '') AS INT)), 0) AS m
-     FROM customer_profiles WHERE id ~ '^CUS-[0-9]+$'`,
+    `SELECT COALESCE(MAX(CAST(REPLACE(customer_id, 'CUS-', '') AS INT)), 0) AS m
+     FROM customer_accounts WHERE customer_id ~ '^CUS-[0-9]+$'`,
   );
   const m = Number((rows[0] as { m: string }).m) || 0;
   return `CUS-${String(m + 1).padStart(4, "0")}`;
@@ -2312,12 +2236,15 @@ app.get("/api/mobile/profile", async (req, res) => {
   try {
     await refreshLoyaltyTotalsForUser(userEmail);
     const { rows } = await getPool().query(
-      `SELECT user_email, full_name, contact_number, delivery_address, delivery_map_confirmed,
-              delivery_lat, delivery_lng, loyalty_points,
-              COALESCE(loyalty_points_restaurant, 0) AS loyalty_points_restaurant,
-              COALESCE(loyalty_points_catering, 0) AS loyalty_points_catering,
-              COALESCE(delivery_addresses, '[]'::jsonb) AS delivery_addresses
-       FROM customer_profiles WHERE user_email = $1`,
+      `SELECT email AS user_email, full_name, contact_number,
+              COALESCE(primary_delivery_address, delivery_address, '') AS delivery_address,
+              delivery_map_confirmed, delivery_lat, delivery_lng,
+              COALESCE(restaurant_loyalty_points, loyalty_points_restaurant, 0) AS loyalty_points_restaurant,
+              COALESCE(catering_loyalty_points, loyalty_points_catering, 0) AS loyalty_points_catering,
+              COALESCE(restaurant_loyalty_points, 0) + COALESCE(catering_loyalty_points, 0) AS loyalty_points,
+              COALESCE(other_delivery_addresses, delivery_addresses, '[]'::jsonb) AS delivery_addresses,
+              customer_id
+       FROM customer_accounts WHERE LOWER(TRIM(email)) = $1`,
       [userEmail],
     );
     if (!rows[0]) {
@@ -2426,26 +2353,39 @@ app.put("/api/mobile/profile", async (req, res) => {
     return;
   }
   try {
-    const existingId = await getPool().query(`SELECT id FROM customer_profiles WHERE user_email = $1`, [userEmail]);
+    const existingId = await getPool().query(
+      `SELECT customer_id FROM customer_accounts WHERE LOWER(TRIM(email)) = $1`,
+      [userEmail],
+    );
     const rowId =
-      (existingId.rows[0] as { id: string } | undefined)?.id ?? (await nextCustomerProfileRowId());
+      (existingId.rows[0] as { customer_id: string } | undefined)?.customer_id ??
+      (await nextCustomerProfileRowId());
     const { rows } = await getPool().query(
-      `INSERT INTO customer_profiles (id, user_email, full_name, contact_number, delivery_address, delivery_map_confirmed, delivery_lat, delivery_lng, delivery_addresses)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
-       ON CONFLICT (user_email)
+      `INSERT INTO customer_accounts (
+         email, password_hash, full_name, contact_number, is_verified, customer_id,
+         primary_delivery_address, delivery_map_confirmed, delivery_lat, delivery_lng, other_delivery_addresses,
+         updated_at, updated_pw_dt_stamp
+       )
+       VALUES ($2, '', $3, $4, TRUE, $1, $5, $6, $7, $8, $9::jsonb, NOW(), NOW())
+       ON CONFLICT (email)
        DO UPDATE SET full_name = EXCLUDED.full_name,
                      contact_number = EXCLUDED.contact_number,
-                     delivery_address = EXCLUDED.delivery_address,
+                     primary_delivery_address = EXCLUDED.primary_delivery_address,
                      delivery_map_confirmed = EXCLUDED.delivery_map_confirmed,
                      delivery_lat = EXCLUDED.delivery_lat,
                      delivery_lng = EXCLUDED.delivery_lng,
-                     delivery_addresses = EXCLUDED.delivery_addresses,
+                     other_delivery_addresses = EXCLUDED.other_delivery_addresses,
+                     customer_id = COALESCE(NULLIF(TRIM(customer_accounts.customer_id), ''), EXCLUDED.customer_id),
+                     updated_pw_dt_stamp = NOW(),
                      updated_at = NOW()
-       RETURNING user_email, full_name, contact_number, delivery_address, delivery_map_confirmed, delivery_lat, delivery_lng,
-                 COALESCE(delivery_addresses, '[]'::jsonb) AS delivery_addresses,
-                 COALESCE(loyalty_points_restaurant, 0) AS loyalty_points_restaurant,
-                 COALESCE(loyalty_points_catering, 0) AS loyalty_points_catering,
-                 loyalty_points`,
+       RETURNING email AS user_email, full_name, contact_number,
+                 COALESCE(primary_delivery_address, '') AS delivery_address,
+                 delivery_map_confirmed, delivery_lat, delivery_lng,
+                 COALESCE(other_delivery_addresses, '[]'::jsonb) AS delivery_addresses,
+                 COALESCE(restaurant_loyalty_points, 0) AS loyalty_points_restaurant,
+                 COALESCE(catering_loyalty_points, 0) AS loyalty_points_catering,
+                 COALESCE(restaurant_loyalty_points, 0) + COALESCE(catering_loyalty_points, 0) AS loyalty_points,
+                 customer_id`,
       [rowId, userEmail, fullName, contactNumber, deliveryAddress, mapConfirmed, latNum, lngNum, deliveryAddressesJson],
     );
     await logActionBestEffort("profile.update", userEmail, "Customer profile updated", {
@@ -4784,7 +4724,7 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
       `SELECT
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM menu_dishes), '') AS menu_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM customer_profiles), '') AS profile_stamp,
+         COALESCE((SELECT MAX(COALESCE(updated_at, created_account_dt_stamp, created_at))::text FROM customer_accounts), '') AS profile_stamp,
          COALESCE((SELECT MAX(created_at)::text FROM notifications WHERE user_id = $1), '') AS notifications_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM catering_orders WHERE LOWER(email_address) = $1), '') AS catering_inquiries_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM event_orders WHERE LOWER(email_address) = $1), '') AS event_inquiries_stamp,
@@ -4838,12 +4778,12 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
       )
     ).rowCount ?? 0) > 0;
 
-    const profileChanged = (( 
+    const profileChanged = ((
       await getPool().query(
         `SELECT 1
-         FROM customer_profiles
-         WHERE LOWER(TRIM(user_email)) = $1
-           AND COALESCE(updated_at, created_at) > $2
+         FROM customer_accounts
+         WHERE LOWER(TRIM(email)) = $1
+           AND COALESCE(updated_pw_dt_stamp, updated_at, created_account_dt_stamp, created_at) > $2
          LIMIT 1`,
         [userEmail, since.toISOString()],
       )
@@ -5164,19 +5104,10 @@ async function seedCustomerSeedRow(): Promise<void> {
   try {
     const pool = getPool();
     await pool.query(
-      `INSERT INTO customer_profiles (id, user_email, full_name, contact_number, delivery_address)
-       VALUES ('CUS-0001', $1, 'CUS-0001', '', '')
-       ON CONFLICT (id) DO NOTHING`,
-      [email],
-    );
-  } catch (e) {
-    console.warn("[db] customer_profiles CUS-0001 seed skipped:", e);
-  }
-  try {
-    const pool = getPool();
-    await pool.query(
-      `INSERT INTO customer_accounts (email, password_hash, full_name, is_verified)
-       VALUES ($1, $2, 'CUS-0001', TRUE)
+      `INSERT INTO customer_accounts (
+         email, password_hash, full_name, is_verified, customer_id, contact_number, primary_delivery_address
+       )
+       VALUES ($1, $2, 'CUS-0001', TRUE, 'CUS-0001', '', '')
        ON CONFLICT (email) DO NOTHING`,
       [email, hash],
     );
