@@ -12,8 +12,11 @@ export async function menuDishAllergensSelectExpr(pool: pg.Pool): Promise<string
 
   const udt = await columnUdtName(pool, "menu_dishes", "allergens");
   if (udt === "_int8") {
-    const hasJoinTable = await columnExists(pool, "menu_dishes_allergens", "allergen_id");
+    const hasJoinTable =
+      (await tableExists(pool, "menu_dishes_allergens")) &&
+      (await columnExists(pool, "menu_dishes_allergens", "allergen_id"));
     if (hasJoinTable) return MENU_DISH_ALLERGEN_NAMES_JSON_SQL;
+    return `'[]'::text`;
   }
   if (udt === "_text") {
     return `COALESCE(

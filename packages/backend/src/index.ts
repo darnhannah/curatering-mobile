@@ -46,6 +46,17 @@ import {
   mapRestaurantOrderRowForApi,
   restaurantLoyaltyEarnedSql,
   isPgUndefinedColumn,
+  getRestaurantOrderSelectSql,
+  getRestaurantOrderPatchSelectSql,
+  getCashierOnlineOrderWhereSql,
+  getRestaurantOrderCreatedAtSql,
+  getRestaurantOrderUpdatedAtSql,
+  getRestaurantOrderChangedSinceSql,
+  getCateringOrderCreatedAtSql,
+  restaurantOrderMatchesEmailWhere,
+  restaurantOrderEmailExpr,
+  restaurantLoyaltyEarnedSqlAsync,
+  getTrayDraftColumns,
 } from "./sqlCompat.js";
 import {
   mapManagerCateringStageToDb,
@@ -78,10 +89,10 @@ import { parseAllergenNamesFromRow, queryAllergensCatalog } from "./menuAllergen
 import { buildMenuSql, buildSetMenusSql, MINIMAL_PUBLIC_MENU_SQL } from "./menuQuery.js";
 import { DEFAULT_PUBLIC_MENU_SQL, DEFAULT_PUBLIC_SET_MENUS_SQL } from "./webMenu.js";
 import {
+  columnExists,
   CUSTOMER_ACCOUNT_STAMP_SQL,
   menuDishesChangedSinceSql,
   menuDishesMaxStampExpr,
-  RESTAURANT_ORDER_CHANGED_SINCE_SQL,
 } from "./schemaColumns.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
@@ -232,6 +243,15 @@ function ensureNewEventSchemaOnce(): Promise<void> {
       WHERE LOWER(TRIM(status)) = 'for_processing';
     `;
     await p.query(splitLegacyProcessing);
+    const allowedStatuses = `'new_event', 'online_inquiries', 'for_down_payment', 'for_ongoing', 'for_full_payment', 'completed', 'cancelled'`;
+    await p.query(`
+      UPDATE event_orders SET status = 'new_event'
+      WHERE LOWER(TRIM(COALESCE(status, ''))) NOT IN (${allowedStatuses})
+    `);
+    await p.query(`
+      UPDATE catering_orders SET status = 'new_event'
+      WHERE LOWER(TRIM(COALESCE(status, ''))) NOT IN (${allowedStatuses})
+    `);
     await p.query(`
       ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
       CHECK (status = ANY (ARRAY[
@@ -263,11 +283,24 @@ function ensureCustomerTrayDraftsSchemaOnce(): Promise<void> {
     const p = getPool();
     await p.query(`
       CREATE TABLE IF NOT EXISTS customer_tray_drafts (
-        user_email TEXT PRIMARY KEY,
+        email TEXT PRIMARY KEY,
         tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
+    await p.query(`ALTER TABLE customer_tray_drafts ADD COLUMN IF NOT EXISTS email TEXT`);
+    await p.query(`ALTER TABLE customer_tray_drafts ADD COLUMN IF NOT EXISTS user_email TEXT`);
+    await p.query(`ALTER TABLE customer_tray_drafts ADD COLUMN IF NOT EXISTS tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb`);
+    await p.query(`ALTER TABLE customer_tray_drafts ADD COLUMN IF NOT EXISTS tray_items JSONB NOT NULL DEFAULT '[]'::jsonb`);
+    await p.query(
+      `ALTER TABLE customer_tray_drafts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+    );
+    await p.query(`
+      UPDATE customer_tray_drafts
+      SET email = LOWER(TRIM(user_email))
+      WHERE (email IS NULL OR TRIM(email) = '')
+        AND user_email IS NOT NULL AND TRIM(user_email) <> ''
+    `).catch(() => {});
   })().catch((err) => {
     ensureCustomerTrayDraftsSchemaPromise = null;
     throw err;
@@ -1194,10 +1227,12 @@ async function applyLoyaltyRewardsBestEffort(
     const deliveryNotes =
       kind === "catering_event" ? `Catering event loyalty · ${email}` : `Mobile app loyalty · ${email}`;
 
-    await getPool().query(
+    const pool = getPool();
+    const roMatch = await restaurantOrderMatchesEmailWhere(pool, "", "$1");
+    await pool.query(
       `UPDATE restaurant_orders
        SET loyalty_points_restaurant_obtained = GREATEST(COALESCE(loyalty_points_restaurant_obtained, 0), $3)
-       WHERE LOWER(TRIM(COALESCE(user_email, ''))) = LOWER($1)
+       WHERE ${roMatch}
          AND COALESCE(order_source, 'MOBILE_APP') NOT IN ('POS', 'LOYALTY_SYNC')
          AND (
            NULLIF(TRIM(order_id), '') = $2
@@ -1206,15 +1241,28 @@ async function applyLoyaltyRewardsBestEffort(
       [email, orderNo, pointsEarned],
     );
 
-    await getPool().query(
-      `INSERT INTO restaurant_orders (
-         user_email, customer_id, tray_items, total_cost, delivery_notes,
-         order_status, payment_reference_initial, payment_confirmed_initial,
-         loyalty_points_restaurant_obtained, order_source
-       )
-       VALUES ($1, $2, '[]'::jsonb, $3, $4, 'DELIVERED', $5, TRUE, $6, 'LOYALTY_SYNC')`,
-      [email, customerId, totalAmount, deliveryNotes, paymentRef, pointsEarned],
-    );
+    const hasRoUserEmail = await columnExists(pool, "restaurant_orders", "user_email");
+    if (hasRoUserEmail) {
+      await pool.query(
+        `INSERT INTO restaurant_orders (
+           user_email, customer_id, tray_items, total_cost, delivery_notes,
+           order_status, payment_reference_initial, payment_confirmed_initial,
+           loyalty_points_restaurant_obtained, order_source
+         )
+         VALUES ($1, $2, '[]'::jsonb, $3, $4, 'DELIVERED', $5, TRUE, $6, 'LOYALTY_SYNC')`,
+        [email, customerId, totalAmount, deliveryNotes, paymentRef, pointsEarned],
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO restaurant_orders (
+           customer_id, tray_items, total_cost, delivery_notes,
+           order_status, payment_reference_initial, payment_confirmed_initial,
+           loyalty_points_restaurant_obtained, order_source
+         )
+         VALUES ($1, '[]'::jsonb, $2, $3, 'DELIVERED', $4, TRUE, $5, 'LOYALTY_SYNC')`,
+        [customerId, totalAmount, deliveryNotes, paymentRef, pointsEarned],
+      );
+    }
 
     if (kind === "catering_event") {
       await getPool().query(
@@ -1246,11 +1294,13 @@ async function applyLoyaltyRewardsBestEffort(
 
 async function backfillLoyaltyForConfirmedMobileOrders(): Promise<void> {
   try {
-    const { rows } = await getPool().query(
+    const pool = getPool();
+    const moEmail = await restaurantOrderEmailExpr(pool, "mo");
+    const { rows } = await pool.query(
       `SELECT COALESCE(mo.order_id, 'ORD-' || LPAD(mo.mobile_id::text, 6, '0')) AS order_no,
-              mo.user_email, mo.total_cost::float AS total
+              ${moEmail} AS user_email, mo.total_cost::float AS total
        FROM restaurant_orders mo
-       WHERE mo.user_email IS NOT NULL AND TRIM(mo.user_email) <> ''
+       WHERE ${moEmail} <> ''
          AND mo.order_source = 'MOBILE_APP'
          AND (upper(COALESCE(mo.order_status, '')) LIKE '%ORDER CONFIRMED%'
               OR upper(COALESCE(mo.order_status, '')) LIKE '%OVERPAYMENT%')
@@ -1261,6 +1311,7 @@ async function backfillLoyaltyForConfirmedMobileOrders(): Promise<void> {
       [MOBILE_LOYALTY_PAYMENT_PREFIX],
     );
     for (const r of rows as Array<{ order_no: string; user_email: string; total: number }>) {
+      if (!String(r.user_email ?? "").trim()) continue;
       await applyLoyaltyRewardsBestEffort(r.user_email, r.order_no, r.total);
     }
     if (rows.length) {
@@ -1926,13 +1977,17 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
   }
   try {
     await ensureCashierPosSchemaOnce();
-    const { rows } = await getPool().query(
-      `SELECT ${RESTAURANT_ORDER_SELECT},
-              COALESCE(NULLIF(TRIM(mo.full_name), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
-              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
+    const pool = getPool();
+    const roSelect = await getRestaurantOrderSelectSql(pool);
+    const roOrderBy = `ORDER BY ${await getRestaurantOrderCreatedAtSql(pool, "mo")} DESC`;
+    const moEmail = await restaurantOrderEmailExpr(pool, "mo");
+    const { rows } = await pool.query(
+      `SELECT ${roSelect},
+              COALESCE(NULLIF(TRIM(mo.full_name), ''), NULLIF(${moEmail}, ''), mo.guest_contact_email) AS customer_display_name,
+              ${await restaurantLoyaltyEarnedSqlAsync(pool, RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")}
        FROM restaurant_orders mo
-       WHERE ${CASHIER_ONLINE_ORDER_WHERE}
-       ${RESTAURANT_ORDER_ORDER_BY_CREATED_DESC}`,
+       WHERE ${await getCashierOnlineOrderWhereSql(pool)}
+       ${roOrderBy}`,
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
     res.json(out);
@@ -2614,15 +2669,18 @@ app.post("/api/mobile/pos/order-history", async (req, res) => {
   }
   try {
     await ensureCashierPosSchemaOnce();
-    const { rows } = await getPool().query(
-      `SELECT ${RESTAURANT_ORDER_SELECT},
-              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
+    const pool = getPool();
+    const roSelect = await getRestaurantOrderSelectSql(pool);
+    const roOrderBy = `ORDER BY ${await getRestaurantOrderCreatedAtSql(pool)} DESC`;
+    const { rows } = await pool.query(
+      `SELECT ${roSelect},
+              ${await restaurantLoyaltyEarnedSqlAsync(pool, RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders
        WHERE (
          (order_source = 'MOBILE_APP' AND upper(COALESCE(order_status, '')) LIKE '%DELIVERED%')
          OR (order_source = 'POS' AND upper(COALESCE(order_status, '')) LIKE '%CLAIMED%')
        )
-       ${RESTAURANT_ORDER_ORDER_BY_CREATED_DESC}
+       ${roOrderBy}
        LIMIT 250`,
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
@@ -2652,12 +2710,16 @@ app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
   }
   try {
     await ensureCashierPosSchemaOnce();
+    const pool = getPool();
+    const roSelect = await getRestaurantOrderSelectSql(pool);
+    const roOrderByUpdated = `ORDER BY ${await getRestaurantOrderUpdatedAtSql(pool)} DESC`;
+    const roOrderByCreated = `ORDER BY ${await getRestaurantOrderCreatedAtSql(pool)} DESC`;
     if (filter === "cancelled") {
-      const { rows } = await getPool().query(
-        `SELECT ${RESTAURANT_ORDER_SELECT}, 0 AS loyalty_points_earned
+      const { rows } = await pool.query(
+        `SELECT ${roSelect}, 0 AS loyalty_points_earned
          FROM restaurant_orders
          WHERE order_source = 'POS' AND upper(COALESCE(order_status, '')) LIKE '%CANCEL%'
-         ${RESTAURANT_ORDER_ORDER_BY_UPDATED_DESC}
+         ${roOrderByUpdated}
          LIMIT 120`,
       );
       const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
@@ -2668,14 +2730,14 @@ app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
     const claimedClause = claimed
       ? `upper(COALESCE(order_status, '')) LIKE '%CLAIMED%'`
       : `upper(COALESCE(order_status, '')) NOT LIKE '%CLAIMED%'`;
-    const { rows } = await getPool().query(
-      `SELECT ${RESTAURANT_ORDER_SELECT},
-              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
+    const { rows } = await pool.query(
+      `SELECT ${roSelect},
+              ${await restaurantLoyaltyEarnedSqlAsync(pool, RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders
        WHERE order_source = 'POS'
          AND ${claimedClause}
          AND upper(COALESCE(order_status, '')) NOT LIKE '%CANCEL%'
-       ${RESTAURANT_ORDER_ORDER_BY_CREATED_DESC}
+       ${roOrderByCreated}
        LIMIT 120`,
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
@@ -2802,7 +2864,13 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
     return;
   }
   try {
-    const { rows } = await getPool().query(
+    await ensureNewEventSchemaOnce();
+    const pool = getPool();
+    const roMatch = await restaurantOrderMatchesEmailWhere(pool, "ro", "$1");
+    const roCreatedAt = await getRestaurantOrderCreatedAtSql(pool, "ro");
+    const eoCreatedAt = await getCateringOrderCreatedAtSql(pool, "event_orders", "eo");
+    const coCreatedAt = await getCateringOrderCreatedAtSql(pool, "catering_orders", "co");
+    const { rows } = await pool.query(
       `SELECT order_no, points_delta, created_at, source
        FROM (
          SELECT SUBSTRING(ro.payment_reference_initial FROM LENGTH($3::text) + 1) AS order_no,
@@ -2815,7 +2883,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
                       FLOOR(COALESCE(ro.total_cost, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
                   END
                 ) AS points_delta,
-                COALESCE(ro.submitted_order_dt_stamp, ro.last_updated_order_status_dt_stamp) AS created_at,
+                ${roCreatedAt} AS created_at,
                 CASE
                   WHEN COALESCE(ro.delivery_notes, '') LIKE '%Catering event loyalty%' THEN 'catering'
                   ELSE 'restaurant'
@@ -2823,11 +2891,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
          FROM restaurant_orders ro
          WHERE ro.payment_reference_initial LIKE $2
            AND (
-             LOWER(TRIM(COALESCE(ro.user_email, ''))) = LOWER($1)
-             OR ro.customer_id IN (
-               SELECT customer_id FROM customer_accounts
-               WHERE LOWER(TRIM(email)) = LOWER($1) AND customer_id IS NOT NULL
-             )
+             ${roMatch}
              OR POSITION(LOWER($1) IN LOWER(COALESCE(ro.delivery_notes, ''))) > 0
            )
          UNION ALL
@@ -2842,16 +2906,10 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
                     ELSE 0
                   END
                 ) AS points_delta,
-                COALESCE(ro.submitted_order_dt_stamp, ro.last_updated_order_status_dt_stamp) AS created_at,
+                ${roCreatedAt} AS created_at,
                 'restaurant' AS source
          FROM restaurant_orders ro
-         WHERE (
-             LOWER(TRIM(COALESCE(ro.user_email, ''))) = LOWER($1)
-             OR ro.customer_id IN (
-               SELECT customer_id FROM customer_accounts
-               WHERE LOWER(TRIM(email)) = LOWER($1) AND customer_id IS NOT NULL
-             )
-           )
+         WHERE ${roMatch}
            AND COALESCE(ro.order_source, '') NOT IN ('POS', 'LOYALTY_SYNC')
            AND (
              upper(COALESCE(ro.order_status, '')) LIKE '%ORDER CONFIRMED%'
@@ -2861,7 +2919,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
          UNION ALL
          SELECT COALESCE(NULLIF(TRIM(${EVENT_TRANSACTION_ID}), ''), 'EVT-' || eo.id::text) AS order_no,
                 COALESCE(eo.loyalty_points_catering_obtained, 0) AS points_delta,
-                COALESCE(eo.stage_entered_at, eo.last_updated_order_status_dt_stamp, eo.submitted_order_dt_stamp, eo.created_at) AS created_at,
+                ${eoCreatedAt} AS created_at,
                 'catering' AS source
          FROM event_orders eo
          WHERE LOWER(TRIM(eo.email_address)) = LOWER($1)
@@ -2870,7 +2928,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
          UNION ALL
          SELECT COALESCE(NULLIF(TRIM(${CATERING_TRANSACTION_ID}), ''), 'CAT-' || co.id::text) AS order_no,
                 COALESCE(co.loyalty_points_catering_obtained, 0) AS points_delta,
-                COALESCE(co.stage_entered_at, co.last_updated_order_status_dt_stamp, co.submitted_order_dt_stamp, co.created_at) AS created_at,
+                ${coCreatedAt} AS created_at,
                 'catering' AS source
          FROM catering_orders co
          WHERE LOWER(TRIM(co.email_address)) = LOWER($1)
@@ -2963,21 +3021,17 @@ app.get("/api/mobile/orders", async (req, res) => {
   }
   try {
     await ensureRestaurantOrdersApiSchemaOnce();
-    const { rows } = await getPool().query(
-      `SELECT ${RESTAURANT_ORDER_SELECT},
-              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
+    const pool = getPool();
+    const roSelect = await getRestaurantOrderSelectSql(pool);
+    const roMatch = await restaurantOrderMatchesEmailWhere(pool, "", "$1");
+    const { rows } = await pool.query(
+      `SELECT ${roSelect},
+              ${await restaurantLoyaltyEarnedSqlAsync(pool, RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders
-       WHERE LOWER(TRIM(COALESCE(user_email, ''))) = LOWER(TRIM($1))
+       WHERE ${roMatch}
           OR LOWER(TRIM(COALESCE(guest_contact_email, ''))) = LOWER(TRIM($1))
           OR ($2 <> '' AND LOWER(TRIM(COALESCE(guest_contact_email, ''))) = LOWER(TRIM($2)))
-          OR EXISTS (
-            SELECT 1 FROM customer_accounts ca
-            WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM($1))
-              AND ca.customer_id IS NOT NULL
-              AND TRIM(ca.customer_id::text) <> ''
-              AND ca.customer_id::text = TRIM(restaurant_orders.customer_id::text)
-          )
-       ORDER BY ${RESTAURANT_ORDER_CREATED_AT_SQL} DESC`,
+       ORDER BY ${await getRestaurantOrderCreatedAtSql(pool)} DESC`,
       [userEmail, contactEmail],
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
@@ -3019,25 +3073,24 @@ app.post("/api/mobile/orders", async (req, res) => {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
+    const hasRoUserEmail = await columnExists(getPool(), "restaurant_orders", "user_email");
     const { rows } = await client.query(
-      `INSERT INTO restaurant_orders
-        (user_email, customer_id, guest_contact_email, order_id, delivery_notes, payment_mode,
-         full_name, contact_number, delivery_address, delivery_time, total_cost)
-       VALUES
-        ($1, $2, $3, 'TEMP', $4, $5, $6, $7, $8, $9, $10)
-       RETURNING mobile_id AS id`,
-      [
-        userEmail,
-        customerId,
-        guestContactEmail,
-        note,
-        paymentMode,
-        deliveryName,
-        deliveryContact,
-        deliveryAddress,
-        deliveryTime,
-        total,
-      ],
+      hasRoUserEmail
+        ? `INSERT INTO restaurant_orders
+            (user_email, customer_id, guest_contact_email, order_id, delivery_notes, payment_mode,
+             full_name, contact_number, delivery_address, delivery_time, total_cost)
+           VALUES
+            ($1, $2, $3, 'TEMP', $4, $5, $6, $7, $8, $9, $10)
+           RETURNING mobile_id AS id`
+        : `INSERT INTO restaurant_orders
+            (customer_id, guest_contact_email, order_id, delivery_notes, payment_mode,
+             full_name, contact_number, delivery_address, delivery_time, total_cost)
+           VALUES
+            ($1, $2, 'TEMP', $3, $4, $5, $6, $7, $8, $9)
+           RETURNING mobile_id AS id`,
+      hasRoUserEmail
+        ? [userEmail, customerId, guestContactEmail, note, paymentMode, deliveryName, deliveryContact, deliveryAddress, deliveryTime, total]
+        : [customerId, guestContactEmail, note, paymentMode, deliveryName, deliveryContact, deliveryAddress, deliveryTime, total],
     );
     const orderId = Number(rows[0].id);
     const orderNo = await finalizeRestaurantOrderAfterInsert(client, orderId, parsedItems, {
@@ -3332,8 +3385,11 @@ app.patch("/api/mobile/orders/:id/cancel-customer", async (req, res) => {
     return;
   }
   try {
-    const { rows } = await getPool().query(
-      `SELECT mobile_id AS id, status, order_no FROM restaurant_orders WHERE mobile_id = $1 AND LOWER(TRIM(user_email)) = $2`,
+    const pool = getPool();
+    const roMatch = await restaurantOrderMatchesEmailWhere(pool, "", "$2");
+    const { rows } = await pool.query(
+      `SELECT mobile_id AS id, COALESCE(order_status, '') AS status, ${RESTAURANT_ORDER_BUSINESS_ID_SQL} AS order_no
+       FROM restaurant_orders WHERE mobile_id = $1 AND ${roMatch}`,
       [id, userEmail],
     );
     const row = rows[0] as { id: number; status: string; order_no: string } | undefined;
@@ -5449,10 +5505,12 @@ app.get("/api/mobile/customer/tray-draft", async (req, res) => {
   }
   try {
     await ensureCustomerTrayDraftsSchemaOnce();
-    const { rows } = await getPool().query(
-      `SELECT tray_lines, updated_at
+    const pool = getPool();
+    const trayCols = await getTrayDraftColumns(pool);
+    const { rows } = await pool.query(
+      `SELECT ${trayCols.linesCol} AS tray_lines, updated_at
        FROM customer_tray_drafts
-       WHERE LOWER(user_email) = $1
+       WHERE LOWER(TRIM(${trayCols.emailCol})) = $1
        LIMIT 1`,
       [userEmail],
     );
@@ -5478,11 +5536,13 @@ app.put("/api/mobile/customer/tray-draft", async (req, res) => {
   }
   try {
     await ensureCustomerTrayDraftsSchemaOnce();
-    const { rows } = await getPool().query(
-      `INSERT INTO customer_tray_drafts (user_email, tray_lines, updated_at)
+    const pool = getPool();
+    const trayCols = await getTrayDraftColumns(pool);
+    const { rows } = await pool.query(
+      `INSERT INTO customer_tray_drafts (${trayCols.emailCol}, ${trayCols.linesCol}, updated_at)
        VALUES ($1, $2::jsonb, NOW())
-       ON CONFLICT (user_email)
-       DO UPDATE SET tray_lines = EXCLUDED.tray_lines, updated_at = NOW()
+       ON CONFLICT (${trayCols.emailCol})
+       DO UPDATE SET ${trayCols.linesCol} = EXCLUDED.${trayCols.linesCol}, updated_at = NOW()
        RETURNING updated_at`,
       [userEmail, JSON.stringify(trayLines)],
     );
@@ -5510,17 +5570,19 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
   try {
     const pool = getPool();
     const menuStampExpr = await menuDishesMaxStampExpr(pool);
+    const roChangedSince = await getRestaurantOrderChangedSinceSql(pool);
     let trayStampExpr = `''::text`;
     try {
       await ensureCustomerTrayDraftsSchemaOnce();
-      trayStampExpr = `COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(user_email) = $1), '')`;
+      const trayCols = await getTrayDraftColumns(pool);
+      trayStampExpr = `COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(TRIM(${trayCols.emailCol})) = $1), '')`;
     } catch (trayErr) {
       console.warn("[sync-stamps] customer_tray_drafts unavailable", trayErr);
     }
     const { rows } = await pool.query(
       `SELECT
          ${menuStampExpr} AS menu_stamp,
-         COALESCE((SELECT MAX(${RESTAURANT_ORDER_CHANGED_SINCE_SQL})::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
+         COALESCE((SELECT MAX(${roChangedSince})::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
          COALESCE((SELECT MAX(${CUSTOMER_ACCOUNT_STAMP_SQL})::text FROM customer_accounts), '') AS profile_stamp,
          COALESCE((SELECT MAX(created_at)::text FROM notifications WHERE user_id = $1), '') AS notifications_stamp,
          COALESCE((SELECT MAX((${CATERING_ORDER_UPDATED_AT_SQL}))::text FROM catering_orders WHERE LOWER(email_address) = $1), '') AS catering_inquiries_stamp,
@@ -5592,18 +5654,20 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
       )
     ).rowCount ?? 0) > 0;
 
+    const roChangedSince = await getRestaurantOrderChangedSinceSql(pool);
+    const roMatch = await restaurantOrderMatchesEmailWhere(pool, "", "$1");
     const orderRows = await pool.query(
       role === "customer"
         ? `SELECT mobile_id::text AS id
            FROM restaurant_orders
-           WHERE LOWER(TRIM(user_email)) = $1
-             AND ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} > $2
-           ORDER BY ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} DESC
+           WHERE ${roMatch}
+             AND ${roChangedSince} > $2
+           ORDER BY ${roChangedSince} DESC
            LIMIT 200`
         : `SELECT mobile_id::text AS id
            FROM restaurant_orders
-           WHERE ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} > $1
-           ORDER BY ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} DESC
+           WHERE ${roChangedSince} > $1
+           ORDER BY ${roChangedSince} DESC
            LIMIT 200`,
       role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
     );
@@ -5726,10 +5790,12 @@ app.post("/api/mobile/order-feedback", async (req, res) => {
   }
   try {
     if (kind === "restaurant_order") {
-      const { rows } = await getPool().query(
+      const pool = getPool();
+      const roMatch = await restaurantOrderMatchesEmailWhere(pool, "ro", "$1");
+      const { rows } = await pool.query(
         `SELECT 1 FROM restaurant_orders ro
-         WHERE LOWER(TRIM(ro.user_email)) = $1
-           AND ro.order_no = $2
+         WHERE ${roMatch}
+           AND ${RESTAURANT_ORDER_BUSINESS_ID_SQL} = $2
            AND (
              UPPER(COALESCE(ro.fulfillment_stage, '')) = 'DELIVERED'
              OR UPPER(ro.status) LIKE '%COMPLETE%'

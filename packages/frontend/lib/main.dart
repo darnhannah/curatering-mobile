@@ -15921,7 +15921,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                   borderRadius: BorderRadius.circular(999),
                                 ),
                                 child: Text(
-                                  cateringManagerListStatusLabelFor(r.status, listSubstage),
+                                  inquiryStatusReadable(r.status),
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(

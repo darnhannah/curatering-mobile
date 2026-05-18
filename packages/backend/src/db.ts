@@ -511,29 +511,13 @@ export async function initDb(): Promise<void> {
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS customer_tray_drafts (
-      user_email TEXT PRIMARY KEY,
+      email TEXT PRIMARY KEY,
       tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  // Customer / manager cancellation requires `cancelled` on event inquiries too (older DBs may omit it from CHECK).
-  try {
-    await p.query(`ALTER TABLE event_orders DROP CONSTRAINT IF EXISTS event_orders_status_check`);
-  } catch {
-    // ignore
-  }
-  try {
-    await p.query(`
-      ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
-      CHECK (status = ANY (ARRAY[
-        'new_event'::text, 'online_inquiries'::text, 'for_down_payment'::text, 'for_ongoing'::text,
-        'for_full_payment'::text, 'completed'::text, 'cancelled'::text
-      ]))
-    `);
-  } catch {
-    // Constraint may already be correct or renamed in some deployments.
-  }
+  // Status CHECK constraints are applied in ensureNewEventSchemaOnce() after row migration.
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS customer_order_feedback (
