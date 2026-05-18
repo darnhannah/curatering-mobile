@@ -7,12 +7,13 @@ import { CATERING_ORDER_TOUCH_SET } from "./sqlCompat.js";
 
 const VENUE_FLOOR_SHAPES = new Set(["banquet_rect", "theater", "round_hall", "u_shape", "l_shape"]);
 const TABLE_SHAPES = new Set(["rect", "round", "chair"]);
-const SEATING_EDIT_STATUSES = new Set(["for_processing"]);
+const SEATING_EDIT_STATUSES = new Set(["for_ongoing"]);
 const THEME_EDIT_STATUSES = new Set([
   "online_inquiries",
   "new_event",
-  "for_processing",
-  "for_post_analysis",
+  "for_down_payment",
+  "for_ongoing",
+  "for_full_payment",
 ]);
 
 type Deps = {

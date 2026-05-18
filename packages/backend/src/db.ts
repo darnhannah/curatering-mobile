@@ -527,7 +527,7 @@ export async function initDb(): Promise<void> {
     await p.query(`
       ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
       CHECK (status = ANY (ARRAY[
-        'new_event'::text, 'online_inquiries'::text, 'for_processing'::text,
+        'new_event'::text, 'online_inquiries'::text, 'for_down_payment'::text, 'for_ongoing'::text,
         'for_full_payment'::text, 'completed'::text, 'cancelled'::text
       ]))
     `);

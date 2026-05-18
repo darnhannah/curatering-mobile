@@ -609,6 +609,26 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                           ),
                         ],
                         IconButton(
+                          tooltip: 'Nudge left',
+                          onPressed: () => _moveTable(tid, -0.012, 0),
+                          icon: const Icon(Icons.arrow_back),
+                        ),
+                        IconButton(
+                          tooltip: 'Nudge right',
+                          onPressed: () => _moveTable(tid, 0.012, 0),
+                          icon: const Icon(Icons.arrow_forward),
+                        ),
+                        IconButton(
+                          tooltip: 'Nudge up',
+                          onPressed: () => _moveTable(tid, 0, -0.012),
+                          icon: const Icon(Icons.arrow_upward),
+                        ),
+                        IconButton(
+                          tooltip: 'Nudge down',
+                          onPressed: () => _moveTable(tid, 0, 0.012),
+                          icon: const Icon(Icons.arrow_downward),
+                        ),
+                        IconButton(
                           tooltip: 'Duplicate',
                           onPressed: _duplicateSelectedTable,
                           icon: const Icon(Icons.copy_outlined),

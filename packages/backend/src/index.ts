@@ -39,13 +39,22 @@ import {
   RESTAURANT_ORDER_TOUCH_SET,
   RESTAURANT_ORDER_ORDER_BY_CREATED_DESC,
   RESTAURANT_ORDER_ORDER_BY_UPDATED_DESC,
-  customerForgotOtpUpdateSql,
+  buildCustomerForgotOtpClearSet,
+  buildCustomerForgotOtpUpdateSet,
+  buildCustomerForgotOtpValidWhere,
   mapProfileRowForApi,
   mapRestaurantOrderRowForApi,
-  mapManagerCateringStageToDb,
   restaurantLoyaltyEarnedSql,
   isPgUndefinedColumn,
 } from "./sqlCompat.js";
+import {
+  mapManagerCateringStageToDb,
+  cateringStatusesForApiStage,
+  normalizeCateringStatusForApi,
+  CATERING_ACTIVE_SCHEDULE_STATUSES_SQL,
+  CATERING_BILLING_LATE_STATUSES_SQL,
+  processingSubstageFromRow,
+} from "./cateringStages.js";
 
 function isCashierOnlineRestaurantOrder(row: {
   order_source?: string | null;
@@ -66,7 +75,8 @@ import {
 } from "./guestNotify.js";
 import { ensureIdCounterRow, nextCusIdFromCounter, nextTrIdFromCounter } from "./idCounters.js";
 import { parseAllergenNamesFromRow, queryAllergensCatalog } from "./menuAllergens.js";
-import { buildMenuSql, MINIMAL_PUBLIC_MENU_SQL } from "./menuQuery.js";
+import { buildMenuSql, buildSetMenusSql, MINIMAL_PUBLIC_MENU_SQL } from "./menuQuery.js";
+import { DEFAULT_PUBLIC_MENU_SQL, DEFAULT_PUBLIC_SET_MENUS_SQL } from "./webMenu.js";
 import {
   CUSTOMER_ACCOUNT_STAMP_SQL,
   menuDishesChangedSinceSql,
@@ -189,28 +199,53 @@ function ensureNewEventSchemaOnce(): Promise<void> {
     await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS down_payment_reference TEXT`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS full_payment_reference TEXT`);
     await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS full_payment_reference TEXT`);
+    await p.query(`ALTER TABLE event_orders DROP CONSTRAINT IF EXISTS event_orders_status_check`);
+    await p.query(`ALTER TABLE catering_orders DROP CONSTRAINT IF EXISTS catering_orders_status_check`);
     await p.query(
       `UPDATE event_orders SET status = 'for_full_payment' WHERE LOWER(TRIM(status)) = 'for_post_analysis'`,
     );
     await p.query(
       `UPDATE catering_orders SET status = 'for_full_payment' WHERE LOWER(TRIM(status)) = 'for_post_analysis'`,
     );
-    await p.query(`ALTER TABLE event_orders DROP CONSTRAINT IF EXISTS event_orders_status_check`);
-    await p.query(`ALTER TABLE catering_orders DROP CONSTRAINT IF EXISTS catering_orders_status_check`);
+    const splitLegacyProcessing = `
+      UPDATE catering_orders SET status = 'for_ongoing'
+      WHERE LOWER(TRIM(status)) = 'for_processing'
+        AND (
+          LOWER(TRIM(COALESCE(checklist->'post_analysis'->>'processing_phase', ''))) = 'ongoing'
+          OR (
+            jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) = 'object'
+            AND COALESCE(jsonb_array_length(COALESCE(checklist->'items', '[]'::jsonb)), 0) > 0
+          )
+        );
+      UPDATE catering_orders SET status = 'for_down_payment'
+      WHERE LOWER(TRIM(status)) = 'for_processing';
+      UPDATE event_orders SET status = 'for_ongoing'
+      WHERE LOWER(TRIM(status)) = 'for_processing'
+        AND (
+          LOWER(TRIM(COALESCE(checklist->'post_analysis'->>'processing_phase', ''))) = 'ongoing'
+          OR (
+            jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) = 'object'
+            AND COALESCE(jsonb_array_length(COALESCE(checklist->'items', '[]'::jsonb)), 0) > 0
+          )
+        );
+      UPDATE event_orders SET status = 'for_down_payment'
+      WHERE LOWER(TRIM(status)) = 'for_processing';
+    `;
+    await p.query(splitLegacyProcessing);
     await p.query(`
       ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
       CHECK (status = ANY (ARRAY[
-        'new_event'::text, 'online_inquiries'::text, 'for_processing'::text,
+        'new_event'::text, 'online_inquiries'::text, 'for_down_payment'::text, 'for_ongoing'::text,
         'for_full_payment'::text, 'completed'::text, 'cancelled'::text
       ]))
-    `).catch(() => {});
+    `).catch((err) => console.warn("[schema] event_orders_status_check:", err));
     await p.query(`
       ALTER TABLE catering_orders ADD CONSTRAINT catering_orders_status_check
       CHECK (status = ANY (ARRAY[
-        'new_event'::text, 'online_inquiries'::text, 'for_processing'::text,
+        'new_event'::text, 'online_inquiries'::text, 'for_down_payment'::text, 'for_ongoing'::text,
         'for_full_payment'::text, 'completed'::text, 'cancelled'::text
       ]))
-    `).catch(() => {});
+    `).catch((err) => console.warn("[schema] catering_orders_status_check:", err));
   })().catch((err) => {
     ensureNewEventSchemaPromise = null;
     throw err;
@@ -219,6 +254,26 @@ function ensureNewEventSchemaOnce(): Promise<void> {
 }
 
 let ensureRestaurantOrdersApiSchemaPromise: Promise<void> | null = null;
+
+let ensureCustomerTrayDraftsSchemaPromise: Promise<void> | null = null;
+
+function ensureCustomerTrayDraftsSchemaOnce(): Promise<void> {
+  if (ensureCustomerTrayDraftsSchemaPromise != null) return ensureCustomerTrayDraftsSchemaPromise;
+  ensureCustomerTrayDraftsSchemaPromise = (async () => {
+    const p = getPool();
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS customer_tray_drafts (
+        user_email TEXT PRIMARY KEY,
+        tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+  })().catch((err) => {
+    ensureCustomerTrayDraftsSchemaPromise = null;
+    throw err;
+  });
+  return ensureCustomerTrayDraftsSchemaPromise;
+}
 
 /** Self-heal canonical restaurant_orders columns used by customer menu/orders APIs. */
 function ensureRestaurantOrdersApiSchemaOnce(): Promise<void> {
@@ -297,16 +352,6 @@ function parseJsonTextArray(raw: unknown): string[] {
   } catch {
     return [];
   }
-}
-
-/** Down payment vs on-going work within `for_processing` (see `post_analysis.processing_phase`). */
-function processingSubstageFromRow(row: Record<string, unknown>): "down_payment" | "ongoing" {
-  const raw = String(row.processing_phase_sk ?? "").trim().toLowerCase();
-  if (raw === "ongoing") return "ongoing";
-  if (raw === "down_payment") return "down_payment";
-  const n = Number(row.checklist_count_summary ?? 0);
-  if (Number.isFinite(n) && n > 0) return "ongoing";
-  return "down_payment";
 }
 
 function processingSubstageFromPostAndChecklist(postAnalysis: unknown, checklistRaw: unknown): "down_payment" | "ongoing" {
@@ -1011,13 +1056,13 @@ async function refreshLoyaltyTotalsForUser(userEmailRaw: string): Promise<void> 
            SELECT SUM(COALESCE(loyalty_points_catering_obtained, 0))::int
            FROM event_orders
            WHERE LOWER(TRIM(email_address)) = $1
-             AND LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+             AND LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
          ), 0)
          + COALESCE((
            SELECT SUM(COALESCE(loyalty_points_catering_obtained, 0))::int
            FROM catering_orders
            WHERE LOWER(TRIM(email_address)) = $1
-             AND LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+             AND LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
          ), 0)
        )::int AS c
    )`;
@@ -1056,7 +1101,7 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
     await getPool().query(
       `UPDATE event_orders
        SET loyalty_points_catering_obtained = CASE
-         WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+         WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
            THEN FLOOR(COALESCE(total_cost, 0)::numeric / $1::numeric)::int * $2::int
          ELSE 0
        END`,
@@ -1065,7 +1110,7 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
     await getPool().query(
       `UPDATE catering_orders
        SET loyalty_points_catering_obtained = CASE
-         WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+         WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
            THEN FLOOR(COALESCE(total_cost, 0)::numeric / $1::numeric)::int * $2::int
          ELSE 0
        END`,
@@ -1096,14 +1141,14 @@ async function recomputeHistoricalLoyaltyPoints(): Promise<void> {
                   0 AS rp,
                   COALESCE(loyalty_points_catering_obtained, 0) AS cp
            FROM event_orders
-           WHERE LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+           WHERE LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
              AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
            UNION ALL
            SELECT LOWER(TRIM(email_address)) AS email_key,
                   0 AS rp,
                   COALESCE(loyalty_points_catering_obtained, 0) AS cp
            FROM catering_orders
-           WHERE LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+           WHERE LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
              AND NULLIF(LOWER(TRIM(email_address)), '') IS NOT NULL
          ) t
          WHERE email_key <> ''
@@ -1274,17 +1319,32 @@ app.get("/api/mobile/menu", async (_req, res) => {
       }
     }
     let rows: Array<Record<string, unknown>>;
+    const runMenuQuery = async (querySql: string) => {
+      const result = await pool.query(querySql);
+      return result.rows as Array<Record<string, unknown>>;
+    };
     try {
-      const result = await pool.query(sql);
-      rows = result.rows as Array<Record<string, unknown>>;
+      rows = await runMenuQuery(sql);
     } catch (err) {
       const pgCode = (err as { code?: string })?.code;
-      const canFallback =
-        sql !== MINIMAL_PUBLIC_MENU_SQL && (isPgUndefinedColumn(err) || pgCode === "42804");
+      const canFallback = isPgUndefinedColumn(err) || pgCode === "42804";
       if (!canFallback) throw err;
-      console.warn("[menu] primary query failed, using minimal menu SQL", err);
-      const result = await pool.query(MINIMAL_PUBLIC_MENU_SQL);
-      rows = result.rows as Array<Record<string, unknown>>;
+      console.warn("[menu] primary query failed, trying safe menu SQL", err);
+      try {
+        rows = await runMenuQuery(await buildMenuSql(pool, { skipAllergens: true }));
+      } catch (err2) {
+        console.warn("[menu] safe buildMenuSql failed, trying default public menu SQL", err2);
+        try {
+          if (sql !== DEFAULT_PUBLIC_MENU_SQL) {
+            rows = await runMenuQuery(DEFAULT_PUBLIC_MENU_SQL);
+          } else {
+            throw err2;
+          }
+        } catch (err3) {
+          console.warn("[menu] default public menu SQL failed, using minimal menu SQL", err3);
+          rows = await runMenuQuery(MINIMAL_PUBLIC_MENU_SQL);
+        }
+      }
     }
     res.json(mapMenuRows(rows));
   } catch (err) {
@@ -1305,24 +1365,42 @@ app.get("/api/mobile/allergens", async (_req, res) => {
 });
 
 app.get("/api/mobile/set-menus", async (_req, res) => {
-  const sql = resolveSetMenusSql();
-  if (!sql) {
-    res.json([]);
-    return;
-  }
+  const envSql = resolveSetMenusSql();
   try {
-    const { rows } = await getPool().query(sql);
+    const pool = getPool();
+    let sql = envSql;
+    if (!sql) {
+      try {
+        sql = await buildSetMenusSql(pool);
+      } catch (buildErr) {
+        console.error("[set-menus] buildSetMenusSql failed", buildErr);
+        sql = null;
+      }
+    }
+    if (!sql) {
+      res.json([]);
+      return;
+    }
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = (await pool.query(sql)).rows as Array<Record<string, unknown>>;
+    } catch (err) {
+      const canFallback = isPgUndefinedColumn(err) || (err as { code?: string })?.code === "42804";
+      if (!canFallback || sql === DEFAULT_PUBLIC_SET_MENUS_SQL) throw err;
+      console.warn("[set-menus] primary query failed, trying default public set menus SQL", err);
+      rows = (await pool.query(DEFAULT_PUBLIC_SET_MENUS_SQL)).rows as Array<Record<string, unknown>>;
+    }
     res.json(
       rows.map((r) => ({
-        name: String((r as Record<string, unknown>).name ?? ""),
-        description: String((r as Record<string, unknown>).description ?? ""),
-        dishes: parseJsonTextArray((r as Record<string, unknown>).dishes),
+        name: String(r.name ?? ""),
+        description: String(r.description ?? ""),
+        dishes: parseJsonTextArray(r.dishes),
       })),
     );
   } catch (err) {
     console.error(err);
     res.status(500).json({
-      error: "set menu query failed — check WEB_SET_MENUS_SQL / WEB_SET_MENU_* env",
+      error: "set menu query failed — check set_menus / menu_dishes.set_menus schema",
     });
   }
 });
@@ -1543,14 +1621,18 @@ app.post("/api/mobile/auth/login", async (req, res) => {
     }
     const cusId = await customerBusinessIdForEmail(email);
     if (!cusId) {
-      const newCusId = await nextCustomerProfileRowId();
-      await getPool().query(
-        `UPDATE customer_accounts
-         SET customer_id = $2, updated_pw_dt_stamp = NOW()
-         WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
-           AND (customer_id IS NULL OR TRIM(customer_id::text) = '')`,
-        [email, newCusId],
-      );
+      try {
+        const newCusId = await nextCustomerProfileRowId();
+        await getPool().query(
+          `UPDATE customer_accounts
+           SET customer_id = $2
+           WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+             AND (customer_id IS NULL OR TRIM(customer_id::text) = '')`,
+          [email, newCusId],
+        );
+      } catch (assignErr) {
+        console.warn("[auth] customer_id assignment failed (login still succeeds):", assignErr);
+      }
     }
     const ts = new Date().toISOString();
     try {
@@ -1619,10 +1701,21 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
         return;
       }
       targetEmail = account.email;
-      const otpSql = customerForgotOtpUpdateSql();
-      const { rowCount } = await getPool().query(
-        `UPDATE customer_accounts SET ${otpSql.set} WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))`,
-        [targetEmail, otp, expiresAt.toISOString()],
+      const pool = getPool();
+      await pool.query(
+        `ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS forgot_password_otp_code TEXT`,
+      );
+      await pool.query(
+        `ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS forgot_password_otp_code_expiry TIMESTAMPTZ`,
+      );
+      await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS password_reset_otp TEXT`);
+      await pool.query(
+        `ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ`,
+      );
+      const otpSet = await buildCustomerForgotOtpUpdateSet(pool);
+      const { rowCount } = await pool.query(
+        `UPDATE customer_accounts SET ${otpSet} WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))`,
+        [targetEmail, otp, expiresAt],
       );
       if (!rowCount) {
         res.status(500).json({ error: "could not store reset code" });
@@ -1690,11 +1783,12 @@ app.post("/api/mobile/auth/check-password-reset-otp", async (req, res) => {
         res.status(400).json({ error: "invalid or expired reset OTP" });
         return;
       }
-      const { rows } = await getPool().query(
+      const pool = getPool();
+      const otpValidWhere = await buildCustomerForgotOtpValidWhere(pool, "$2");
+      const { rows } = await pool.query(
         `SELECT 1 AS ok FROM customer_accounts
          WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
-           AND ${sqlOtpMatches("forgot_password_otp_code", "$2")}
-           AND forgot_password_otp_code_expiry > NOW()
+           AND ${otpValidWhere}
          LIMIT 1`,
         [account.email, otp],
       );
@@ -1750,15 +1844,15 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
         return;
       }
       email = account.email;
-      const { rows: updated } = await getPool().query(
+      const pool = getPool();
+      const otpClearSet = await buildCustomerForgotOtpClearSet(pool);
+      const otpValidWhere = await buildCustomerForgotOtpValidWhere(pool, "$3");
+      const { rows: updated } = await pool.query(
         `UPDATE customer_accounts
          SET password_hash = $2,
-             forgot_password_otp_code = NULL,
-             forgot_password_otp_code_expiry = NULL,
-             updated_pw_dt_stamp = NOW()
+             ${otpClearSet}
          WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
-           AND ${sqlOtpMatches("forgot_password_otp_code", "$3")}
-           AND forgot_password_otp_code_expiry > NOW()
+           AND ${otpValidWhere}
          RETURNING email`,
         [email, hash, otp],
       );
@@ -1834,12 +1928,11 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
     await ensureCashierPosSchemaOnce();
     const { rows } = await getPool().query(
       `SELECT ${RESTAURANT_ORDER_SELECT},
-              COALESCE(NULLIF(TRIM(cp.full_name), ''), NULLIF(TRIM(mo.full_name), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
+              COALESCE(NULLIF(TRIM(mo.full_name), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
               ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders mo
-       LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
        WHERE ${CASHIER_ONLINE_ORDER_WHERE}
-       ORDER BY COALESCE(mo.submitted_order_dt_stamp, mo.created_at, mo.last_updated_order_status_dt_stamp) DESC`,
+       ${RESTAURANT_ORDER_ORDER_BY_CREATED_DESC}`,
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
     res.json(out);
@@ -2773,7 +2866,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
          FROM event_orders eo
          WHERE LOWER(TRIM(eo.email_address)) = LOWER($1)
            AND COALESCE(eo.loyalty_points_catering_obtained, 0) > 0
-           AND LOWER(TRIM(eo.status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+           AND LOWER(TRIM(eo.status)) = 'completed'
          UNION ALL
          SELECT COALESCE(NULLIF(TRIM(${CATERING_TRANSACTION_ID}), ''), 'CAT-' || co.id::text) AS order_no,
                 COALESCE(co.loyalty_points_catering_obtained, 0) AS points_delta,
@@ -2782,7 +2875,7 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
          FROM catering_orders co
          WHERE LOWER(TRIM(co.email_address)) = LOWER($1)
            AND COALESCE(co.loyalty_points_catering_obtained, 0) > 0
-           AND LOWER(TRIM(co.status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+           AND LOWER(TRIM(co.status)) = 'completed'
        ) combined
        WHERE points_delta > 0
        ORDER BY created_at DESC
@@ -2990,6 +3083,7 @@ async function saveRestaurantPaymentProof(
   insufficient: boolean,
 ): Promise<void> {
   const pool = getPool();
+  const touch = RESTAURANT_ORDER_TOUCH_SET;
   if (insufficient) {
     try {
       await pool.query(
@@ -2997,7 +3091,7 @@ async function saveRestaurantPaymentProof(
          SET payment_proof_balance = $2,
              order_status = 'WAITING FOR BALANCE PAYMENT CONFIRMATION',
              payment_uploaded_balance = TRUE,
-             last_updated_order_status_dt_stamp = NOW()
+             ${touch}
          WHERE mobile_id = $1`,
         [id, proof],
       );
@@ -3010,7 +3104,7 @@ async function saveRestaurantPaymentProof(
          SET supplemental_payment_proof = $2,
              order_status = 'WAITING FOR BALANCE PAYMENT CONFIRMATION',
              payment_uploaded = TRUE,
-             last_updated_order_status_dt_stamp = NOW()
+             ${touch}
          WHERE mobile_id = $1`,
         [id, proof],
       );
@@ -3022,7 +3116,7 @@ async function saveRestaurantPaymentProof(
       `UPDATE restaurant_orders
        SET payment_uploaded_initial = TRUE,
            payment_proof_initial = $2,
-           last_updated_order_status_dt_stamp = NOW()
+           ${touch}
        WHERE mobile_id = $1`,
       [id, proof],
     );
@@ -3033,7 +3127,7 @@ async function saveRestaurantPaymentProof(
       `UPDATE restaurant_orders
        SET payment_uploaded = TRUE,
            payment_proof = $2,
-           last_updated_order_status_dt_stamp = NOW()
+           ${touch}
        WHERE mobile_id = $1`,
       [id, proof],
     );
@@ -3052,6 +3146,7 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
     return;
   }
   try {
+    await ensureRestaurantOrdersApiSchemaOnce();
     const { rows: found } = await getPool().query(
       `SELECT mobile_id AS id,
               COALESCE(order_status, 'PENDING_CASHIER') AS status,
@@ -3178,7 +3273,12 @@ app.patch("/api/mobile/inquiries/:id/cancel-customer", async (req, res) => {
       const row = rows[0] as { id: string; status: string; tx: string } | undefined;
       if (!row) return { found: false, cancelled: false, tx: "" };
       const st = String(row.status ?? "").trim().toLowerCase();
-      if (st !== "new_event" && st !== "online_inquiries" && st !== "for_processing") {
+      if (
+        st !== "new_event" &&
+        st !== "online_inquiries" &&
+        st !== "for_down_payment" &&
+        st !== "for_ongoing"
+      ) {
         return { found: true, cancelled: false, tx: row.tx };
       }
       await client.query(
@@ -3278,9 +3378,9 @@ app.post("/api/mobile/catering/schedule-conflicts", async (req, res) => {
   const candidate = windowsFromScheduleSlots(fakeSlots);
   try {
     const { rows } = await getPool().query(
-      `SELECT schedule_slots FROM catering_orders WHERE status = 'for_processing'
+      `SELECT schedule_slots FROM catering_orders WHERE status IN (${CATERING_ACTIVE_SCHEDULE_STATUSES_SQL})
        UNION ALL
-       SELECT schedule_slots FROM event_orders WHERE status = 'for_processing'`,
+       SELECT schedule_slots FROM event_orders WHERE status IN (${CATERING_ACTIVE_SCHEDULE_STATUSES_SQL})`,
     );
     let conflictWindowCount = 0;
     for (const c of candidate) {
@@ -3837,7 +3937,7 @@ app.get("/api/mobile/inquiries", async (req, res) => {
               COALESCE(down_payment_amount, 0)::float8 AS down_payment_amount,
               COALESCE(full_payment_amount, 0)::float8 AS full_payment_amount,
               CASE
-                WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+                WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
                   THEN FLOOR(COALESCE(total_cost, 0)::numeric / ${CATERING_LOYALTY_STEP_AMOUNT}::numeric)::int * ${CATERING_LOYALTY_STEP_POINTS}
                 ELSE 0
               END AS loyalty_points_earned,
@@ -3852,8 +3952,14 @@ app.get("/api/mobile/inquiries", async (req, res) => {
               COALESCE(NULLIF(TRIM(order_type), ''), 'catering_event') AS order_type,
               'event'::text AS order_kind
          FROM event_orders
-         WHERE LOWER(TRIM(COALESCE(customer_id::text, ''))) = $1
-            OR LOWER(TRIM(email_address)) = $1
+         WHERE LOWER(TRIM(email_address)) = LOWER(TRIM($1))
+            OR EXISTS (
+              SELECT 1 FROM customer_accounts ca
+              WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM($1))
+                AND ca.customer_id IS NOT NULL
+                AND TRIM(ca.customer_id::text) <> ''
+                AND TRIM(ca.customer_id::text) = TRIM(COALESCE(event_orders.customer_id::text, ''))
+            )
          UNION ALL
          SELECT id::text AS id,
                 ('INQ-' || UPPER(SUBSTRING(id::text, 1, 8))) AS inquiry_no,
@@ -3882,7 +3988,7 @@ app.get("/api/mobile/inquiries", async (req, res) => {
                 COALESCE(down_payment_amount, 0)::float8 AS down_payment_amount,
                 COALESCE(full_payment_amount, 0)::float8 AS full_payment_amount,
                 CASE
-                  WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'for_post_analysis', 'completed')
+                  WHEN LOWER(TRIM(status)) IN ('for_full_payment', 'completed')
                   THEN FLOOR(COALESCE(total_cost, 0)::numeric / ${CATERING_LOYALTY_STEP_AMOUNT}::numeric)::int * ${CATERING_LOYALTY_STEP_POINTS}
                 ELSE 0
               END AS loyalty_points_earned,
@@ -3897,8 +4003,14 @@ app.get("/api/mobile/inquiries", async (req, res) => {
                 'catering'::text AS order_type,
                 'catering'::text AS order_kind
          FROM catering_orders
-         WHERE LOWER(TRIM(COALESCE(customer_id::text, ''))) = $1
-            OR LOWER(TRIM(email_address)) = $1
+         WHERE LOWER(TRIM(email_address)) = LOWER(TRIM($1))
+            OR EXISTS (
+              SELECT 1 FROM customer_accounts ca
+              WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM($1))
+                AND ca.customer_id IS NOT NULL
+                AND TRIM(ca.customer_id::text) <> ''
+                AND TRIM(ca.customer_id::text) = TRIM(COALESCE(catering_orders.customer_id::text, ''))
+            )
        ) q
        ORDER BY created_at DESC`,
       [userEmail],
@@ -4176,27 +4288,29 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
     res.status(403).json({ error: "invalid manager/supervisor credentials" });
     return;
   }
-  if (auth.role === "supervisor" && mapManagerCateringStageToDb(stage) !== "for_processing") {
+  if (auth.role === "supervisor" && stage !== "for_ongoing" && mapManagerCateringStageToDb(stage) !== "for_ongoing") {
     res.status(403).json({ error: "supervisor can only access on-going orders" });
     return;
   }
+  const canonicalStage = mapManagerCateringStageToDb(stage);
   const allowed = [
     "new_event",
     "online_inquiries",
-    "for_processing",
-    "for_post_analysis",
+    "for_down_payment",
+    "for_ongoing",
     "for_full_payment",
     "completed",
     "cancelled",
   ];
-  if (!allowed.includes(stage)) {
+  if (!allowed.includes(canonicalStage)) {
     res.status(400).json({ error: "invalid stage" });
     return;
   }
-  const dbStage = mapManagerCateringStageToDb(stage);
+  const dbStatuses = cateringStatusesForApiStage(canonicalStage);
   /** When true, omit heavy JSON blobs so large stages (e.g. online_inquiries) load reliably; fetch full row via /catering/item. */
   const summary = Boolean(req.body?.summary);
-  const fullPaymentStages = new Set(["for_post_analysis", "for_full_payment"]);
+  const fullPaymentStages = new Set(["for_full_payment"]);
+  const pipelineWorkStages = new Set(["for_down_payment", "for_ongoing"]);
   try {
     await ensureNewEventSchemaOnce();
     const { rows } = await getPool().query(
@@ -4204,12 +4318,12 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
          SELECT 'event'::text AS order_kind,
                 id::text, source, status, order_type, customer_name, contact_person, contact_number, email_address,
               CASE
-                WHEN ($2::boolean AND $1::text <> 'for_processing') THEN '[]'::jsonb
+                WHEN ($2::boolean AND $1::text NOT IN ('for_down_payment', 'for_ongoing')) THEN '[]'::jsonb
                 ELSE COALESCE(schedule_slots, '[]'::jsonb)
               END AS schedule_slots, address, guest_count, COALESCE(pax_buffer, 0) AS pax_buffer,
               CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(menu, '[]'::jsonb) END AS menu,
               CASE WHEN $2::boolean THEN '{}'::jsonb ELSE COALESCE(theme_design, '{}'::jsonb) END AS theme_design,
-              CASE WHEN ($2::boolean AND $1::text NOT IN ('for_post_analysis', 'for_full_payment')) THEN '{}'::jsonb ELSE ${POST_ANALYSIS_JSON} END AS post_analysis,
+              CASE WHEN ($2::boolean AND $1::text <> 'for_full_payment') THEN '{}'::jsonb ELSE ${POST_ANALYSIS_JSON} END AS post_analysis,
               CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(checklist, '[]'::jsonb) END AS checklist,
               down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
                 total_cost, ${CATERING_ORDER_CREATED_AT_SQL} AS created_at, ${CATERING_ORDER_UPDATED_AT_SQL} AS updated_at, stage_entered_at, event_title, event_type, formality_level,
@@ -4253,17 +4367,17 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                 END) AS checklist_count_summary,
                 NULLIF(TRIM(COALESCE((${POST_ANALYSIS_JSON})->>'processing_phase', '')), '') AS processing_phase_sk
          FROM event_orders
-         WHERE status = $3
-         UNION ALL
+         WHERE status = ANY($3::text[])
+       UNION ALL
          SELECT 'catering'::text AS order_kind,
                 id::text, source, status, order_type, customer_name, contact_person, contact_number, email_address,
                 CASE
-                  WHEN ($2::boolean AND $1::text <> 'for_processing') THEN '[]'::jsonb
+                  WHEN ($2::boolean AND $1::text NOT IN ('for_down_payment', 'for_ongoing')) THEN '[]'::jsonb
                   ELSE COALESCE(schedule_slots, '[]'::jsonb)
                 END AS schedule_slots, address, guest_count, COALESCE(pax_buffer, 0) AS pax_buffer,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(menu, '[]'::jsonb) END AS menu,
                 '{}'::jsonb AS theme_design,
-                CASE WHEN ($2::boolean AND $1::text NOT IN ('for_post_analysis', 'for_full_payment')) THEN '{}'::jsonb ELSE ${POST_ANALYSIS_JSON} END AS post_analysis,
+                CASE WHEN ($2::boolean AND $1::text <> 'for_full_payment') THEN '{}'::jsonb ELSE ${POST_ANALYSIS_JSON} END AS post_analysis,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(checklist, '[]'::jsonb) END AS checklist,
                 down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
                 total_cost, ${CATERING_ORDER_CREATED_AT_SQL} AS created_at, ${CATERING_ORDER_UPDATED_AT_SQL} AS updated_at, stage_entered_at,
@@ -4310,16 +4424,21 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                 END) AS checklist_count_summary,
                 NULLIF(TRIM(COALESCE((${POST_ANALYSIS_JSON})->>'processing_phase', '')), '') AS processing_phase_sk
          FROM catering_orders
-         WHERE status = $3
+         WHERE status = ANY($3::text[])
        ) q
        ORDER BY created_at DESC`,
-      [stage, summary, dbStage],
+      [canonicalStage, summary, dbStatuses],
     );
-    if (stage === "for_processing" || fullPaymentStages.has(stage) || stage === "completed") {
+    if (pipelineWorkStages.has(canonicalStage) || fullPaymentStages.has(canonicalStage) || canonicalStage === "completed") {
       for (const r of rows as Array<Record<string, unknown>>) {
-        if (stage === "for_processing" && processingSubstageFromRow(r) !== "ongoing") continue;
         const existingChecklist = normalizeChecklist(r.checklist);
-        if (existingChecklist.length > 0) continue;
+        const checklistRaw = r.checklist;
+        const hasEditorShape =
+          checklistRaw != null &&
+          typeof checklistRaw === "object" &&
+          !Array.isArray(checklistRaw) &&
+          "items" in (checklistRaw as Record<string, unknown>);
+        if (existingChecklist.length > 0 || hasEditorShape) continue;
         const autoChecklist = await generateChecklistFromMenu(r.menu);
         if (autoChecklist.length == 0) continue;
         const table = String(r.order_kind) === "catering" ? "catering_orders" : "event_orders";
@@ -4333,11 +4452,13 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
         r.checklist = packed ?? { items: autoChecklist };
       }
     }
-    if (stage === "for_processing") {
+    if (canonicalStage === "for_down_payment" || canonicalStage === "for_ongoing") {
       attachForProcessingScheduleOverlaps(rows as Array<Record<string, unknown>>);
     }
     for (const row of rows as Array<Record<string, unknown>>) {
+      row.status = normalizeCateringStatusForApi(String(row.status ?? ""), row);
       enrichCateringThemeDesignForApi(row);
+      if (!summary) row.checklist = normalizeChecklist(row.checklist);
     }
     res.json(rows);
   } catch (err) {
@@ -4400,9 +4521,21 @@ app.post("/api/mobile/pos/catering/item", async (req, res) => {
     }
     const r = rows[0] as Record<string, unknown>;
     const st = String(r.status ?? "").trim().toLowerCase();
-    if (st === "for_processing" || st === "for_full_payment" || st === "for_post_analysis" || st === "completed") {
+    const stNormItem = normalizeCateringStatusForApi(st, r);
+    if (
+      stNormItem === "for_down_payment" ||
+      stNormItem === "for_ongoing" ||
+      stNormItem === "for_full_payment" ||
+      stNormItem === "completed"
+    ) {
       const existingChecklist = normalizeChecklist(r.checklist);
-      if (existingChecklist.length === 0) {
+      const checklistRaw = r.checklist;
+      const hasEditorShape =
+        checklistRaw != null &&
+        typeof checklistRaw === "object" &&
+        !Array.isArray(checklistRaw) &&
+        "items" in (checklistRaw as Record<string, unknown>);
+      if (existingChecklist.length === 0 && !hasEditorShape) {
         const autoChecklist = await generateChecklistFromMenu(r.menu);
         if (autoChecklist.length > 0) {
           const table = orderKind === "catering" ? "catering_orders" : "event_orders";
@@ -4416,11 +4549,14 @@ app.post("/api/mobile/pos/catering/item", async (req, res) => {
       }
     }
     enrichCateringThemeDesignForApi(r);
-    if (st === "for_processing") {
+    const stNorm = normalizeCateringStatusForApi(st, r);
+    if (stNorm === "for_down_payment" || stNorm === "for_ongoing") {
       const { rows: fpRows } = await getPool().query(
-        `SELECT 'event'::text AS order_kind, id::text, schedule_slots FROM event_orders WHERE status = 'for_processing'
+        `SELECT 'event'::text AS order_kind, id::text, schedule_slots FROM event_orders
+         WHERE status IN (${CATERING_ACTIVE_SCHEDULE_STATUSES_SQL})
          UNION ALL
-         SELECT 'catering'::text, id::text, schedule_slots FROM catering_orders WHERE status = 'for_processing'`,
+         SELECT 'catering'::text, id::text, schedule_slots FROM catering_orders
+         WHERE status IN (${CATERING_ACTIVE_SCHEDULE_STATUSES_SQL})`,
       );
       attachForProcessingScheduleOverlaps(fpRows as Array<Record<string, unknown>>);
       const me = (fpRows as Array<Record<string, unknown> & { id?: string; processing_schedule_overlaps?: number }>).find(
@@ -4428,6 +4564,8 @@ app.post("/api/mobile/pos/catering/item", async (req, res) => {
       );
       r.processing_schedule_overlaps = Number(me?.processing_schedule_overlaps ?? 0);
     }
+    r.status = normalizeCateringStatusForApi(String(r.status ?? ""), r);
+    r.checklist = normalizeChecklist(r.checklist);
     res.json(r);
   } catch (err) {
     console.error(err);
@@ -4633,12 +4771,18 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
     res.status(403).json({ error: "invalid manager/supervisor credentials" });
     return;
   }
-  const allowed = ["for_processing", "for_post_analysis", "for_full_payment", "completed", "cancelled"];
-  if (!allowed.includes(nextStatus)) {
+  const dbNextStatus = mapManagerCateringStageToDb(nextStatus);
+  const allowed = [
+    "for_down_payment",
+    "for_ongoing",
+    "for_full_payment",
+    "completed",
+    "cancelled",
+  ];
+  if (!allowed.includes(dbNextStatus)) {
     res.status(400).json({ error: "invalid next status" });
     return;
   }
-  const dbNextStatus = mapManagerCateringStageToDb(nextStatus);
   if (auth.role === "supervisor" && nextStatus === "completed") {
     res.status(403).json({ error: "supervisor cannot complete orders" });
     return;
@@ -4687,14 +4831,12 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
         return;
       }
     }
-    if (
-      String(before.status ?? "").trim().toLowerCase() === "for_processing" &&
-      (nextStatus === "for_post_analysis" || nextStatus === "for_full_payment")
-    ) {
-      const sub = processingSubstageFromPostAndChecklist(before.post_analysis, before.checklist);
-      if (sub !== "ongoing") {
+    const beforeSt = normalizeCateringStatusForApi(String(before.status ?? ""), before as Record<string, unknown>);
+    const nextSt = normalizeCateringStatusForApi(dbNextStatus);
+    if (nextSt === "for_full_payment" && beforeSt !== "for_ongoing") {
+      if (beforeSt === "for_down_payment") {
         res.status(400).json({
-          error: "complete the Down Payment step and move this order to On Going before advancing to For Full Payment",
+          error: "move this order to On Going before advancing to For Full Payment",
         });
         return;
       }
@@ -4722,10 +4864,10 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
       : null;
     const mergedPost: Record<string, unknown> | null = incomingPost != null ? { ...existingPost, ...incomingPost } : null;
     const postToSave =
-      nextStatus === "for_processing"
+      nextSt === "for_down_payment" || nextSt === "for_ongoing"
         ? (() => {
             const base = mergedPost ?? { ...existingPost };
-            if (!base.processing_phase) base.processing_phase = "down_payment";
+            base.processing_phase = nextSt === "for_ongoing" ? "ongoing" : "down_payment";
             const taskRowsRaw = base.task_assignment_rows;
             if (!Array.isArray(taskRowsRaw) || taskRowsRaw.length === 0) {
               base.task_assignment_rows = defaultTaskAssignmentRows();
@@ -4798,8 +4940,8 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
     const orderRef = String(rows[0].transaction_no ?? id);
     const orderTotal = toNum(rows[0].total_cost ?? before.total_cost, 0);
     const dueMsg =
-      nextStatus === "for_processing"
-        ? `Your inquiry ${orderRef} is now FOR PROCESSING. Please pay the down payment to continue.`
+      nextSt === "for_down_payment"
+        ? `Your inquiry ${orderRef} is now For Down Payment. Please pay the down payment to continue.`
         : dbNextStatus === "for_full_payment"
           ? `Down payment confirmed for ${orderRef}. Remaining balance is now due. Current total: ₱${orderTotal.toFixed(2)}.`
           : dbNextStatus === "completed"
@@ -5306,6 +5448,7 @@ app.get("/api/mobile/customer/tray-draft", async (req, res) => {
     return;
   }
   try {
+    await ensureCustomerTrayDraftsSchemaOnce();
     const { rows } = await getPool().query(
       `SELECT tray_lines, updated_at
        FROM customer_tray_drafts
@@ -5334,6 +5477,7 @@ app.put("/api/mobile/customer/tray-draft", async (req, res) => {
     return;
   }
   try {
+    await ensureCustomerTrayDraftsSchemaOnce();
     const { rows } = await getPool().query(
       `INSERT INTO customer_tray_drafts (user_email, tray_lines, updated_at)
        VALUES ($1, $2::jsonb, NOW())
@@ -5366,6 +5510,13 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
   try {
     const pool = getPool();
     const menuStampExpr = await menuDishesMaxStampExpr(pool);
+    let trayStampExpr = `''::text`;
+    try {
+      await ensureCustomerTrayDraftsSchemaOnce();
+      trayStampExpr = `COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(user_email) = $1), '')`;
+    } catch (trayErr) {
+      console.warn("[sync-stamps] customer_tray_drafts unavailable", trayErr);
+    }
     const { rows } = await pool.query(
       `SELECT
          ${menuStampExpr} AS menu_stamp,
@@ -5377,7 +5528,7 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
          COALESCE((SELECT MAX((${CATERING_ORDER_UPDATED_AT_SQL}))::text FROM catering_orders), '') AS manager_catering_stamp,
          COALESCE((SELECT MAX((${CATERING_ORDER_UPDATED_AT_SQL}))::text FROM event_orders), '') AS manager_event_stamp,
          COALESCE((SELECT MAX(${CUSTOMER_ACCOUNT_STAMP_SQL})::text FROM customer_accounts), '') AS loyalty_stamp,
-         COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(user_email) = $1), '') AS tray_stamp`,
+         ${trayStampExpr} AS tray_stamp`,
       [userEmail],
     );
     const row = (rows[0] ?? {}) as Record<string, unknown>;

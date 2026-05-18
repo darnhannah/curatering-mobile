@@ -25,6 +25,28 @@ Future<Uint8List> buildSeatingLayoutPdfBytes({
   final drawW = pageW - margin * 2;
   final drawH = pageH - margin * 2 - 48;
 
+  double minX = 1;
+  double minY = 1;
+  double maxX = 0;
+  double maxY = 0;
+  for (final t in plan.tables) {
+    minX = minX < t.xNorm ? minX : t.xNorm;
+    minY = minY < t.yNorm ? minY : t.yNorm;
+    maxX = maxX > t.xNorm + t.wNorm ? maxX : t.xNorm + t.wNorm;
+    maxY = maxY > t.yNorm + t.hNorm ? maxY : t.yNorm + t.hNorm;
+  }
+  if (plan.tables.isEmpty) {
+    minX = 0;
+    minY = 0;
+    maxX = 1;
+    maxY = 1;
+  }
+  final bboxW = (maxX - minX).clamp(0.05, 1.0);
+  final bboxH = (maxY - minY).clamp(0.05, 1.0);
+  final layoutScale = (drawW / bboxW < drawH / bboxH ? drawW / bboxW : drawH / bboxH) * 0.9;
+  final offsetX = (drawW - bboxW * layoutScale) / 2 - minX * layoutScale;
+  final offsetY = (drawH - bboxH * layoutScale) / 2 - minY * layoutScale;
+
   doc.addPage(
     pw.Page(
       pageFormat: PdfPageFormat(pageW, pageH, marginAll: margin),
@@ -50,10 +72,13 @@ Future<Uint8List> buildSeatingLayoutPdfBytes({
                 children: [
                   for (final t in plan.tables)
                     pw.Transform.translate(
-                      offset: PdfPoint(t.xNorm * drawW, t.yNorm * drawH),
+                      offset: PdfPoint(
+                        t.xNorm * layoutScale + offsetX,
+                        t.yNorm * layoutScale + offsetY,
+                      ),
                       child: pw.Container(
-                        width: t.wNorm * drawW,
-                        height: t.hNorm * drawH,
+                        width: t.wNorm * layoutScale,
+                        height: t.hNorm * layoutScale,
                         decoration: pw.BoxDecoration(
                           border: pw.Border.all(color: PdfColors.black, width: 0.8),
                           color: PdfColors.grey200,

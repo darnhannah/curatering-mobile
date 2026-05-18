@@ -523,10 +523,11 @@ String managerEventSettingDisplayLabel(String raw) {
 }
 
 String managerStageListTimestampLabel(String stage) {
-  switch (stage) {
-    case 'for_processing':
+  switch (normalizeCateringPipelineStatus(stage)) {
+    case kStageForDownPayment:
+    case kStageForOngoing:
       return 'In this stage since';
-    case 'for_post_analysis':
+    case kStageForFullPayment:
       return 'In For Full Payment since';
     case 'completed':
       return 'Last updated';
@@ -631,6 +632,21 @@ String? imageBase64FromCateringMenuEntry(dynamic m) {
     if (img != null && '$img'.trim().isNotEmpty) return '$img';
   }
   return null;
+}
+
+/// Checklist from API: plain array or `{ items: [...] }` saved by Checklist Editor.
+List<dynamic> checklistItemsFromApi(dynamic raw) {
+  if (raw is List) return List<dynamic>.from(raw);
+  if (raw is Map) {
+    final items = raw['items'];
+    if (items is List) return List<dynamic>.from(items);
+  }
+  if (raw is String && raw.trim().isNotEmpty) {
+    try {
+      return checklistItemsFromApi(jsonDecode(raw));
+    } catch (_) {}
+  }
+  return const [];
 }
 
 List<dynamic> normalizeCateringMenuList(List<dynamic> menu) {
@@ -909,7 +925,11 @@ class MenuItemData {
   String get restaurantMenuBucket {
     final t = dishType.trim().toLowerCase();
     if (t == 'other' || t == 'special') return 'others';
-    if (t.isNotEmpty) return t;
+    if (t == 'restaurant') {
+      // meal_type "restaurant" — bucket from category sub-type (rice meals, silog, …)
+    } else if (t.isNotEmpty) {
+      return t;
+    }
     final c = category.toLowerCase().trim();
     if (c.contains('drink') || c.contains('beverage')) return 'drinks';
     if (c.contains('sandwich')) return 'sandwiches';
@@ -1403,12 +1423,14 @@ bool customerOrderPendingTab(OrderData o) {
   if (customerOrderCancelled(o)) return false;
   if (orderLooksCompleted(o)) return false;
   final u = o.status.toUpperCase();
+  final fs = o.fulfillmentStage.toUpperCase();
+  if (fs.contains('PENDING_CASHIER') || u.contains('PENDING_CASHIER')) return true;
+  if (u.contains('INSUFFICIENT') || u.contains('PAYMENT INSUFFICIENT')) return true;
+  if (u.contains('BALANCE') && (u.contains('REVIEW') || u.contains('CONFIRMATION'))) return true;
   return u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
       u.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION') ||
       u.contains('WAITING FOR ORDER CONFIRMATION') ||
-      u.contains('WAITING FOR ORDER') ||
-      u.contains('PAYMENT INSUFFICIENT') ||
-      u.contains('INSUFFICIENT');
+      u.contains('WAITING FOR ORDER');
 }
 
 bool customerOrderConfirmedTab(OrderData o) {
@@ -1453,18 +1475,31 @@ String statusReadableForOrder(OrderData o) {
   return statusReadable(o.status);
 }
 
+const kStageForDownPayment = 'for_down_payment';
+const kStageForOngoing = 'for_ongoing';
+const kStageForFullPayment = 'for_full_payment';
+
+String normalizeCateringPipelineStatus(String raw) {
+  final s = raw.trim().toLowerCase();
+  if (s == 'for_full_payment') return kStageForFullPayment;
+  if (s == 'for_ongoing') return kStageForOngoing;
+  if (s == 'for_down_payment') return kStageForDownPayment;
+  return s;
+}
+
 String inquiryStatusReadable(String status) {
   final s = status.trim();
   if (s.isEmpty) return s;
-  final low = s.toLowerCase();
+  final low = normalizeCateringPipelineStatus(s);
   switch (low) {
     case 'new_event':
       return 'New Event';
     case 'online_inquiries':
       return 'Online Inquiries';
-    case 'for_processing':
+    case 'for_down_payment':
       return 'For Down Payment';
-    case 'for_post_analysis':
+    case 'for_ongoing':
+      return 'On Going';
     case 'for_full_payment':
       return 'For Full Payment';
     default:
@@ -1478,34 +1513,29 @@ String inquiryStatusReadable(String status) {
 }
 
 String cateringManagerListStatusLabelFor(String status, String processingSubstageLabel) {
-  final low = status.trim().toLowerCase();
-  if (low == 'for_processing') {
-    return processingSubstageLabel == 'ongoing' ? 'On Going' : 'For Down Payment';
-  }
   return inquiryStatusReadable(status);
 }
 
 /// Detail AppBar: tab the order is in (not generic status text).
 String cateringManagerDetailTabTitle(
   CateringEventRecord row,
-  String detailStage, {
-  String? processingSubstageOverride,
-}) {
+  String detailStage,
+) {
   switch (detailStage.trim().toLowerCase()) {
     case 'online_inquiries':
       return 'Online Inquiries';
     case 'new_event':
       return 'New Event';
-    case 'for_post_analysis':
     case 'for_full_payment':
       return 'For Full Payment';
+    case 'for_ongoing':
+      return 'On Going';
+    case 'for_down_payment':
+      return 'For Down Payment';
     case 'completed':
       return 'Completed';
     case 'cancelled':
       return 'Cancelled';
-    case 'for_processing':
-      final sub = (processingSubstageOverride ?? row.processingSubstageLabel).trim();
-      return sub == 'ongoing' ? 'On Going' : 'For Down Payment';
     default:
       return cateringManagerListStatusLabelFor(row.status, row.processingSubstageLabel);
   }
@@ -1933,7 +1963,13 @@ class InquiryRecord {
 
   bool get canEditThemeDesign {
     if (!isCateringPlusEvent) return false;
-    const allowed = {'online_inquiries', 'new_event', 'for_processing', 'for_post_analysis'};
+    const allowed = {
+      'online_inquiries',
+      'new_event',
+      kStageForDownPayment,
+      kStageForOngoing,
+      kStageForFullPayment,
+    };
     return allowed.contains(status.trim().toLowerCase());
   }
 
@@ -2069,7 +2105,7 @@ class CateringEventRecord {
   final String eventSetting;
   /// Short date/time line from first `schedule_slots` entry (list summary).
   final String schedulePreview;
-  /// For `for_processing` list: how many *other* active orders overlap this event's schedule.
+  /// For down payment / on going lists: how many *other* active orders overlap this event's schedule.
   final int processingScheduleOverlaps;
 
   /// Points applied when this catering/event order is completed (from `points_earned` in DB).
@@ -2081,31 +2117,18 @@ class CateringEventRecord {
   /// List summary: `post_analysis.processing_phase` (`down_payment` | `ongoing`).
   final String processingPhaseSk;
 
-  /// While [status] is `for_processing`: which workflow tab this row belongs in.
+  /// Legacy helper; canonical stage is now [status] (`for_down_payment` | `for_ongoing`).
   String get processingSubstageLabel {
-    if (status.trim().toLowerCase() != 'for_processing') return '';
-    final p = processingPhaseSk.trim().toLowerCase();
-    if (p == 'ongoing') return 'ongoing';
-    if (p == 'down_payment') return 'down_payment';
-    if (checklistCountSummary > 0) return 'ongoing';
-    var filledChecklistRows = 0;
-    for (final c in checklist) {
-      if (c is Map) {
-        final it = '${c['item'] ?? ''}'.trim();
-        if (it.isNotEmpty) filledChecklistRows++;
-      } else if ('$c'.trim().isNotEmpty) {
-        filledChecklistRows++;
-      }
-    }
-    if (filledChecklistRows > 0) return 'ongoing';
-    return 'down_payment';
+    final s = normalizeCateringPipelineStatus(status);
+    if (s == kStageForOngoing) return 'ongoing';
+    if (s == kStageForDownPayment) return 'down_payment';
+    return '';
   }
 
   int get cateringLoyaltyEligiblePointsIfCompleted => cateringLoyaltyPointsForOrderTotal(totalCost);
 
   factory CateringEventRecord.fromApiMap(Map<String, dynamic> m) {
-    final rawStatus = '${m['status'] ?? ''}'.trim().toLowerCase();
-    final status = rawStatus == 'for_full_payment' ? 'for_post_analysis' : '${m['status'] ?? ''}';
+    final status = normalizeCateringPipelineStatus('${m['status'] ?? ''}');
     return CateringEventRecord(
       id: '${m['id']}',
       orderKind: '${m['order_kind'] ?? 'event'}',
@@ -2141,7 +2164,7 @@ class CateringEventRecord {
         if (pa is Map) return Map<String, dynamic>.from(pa.map((k, v) => MapEntry('$k', v)));
         return const <String, dynamic>{};
       }(),
-      checklist: (m['checklist'] is List) ? (m['checklist'] as List<dynamic>) : const [],
+      checklist: checklistItemsFromApi(m['checklist']),
       scheduleSlots: () {
         final raw = m['schedule_slots'];
         if (raw is List) return List<dynamic>.from(raw);
@@ -2322,11 +2345,11 @@ class AppState extends ChangeNotifier {
       case 1:
         return managerRowsForStage('online_inquiries').length;
       case 2:
-        return managerRowsForStage('for_processing').where((e) => e.processingSubstageLabel == 'down_payment').length;
+        return managerRowsForStage(kStageForDownPayment).length;
       case 3:
-        return managerRowsForStage('for_processing').where((e) => e.processingSubstageLabel == 'ongoing').length;
+        return managerRowsForStage(kStageForOngoing).length;
       case 4:
-        return managerRowsForStage('for_post_analysis').length;
+        return managerRowsForStage(kStageForFullPayment).length;
       default:
         return 0;
     }
@@ -2336,8 +2359,9 @@ class AppState extends ChangeNotifier {
     await Future.wait([
       loadManagerCateringByStage('new_event', force: true),
       loadManagerCateringByStage('online_inquiries', force: true),
-      loadManagerCateringByStage('for_processing', force: true),
-      loadManagerCateringByStage('for_post_analysis', force: true),
+      loadManagerCateringByStage(kStageForDownPayment, force: true),
+      loadManagerCateringByStage(kStageForOngoing, force: true),
+      loadManagerCateringByStage(kStageForFullPayment, force: true),
     ]);
   }
 
@@ -2379,6 +2403,46 @@ class AppState extends ChangeNotifier {
     showLoginWelcomeDialog = false;
   }
 
+  /// Loads menus, orders, etc. after auth — failures are logged but do not block navigation.
+  Future<void> _hydrateSessionAfterLogin() async {
+    try {
+      if (isCashier) {
+        await loadMenu(force: true);
+        await loadCashierOnlineOrders(force: true);
+        await loadCashierWalkInQueues(force: true);
+        await loadNotifications(force: true);
+      } else if (isSupervisor) {
+        _managerActiveStage = kStageForOngoing;
+        await Future.wait([
+          loadMenu(force: true),
+          loadManagerCateringByStage(kStageForOngoing, force: true),
+        ]);
+        await loadNotifications(force: true);
+      } else if (isManager) {
+        await Future.wait([
+          loadMenu(force: true),
+          loadSetMenus(force: true),
+          loadManagerCateringByStage('new_event', force: true),
+        ]);
+        await loadNotifications(force: true);
+      } else {
+        await Future.wait([
+          loadMenu(force: true),
+          loadSetMenus(force: true),
+          loadProfile(force: true),
+          loadOrders(force: true),
+          loadInquiries(force: true),
+        ]);
+        await _restoreReadAttentionOrderNos();
+        await restoreCustomerDraftAfterLogin();
+        await loadNotifications(force: true);
+      }
+      await bootstrapRealtimeSync();
+    } catch (e, st) {
+      debugPrint('_hydrateSessionAfterLogin failed (session still active): $e\n$st');
+    }
+  }
+
   /// Returns null on success, or an error message.
   Future<String?> login(String email, String password) async {
     try {
@@ -2402,42 +2466,11 @@ class AppState extends ChangeNotifier {
       loginPassword = password;
       userRole = '${bodyMap['role'] ?? 'customer'}'.trim().toLowerCase();
       cashierDisplayName = '${bodyMap['display_name'] ?? ''}'.trim();
-      if (isCashier) {
-        await loadMenu(force: true);
-        await loadCashierOnlineOrders(force: true);
-        await loadCashierWalkInQueues(force: true);
-        await loadNotifications(force: true);
-      } else if (isSupervisor) {
-        _managerActiveStage = 'for_processing';
-        await Future.wait([
-          loadMenu(force: true),
-          loadManagerCateringByStage('for_processing', force: true),
-        ]);
-        await loadNotifications(force: true);
-      } else if (isManager) {
-        await Future.wait([
-          loadMenu(force: true),
-          loadSetMenus(force: true),
-          loadManagerCateringByStage('new_event', force: true),
-        ]);
-        await loadNotifications(force: true);
-      } else {
-        await Future.wait([
-          loadMenu(force: true),
-          loadSetMenus(force: true),
-          loadProfile(force: true),
-          loadOrders(force: true),
-          loadInquiries(force: true),
-        ]);
-        await _restoreReadAttentionOrderNos();
-        await restoreCustomerDraftAfterLogin();
-        await loadNotifications(force: true);
-      }
-      await bootstrapRealtimeSync();
       showLoginWelcomeDialog = true;
       reopenAuthAsStaff = false;
       authSessionKey++;
       notifyListeners();
+      unawaited(_hydrateSessionAfterLogin());
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -3114,7 +3147,7 @@ class AppState extends ChangeNotifier {
           if (allow) {
             jobs.add(loadManagerCateringByStage(managerActiveStage, force: true));
             if (isSupervisor) {
-              jobs.add(loadManagerCateringByStage('for_processing', force: true));
+              jobs.add(loadManagerCateringByStage(kStageForOngoing, force: true));
             }
           }
         }
@@ -4332,7 +4365,10 @@ class AppState extends ChangeNotifier {
         );
       _cashierOnlineOrdersLoadedAt = DateTime.now();
       notifyListeners();
-    } catch (_) {
+    } catch (e) {
+      debugPrint('loadCashierOnlineOrders: $e');
+      cashierDataLoadError = 'Could not load online orders';
+      notifyListeners();
     } finally {
       _loadCashierOnlineOrdersInFlight = false;
     }
@@ -5545,8 +5581,8 @@ Widget _managerTabCountBadge(int count) {
   );
 }
 
-Widget _buildManagerHamburgerLeading(BuildContext context, AppState state) {
-  if (Navigator.canPop(context)) {
+Widget _buildManagerHamburgerLeading(BuildContext context, AppState state, {bool menuOnly = false}) {
+  if (!menuOnly && Navigator.canPop(context)) {
     return IconButton(
       icon: const Icon(Icons.arrow_back, color: Color(0xFFFFC024)),
       onPressed: () => Navigator.maybePop(context),
@@ -5740,7 +5776,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
     return AnimatedBuilder(
       animation: state,
       builder: (context, _) {
-        final count = state.managerRowsForStage('for_processing').where((e) => e.processingSubstageLabel == 'ongoing').length;
+        final count = state.managerRowsForStage(kStageForOngoing).length;
         return Scaffold(
           backgroundColor: Theme.of(context).scaffoldBackgroundColor,
           appBar: AppBar(
@@ -5842,8 +5878,10 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
   @override
   void initState() {
     super.initState();
-    widget.state.setManagerActiveStage('for_processing');
-    widget.state.loadManagerCateringByStage('for_processing', force: true);
+    widget.state.setManagerActiveStage(kStageForOngoing);
+    widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
+    widget.state.loadAllergenCatalog(force: true);
+    widget.state.loadMenu(force: true);
   }
 
   @override
@@ -5852,7 +5890,7 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
-        leading: _buildManagerHamburgerLeading(context, widget.state),
+        leading: _buildManagerHamburgerLeading(context, widget.state, menuOnly: true),
         title: const Text('ON GOING', style: kManagerAppBarTitleStyle),
         centerTitle: true,
       ),
@@ -5862,9 +5900,8 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
       ),
       body: _ManagerStageListTab(
         state: widget.state,
-        stage: 'for_processing',
+        stage: kStageForOngoing,
         isReadOnly: false,
-        processingSubstageFilter: 'ongoing',
         supervisorMode: true,
       ),
     );
@@ -6279,6 +6316,16 @@ class RestaurantMenuScreen extends StatefulWidget {
 }
 
 class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
+  static const List<String> _sectionChips = [
+    'ALL',
+    'rice meals',
+    'silog meals',
+    'pasta',
+    'sandwiches',
+    'others',
+    'drinks',
+  ];
+
   String _search = '';
   String _sectionFilter = 'ALL';
 
@@ -6486,16 +6533,9 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
       animation: widget.state,
       builder: (context, _) {
         final restaurantItems = widget.state.menu.where((m) => m.isRestaurantDish).toList();
-        final sectionLabels = <String, String>{};
-        for (final m in restaurantItems) {
-          final k = m.restaurantSectionKey;
-          sectionLabels.putIfAbsent(k, () => m.restaurantSectionLabel);
-        }
-        final sectionKeysSorted = sectionLabels.keys.toList()
-          ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
         final filtered = restaurantItems.where((m) {
-          final okSection =
-              _sectionFilter == 'ALL' || m.restaurantSectionKey == _sectionFilter;
+          final okSection = _sectionFilter == 'ALL' ||
+              m.restaurantMenuBucket.toLowerCase() == _sectionFilter.toLowerCase();
           final q = _search.trim().toLowerCase();
           final okSearch = q.isEmpty || m.name.toLowerCase().contains(q) || m.description.toLowerCase().contains(q);
           return okSection && okSearch;
@@ -6553,14 +6593,13 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                       onSelected: (_) => setState(() => _sectionFilter = 'ALL'),
                     ),
                   ),
-                  ...sectionKeysSorted.map((k) {
-                    final lab = sectionLabels[k] ?? k;
+                  ..._sectionChips.where((c) => c != 'ALL').map((c) {
                     return Padding(
                       padding: const EdgeInsets.only(right: 8),
                       child: FilterChip(
-                        label: Text(lab.toUpperCase()),
-                        selected: _sectionFilter == k,
-                        onSelected: (_) => setState(() => _sectionFilter = k),
+                        label: Text(c.toUpperCase()),
+                        selected: _sectionFilter.toLowerCase() == c.toLowerCase(),
+                        onSelected: (_) => setState(() => _sectionFilter = c),
                       ),
                     );
                   }),
@@ -8613,6 +8652,11 @@ class _PaymentScreenState extends State<PaymentScreen> {
         Navigator.of(context).maybePop();
         return;
       }
+      final base = _placedOrder ?? widget.order;
+      if (base != null) {
+        final synced = widget.state.orders.where((o) => o.id == base.id).toList();
+        if (synced.isNotEmpty) _placedOrder = synced.first;
+      }
       setState(() {});
     });
   }
@@ -8694,13 +8738,14 @@ class _PaymentScreenState extends State<PaymentScreen> {
         appSnack(context, err);
         return;
       }
+      await s.loadOrders(force: true);
+      final syncedAfterPlace = s.orders.where((o) => o.id == newOrder.id).toList();
       setState(() {
-        _placedOrder = newOrder;
+        _placedOrder = syncedAfterPlace.isNotEmpty ? syncedAfterPlace.first : newOrder;
         uploadedFile = file;
         _localProofBytes = bytes;
         localProofUploaded = true;
       });
-      await s.loadOrders(force: true);
       return;
     }
     final ordPre = _placedOrder ?? widget.order;
@@ -8726,6 +8771,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
     });
     await s.loadOrders(force: true);
     final syPin = _syncedOrder(s);
+    if (syPin != null && mounted) {
+      setState(() => _placedOrder = syPin);
+    }
     final pbp = syPin?.paymentProofBase64?.trim();
     if (pbp != null && pbp.isNotEmpty) _pinnedInitialProofB64 ??= pbp;
     } finally {
@@ -8873,7 +8921,11 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       ),
                       const SizedBox(height: 12),
                     ],
-                    _OrderNoCard(displayNo: isDraft ? null : uiOrderNo(orderForUi.orderNo)),
+                    _OrderNoCard(
+                      displayNo: isDraft
+                          ? null
+                          : (orderForUi.orderNo.trim().isNotEmpty ? uiOrderNo(orderForUi.orderNo) : null),
+                    ),
                     const SizedBox(height: 10),
                     if (insufficient) ...[
                       Card(
@@ -8910,6 +8962,13 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
+                          if (!isDraft && orderForUi.orderNo.trim().isNotEmpty) ...[
+                            Text(
+                              'Order No.: ${uiOrderNo(orderForUi.orderNo)}',
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
+                            ),
+                            const SizedBox(height: 8),
+                          ],
                           Text(insufficient ? 'Scan QR to pay the remaining balance' : 'Please scan the QR code below to pay'),
                           const SizedBox(height: 10),
                           Container(
@@ -10666,11 +10725,16 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        const Text(
+                          'Loyalty Points',
+                          style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
+                        ),
+                        const SizedBox(height: 10),
                         Row(
                           children: [
                             const Expanded(
                               child: Text(
-                                'Loyalty (restaurant orders)',
+                                'Total Restaurant Points',
                                 style: TextStyle(fontWeight: FontWeight.w800),
                               ),
                             ),
@@ -10685,7 +10749,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                           children: [
                             const Expanded(
                               child: Text(
-                                'Loyalty (catering / events)',
+                                'Total Catering Points',
                                 style: TextStyle(fontWeight: FontWeight.w800),
                               ),
                             ),
@@ -10695,50 +10759,45 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                             ),
                           ],
                         ),
-                        Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Text(
-                            'Points earned from completed catering & events: ${cateringCompletedLoyaltyEarnedFromHistory(widget.state.loyaltyHistory)} pts',
-                            style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
-                          ),
-                        ),
-                        Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Text(
-                            'Completed catering inquiries (My Catering Inquiries): ${cateringCompletedLoyaltyFromInquiries(widget.state.inquiries)} pts',
-                            style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
-                          ),
-                        ),
                         const Divider(height: 16),
                         const SizedBox(height: 10),
                         SizedBox(
                           height: 140,
-                          child: widget.state.loyaltyHistory.isEmpty
-                              ? const Align(
-                                  alignment: Alignment.topLeft,
-                                  child: Text('No loyalty history yet.'),
-                                )
-                              : ListView.separated(
-                                  padding: EdgeInsets.zero,
-                                  shrinkWrap: true,
-                                  itemCount: widget.state.loyaltyHistory.length,
-                                  separatorBuilder: (_, _) => const SizedBox(height: 10),
-                                  itemBuilder: (context, index) {
-                                    final h = widget.state.loyaltyHistory[index];
-                                    final label = h.orderNo.trim().isEmpty ? '******' : uiOrderNo(h.orderNo);
-                                    final src = h.source == 'catering' ? 'Catering / Event' : 'Restaurant';
-                                    return Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          '$label · $src · +${h.pointsDelta} pts',
-                                          style: const TextStyle(fontWeight: FontWeight.w700),
-                                        ),
-                                        Text(formatDateTimeLocal(h.createdAt)),
-                                      ],
-                                    );
-                                  },
-                                ),
+                          child: () {
+                            final history = widget.state.loyaltyHistory
+                                .where((h) => h.pointsDelta > 0)
+                                .toList();
+                            if (history.isEmpty) {
+                              return const Align(
+                                alignment: Alignment.topLeft,
+                                child: Text('No loyalty history yet.'),
+                              );
+                            }
+                            return ListView.separated(
+                              padding: EdgeInsets.zero,
+                              shrinkWrap: true,
+                              itemCount: history.length,
+                              separatorBuilder: (_, _) => const SizedBox(height: 10),
+                              itemBuilder: (context, index) {
+                                final h = history[index];
+                                final rawNo = h.orderNo.trim();
+                                final label = rawNo.isEmpty
+                                    ? '—'
+                                    : (h.source == 'catering' ? rawNo : uiOrderNo(rawNo));
+                                final src = h.source == 'catering' ? 'Catering / Event' : 'Restaurant';
+                                return Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      '$label · $src · +${h.pointsDelta} pts',
+                                      style: const TextStyle(fontWeight: FontWeight.w700),
+                                    ),
+                                    Text(formatDateTimeLocal(h.createdAt)),
+                                  ],
+                                );
+                              },
+                            );
+                          }(),
                         ),
                       ],
                     ),
@@ -12472,7 +12531,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                         ),
                                         child: Text(dishName, style: const TextStyle(fontSize: 13, decoration: TextDecoration.underline)),
                                       ),
-                                      subtitle: const Text('Tap dish name for allergens', style: TextStyle(fontSize: 11)),
+                                      subtitle: Text(
+                                        dish != null && dish.allergens.isNotEmpty
+                                            ? 'Allergens: ${dish.allergens.join(', ')}'
+                                            : 'Tap dish name for allergen details',
+                                        style: const TextStyle(fontSize: 11),
+                                        maxLines: 3,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
                                       value: sel,
                                       onChanged: (_) => setState(() {
                                         if (sel) {
@@ -12714,7 +12780,9 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     final s = status.trim().toLowerCase();
     if (s == 'completed') return Colors.green.shade100;
     if (s == 'cancelled') return Colors.grey.shade300;
-    if (s == 'for_post_analysis' || s == 'for_processing') return Colors.blue.shade100;
+    if (s == kStageForFullPayment || s == kStageForDownPayment || s == kStageForOngoing) {
+      return Colors.blue.shade100;
+    }
     return Colors.orange.shade100;
   }
 
@@ -12722,7 +12790,9 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     final s = status.trim().toLowerCase();
     if (s == 'completed') return Colors.green.shade900;
     if (s == 'cancelled') return Colors.grey.shade900;
-    if (s == 'for_post_analysis' || s == 'for_processing') return Colors.blue.shade900;
+    if (s == kStageForFullPayment || s == kStageForDownPayment || s == kStageForOngoing) {
+      return Colors.blue.shade900;
+    }
     return Colors.orange.shade900;
   }
 
@@ -12818,7 +12888,10 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     }
     if (r.estimatedTotal > 0) {
       final st = r.status.trim().toLowerCase();
-      final useFinal = st == 'for_processing' || st == 'for_post_analysis' || st == 'completed';
+      final useFinal = st == kStageForDownPayment ||
+          st == kStageForOngoing ||
+          st == kStageForFullPayment ||
+          st == 'completed';
       lines.add(
         line('${useFinal ? 'Final cost' : 'Estimated cost'}: ₱${r.estimatedTotal.toStringAsFixed(2)}'),
       );
@@ -13101,7 +13174,8 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
                           ),
                       ],
                     );
-                  } else if (allowCancel && i.status.trim().toLowerCase() == 'for_processing') {
+                  } else if (allowCancel &&
+                      normalizeCateringPipelineStatus(i.status) == kStageForDownPayment) {
                     trailing = IconButton(
                       icon: Icon(Icons.cancel_outlined, color: Colors.red.shade800),
                       tooltip: 'Cancel order',
@@ -14015,13 +14089,12 @@ class ManagerCateringShellScreen extends StatefulWidget {
 
 class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen> with SingleTickerProviderStateMixin {
   late TabController _tab;
-  /// API stage per tab (Down Payment + On Going both use `for_processing`).
   static const _stages = [
     'new_event',
     'online_inquiries',
-    'for_processing',
-    'for_processing',
-    'for_post_analysis',
+    kStageForDownPayment,
+    kStageForOngoing,
+    kStageForFullPayment,
     'completed',
     'cancelled',
   ];
@@ -14047,6 +14120,9 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
     });
     widget.state.loadManagerCateringByStage(_stages[idx], force: true);
     widget.state.preloadManagerDashboardCounts();
+    widget.state.loadAllergenCatalog(force: true);
+    widget.state.loadMenu(force: true);
+    widget.state.loadSetMenus(force: true);
   }
 
   @override
@@ -14064,7 +14140,7 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
           appBar: AppBar(
             backgroundColor: const Color(0xFF242424),
             foregroundColor: const Color(0xFFFFC024),
-            leading: _buildManagerHamburgerLeading(context, widget.state),
+            leading: _buildManagerHamburgerLeading(context, widget.state, menuOnly: true),
             title: Text((_labels[_tab.index]).toUpperCase(), style: kManagerAppBarTitleStyle),
             centerTitle: true,
             bottom: PreferredSize(
@@ -14115,19 +14191,9 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
             children: [
               _ManagerNewEventListTab(state: widget.state),
               _ManagerStageListTab(state: widget.state, stage: 'online_inquiries', isReadOnly: false),
-              _ManagerStageListTab(
-                state: widget.state,
-                stage: 'for_processing',
-                isReadOnly: false,
-                processingSubstageFilter: 'down_payment',
-              ),
-              _ManagerStageListTab(
-                state: widget.state,
-                stage: 'for_processing',
-                isReadOnly: false,
-                processingSubstageFilter: 'ongoing',
-              ),
-              _ManagerStageListTab(state: widget.state, stage: 'for_post_analysis', isReadOnly: false),
+              _ManagerStageListTab(state: widget.state, stage: kStageForDownPayment, isReadOnly: false),
+              _ManagerStageListTab(state: widget.state, stage: kStageForOngoing, isReadOnly: false),
+              _ManagerStageListTab(state: widget.state, stage: kStageForFullPayment, isReadOnly: false),
               _ManagerStageListTab(state: widget.state, stage: 'completed', isReadOnly: true),
               _ManagerStageListTab(state: widget.state, stage: 'cancelled', isReadOnly: true),
             ],
@@ -14508,7 +14574,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             body: jsonEncode({
               'cashier_email': email,
               'cashier_password': widget.state.loginPassword,
-              'stage': 'for_processing',
+              'stage': kStageForDownPayment,
               'summary': true,
             }),
           )
@@ -14913,7 +14979,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
-        leading: _buildManagerHamburgerLeading(context, widget.state),
+        leading: _buildManagerHamburgerLeading(context, widget.state, menuOnly: true),
         title: const Text('NEW EVENT', style: TextStyle(fontWeight: FontWeight.w800)),
         centerTitle: true,
       ),
@@ -14967,18 +15033,6 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 onSelectionChanged: (s) => setState(() => formalityLevel = s.first),
               ),
               const SizedBox(height: 12),
-              const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
-              const SizedBox(height: 6),
-              buildGuestAllergenSelector(
-                catalog: state.allergenCatalog,
-                selected: _selectedGuestAllergens,
-                enabled: true,
-                onChanged: (next) => setState(() {
-                  _selectedGuestAllergens
-                    ..clear()
-                    ..addAll(next);
-                }),
-              ),
               const SizedBox(height: 12),
               const Text('Event setting', style: TextStyle(fontWeight: FontWeight.w600)),
               const SizedBox(height: 6),
@@ -15208,6 +15262,33 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                     ),
                   ),
                 ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        ToggleSection(
+          title: 'Allergens',
+          expanded: true,
+          onToggle: () {},
+          hideToggleIcon: true,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Select allergens your guests must avoid (optional).',
+                style: TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 8),
+              buildGuestAllergenSelector(
+                catalog: widget.state.allergenCatalog,
+                selected: _selectedGuestAllergens,
+                enabled: true,
+                onChanged: (next) => setState(() {
+                  _selectedGuestAllergens
+                    ..clear()
+                    ..addAll(next);
+                }),
               ),
             ],
           ),
@@ -15666,14 +15747,11 @@ class _ManagerStageListTab extends StatefulWidget {
     required this.state,
     required this.stage,
     required this.isReadOnly,
-    this.processingSubstageFilter,
     this.supervisorMode = false,
   });
   final AppState state;
   final String stage;
   final bool isReadOnly;
-  /// When [stage] is `for_processing`, keep only `down_payment` or `ongoing` rows.
-  final String? processingSubstageFilter;
   final bool supervisorMode;
 
   @override
@@ -15686,9 +15764,10 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
   String _completedListRange = 'past_30';
 
   String _next(String s) {
-    if (s == 'new_event' || s == 'online_inquiries') return 'for_processing';
-    if (s == 'for_processing') return 'for_post_analysis';
-    if (s == 'for_post_analysis') return 'completed';
+    if (s == 'new_event' || s == 'online_inquiries') return kStageForDownPayment;
+    if (s == kStageForDownPayment) return kStageForOngoing;
+    if (s == kStageForOngoing) return kStageForFullPayment;
+    if (s == kStageForFullPayment) return 'completed';
     return 'completed';
   }
 
@@ -15696,8 +15775,8 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
     final s = status.trim().toLowerCase();
     if (s == 'completed') return Colors.green.shade100;
     if (s == 'cancelled') return Colors.grey.shade300;
-    if (s == 'for_post_analysis') return Colors.indigo.shade100;
-    if (s == 'for_processing') return Colors.blue.shade100;
+    if (s == kStageForFullPayment) return Colors.indigo.shade100;
+    if (s == kStageForDownPayment || s == kStageForOngoing) return Colors.blue.shade100;
     return Colors.orange.shade100;
   }
 
@@ -15705,8 +15784,8 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
     final s = status.trim().toLowerCase();
     if (s == 'completed') return Colors.green.shade900;
     if (s == 'cancelled') return Colors.grey.shade900;
-    if (s == 'for_post_analysis') return Colors.indigo.shade900;
-    if (s == 'for_processing') return Colors.blue.shade900;
+    if (s == kStageForFullPayment) return Colors.indigo.shade900;
+    if (s == kStageForDownPayment || s == kStageForOngoing) return Colors.blue.shade900;
     return Colors.orange.shade900;
   }
 
@@ -15717,9 +15796,6 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
     var rows = state.managerRowsForStage(stage);
     if (stage == 'completed' && _completedListRange == 'past_30') {
       rows = rows.where((r) => isWithinPast30Days(r.createdAt)).toList();
-    }
-    if (widget.processingSubstageFilter != null && stage == 'for_processing') {
-      rows = rows.where((e) => e.processingSubstageLabel == widget.processingSubstageFilter).toList();
     }
     if (_kind == 'catering') rows = rows.where((r) => r.orderKind == 'catering').toList();
     if (_kind == 'event') rows = rows.where((r) => r.orderKind == 'event').toList();
@@ -15792,18 +15868,15 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                       final entered = r.stageEnteredAt ?? r.updatedAt;
                       final whenStr = formatDateTimeLocal(entered);
                       final stLower = r.status.trim().toLowerCase();
-                      final listSubstage = stage == 'for_processing'
-                          ? (widget.processingSubstageFilter ?? r.processingSubstageLabel)
-                          : r.processingSubstageLabel;
-                      final isDownPaymentCard =
-                          stLower == 'for_processing' && listSubstage == 'down_payment';
-                      final scheduleLine = (stLower == 'for_post_analysis' || stLower == 'completed' || isDownPaymentCard) &&
+                      final isDownPaymentCard = stage == kStageForDownPayment;
+                      final scheduleLine = (stLower == kStageForFullPayment || stLower == 'completed' || isDownPaymentCard) &&
                               r.totalCost > 0
                           ? 'Total cost: ₱${r.totalCost.toStringAsFixed(2)}'
                           : (r.schedulePreview.trim().isNotEmpty ? 'Event date/time: ${r.schedulePreview}' : '');
                       final settingLabel = managerEventSettingDisplayLabel(r.eventSetting);
                       final settingLine = settingLabel.isNotEmpty ? 'Setting: $settingLabel' : '';
-                      final conflictLine = stage == 'for_processing' && r.processingScheduleOverlaps > 0
+                      final conflictLine = (stage == kStageForDownPayment || stage == kStageForOngoing) &&
+                          r.processingScheduleOverlaps > 0
                           ? 'Schedule overlap: crosses ${r.processingScheduleOverlaps} other active order(s) — open for details.'
                           : '';
                       final loyaltyLine = () {
@@ -15828,7 +15901,8 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                       ];
                       return Card(
                         child: ListTile(
-                          leading: stage == 'for_processing' && r.processingScheduleOverlaps > 0
+                          leading: (stage == kStageForDownPayment || stage == kStageForOngoing) &&
+                              r.processingScheduleOverlaps > 0
                               ? Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800)
                               : (r.status == 'new_event' || r.status == 'online_inquiries')
                                   ? Icon(Icons.notifications_active, color: Colors.red.shade700)
@@ -15915,7 +15989,6 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                   state: state,
                                   row: r,
                                   stage: stage,
-                                  processingSubstage: widget.processingSubstageFilter,
                                   supervisorMode: widget.supervisorMode,
                                 ),
                               ),
@@ -15938,14 +16011,11 @@ class ManagerCateringDetailScreen extends StatefulWidget {
     required this.state,
     required this.row,
     required this.stage,
-    this.processingSubstage,
     this.supervisorMode = false,
   });
   final AppState state;
   final CateringEventRecord row;
   final String stage;
-  /// Tab context for `for_processing` (`down_payment` | `ongoing`).
-  final String? processingSubstage;
   final bool supervisorMode;
   @override
   State<ManagerCateringDetailScreen> createState() => _ManagerCateringDetailScreenState();
@@ -15960,12 +16030,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   CateringEventRecord get d => _loadedDetailRow ?? widget.row;
 
   String get _processingSubstageForUi {
-    if (widget.stage != 'for_processing') return d.processingSubstageLabel;
-    // Tab context wins so On Going list/detail never shows "For Down Payment" for ongoing work.
-    final tab = widget.processingSubstage?.trim();
-    if (tab == 'ongoing' || tab == 'down_payment') return tab!;
-    final fromRow = d.processingSubstageLabel.trim();
-    if (fromRow == 'ongoing' || fromRow == 'down_payment') return fromRow;
+    if (widget.stage == kStageForOngoing) return 'ongoing';
+    if (widget.stage == kStageForDownPayment) return 'down_payment';
+    final s = normalizeCateringPipelineStatus(d.status);
+    if (s == kStageForOngoing) return 'ongoing';
     return 'down_payment';
   }
 
@@ -16075,7 +16143,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   double _guestPaxCostAmount(CateringEventRecord row) => _guestCountEntered(row) * kPesosPerPax;
 
   String _additionalCostsStageLabel() {
-    if (widget.stage == 'for_post_analysis') return 'For Full Payment';
+    if (widget.stage == kStageForFullPayment) return 'For Full Payment';
     final sub = _processingSubstageForUi;
     if (sub == 'ongoing') return 'On Going';
     if (sub == 'down_payment') return 'For Down Payment';
@@ -16093,11 +16161,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   String? _previousAdditionalCostsStageLabel(CateringEventRecord row) {
-    final current = cateringManagerDetailTabTitle(
-      row,
-      widget.stage,
-      processingSubstageOverride: widget.processingSubstage,
-    );
+    final current = cateringManagerDetailTabTitle(row, widget.stage);
     switch (current) {
       case 'For Down Payment':
         return _draftAdditionalCostsStageLabel(row);
@@ -16264,7 +16328,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           : <Map<String, dynamic>>[];
       sum += jsonToDouble(g['total']) > 0 ? jsonToDouble(g['total']) : _sumCostRows(items);
     }
-    if (includeWorkingPostStage && widget.stage == 'for_post_analysis') {
+    if (includeWorkingPostStage && widget.stage == kStageForFullPayment) {
       sum += _sumCostRows(additionalCosts);
     }
     return sum;
@@ -16349,7 +16413,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
     }
     additionalCosts.clear();
-    final stageLabel = cateringManagerDetailTabTitle(row, widget.stage, processingSubstageOverride: widget.processingSubstage);
+    final stageLabel = cateringManagerDetailTabTitle(row, widget.stage);
     for (final g in _additionalCostsGroups) {
       if ('${g['stage'] ?? ''}'.trim() != stageLabel) continue;
       final items = g['items'];
@@ -16491,7 +16555,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             body: jsonEncode({
               'cashier_email': email,
               'cashier_password': widget.state.loginPassword,
-              'stage': 'for_processing',
+              'stage': kStageForDownPayment,
               'summary': true,
             }),
           )
@@ -16940,11 +17004,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   Future<void> _sendOrderSummaryPdfToCustomer() async {
     final r = _loadedDetailRow ?? widget.row;
-    final isProcessing = widget.stage == 'for_processing';
-    final sub = _processingSubstageForUi.trim().toLowerCase();
-    final isOngoingSubstage = isProcessing && sub == 'ongoing';
-    final isDownPaymentSubstage = isProcessing && sub == 'down_payment';
-    final isPost = widget.stage == 'for_post_analysis';
+    final isOngoingSubstage = widget.stage == kStageForOngoing;
+    final isDownPaymentSubstage = widget.stage == kStageForDownPayment;
+    final isPost = widget.stage == kStageForFullPayment;
     final isCompleted = widget.stage == 'completed';
     final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
     final isOnlineInquiry = widget.stage == 'online_inquiries';
@@ -16983,7 +17045,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   Future<void> _capturePostAnalysisPdf1IfNeeded() async {
-    if (widget.stage != 'for_post_analysis') return;
+    if (widget.stage != kStageForFullPayment) return;
     if (_postAnalysisPdf1Bytes != null) return;
 
     final snapshot = additionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
@@ -17005,7 +17067,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   Future<void> _maybeGeneratePostAnalysisPdf2IfNeeded() async {
-    if (widget.stage != 'for_post_analysis') return;
+    if (widget.stage != kStageForFullPayment) return;
     if (_postAnalysisPdf1Bytes == null) {
       await _capturePostAnalysisPdf1IfNeeded();
       if (_postAnalysisPdf1Bytes == null) return;
@@ -17045,7 +17107,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   void _refreshDueAndDefaults() {
-    final total = widget.stage == 'for_processing'
+    final total = widget.stage == kStageForDownPayment || widget.stage == kStageForOngoing
         ? _baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(additionalCosts)
         : _grandTotalComputed();
     downPaymentController.text = (total * 0.5).toStringAsFixed(2);
@@ -17088,8 +17150,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   void _startDetailLivePollIfNeeded() {
-    final ongoing =
-        widget.stage == 'for_processing' && _processingSubstageForUi == 'ongoing';
+    final ongoing = widget.stage == kStageForOngoing;
     if (!ongoing && !widget.supervisorMode) return;
     _detailLivePoll?.cancel();
     _detailLivePoll = Timer.periodic(const Duration(seconds: 3), (_) => _pollDetailLive());
@@ -17398,7 +17459,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     _managerFullPaymentMethod = normPm('${row.postAnalysis['manager_full_payment_method'] ?? 'Cash'}');
     additionalCostsPaidController.text =
         _compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true).toStringAsFixed(2);
-    if (widget.stage == 'for_post_analysis') {
+    if (widget.stage == kStageForFullPayment) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!mounted) return;
         await _capturePostAnalysisPdf1IfNeeded();
@@ -17990,14 +18051,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       );
     }
     final row = d;
-    final isProcessing = widget.stage == 'for_processing';
-    final processingSubstage = _processingSubstageForUi;
-    final tabSub = widget.processingSubstage?.trim();
-    final isOngoingSubstage = isProcessing &&
-        (processingSubstage == 'ongoing' || tabSub == 'ongoing');
-    final isDownPaymentSubstage =
-        isProcessing && !isOngoingSubstage && (processingSubstage == 'down_payment' || tabSub == 'down_payment');
-    final isPost = widget.stage == 'for_post_analysis';
+    final isProcessing = widget.stage == kStageForDownPayment || widget.stage == kStageForOngoing;
+    final isOngoingSubstage = widget.stage == kStageForOngoing;
+    final isDownPaymentSubstage = widget.stage == kStageForDownPayment;
+    final isPost = widget.stage == kStageForFullPayment;
     final isCompleted = widget.stage == 'completed';
     final isOnlineInquiry = widget.stage == 'online_inquiries';
     final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
@@ -18077,7 +18134,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
 
     Future<bool> saveCurrentStage({bool showConfirmDialog = true, bool popAfterSuccess = true}) async {
-      final isProcessingHere = widget.stage == 'for_processing';
+      final isProcessingHere = widget.stage == kStageForDownPayment || widget.stage == kStageForOngoing;
       final isDraftStageHereEarly = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
       if (!isDraftStageHereEarly) {
         _applyDraftLaborTravelFromRow(d);
@@ -18161,7 +18218,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             'manager_down_payment_method': _managerDownPaymentMethod,
             'processing_phase': _processingSubstageForUi,
           },
-          if (widget.stage == 'for_post_analysis') 'manager_full_payment_method': _managerFullPaymentMethod,
+          if (widget.stage == kStageForFullPayment) 'manager_full_payment_method': _managerFullPaymentMethod,
         };
         if (_managerDownPaymentProofBytes != null) {
           postAnalysis['manager_down_payment_proof_b64'] = base64Encode(_managerDownPaymentProofBytes!);
@@ -18735,7 +18792,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           foregroundColor: const Color(0xFFFFC024),
           leading: _buildManagerHamburgerLeading(context, widget.state),
           title: Text(
-            cateringManagerDetailTabTitle(row, widget.stage, processingSubstageOverride: widget.processingSubstage),
+            cateringManagerDetailTabTitle(row, widget.stage),
             style: kManagerAppBarTitleStyle,
           ),
           centerTitle: true,
@@ -18809,7 +18866,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     Future<void> submitNext() async {
       final processingSubstageEarly = _processingSubstageForUi;
-      if (widget.stage == 'for_processing' && processingSubstageEarly == 'down_payment') {
+      if (widget.stage == kStageForDownPayment) {
         final invoiceEarly = _baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(additionalCosts);
         final dueHalfEarly = invoiceEarly * 0.5;
         if (!cateringDownPaymentConfirmed(d, dueHalfEarly)) {
@@ -18835,10 +18892,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         _snapshotAdditionalCostsForCurrentStage(clearWorking: true, refreshTimestamp: true);
         _showManagerBlockingProgress('Moving to On Going…');
         try {
-          final err = await widget.state.managerPatchCateringPostAnalysis(
+          final err = await widget.state.managerAdvanceCateringStage(
             id: d.id,
             orderKind: d.orderKind,
-            patch: {
+            status: kStageForOngoing,
+            postAnalysis: {
               'processing_phase': 'ongoing',
               'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
             },
@@ -18851,7 +18909,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           final full = await widget.state.loadManagerCateringItem(id: d.id, orderKind: d.orderKind);
           if (!mounted) return;
           if (full != null) setState(() => _loadedDetailRow = full);
-          await widget.state.loadManagerCateringByStage(widget.stage, force: true);
+          await widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
           appSnack(context, 'Moved to On Going');
         } finally {
           if (mounted) _hideManagerBlockingProgress();
@@ -18860,14 +18918,16 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
 
       final target = widget.stage == 'online_inquiries'
-          ? 'for_processing'
+          ? kStageForDownPayment
           : widget.stage == 'new_event'
-              ? 'for_processing'
-          : widget.stage == 'for_processing'
-          ? 'for_post_analysis'
-          : widget.stage == 'for_post_analysis'
-              ? 'completed'
-              : '';
+              ? kStageForDownPayment
+              : widget.stage == kStageForDownPayment
+                  ? kStageForOngoing
+                  : widget.stage == kStageForOngoing
+                      ? kStageForFullPayment
+                      : widget.stage == kStageForFullPayment
+                          ? 'completed'
+                          : '';
       if (target.isEmpty) return;
       if (!canComplete && target == 'completed') {
         appSnack(context, 'Supervisor cannot complete orders.');
@@ -18969,8 +19029,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           {'label': 'Theme design cost', 'amount': _themeDesignCostAmount()},
         {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSubmit)},
       ];
-      final advancingToFullPayment =
-          widget.stage == 'for_processing' && processingSubstageEarly == 'ongoing' && target == 'for_post_analysis';
+      final advancingToFullPayment = widget.stage == kStageForOngoing && target == kStageForFullPayment;
       final confirm = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -18990,7 +19049,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (advancingToFullPayment) {
         _snapshotAdditionalCostsForCurrentStage(clearWorking: true, refreshTimestamp: true);
       }
-      if (target == 'for_post_analysis' && !advancingToFullPayment) {
+      if (target == kStageForFullPayment && !advancingToFullPayment) {
         final dueHalf = invoiceTotalSubmit * 0.5;
         if (!cateringDownPaymentConfirmed(rowSubmit, dueHalf)) {
           appSnack(
@@ -19011,7 +19070,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           return;
         }
       }
-      if (widget.stage == 'for_post_analysis' && target == 'completed') {
+      if (widget.stage == kStageForFullPayment && target == 'completed') {
         postAnalysis['order_summary_pdf1_additional_costs'] =
             _orderSummaryPdf1AdditionalCosts.map((e) => Map<String, dynamic>.from(e)).toList();
       }
@@ -19049,9 +19108,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               : (advancingToFullPayment ? 'Moved to For Full Payment' : 'Moved to next stage'),
         );
         if (advancingToFullPayment) {
-          await widget.state.loadManagerCateringByStage('for_post_analysis', force: true);
+          await widget.state.loadManagerCateringByStage(kStageForFullPayment, force: true);
         }
-        await widget.state.loadManagerCateringByStage('for_processing', force: true);
+        await widget.state.loadManagerCateringByStage(kStageForDownPayment, force: true);
+        await widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
         await widget.state.loadManagerCateringByStage(widget.stage, force: true);
         if (mounted) Navigator.of(context).pop();
       } finally {
@@ -19103,7 +19163,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         leading: _buildManagerHamburgerLeading(context, widget.state),
         title: Text(
           row.transactionNo.trim().isNotEmpty
-              ? '${cateringManagerDetailTabTitle(row, widget.stage, processingSubstageOverride: widget.processingSubstage)} — ${row.transactionNo.trim()}'
+              ? '${cateringManagerDetailTabTitle(row, widget.stage)} — ${row.transactionNo.trim()}'
               : (row.eventTitle.isEmpty ? row.customerName : row.eventTitle),
           style: kManagerAppBarTitleStyle,
         ),
@@ -20087,20 +20147,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 })
                             : null,
                       ),
-                      const SizedBox(height: 8),
-                      const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
-                      const SizedBox(height: 6),
-                      buildGuestAllergenSelector(
-                        catalog: widget.state.allergenCatalog,
-                        selected: managerGuestAllergens,
-                        enabled: canEditStage,
-                        onChanged: (next) => setState(() {
-                          managerGuestAllergens
-                            ..clear()
-                            ..addAll(next);
-                        }),
-                      ),
-                      const SizedBox(height: 8),
                     ],
                     TextField(
                       controller: managerGuestCountController,
@@ -20162,6 +20208,35 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ),
             ),
           ),
+          if (_isManagerDraftDetailStage)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'Select allergens your guests must avoid (optional).',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                    const SizedBox(height: 8),
+                    buildGuestAllergenSelector(
+                      catalog: widget.state.allergenCatalog,
+                      selected: managerGuestAllergens,
+                      enabled: canEditStage,
+                      onChanged: (next) => setState(() {
+                        managerGuestAllergens
+                          ..clear()
+                          ..addAll(next);
+                      }),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (_isManagerDraftDetailStage) const SizedBox(height: 8),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
@@ -20228,37 +20303,52 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               child: Material(
                                 color: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
                                 borderRadius: BorderRadius.circular(10),
-                                child: InkWell(
-                                  borderRadius: BorderRadius.circular(10),
-                                  onTap: !canEditStage
-                                      ? null
-                                      : () => setState(() {
-                                            if (sel) {
-                                              selectedDishes.remove(dish.name);
-                                            } else {
-                                              selectedDishes.add(dish.name);
-                                            }
-                                          }),
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                    child: Row(
-                                      children: [
-                                        SizedBox(
-                                          width: 40,
-                                          height: 40,
-                                          child: ClipRRect(
-                                            borderRadius: BorderRadius.circular(8),
-                                            child: _MenuThumb(item: dish, compact: true),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  child: Row(
+                                    children: [
+                                      SizedBox(
+                                        width: 40,
+                                        height: 40,
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(8),
+                                          child: _MenuThumb(item: dish, compact: true),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: InkWell(
+                                          onTap: () => showDishAllergensDialog(
+                                            context,
+                                            dishName: dish.name,
+                                            allergens: dish.allergens,
+                                          ),
+                                          child: Text(
+                                            dish.name,
+                                            style: const TextStyle(
+                                              decoration: TextDecoration.underline,
+                                              fontWeight: FontWeight.w600,
+                                            ),
                                           ),
                                         ),
-                                        const SizedBox(width: 10),
-                                        Expanded(child: Text(dish.name)),
-                                        Icon(
+                                      ),
+                                      IconButton(
+                                        tooltip: sel ? 'Remove from menu' : 'Add to menu',
+                                        onPressed: !canEditStage
+                                            ? null
+                                            : () => setState(() {
+                                                  if (sel) {
+                                                    selectedDishes.remove(dish.name);
+                                                  } else {
+                                                    selectedDishes.add(dish.name);
+                                                  }
+                                                }),
+                                        icon: Icon(
                                           sel ? Icons.check_circle : Icons.circle_outlined,
                                           color: sel ? AppColors.success : Colors.grey.shade500,
                                         ),
-                                      ],
-                                    ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ),
@@ -20397,7 +20487,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       transactionNo: row.transactionNo,
                       helperText: widget.supervisorMode
                           ? 'View seating layout output. Download as image or PDF.'
-                          : widget.stage == 'for_processing'
+                          : widget.stage == kStageForDownPayment || widget.stage == kStageForOngoing
                               ? 'Edit table and chair placement while this order is in For Processing.'
                               : 'View the seating layout submitted with this inquiry.',
                       buttonLabel:
@@ -20811,7 +20901,19 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(item.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
+                InkWell(
+                  onTap: () => showDishAllergensDialog(
+                    context,
+                    dishName: item.name,
+                    allergens: item.allergens,
+                  ),
+                  child: Text(
+                    item.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12, decoration: TextDecoration.underline),
+                  ),
+                ),
                 if (item.dips.isNotEmpty)
                   Text(
                     item.dips.join(', ').toUpperCase(),

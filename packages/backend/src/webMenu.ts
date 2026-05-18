@@ -52,7 +52,8 @@ export const DEFAULT_PUBLIC_SET_MENUS_SQL = `
       (
         SELECT json_agg(md.name ORDER BY u.ord)::text
         FROM unnest(sm.dish_ids) WITH ORDINALITY AS u(dish_id, ord)
-        INNER JOIN public.menu_dishes md ON md.id::text = TRIM(BOTH FROM u.dish_id::text)
+        LEFT JOIN public.menu_dishes md ON md.id::text = TRIM(BOTH FROM u.dish_id::text)
+        WHERE md.id IS NOT NULL
       ),
       '[]'
     ) AS dishes

@@ -21,12 +21,16 @@ bool canShowSeatingLayout(String status) {
   final s = status.trim().toLowerCase();
   return s == 'online_inquiries' ||
       s == 'new_event' ||
-      s == 'for_processing' ||
-      s == 'for_post_analysis';
+      s == 'for_down_payment' ||
+      s == 'for_ongoing' ||
+      s == 'for_full_payment';
 }
 
-/// Edit seating only while order is in For Processing.
-bool canEditSeatingLayout(String status) => status.trim().toLowerCase() == 'for_processing';
+/// Edit seating only while order is On Going.
+bool canEditSeatingLayout(String status) {
+  final s = status.trim().toLowerCase();
+  return s == 'for_ongoing';
+}
 
 String eventDesignSourceLabel(Map<String, dynamic> themeDesign) {
   final src = '${themeDesign['eventDesignSource'] ?? ''}'.trim().toLowerCase();

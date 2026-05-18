@@ -1,9 +1,22 @@
 /**
  * SQL fragments and row normalizers so APIs stay stable while the DB uses canonical column names.
  */
+import type pg from "pg";
+import { columnExists } from "./schemaColumns.js";
 
 /** Touch timestamp on customer_accounts (legacy updated_at was pruned). */
 export const CUSTOMER_ACCOUNT_TOUCH = `updated_pw_dt_stamp = NOW()`;
+
+/** Optional touch fragment when updated_pw_dt_stamp exists. */
+export async function customerAccountTouchSet(pool: pg.Pool): Promise<string> {
+  if (await columnExists(pool, "customer_accounts", "updated_pw_dt_stamp")) {
+    return "updated_pw_dt_stamp = NOW()";
+  }
+  if (await columnExists(pool, "customer_accounts", "updated_at")) {
+    return "updated_at = NOW()";
+  }
+  return "";
+}
 
 /** Business order number ORD-****** from canonical `order_id` / `mobile_id`. */
 export const RESTAURANT_ORDER_BUSINESS_ID_SQL = `
@@ -16,7 +29,6 @@ export const RESTAURANT_ORDER_BUSINESS_ID_SQL = `
 /** Timestamps for restaurant_orders (canonical columns only). */
 export const RESTAURANT_ORDER_CREATED_AT_SQL = `COALESCE(
   submitted_order_dt_stamp,
-  created_at,
   last_updated_order_status_dt_stamp,
   NOW()
 )`.trim();
@@ -24,7 +36,6 @@ export const RESTAURANT_ORDER_CREATED_AT_SQL = `COALESCE(
 export const RESTAURANT_ORDER_UPDATED_AT_SQL = `COALESCE(
   last_updated_order_status_dt_stamp,
   submitted_order_dt_stamp,
-  created_at,
   NOW()
 )`.trim();
 
@@ -47,12 +58,13 @@ export const RESTAURANT_ORDER_TOUCH_SET = `last_updated_order_status_dt_stamp = 
 /** Touch row after catering_orders / event_orders mutation. */
 export const CATERING_ORDER_TOUCH_SET = `stage_entered_at = NOW()`;
 
-/** Map manager API tab stage to DB status (for_post_analysis → for_full_payment). */
-export function mapManagerCateringStageToDb(apiStage: string): string {
-  const s = apiStage.trim().toLowerCase();
-  if (s === "for_post_analysis") return "for_full_payment";
-  return s;
-}
+export {
+  cateringStatusesForApiStage,
+  mapManagerCateringStageToDb,
+  normalizeCateringStatusForApi,
+  CATERING_ACTIVE_SCHEDULE_STATUSES_SQL,
+  CATERING_BILLING_LATE_STATUSES_SQL,
+} from "./cateringStages.js";
 
 /** Shared SELECT for restaurant order API responses — canonical `restaurant_orders` columns only. */
 export const RESTAURANT_ORDER_SELECT = `
@@ -262,13 +274,85 @@ export function postAnalysisPersistCoalesceSet(paramRef: string): string {
   return postAnalysisPersistSet(paramRef);
 }
 
+/** SET clause for storing forgot-password OTP + expiry (all column names that exist). */
+export async function buildCustomerForgotOtpUpdateSet(pool: pg.Pool): Promise<string> {
+  const parts: string[] = [];
+  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code")) {
+    parts.push("forgot_password_otp_code = $2");
+  }
+  if (await columnExists(pool, "customer_accounts", "password_reset_otp")) {
+    parts.push("password_reset_otp = $2");
+  }
+  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code_expiry")) {
+    parts.push("forgot_password_otp_code_expiry = $3::timestamptz");
+  }
+  if (await columnExists(pool, "customer_accounts", "password_reset_expires_at")) {
+    parts.push("password_reset_expires_at = $3::timestamptz");
+  }
+  const touch = await customerAccountTouchSet(pool);
+  if (touch) parts.push(touch);
+  if (parts.length === 0) {
+    throw new Error("customer_accounts has no password-reset OTP columns");
+  }
+  return parts.join(", ");
+}
+
+/** SET clause to clear forgot-password OTP after a successful reset. */
+export async function buildCustomerForgotOtpClearSet(pool: pg.Pool): Promise<string> {
+  const parts: string[] = [];
+  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code")) {
+    parts.push("forgot_password_otp_code = NULL");
+  }
+  if (await columnExists(pool, "customer_accounts", "password_reset_otp")) {
+    parts.push("password_reset_otp = NULL");
+  }
+  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code_expiry")) {
+    parts.push("forgot_password_otp_code_expiry = NULL");
+  }
+  if (await columnExists(pool, "customer_accounts", "password_reset_expires_at")) {
+    parts.push("password_reset_expires_at = NULL");
+  }
+  const touch = await customerAccountTouchSet(pool);
+  if (touch) parts.push(touch);
+  return parts.join(", ");
+}
+
+/** WHERE fragment: OTP matches and not expired (any column set that exists). */
+export async function buildCustomerForgotOtpValidWhere(pool: pg.Pool, otpParam: string): Promise<string> {
+  const checks: string[] = [];
+  const hasCanonOtp = await columnExists(pool, "customer_accounts", "forgot_password_otp_code");
+  const hasCanonExp = await columnExists(pool, "customer_accounts", "forgot_password_otp_code_expiry");
+  const hasLegacyOtp = await columnExists(pool, "customer_accounts", "password_reset_otp");
+  const hasLegacyExp = await columnExists(pool, "customer_accounts", "password_reset_expires_at");
+
+  if (hasCanonOtp && hasCanonExp) {
+    checks.push(
+      `(${sqlOtpMatches("forgot_password_otp_code", otpParam)} AND forgot_password_otp_code_expiry > NOW())`,
+    );
+  } else if (hasCanonOtp) {
+    checks.push(sqlOtpMatches("forgot_password_otp_code", otpParam));
+  }
+  if (hasLegacyOtp && hasLegacyExp) {
+    checks.push(`(${sqlOtpMatches("password_reset_otp", otpParam)} AND password_reset_expires_at > NOW())`);
+  } else if (hasLegacyOtp) {
+    checks.push(sqlOtpMatches("password_reset_otp", otpParam));
+  }
+  if (checks.length === 0) return "FALSE";
+  return `(${checks.join(" OR ")})`;
+}
+
+/** @deprecated Use [buildCustomerForgotOtpUpdateSet]. */
 export function customerForgotOtpUpdateSql(): { set: string; clear: string } {
   return {
     set: `forgot_password_otp_code = $2,
-          forgot_password_otp_code_expiry = $3,
+          forgot_password_otp_code_expiry = $3::timestamptz,
+          password_reset_otp = $2,
+          password_reset_expires_at = $3::timestamptz,
           updated_pw_dt_stamp = NOW()`,
     clear: `forgot_password_otp_code = NULL,
             forgot_password_otp_code_expiry = NULL,
+            password_reset_otp = NULL,
+            password_reset_expires_at = NULL,
             updated_pw_dt_stamp = NOW()`,
   };
 }
