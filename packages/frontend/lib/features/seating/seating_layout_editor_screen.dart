@@ -139,6 +139,7 @@ class _SeatingLayoutEditorScreenState extends State<SeatingLayoutEditorScreen> {
         const SnackBar(content: Text('Seating layout saved.')),
       );
       await previewSeatingLayoutPdf(
+        context: context,
         plan: _plan,
         eventTitle: widget.eventTitle,
         transactionNo: widget.transactionNo,
@@ -175,6 +176,7 @@ class _SeatingLayoutEditorScreenState extends State<SeatingLayoutEditorScreen> {
                 tooltip: 'Preview PDF',
                 icon: const Icon(Icons.picture_as_pdf_outlined),
                 onPressed: () => previewSeatingLayoutPdf(
+                  context: context,
                   plan: _plan,
                   eventTitle: widget.eventTitle,
                   transactionNo: widget.transactionNo,

@@ -176,6 +176,8 @@ const RESTAURANT_ORDERS_COLUMNS = new Set([
   "user_email",
   "guest_contact_email",
   "payment_mode",
+  "order_no",
+  "pos_customer_label",
   "created_at",
   "updated_at",
 ]);

@@ -12,44 +12,21 @@ import 'package:printing/printing.dart';
 import 'seating_plan.dart';
 import 'seating_plan_canvas.dart';
 
-/// Build a landscape PDF of the seating layout (tables + seat counts).
+/// Build a landscape PDF embedding the same PNG capture used for gallery export.
 Future<Uint8List> buildSeatingLayoutPdfBytes({
+  required BuildContext context,
   required SeatingPlanData plan,
   String eventTitle = '',
   String transactionNo = '',
 }) async {
+  final png = await _captureSeatingLayoutPng(context: context, plan: plan);
   final doc = pw.Document();
-  const pageW = 792.0;
-  const pageH = 612.0;
-  const margin = 36.0;
-  final drawW = pageW - margin * 2;
-  final drawH = pageH - margin * 2 - 48;
-
-  double minX = 1;
-  double minY = 1;
-  double maxX = 0;
-  double maxY = 0;
-  for (final t in plan.tables) {
-    minX = minX < t.xNorm ? minX : t.xNorm;
-    minY = minY < t.yNorm ? minY : t.yNorm;
-    maxX = maxX > t.xNorm + t.wNorm ? maxX : t.xNorm + t.wNorm;
-    maxY = maxY > t.yNorm + t.hNorm ? maxY : t.yNorm + t.hNorm;
-  }
-  if (plan.tables.isEmpty) {
-    minX = 0;
-    minY = 0;
-    maxX = 1;
-    maxY = 1;
-  }
-  final bboxW = (maxX - minX).clamp(0.05, 1.0);
-  final bboxH = (maxY - minY).clamp(0.05, 1.0);
-  final layoutScale = (drawW / bboxW < drawH / bboxH ? drawW / bboxW : drawH / bboxH) * 0.9;
-  final offsetX = (drawW - bboxW * layoutScale) / 2 - minX * layoutScale;
-  final offsetY = (drawH - bboxH * layoutScale) / 2 - minY * layoutScale;
+  final image = pw.MemoryImage(png);
 
   doc.addPage(
     pw.Page(
-      pageFormat: PdfPageFormat(pageW, pageH, marginAll: margin),
+      pageFormat: PdfPageFormat.landscape,
+      margin: const pw.EdgeInsets.all(28),
       build: (ctx) {
         return pw.Column(
           crossAxisAlignment: pw.CrossAxisAlignment.start,
@@ -61,40 +38,13 @@ Future<Uint8List> buildSeatingLayoutPdfBytes({
             if (eventTitle.trim().isNotEmpty) pw.Text('Event: ${eventTitle.trim()}'),
             if (transactionNo.trim().isNotEmpty) pw.Text('Reference: ${transactionNo.trim()}'),
             pw.Text('Generated: ${DateTime.now().toLocal()}'),
-            pw.SizedBox(height: 12),
-            pw.Container(
-              width: drawW,
-              height: drawH,
-              decoration: pw.BoxDecoration(
-                border: pw.Border.all(color: PdfColors.grey500, width: 0.5),
-              ),
-              child: pw.Stack(
-                children: [
-                  for (final t in plan.tables)
-                    pw.Transform.translate(
-                      offset: PdfPoint(
-                        t.xNorm * layoutScale + offsetX,
-                        t.yNorm * layoutScale + offsetY,
-                      ),
-                      child: pw.Container(
-                        width: t.wNorm * layoutScale,
-                        height: t.hNorm * layoutScale,
-                        decoration: pw.BoxDecoration(
-                          border: pw.Border.all(color: PdfColors.black, width: 0.8),
-                          color: PdfColors.grey200,
-                        ),
-                        alignment: pw.Alignment.center,
-                        child: pw.Text(
-                          '${t.label}\n${t.seatCount} seats',
-                          textAlign: pw.TextAlign.center,
-                          style: const pw.TextStyle(fontSize: 8),
-                        ),
-                      ),
-                    ),
-                ],
+            pw.SizedBox(height: 10),
+            pw.Expanded(
+              child: pw.Center(
+                child: pw.Image(image, fit: pw.BoxFit.contain),
               ),
             ),
-            pw.SizedBox(height: 8),
+            pw.SizedBox(height: 6),
             pw.Text(
               'Tables: ${plan.tables.length} · Seats: ${plan.seats.length}',
               style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700),
@@ -108,11 +58,13 @@ Future<Uint8List> buildSeatingLayoutPdfBytes({
 }
 
 Future<void> previewSeatingLayoutPdf({
+  required BuildContext context,
   required SeatingPlanData plan,
   String eventTitle = '',
   String transactionNo = '',
 }) async {
   final bytes = await buildSeatingLayoutPdfBytes(
+    context: context,
     plan: plan,
     eventTitle: eventTitle,
     transactionNo: transactionNo,
@@ -136,8 +88,8 @@ Future<Uint8List> _captureSeatingLayoutPng({
         child: RepaintBoundary(
           key: boundaryKey,
           child: Container(
-            width: 900,
-            height: 620,
+            width: 1200,
+            height: 800,
             color: Colors.white,
             padding: const EdgeInsets.all(8),
             child: SeatingPlanInteractive(plan: plan, editable: false),
@@ -147,7 +99,7 @@ Future<Uint8List> _captureSeatingLayoutPng({
     ),
   );
   overlay.insert(entry);
-  await Future<void>.delayed(const Duration(milliseconds: 120));
+  await Future<void>.delayed(const Duration(milliseconds: 150));
   try {
     final boundary = boundaryKey.currentContext?.findRenderObject();
     if (boundary is! RenderRepaintBoundary) {

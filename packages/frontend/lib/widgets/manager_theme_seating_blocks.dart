@@ -69,6 +69,7 @@ Widget buildManagerSeatingLayoutBlock({
   final hasPlan = !plan.isEffectivelyEmpty;
 
   Future<void> previewPdf() => previewSeatingLayoutPdf(
+        context: context,
         plan: plan,
         eventTitle: eventTitle,
         transactionNo: transactionNo,

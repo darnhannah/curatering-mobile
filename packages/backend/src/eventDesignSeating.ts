@@ -6,7 +6,14 @@ import type pg from "pg";
 
 const VENUE_FLOOR_SHAPES = new Set(["banquet_rect", "theater", "round_hall", "u_shape", "l_shape"]);
 const TABLE_SHAPES = new Set(["rect", "round", "chair"]);
-const SEATING_EDIT_STATUSES = new Set(["for_processing"]);
+const SEATING_EDIT_STATUSES = new Set([
+  "new_event",
+  "online_inquiries",
+  "for_down_payment",
+  "for_ongoing",
+  "for_full_payment",
+  "for_processing",
+]);
 const THEME_EDIT_STATUSES = new Set([
   "online_inquiries",
   "new_event",
@@ -459,7 +466,7 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
       }
       const st = String(access.row.status ?? "").trim().toLowerCase();
       if (!canEditSeating(st)) {
-        res.status(400).json({ error: "seating can only be edited while order is in For Processing" });
+        res.status(400).json({ error: "seating cannot be edited in this order stage" });
         return;
       }
       const normalized = normalizeSeatingPlan(rawPlan);

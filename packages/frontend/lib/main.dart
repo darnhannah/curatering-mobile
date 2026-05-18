@@ -362,7 +362,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
         }
         if (email != null &&
             !(appState.userRole == 'customer' && appState.isGuestSession)) {
-          final every = (appState.isCashier || appState.isManagerOrSupervisor) ? 3 : 4;
+          final every = (appState.isCashier || appState.isManagerOrSupervisor) ? 3 : 6;
           if (_realtimeSyncTimer == null || !_realtimeSyncTimer!.isActive || _realtimePollIntervalSec != every) {
             _realtimePollIntervalSec = every;
             _realtimeSyncTimer?.cancel();
@@ -1357,6 +1357,10 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
 }
 
 String cashierCustomerLabel(OrderData o) {
+  if (o.orderSource.toUpperCase() == 'POS') {
+    final pos = o.posCustomerLabel.trim();
+    if (pos.isNotEmpty) return pos;
+  }
   final n = o.customerDisplayName?.trim();
   if (n != null && n.isNotEmpty) return n;
   final fn = o.orderFullName?.trim();
@@ -1387,13 +1391,13 @@ bool orderShowsDeliveryTrackingLink(OrderData o) {
   return false;
 }
 
-/// Prefer business `order_id` (ORD-******) over legacy `order_no` alias.
+/// Prefer canonical `order_no` from restaurant_orders, then `order_id`.
 String orderNoFromApiMap(Map<String, dynamic> map) {
-  var orderId = '${map['order_id'] ?? ''}'.trim();
-  if (orderId.isEmpty || orderId.toUpperCase() == 'TEMP') {
-    orderId = '${map['order_no'] ?? ''}'.trim();
+  var orderNo = '${map['order_no'] ?? ''}'.trim();
+  if (orderNo.isEmpty || orderNo.toUpperCase() == 'TEMP') {
+    orderNo = '${map['order_id'] ?? ''}'.trim();
   }
-  if (orderId.isNotEmpty && orderId.toUpperCase() != 'TEMP') return orderId;
+  if (orderNo.isNotEmpty && orderNo.toUpperCase() != 'TEMP') return orderNo;
   final mid = map['id'] ?? map['mobile_id'];
   if (mid != null) {
     final n = int.tryParse('$mid');
@@ -2308,12 +2312,15 @@ class AppState extends ChangeNotifier {
   bool _realtimePollInFlight = false;
   String _lastTrayServerStamp = '';
   String _lastRealtimeServerTime = '';
+  DateTime? _trayServerSyncHoldUntil;
+  final List<Map<String, dynamic>> _pendingTrayLines = [];
   DateTime? _ordersLoadedAt;
   DateTime? _inquiriesLoadedAt;
   DateTime? _profileLoadedAt;
   DateTime? _notificationsLoadedAt;
   final Set<String> _managerCateringInFlightStages = <String>{};
   final Map<String, DateTime> _managerCateringLoadedAt = <String, DateTime>{};
+  final Map<String, String> _managerCateringLoadErrors = <String, String>{};
   String _managerActiveStage = 'new_event';
   bool _loadOrdersInFlight = false;
   bool _loadInquiriesInFlight = false;
@@ -2337,6 +2344,8 @@ class AppState extends ChangeNotifier {
   bool get hasCashierAttentionBadge => cashierOnlineOrders.any((o) => o.balanceProofPendingReview);
   List<CateringEventRecord> managerRowsForStage(String stage) =>
       List.unmodifiable(_managerCateringByStage[stage] ?? const <CateringEventRecord>[]);
+
+  String? managerCateringLoadErrorForStage(String stage) => _managerCateringLoadErrors[stage];
 
   int managerCateringCountForTab(int tabIdx) {
     switch (tabIdx) {
@@ -2711,7 +2720,9 @@ class AppState extends ChangeNotifier {
 
   /// After order is placed (before payment), empty tray so checkout items do not linger in UI.
   Future<void> clearTrayPersistOnly() async {
+    _markTrayLocallyEdited();
     tray.clear();
+    _pendingTrayLines.clear();
     notifyListeners();
     final e = userEmail?.toLowerCase();
     if (e == null || userRole != 'customer') return;
@@ -2736,8 +2747,57 @@ class AppState extends ChangeNotifier {
     } else {
       tray.clear();
     }
-    await pullCustomerTrayDraftFromServer();
+    if (tray.isEmpty) {
+      await pullCustomerTrayDraftFromServer();
+    } else {
+      await _refreshTrayServerStampOnly();
+    }
     notifyListeners();
+  }
+
+  Future<void> _refreshTrayServerStampOnly() async {
+    final email = userEmail;
+    if (email == null || userRole != 'customer' || isGuestSession) return;
+    try {
+      final res =
+          await http.get(_uri('/api/mobile/customer/tray-draft', {'user_email': email})).timeout(_apiTimeout);
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return;
+      _lastTrayServerStamp = '${body['updated_at'] ?? ''}';
+    } catch (_) {}
+  }
+
+  void _markTrayLocallyEdited() {
+    _trayServerSyncHoldUntil = DateTime.now().add(const Duration(seconds: 25));
+  }
+
+  bool get _shouldSkipTrayServerPull {
+    if (isGuestSession) return true;
+    final hold = _trayServerSyncHoldUntil;
+    return hold != null && DateTime.now().isBefore(hold);
+  }
+
+  List<Map<String, dynamic>> _trayLinesSnapshot() {
+    return tray
+        .map(
+          (e) => <String, dynamic>{
+            'id': e.menu.id,
+            'dip': e.dip,
+            'dip_qty': e.dipQty,
+            'qty': e.qty,
+          },
+        )
+        .toList();
+  }
+
+  int _trayLineQtyTotal(List<dynamic> list) {
+    var n = 0;
+    for (final e in list) {
+      if (e is! Map) continue;
+      n += jsonToInt(e['qty']);
+    }
+    return n;
   }
 
   Future<void> _persistCustomerTraySnapshot() async {
@@ -2755,6 +2815,7 @@ class AppState extends ChangeNotifier {
         )
         .toList();
     await prefs.setString('customer_tray_v1_$k', jsonEncode(lines));
+    _markTrayLocallyEdited();
     unawaited(_pushCustomerTrayDraftToServer(lines));
   }
 
@@ -2780,14 +2841,20 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
 
-  void _applyTrayLinesSnapshot(List<dynamic> list) {
-    tray.clear();
+  void _applyTrayLinesSnapshot(List<dynamic> list, {bool allowEmptyClear = false}) {
+    if (list.isEmpty) {
+      if (allowEmptyClear) tray.clear();
+      return;
+    }
+    final next = <CartItem>[];
+    final pending = <Map<String, dynamic>>[];
     for (final e in list) {
       if (e is! Map) continue;
       final id = '${e['id']}';
       final dip = '${e['dip'] ?? ''}';
       final dipQty = math.max(0, jsonToInt(e['dip_qty'], 1));
       final qty = jsonToInt(e['qty']);
+      if (qty <= 0) continue;
       MenuItemData? foundItem;
       for (final x in menu) {
         if (x.id == id) {
@@ -2795,10 +2862,26 @@ class AppState extends ChangeNotifier {
           break;
         }
       }
-      if (foundItem != null && qty > 0) {
-        tray.add(CartItem(menu: foundItem, dip: dip, dipQty: dipQty, qty: qty));
+      if (foundItem != null) {
+        next.add(CartItem(menu: foundItem, dip: dip, dipQty: dipQty, qty: qty));
+      } else {
+        pending.add({'id': id, 'dip': dip, 'dip_qty': dipQty, 'qty': qty});
       }
     }
+    if (next.isNotEmpty || pending.isEmpty) {
+      tray
+        ..clear()
+        ..addAll(next);
+    }
+    _pendingTrayLines
+      ..clear()
+      ..addAll(pending);
+  }
+
+  void _reapplyPendingTrayLines() {
+    if (_pendingTrayLines.isEmpty) return;
+    final pending = List<Map<String, dynamic>>.from(_pendingTrayLines);
+    _applyTrayLinesSnapshot(pending);
   }
 
   Future<void> _pushCustomerTrayDraftToServer(List<Map<String, dynamic>> lines) async {
@@ -2823,6 +2906,7 @@ class AppState extends ChangeNotifier {
   Future<void> pullCustomerTrayDraftFromServer() async {
     final email = userEmail;
     if (email == null || userRole != 'customer' || isGuestSession) return;
+    if (_shouldSkipTrayServerPull) return;
     try {
       final res =
           await http.get(_uri('/api/mobile/customer/tray-draft', {'user_email': email})).timeout(_apiTimeout);
@@ -2832,7 +2916,9 @@ class AppState extends ChangeNotifier {
       final trayLines = body['tray_lines'];
       final updatedAt = '${body['updated_at'] ?? ''}';
       if (trayLines is! List) return;
-      _applyTrayLinesSnapshot(trayLines);
+      if (tray.isNotEmpty && trayLines.isEmpty) return;
+      if (tray.isNotEmpty && _trayLineQtyTotal(trayLines) < _trayLineQtyTotal(_trayLinesSnapshot())) return;
+      _applyTrayLinesSnapshot(trayLines, allowEmptyClear: true);
       final prefs = await SharedPreferences.getInstance();
       final k = email.toLowerCase();
       await prefs.setString('customer_tray_v1_$k', jsonEncode(trayLines));
@@ -2966,6 +3052,8 @@ class AppState extends ChangeNotifier {
     cashierWalkInComplete.clear();
     cashierWalkInCancelled.clear();
     _managerCateringByStage.clear();
+    _managerCateringLoadErrors.clear();
+    _managerCateringLoadedAt.clear();
     loyaltyHistory.clear();
     showLoginWelcomeDialog = false;
     profile = ProfileData();
@@ -3167,7 +3255,9 @@ class AppState extends ChangeNotifier {
           final allow = delta == null || (inquiryIds is List && inquiryIds.isNotEmpty);
           if (allow) jobs.add(loadInquiries(force: true));
         }
-        if (_stampChanged(previous, next, 'tray') && next['tray'] != _lastTrayServerStamp) {
+        if (!_shouldSkipTrayServerPull &&
+            _stampChanged(previous, next, 'tray') &&
+            next['tray'] != _lastTrayServerStamp) {
           jobs.add(pullCustomerTrayDraftFromServer());
         }
         if (_stampChanged(previous, next, 'profile') || _stampChanged(previous, next, 'loyalty')) {
@@ -3198,6 +3288,7 @@ class AppState extends ChangeNotifier {
     }
     _loadMenuInFlight = true;
     try {
+      final trayBeforeReload = _trayLinesSnapshot();
       final res = await http.get(_uri('/api/mobile/menu'));
       if (res.statusCode != 200) {
         debugPrint('loadMenu failed: ${res.statusCode} ${res.body}');
@@ -3228,6 +3319,11 @@ class AppState extends ChangeNotifier {
             );
           }),
         );
+      if (trayBeforeReload.isNotEmpty) {
+        _applyTrayLinesSnapshot(trayBeforeReload);
+      } else {
+        _reapplyPendingTrayLines();
+      }
       _menuLoadedAt = DateTime.now();
       notifyListeners();
     } finally {
@@ -3328,7 +3424,7 @@ class AppState extends ChangeNotifier {
       deliveryAddresses: addrList,
     );
       _profileLoadedAt = DateTime.now();
-      await loadLoyaltyHistory(force: true);
+      await loadLoyaltyHistory(force: force);
       notifyListeners();
     } finally {
       _loadProfileInFlight = false;
@@ -3429,6 +3525,7 @@ class AppState extends ChangeNotifier {
     } else {
       existing.first.qty += 1;
     }
+    _markTrayLocallyEdited();
     notifyListeners();
     _persistCustomerTraySnapshot().catchError((_) {});
   }
@@ -3438,6 +3535,7 @@ class AppState extends ChangeNotifier {
     if (item.qty <= 0) {
       tray.remove(item);
     }
+    _markTrayLocallyEdited();
     notifyListeners();
     _persistCustomerTraySnapshot().catchError((_) {});
   }
@@ -3446,6 +3544,7 @@ class AppState extends ChangeNotifier {
     if (item.dip.trim().isEmpty) return;
     item.dipQty += delta;
     if (item.dipQty < 0) item.dipQty = 0;
+    _markTrayLocallyEdited();
     notifyListeners();
     _persistCustomerTraySnapshot().catchError((_) {});
   }
@@ -3525,6 +3624,8 @@ class AppState extends ChangeNotifier {
 
   void clearTray() {
     tray.clear();
+    _pendingTrayLines.clear();
+    _markTrayLocallyEdited();
     notifyListeners();
     _persistCustomerTraySnapshot().catchError((_) {});
   }
@@ -3736,7 +3837,11 @@ class AppState extends ChangeNotifier {
         ..addAll(parsed);
       _ordersLoadedAt = DateTime.now();
       notifyListeners();
-      if (!isCashier && !isManagerOrSupervisor) {
+      if (!isCashier &&
+          !isManagerOrSupervisor &&
+          (force ||
+              _notificationsLoadedAt == null ||
+              DateTime.now().difference(_notificationsLoadedAt!) > const Duration(seconds: 45))) {
         await loadNotifications(force: true);
       }
     } finally {
@@ -3774,7 +3879,7 @@ class AppState extends ChangeNotifier {
     if (userEmail == null || !isManagerOrSupervisor) return;
     if (_managerCateringInFlightStages.contains(stage)) return;
     final loadedAt = _managerCateringLoadedAt[stage];
-    if (!force && loadedAt != null && DateTime.now().difference(loadedAt) < const Duration(seconds: 5)) {
+    if (!force && loadedAt != null && DateTime.now().difference(loadedAt) < const Duration(seconds: 20)) {
       return;
     }
     _managerCateringInFlightStages.add(stage);
@@ -3792,20 +3897,32 @@ class AppState extends ChangeNotifier {
           )
           .timeout(_managerCateringListTimeout);
       if (res.statusCode != 200) {
+        String msg = 'Could not load inquiries (${res.statusCode})';
+        try {
+          final err = jsonDecode(res.body);
+          if (err is Map && err['error'] != null) msg = '${err['error']}';
+        } catch (_) {}
+        _managerCateringLoadErrors[stage] = msg;
         debugPrint('loadManagerCateringByStage($stage): HTTP ${res.statusCode} ${res.body}');
+        notifyListeners();
         return;
       }
       final body = jsonDecode(res.body);
       if (body is! List) {
+        _managerCateringLoadErrors[stage] = 'Unexpected server response';
         debugPrint('loadManagerCateringByStage($stage): expected List, got ${body.runtimeType}');
+        notifyListeners();
         return;
       }
       _managerCateringByStage[stage] =
           body.whereType<Map<String, dynamic>>().map(CateringEventRecord.fromApiMap).toList();
       _managerCateringLoadedAt[stage] = DateTime.now();
+      _managerCateringLoadErrors.remove(stage);
       notifyListeners();
     } catch (e) {
+      _managerCateringLoadErrors[stage] = describeApiNetworkError(e, normalizeApiBase(apiBase));
       debugPrint('loadManagerCateringByStage($stage): $e');
+      notifyListeners();
     } finally {
       _managerCateringInFlightStages.remove(stage);
     }
@@ -4321,7 +4438,7 @@ class AppState extends ChangeNotifier {
     if (userEmail == null || !isCashier) return;
     if (!force &&
         _cashierOnlineOrdersLoadedAt != null &&
-        DateTime.now().difference(_cashierOnlineOrdersLoadedAt!) < const Duration(seconds: 2)) {
+        DateTime.now().difference(_cashierOnlineOrdersLoadedAt!) < const Duration(seconds: 4)) {
       return;
     }
     if (_loadCashierOnlineOrdersInFlight) {
@@ -4415,7 +4532,7 @@ class AppState extends ChangeNotifier {
     if (userEmail == null || !isCashier || _loadCashierWalkInQueuesInFlight) return;
     if (!force &&
         _cashierWalkInQueuesLoadedAt != null &&
-        DateTime.now().difference(_cashierWalkInQueuesLoadedAt!) < const Duration(seconds: 2)) {
+        DateTime.now().difference(_cashierWalkInQueuesLoadedAt!) < const Duration(seconds: 4)) {
       return;
     }
     _loadCashierWalkInQueuesInFlight = true;
@@ -5494,7 +5611,7 @@ class AppDrawer extends StatelessWidget {
   final AppState state;
 
   void open(BuildContext context, Widget screen) {
-    Navigator.of(context).pushReplacement(MaterialPageRoute<void>(builder: (_) => screen));
+    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
   }
 
   @override
@@ -6110,7 +6227,7 @@ class CustomerDashboardScreen extends StatelessWidget {
                             }
                             final screen = item.screen;
                             if (screen == null) return;
-                            Navigator.of(context).pushReplacement(
+                            Navigator.of(context).push(
                               MaterialPageRoute<void>(builder: (_) => screen),
                             );
                           },
@@ -8663,13 +8780,6 @@ class _PaymentScreenState extends State<PaymentScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await widget.state.loadOrders(force: true);
       if (!mounted) return;
-      if (widget.draftCheckout &&
-          _placedOrder == null &&
-          widget.state.tray.isEmpty) {
-        appSnack(context, 'Your tray is empty.');
-        Navigator.of(context).maybePop();
-        return;
-      }
       final base = _placedOrder ?? widget.order;
       if (base != null) {
         final synced = widget.state.orders.where((o) => o.id == base.id).toList();
@@ -8866,6 +8976,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
         final isDraft = widget.draftCheckout && _placedOrder == null;
         final synced = _syncedOrder(s);
         final orderForUi = isDraft ? _draftSnapshot(s) : (synced ?? _placedOrder ?? widget.order!);
+        final paymentOrderNo = () {
+          final raw = orderForUi.orderNo.trim();
+          if (raw.isNotEmpty) return uiOrderNo(raw);
+          if (orderForUi.id > 0) return uiOrderNo('ORD-${orderForUi.id.toString().padLeft(6, '0')}');
+          return null;
+        }();
         final finalOrderStatusUp = orderForUi.status.toUpperCase();
         // Keep the balance-payment UI (additional-payment card + original proof)
         // even after uploading the balance proof; the backend switches the status
@@ -8939,11 +9055,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       ),
                       const SizedBox(height: 12),
                     ],
-                    _OrderNoCard(
-                      displayNo: isDraft
-                          ? null
-                          : (orderForUi.orderNo.trim().isNotEmpty ? uiOrderNo(orderForUi.orderNo) : null),
-                    ),
+                    _OrderNoCard(displayNo: paymentOrderNo),
                     const SizedBox(height: 10),
                     if (insufficient) ...[
                       Card(
@@ -8980,9 +9092,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          if (!isDraft && orderForUi.orderNo.trim().isNotEmpty) ...[
+                          if (!isDraft && paymentOrderNo != null) ...[
                             Text(
-                              'Order No.: ${uiOrderNo(orderForUi.orderNo)}',
+                              'Order No.: $paymentOrderNo',
                               style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
                             ),
                             const SizedBox(height: 8),
@@ -10782,9 +10894,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                         SizedBox(
                           height: 140,
                           child: () {
-                            final history = widget.state.loyaltyHistory
-                                .where((h) => h.pointsDelta > 0)
-                                .toList();
+                            final history = widget.state.loyaltyHistory.toList();
                             if (history.isEmpty) {
                               return const Align(
                                 alignment: Alignment.topLeft,
@@ -11387,9 +11497,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
     eventCity.addListener(_onVenueChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await Future.wait([
-        widget.state.loadMenu(force: true),
-        widget.state.loadSetMenus(force: true),
-        widget.state.loadAllergenCatalog(force: true),
+        widget.state.loadMenu(),
+        widget.state.loadSetMenus(),
+        widget.state.loadAllergenCatalog(),
       ]);
       _scheduleConflictRefresh();
       if (mounted) setState(() {});
@@ -12719,8 +12829,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
               appSnack(context, 'Inquiry submitted');
               if (state.isGuestSession) {
                 _resetInquiryForm();
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)),
+                );
+              } else {
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute<void>(builder: (_) => MyInquiriesScreen(state: state)),
+                );
               }
-              Navigator.of(context).pushReplacement(MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)));
             },
           ),
         ],
@@ -14078,8 +14194,13 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
                             ],
                           ),
                           subtitle: Text(
-                            '${o.orderSource}\n${formatDateTimeLocal(o.createdAt)}'
-                            '${o.loyaltyPointsEarned > 0 ? '\nLoyalty: +${o.loyaltyPointsEarned} pts' : ''}',
+                            [
+                              o.orderSource,
+                              if (cashierCustomerLabel(o) != '—') cashierCustomerLabel(o),
+                              formatDateTimeLocal(o.createdAt),
+                              if (o.orderSource.toUpperCase() != 'POS' && o.loyaltyPointsEarned > 0)
+                                'Loyalty: +${o.loyaltyPointsEarned} pts',
+                            ].join('\n'),
                           ),
                           isThreeLine: true,
                           trailing: Text('₱${o.total.toStringAsFixed(2)}'),
@@ -15452,7 +15573,39 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                                     ),
                                   ),
                                   const SizedBox(width: 10),
-                                  Expanded(child: Text(dishName, style: const TextStyle(fontSize: 13))),
+                                  Expanded(
+                                    child: InkWell(
+                                      onTap: dish != null
+                                          ? () => showDishAllergensDialog(
+                                                context,
+                                                dishName: dishName,
+                                                allergens: dish.allergens,
+                                              )
+                                          : null,
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            dishName,
+                                            style: TextStyle(
+                                              fontSize: 13,
+                                              fontWeight: dish != null && dish.allergens.isNotEmpty
+                                                  ? FontWeight.w600
+                                                  : FontWeight.normal,
+                                              decoration: dish != null && dish.allergens.isNotEmpty
+                                                  ? TextDecoration.underline
+                                                  : null,
+                                            ),
+                                          ),
+                                          if (dish != null && dish.allergens.isNotEmpty)
+                                            Text(
+                                              'Allergens: ${dish.allergens.join(', ')}',
+                                              style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
                                   Icon(
                                     sel ? Icons.check_circle : Icons.circle_outlined,
                                     size: 22,
@@ -15811,6 +15964,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
   Widget build(BuildContext context) {
     final state = widget.state;
     final stage = widget.stage;
+    final loadErr = state.managerCateringLoadErrorForStage(stage);
     var rows = state.managerRowsForStage(stage);
     if (stage == 'completed' && _completedListRange == 'past_30') {
       rows = rows.where((r) => isWithinPast30Days(r.createdAt)).toList();
@@ -15867,10 +16021,27 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
             ],
           ),
         ),
+        if (loadErr != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 0, 10, 6),
+            child: Material(
+              color: Colors.red.shade50,
+              borderRadius: BorderRadius.circular(8),
+              child: ListTile(
+                dense: true,
+                leading: Icon(Icons.error_outline, color: Colors.red.shade800),
+                title: Text(loadErr, style: TextStyle(color: Colors.red.shade900, fontSize: 13)),
+                trailing: TextButton(
+                  onPressed: () => state.loadManagerCateringByStage(stage, force: true),
+                  child: const Text('Retry'),
+                ),
+              ),
+            ),
+          ),
         Expanded(
           child: RefreshIndicator(
             onRefresh: () => state.loadManagerCateringByStage(stage, force: true),
-            child: rows.isEmpty
+            child: rows.isEmpty && loadErr == null
                 ? ListView(
                     physics: const AlwaysScrollableScrollPhysics(),
                     children: const [
@@ -20505,8 +20676,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       transactionNo: row.transactionNo,
                       helperText: widget.supervisorMode
                           ? 'View seating layout output. Download as image or PDF.'
-                          : widget.stage == kStageForDownPayment || widget.stage == kStageForOngoing
-                              ? 'Edit table and chair placement while this order is in For Processing.'
+                          : canEditSeatingLayout(row.status)
+                              ? 'Edit table and chair placement. Drag tables or use nudge arrows in the editor.'
                               : 'View the seating layout submitted with this inquiry.',
                       buttonLabel:
                           (widget.supervisorMode || !canEditSeatingLayout(row.status))
@@ -20770,6 +20941,10 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
           widget.state.loadCashierWalkInQueues(force: true);
         }
       }
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.state.loadCashierOnlineOrders(force: true);
+      widget.state.loadCashierWalkInQueues(force: true);
     });
   }
 
@@ -21941,6 +22116,8 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        Text(cashierCustomerLabel(o), style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                        const SizedBox(height: 4),
                         Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w700)),
                         const SizedBox(height: 4),
                         Text(
@@ -21948,9 +22125,6 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                             'Submitted: $submitted',
                             if (isCancelledList) 'Status: ${statusReadable(o.status)}',
                             if (!isCancelledList && !showClaim && completed.isNotEmpty) 'Completed: $completed',
-                            if (!isCancelledList && !showClaim && o.loyaltyPointsEarned > 0)
-                              'Loyalty earned: +${o.loyaltyPointsEarned} pts',
-                            if (o.posCustomerLabel.trim().isNotEmpty) o.posCustomerLabel.trim(),
                             if (o.paymentMode.trim().isNotEmpty) o.paymentMode.toUpperCase(),
                           ].where((s) => s.isNotEmpty).join('\n'),
                           style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.25),

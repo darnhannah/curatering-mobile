@@ -609,26 +609,6 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                           ),
                         ],
                         IconButton(
-                          tooltip: 'Nudge left',
-                          onPressed: () => _moveTable(tid, -0.012, 0),
-                          icon: const Icon(Icons.arrow_back),
-                        ),
-                        IconButton(
-                          tooltip: 'Nudge right',
-                          onPressed: () => _moveTable(tid, 0.012, 0),
-                          icon: const Icon(Icons.arrow_forward),
-                        ),
-                        IconButton(
-                          tooltip: 'Nudge up',
-                          onPressed: () => _moveTable(tid, 0, -0.012),
-                          icon: const Icon(Icons.arrow_upward),
-                        ),
-                        IconButton(
-                          tooltip: 'Nudge down',
-                          onPressed: () => _moveTable(tid, 0, 0.012),
-                          icon: const Icon(Icons.arrow_downward),
-                        ),
-                        IconButton(
                           tooltip: 'Duplicate',
                           onPressed: _duplicateSelectedTable,
                           icon: const Icon(Icons.copy_outlined),
@@ -652,6 +632,47 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
               ],
             ],
           ),
+          if (_selectedTableId != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, bottom: 4),
+              child: Card(
+                margin: EdgeInsets.zero,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: Row(
+                    children: [
+                      const Text('Nudge', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                      const SizedBox(width: 4),
+                      IconButton(
+                        tooltip: 'Nudge left',
+                        onPressed: () => _moveTable(_selectedTableId!, -0.012, 0),
+                        icon: const Icon(Icons.arrow_back),
+                      ),
+                      IconButton(
+                        tooltip: 'Nudge right',
+                        onPressed: () => _moveTable(_selectedTableId!, 0.012, 0),
+                        icon: const Icon(Icons.arrow_forward),
+                      ),
+                      IconButton(
+                        tooltip: 'Nudge up',
+                        onPressed: () => _moveTable(_selectedTableId!, 0, -0.012),
+                        icon: const Icon(Icons.arrow_upward),
+                      ),
+                      IconButton(
+                        tooltip: 'Nudge down',
+                        onPressed: () => _moveTable(_selectedTableId!, 0, 0.012),
+                        icon: const Icon(Icons.arrow_downward),
+                      ),
+                      const Spacer(),
+                      const Text(
+                        'Drag on canvas or use arrows',
+                        style: TextStyle(fontSize: 11, color: Colors.black54),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           if (_selectedTableId != null || _selectedSeatId != null)
             Padding(
               padding: const EdgeInsets.only(top: 4, bottom: 8),

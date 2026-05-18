@@ -26,10 +26,15 @@ bool canShowSeatingLayout(String status) {
       s == 'for_full_payment';
 }
 
-/// Edit seating only while order is On Going.
+/// Edit seating in draft / active pipeline stages (not completed or cancelled).
 bool canEditSeatingLayout(String status) {
   final s = status.trim().toLowerCase();
-  return s == 'for_ongoing';
+  return s == 'online_inquiries' ||
+      s == 'new_event' ||
+      s == 'for_down_payment' ||
+      s == 'for_ongoing' ||
+      s == 'for_full_payment' ||
+      s == 'for_processing';
 }
 
 String eventDesignSourceLabel(Map<String, dynamic> themeDesign) {
