@@ -25,7 +25,7 @@ Future<Uint8List> buildSeatingLayoutPdfBytes({
 
   doc.addPage(
     pw.Page(
-      pageFormat: PdfPageFormat.landscape,
+      pageFormat: PdfPageFormat.a4.landscape,
       margin: const pw.EdgeInsets.all(28),
       build: (ctx) {
         return pw.Column(

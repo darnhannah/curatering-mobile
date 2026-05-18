@@ -140,6 +140,11 @@ function isCateringPlusEvent(row: Record<string, unknown>, table: string): boole
 }
 
 async function ensureAiGenerationsTable(pool: pg.Pool): Promise<void> {
+  const exists = await pool.query(
+    `SELECT 1 FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_name = 'ai_generations' LIMIT 1`,
+  );
+  if (exists.rows.length > 0) return;
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ai_generations (
       id BIGSERIAL PRIMARY KEY,

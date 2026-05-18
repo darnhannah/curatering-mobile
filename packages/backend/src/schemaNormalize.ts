@@ -223,6 +223,11 @@ const CATERING_ORDERS_COLUMNS = new Set([
   "loyalty_reward_catering_obtained",
   "payment_method",
   "checklist",
+  "post_analysis",
+  "theme_design",
+  "seating_plan",
+  "allergens",
+  "points_earned",
   "full_payment_due_at",
   "created_by",
   "updated_by",
@@ -251,7 +256,8 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
 
   await normalizeCanonicalBusinessIds(pool);
   await dedupeCustomerAccountIds(pool);
-  await pruneCanonicalColumns(pool);
+  await ensureProductionColumns(pool);
+  // Never drop extra DB columns in production — pruning removed order_no, seating_plan, etc.
   await dropLegacyTables(pool);
   console.info("[schema] normalize complete");
 }
@@ -655,11 +661,43 @@ async function normalizeCanonicalBusinessIds(pool: pg.Pool): Promise<void> {
   );
 }
 
+/** Re-add columns required by the mobile app (never drop via prune). */
+async function ensureProductionColumns(pool: pg.Pool): Promise<void> {
+  if (await tableExists(pool, "restaurant_orders")) {
+    await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_no TEXT`);
+    await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT`);
+    await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS guest_contact_email TEXT`);
+    await safeExec(
+      pool,
+      `UPDATE restaurant_orders
+       SET order_no = COALESCE(NULLIF(TRIM(order_no), ''), NULLIF(TRIM(order_id), ''))
+       WHERE order_no IS NULL OR TRIM(order_no) = ''`,
+    );
+  }
+  if (await tableExists(pool, "catering_orders")) {
+    await pool.query(
+      `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    );
+    await pool.query(
+      `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS theme_design JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    );
+    await pool.query(
+      `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS post_analysis JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    );
+  }
+  if (await tableExists(pool, "event_orders")) {
+    await pool.query(
+      `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    );
+    await pool.query(
+      `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS post_analysis JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    );
+  }
+}
+
 async function pruneCanonicalColumns(pool: pg.Pool): Promise<void> {
-  await pruneTableColumns(pool, "customer_accounts", CUSTOMER_ACCOUNTS_COLUMNS);
-  await pruneTableColumns(pool, "restaurant_orders", RESTAURANT_ORDERS_COLUMNS);
-  await pruneTableColumns(pool, "catering_orders", CATERING_ORDERS_COLUMNS);
-  await pruneTableColumns(pool, "event_orders", EVENT_ORDERS_COLUMNS);
+  // Disabled: production DBs retain extra columns (order_no, seating_plan, post_analysis, …).
+  void pool;
 }
 
 async function normalizeAiGenerations(pool: pg.Pool): Promise<void> {
@@ -979,6 +1017,8 @@ async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "restaurant_orders"))) return;
 
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_no TEXT`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS total_cost NUMERIC(12,2)`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_notes TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS tray_items JSONB NOT NULL DEFAULT '[]'::jsonb`);
@@ -1082,7 +1122,7 @@ async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
   await copyColumnIfBothExist(pool, "restaurant_orders", "contact_number", "delivery_contact");
 }
 
-/** Copy legacy post_analysis column into checklist.post_analysis, then drop the column. */
+/** Merge legacy `post_analysis` column into checklist.post_analysis (keep both columns). */
 async function migratePostAnalysisIntoChecklistAndDrop(pool: pg.Pool): Promise<void> {
   for (const table of ["catering_orders", "event_orders"] as const) {
     if (!(await tableExists(pool, table))) continue;
@@ -1098,10 +1138,13 @@ async function migratePostAnalysisIntoChecklistAndDrop(pool: pg.Pool): Promise<v
              COALESCE(checklist, '{}'::jsonb) || jsonb_build_object('post_analysis', post_analysis)
          END
          WHERE post_analysis IS NOT NULL
-           AND post_analysis <> '{}'::jsonb`,
+           AND post_analysis <> '{}'::jsonb
+           AND (
+             jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) <> 'object'
+             OR COALESCE(checklist->'post_analysis', '{}'::jsonb) = '{}'::jsonb
+           )`,
       );
     }
-    await safeExec(pool, `ALTER TABLE ${table} DROP COLUMN IF EXISTS post_analysis`);
   }
 }
 
@@ -1133,6 +1176,15 @@ async function normalizeCateringOrders(pool: pg.Pool): Promise<void> {
   await copyColumnIfBothExist(pool, "catering_orders", "loyalty_points_catering_obtained", "points_earned");
   await copyColumnIfBothExist(pool, "catering_orders", "estimated_cost", "estimated_total");
 
+  await pool.query(
+    `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS theme_design JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  );
+  await pool.query(
+    `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  );
+  await pool.query(
+    `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS post_analysis JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  );
   if (await columnExists(pool, "catering_orders", "theme_design")) {
     await safeExec(
       pool,
@@ -1152,7 +1204,6 @@ async function normalizeCateringOrders(pool: pg.Pool): Promise<void> {
          )
        WHERE theme_design IS NOT NULL AND theme_design <> '{}'::jsonb`,
     );
-    await dropColumnIfExists(pool, "catering_orders", "theme_design");
   }
 }
 
@@ -1161,6 +1212,9 @@ async function normalizeEventOrders(pool: pg.Pool): Promise<void> {
 
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS event_id TEXT`);
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await pool.query(
+    `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS post_analysis JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  );
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS pax_buffer INTEGER NOT NULL DEFAULT 0`);
   await pool.query(
     `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS inquiry_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`,

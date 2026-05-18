@@ -15546,6 +15546,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                         }
                       }
                       final sel = selectedDishes.contains(dishName);
+                      final dishItem = dish;
                       return Padding(
                         padding: const EdgeInsets.only(bottom: 6),
                         child: Material(
@@ -15569,17 +15570,17 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                                     child: SizedBox(
                                       width: 40,
                                       height: 40,
-                                      child: dish != null ? _MenuThumb(item: dish, compact: true) : const Icon(Icons.fastfood, size: 22),
+                                      child: dishItem != null ? _MenuThumb(item: dishItem, compact: true) : const Icon(Icons.fastfood, size: 22),
                                     ),
                                   ),
                                   const SizedBox(width: 10),
                                   Expanded(
                                     child: InkWell(
-                                      onTap: dish != null
+                                      onTap: dishItem != null
                                           ? () => showDishAllergensDialog(
                                                 context,
                                                 dishName: dishName,
-                                                allergens: dish.allergens,
+                                                allergens: dishItem.allergens,
                                               )
                                           : null,
                                       child: Column(
@@ -15589,17 +15590,17 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                                             dishName,
                                             style: TextStyle(
                                               fontSize: 13,
-                                              fontWeight: dish != null && dish.allergens.isNotEmpty
+                                              fontWeight: dishItem != null && dishItem.allergens.isNotEmpty
                                                   ? FontWeight.w600
                                                   : FontWeight.normal,
-                                              decoration: dish != null && dish.allergens.isNotEmpty
+                                              decoration: dishItem != null && dishItem.allergens.isNotEmpty
                                                   ? TextDecoration.underline
                                                   : null,
                                             ),
                                           ),
-                                          if (dish != null && dish.allergens.isNotEmpty)
+                                          if (dishItem != null && dishItem.allergens.isNotEmpty)
                                             Text(
-                                              'Allergens: ${dish.allergens.join(', ')}',
+                                              'Allergens: ${dishItem.allergens.join(', ')}',
                                               style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
                                             ),
                                         ],

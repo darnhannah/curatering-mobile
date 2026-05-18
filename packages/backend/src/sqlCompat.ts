@@ -204,8 +204,19 @@ export const CUSTOMER_FORGOT_OTP_SELECT = `
   forgot_password_otp_code_expiry AS password_reset_expires_at
 `.trim();
 
-/** Manager catering/event post-analysis JSON (stored under checklist.post_analysis). */
-export const POST_ANALYSIS_JSON = `COALESCE(checklist->'post_analysis', '{}'::jsonb)`;
+/**
+ * Post-analysis for catering/event orders: checklist.post_analysis plus optional
+ * legacy/top-level `post_analysis` column when present in production DB.
+ */
+export const POST_ANALYSIS_JSON = `COALESCE(
+  CASE
+    WHEN jsonb_typeof(COALESCE(checklist, '[]'::jsonb)) = 'object'
+      THEN NULLIF(checklist->'post_analysis', 'null'::jsonb)
+    ELSE NULL
+  END,
+  COALESCE(post_analysis, '{}'::jsonb),
+  '{}'::jsonb
+)`;
 
 /** Business transaction id TR-****** (catering_orders.catering_id). */
 export const CATERING_TRANSACTION_ID = `COALESCE(NULLIF(TRIM(catering_id::text), ''), '')`;

@@ -167,6 +167,30 @@ function ensureNewEventSchemaOnce(): Promise<void> {
   return ensureNewEventSchemaPromise;
 }
 
+/** Parse menu_dishes.allergens (TEXT: JSON array, comma-separated, or empty). */
+function parseMenuAllergens(raw: unknown): string[] {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) {
+    return raw.map((x) => String(x).trim()).filter((t) => t.length > 0);
+  }
+  const s = String(raw).trim();
+  if (!s || s === "[]") return [];
+  if (s.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(s) as unknown;
+      if (Array.isArray(parsed)) {
+        return parsed.map((x) => String(x).trim()).filter((t) => t.length > 0);
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter((t) => t.length > 0);
+}
+
 function parseJsonTextArray(raw: unknown): string[] {
   if (raw == null) return [];
   if (Array.isArray(raw)) {
@@ -226,7 +250,9 @@ function rowMatchesCateringListStage(row: Record<string, unknown>, stage: string
     return false;
   }
   if (s === "for_full_payment") return st === "for_full_payment" || st === "for_post_analysis";
-  if (s === "for_processing") return st === "for_processing" && processingSubstageFromRow(row) === "ongoing";
+  if (["new_event", "online_inquiries", "completed", "cancelled"].includes(s)) {
+    return st === s;
+  }
   return st === s;
 }
 
@@ -1091,11 +1117,18 @@ app.post("/api/items", async (_req, res) => {
 
 app.get("/api/mobile/allergens", async (_req, res) => {
   try {
-    const { rows } = await getPool().query(
-      `SELECT allergen_name AS name
+    const pool = getPool();
+    const hasName = await pool.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'menu_dishes_allergens' AND column_name = 'name'
+       LIMIT 1`,
+    );
+    const nameCol = hasName.rows.length > 0 ? "name" : "allergen_name";
+    const { rows } = await pool.query(
+      `SELECT TRIM(${nameCol}::text) AS name
        FROM menu_dishes_allergens
-       WHERE COALESCE(TRIM(allergen_name), '') <> ''
-       ORDER BY allergen_name`,
+       WHERE COALESCE(TRIM(${nameCol}::text), '') <> ''
+       ORDER BY 1`,
     );
     res.json(rows);
   } catch (err) {
@@ -1128,7 +1161,7 @@ app.get("/api/mobile/menu", async (_req, res) => {
         image_base64: (r as Record<string, unknown>).image_base64 != null
           ? String((r as Record<string, unknown>).image_base64)
           : null,
-        allergens: parseJsonTextArray((r as Record<string, unknown>).allergens),
+        allergens: parseMenuAllergens((r as Record<string, unknown>).allergens),
       })),
     );
   } catch (err) {
