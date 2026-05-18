@@ -22,7 +22,9 @@ import 'customer_local_notifications.dart';
 import 'features/event_design/event_theme_design_screen.dart';
 import 'features/seating/seating_layout_editor_screen.dart';
 import 'features/seating/seating_plan.dart';
+import 'utils/allergen_ui.dart';
 import 'utils/order_type_utils.dart';
+import 'widgets/manager_theme_seating_blocks.dart';
 
 /// Optional logical flavor at Dart level (`customer` / `staff`).
 const String kAppFlavor = String.fromEnvironment('APP_FLAVOR', defaultValue: 'customer');
@@ -870,6 +872,7 @@ class MenuItemData {
     required this.price,
     required this.dips,
     this.ingredients = const [],
+    this.allergens = const [],
     this.category = '',
     this.dishType = '',
     this.imageBase64,
@@ -881,6 +884,7 @@ class MenuItemData {
   final double price;
   final List<String> dips;
   final List<String> ingredients;
+  final List<String> allergens;
   final String category;
   /// From `menu_dishes.type` when exposed by the API (`dish_type`).
   final String dishType;
@@ -940,8 +944,12 @@ class MenuItemData {
   }
 
   bool get isCateringDish {
+    if (isRestaurantDish) return false;
     final c = category.toLowerCase().trim();
-    return c == 'catering' || c.isEmpty;
+    final t = dishType.toLowerCase().trim();
+    if (c == 'catering' || c.contains('catering')) return true;
+    if (t == 'catering' || t.contains('catering')) return true;
+    return c.isEmpty;
   }
 }
 
@@ -1359,9 +1367,17 @@ bool orderShowsDeliveryTrackingLink(OrderData o) {
 
 /// Prefer business `order_id` (ORD-******) over legacy `order_no` alias.
 String orderNoFromApiMap(Map<String, dynamic> map) {
-  final orderId = '${map['order_id'] ?? ''}'.trim();
-  if (orderId.isNotEmpty) return orderId;
-  return '${map['order_no'] ?? ''}'.trim();
+  var orderId = '${map['order_id'] ?? ''}'.trim();
+  if (orderId.isEmpty || orderId.toUpperCase() == 'TEMP') {
+    orderId = '${map['order_no'] ?? ''}'.trim();
+  }
+  if (orderId.isNotEmpty && orderId.toUpperCase() != 'TEMP') return orderId;
+  final mid = map['id'] ?? map['mobile_id'];
+  if (mid != null) {
+    final n = int.tryParse('$mid');
+    if (n != null && n > 0) return 'ORD-${n.toString().padLeft(6, '0')}';
+  }
+  return '';
 }
 
 /// UI-only formatting for customer-facing order numbers.
@@ -1906,9 +1922,10 @@ class InquiryRecord {
       orderKind == 'event' ||
       isCateringPlusEventOrderType(orderKind, eventTitle: eventTitle);
 
-  bool get canShowSeating => isCateringPlusEvent && canShowSeatingLayout(status);
+  /// Seating layout is manager-only; customers do not access seating in the app.
+  bool get canShowSeating => false;
 
-  bool get canEditSeating => isCateringPlusEvent && canEditSeatingLayout(status);
+  bool get canEditSeating => false;
 
   bool get canEditThemeDesign {
     if (!isCateringPlusEvent) return false;
@@ -2229,6 +2246,7 @@ class AppState extends ChangeNotifier {
   final List<OrderData> orders = [];
   final List<InquiryRecord> inquiries = [];
   final List<SetMenuData> setMenus = [];
+  final List<String> allergenCatalog = [];
   String checkoutNote = '';
   /// Persists chosen delivery line for checkout when navigating away from [CheckoutScreen].
   String? checkoutSelectedAddress;
@@ -2276,9 +2294,13 @@ class AppState extends ChangeNotifier {
   bool _loadCashierWalkInQueuesInFlight = false;
   bool _loadCashierOrderHistoryInFlight = false;
   DateTime? _cashierOnlineOrdersLoadedAt;
+  /// Last cashier list/load failure (online or walk-in queues).
+  String? cashierDataLoadError;
   DateTime? _cashierWalkInQueuesLoadedAt;
   DateTime? _cashierOrderHistoryLoadedAt;
   bool _loadSetMenusInFlight = false;
+  bool _loadAllergensInFlight = false;
+  DateTime? _allergensLoadedAt;
   bool _loadLoyaltyHistoryInFlight = false;
   bool _loadMenuInFlight = false;
   DateTime? _setMenusLoadedAt;
@@ -2470,7 +2492,7 @@ class AppState extends ChangeNotifier {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'email': email.trim(),
-              'otp': otp.trim(),
+              'otp': otp.replaceAll(RegExp(r'\D'), '').trim(),
               'password': password,
             }),
           )
@@ -2551,7 +2573,7 @@ class AppState extends ChangeNotifier {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'identity': identity.trim(),
-              'otp': otp.trim(),
+              'otp': otp.replaceAll(RegExp(r'\D'), '').trim(),
               'password': password,
               'role': role,
             }),
@@ -2583,7 +2605,7 @@ class AppState extends ChangeNotifier {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'identity': identity.trim(),
-              'otp': otp.trim(),
+              'otp': otp.replaceAll(RegExp(r'\D'), '').trim(),
               'role': role,
             }),
           )
@@ -3109,6 +3131,8 @@ class AppState extends ChangeNotifier {
             final dipValues = map['dips'] is List ? (map['dips'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
             final ingValues =
                 map['ingredients'] is List ? (map['ingredients'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
+            final allergenValues =
+                map['allergens'] is List ? (map['allergens'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
             return MenuItemData(
               id: '${map['id']}',
               name: '${map['name']}',
@@ -3116,6 +3140,7 @@ class AppState extends ChangeNotifier {
               price: jsonToDouble(map['price']),
               dips: dipValues,
               ingredients: ingValues,
+              allergens: allergenValues,
               category: '${map['category'] ?? ''}',
               dishType: '${map['dish_type'] ?? ''}',
               imageBase64: map['image_base64'] != null ? '${map['image_base64']}' : null,
@@ -3126,6 +3151,35 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     } finally {
       _loadMenuInFlight = false;
+    }
+  }
+
+  Future<void> loadAllergenCatalog({bool force = false}) async {
+    if (_loadAllergensInFlight) return;
+    if (!force &&
+        _allergensLoadedAt != null &&
+        DateTime.now().difference(_allergensLoadedAt!) < const Duration(seconds: 30) &&
+        allergenCatalog.isNotEmpty) {
+      return;
+    }
+    _loadAllergensInFlight = true;
+    try {
+      final res = await http.get(_uri('/api/mobile/allergens'));
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! List) return;
+      allergenCatalog
+        ..clear()
+        ..addAll(
+          body
+              .whereType<Map<String, dynamic>>()
+              .map((m) => '${m['name'] ?? ''}'.trim())
+              .where((n) => n.isNotEmpty),
+        );
+      _allergensLoadedAt = DateTime.now();
+      notifyListeners();
+    } finally {
+      _loadAllergensInFlight = false;
     }
   }
 
@@ -3533,7 +3587,12 @@ class AppState extends ChangeNotifier {
 
   Future<String?> uploadPaymentProof(int orderId, XFile file, {String? paymentProofBase64}) async {
     try {
-      final encoded = paymentProofBase64 ?? base64Encode(await file.readAsBytes());
+      var encoded = paymentProofBase64 ?? base64Encode(await file.readAsBytes());
+      final comma = encoded.indexOf(',');
+      if (encoded.toLowerCase().startsWith('data:') && comma >= 0) {
+        encoded = encoded.substring(comma + 1).trim();
+      }
+      encoded = encoded.replaceAll(RegExp(r'\s+'), '');
       final res = await http.patch(
         _uri('/api/mobile/orders/$orderId/payment'),
         headers: {'Content-Type': 'application/json'},
@@ -3572,8 +3631,16 @@ class AppState extends ChangeNotifier {
     }
     _loadOrdersInFlight = true;
     try {
-      final res = await http.get(_uri('/api/mobile/orders', {'user_email': userEmail!}));
-      if (res.statusCode != 200) return;
+      final query = <String, String>{'user_email': userEmail!};
+      if (isGuestSession) {
+        final guestContact = profile.contactEmail.trim().toLowerCase();
+        if (guestContact.isNotEmpty) query['contact_email'] = guestContact;
+      }
+      final res = await http.get(_uri('/api/mobile/orders', query));
+      if (res.statusCode != 200) {
+        debugPrint('loadOrders failed: ${res.statusCode} ${res.body}');
+        return;
+      }
       final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
     final parsed = <OrderData>[];
     for (final e in body) {
@@ -3702,6 +3769,7 @@ class AppState extends ChangeNotifier {
     List<dynamic> menu = const [],
     Map<String, dynamic> themeDesign = const {},
     String formalityLevel = '',
+    Map<String, dynamic>? seatingPlan,
   }) async {
     if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
     try {
@@ -3732,6 +3800,7 @@ class AppState extends ChangeNotifier {
               'menu': menu,
               'theme_design': themeDesign,
               'formality_level': formalityLevel,
+              if (seatingPlan != null && seatingPlan.isNotEmpty) 'seating_plan': seatingPlan,
             }),
           )
           .timeout(_apiTimeout);
@@ -3793,7 +3862,13 @@ class AppState extends ChangeNotifier {
             }),
           )
           .timeout(_apiTimeout);
-      if (res.statusCode != 200) return 'Could not update stage';
+      if (res.statusCode != 200) {
+        try {
+          final body = jsonDecode(res.body);
+          if (body is Map && body['error'] != null) return '${body['error']}';
+        } catch (_) {}
+        return 'Could not update stage (${res.statusCode})';
+      }
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -4177,7 +4252,17 @@ class AppState extends ChangeNotifier {
             }),
           )
           .timeout(_apiTimeout);
-      if (res.statusCode != 200) return;
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          cashierDataLoadError = '${err['error'] ?? 'Could not load online orders'}';
+        } catch (_) {
+          cashierDataLoadError = 'Could not load online orders (${res.statusCode})';
+        }
+        notifyListeners();
+        return;
+      }
+      cashierDataLoadError = null;
       final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
       cashierOnlineOrders
         ..clear()
@@ -4253,7 +4338,15 @@ class AppState extends ChangeNotifier {
               }),
             )
             .timeout(_apiTimeout);
-        if (res.statusCode != 200) return [];
+        if (res.statusCode != 200) {
+          try {
+            final err = jsonDecode(res.body) as Map<String, dynamic>;
+            throw StateError('${err['error'] ?? 'Could not load walk-in orders'}');
+          } catch (e) {
+            if (e is StateError) rethrow;
+            throw StateError('Could not load walk-in orders (${res.statusCode})');
+          }
+        }
         final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
         return body.map((e) {
           final map = e as Map<String, dynamic>;
@@ -4275,8 +4368,11 @@ class AppState extends ChangeNotifier {
         ..clear()
         ..addAll(results[2]);
       _cashierWalkInQueuesLoadedAt = DateTime.now();
+      cashierDataLoadError = null;
       notifyListeners();
-    } catch (_) {
+    } catch (e) {
+      cashierDataLoadError = e is StateError ? e.message : 'Could not load walk-in orders';
+      notifyListeners();
     } finally {
       _loadCashierWalkInQueuesInFlight = false;
     }
@@ -4553,17 +4649,10 @@ class _AuthScreenState extends State<AuthScreen> {
           children: [
             Column(
               children: [
-            const SizedBox(height: 50),
-            const Text(
-              'WELCOME',
-              style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: Colors.white),
-            ),
-            const SizedBox(height: 30),
-            if (widget.cashierMode) ...[
-              Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain),
-              const SizedBox(height: 14),
-              Image.asset(AppBrandAssets.logoCuratering, height: 44, fit: BoxFit.contain),
-            ] else
+            const SizedBox(height: 36),
+            if (widget.cashierMode)
+              Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain)
+            else
               SizedBox(
                 height: 140,
                 width: double.infinity,
@@ -4578,9 +4667,12 @@ class _AuthScreenState extends State<AuthScreen> {
                   color: AppColors.brand,
                   borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
                 ),
-                child: SingleChildScrollView(
-                  child: Column(
-                    children: [
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: SingleChildScrollView(
+                        child: Column(
+                          children: [
                       Text(
                         signupMode ? 'SIGN UP' : 'LOG IN',
                         style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
@@ -4796,39 +4888,47 @@ class _AuthScreenState extends State<AuthScreen> {
                                                         ),
                                                       const SizedBox(height: 12),
                                                       FilledButton(
-                                                        onPressed: () async {
-                                                          notReg = null;
-                                                          final id = emailForRequest();
-                                                          if (id == null) {
-                                                            await _toast('Enter your email');
-                                                            setDialogState(() {});
-                                                            return;
-                                                          }
-                                                          if (!emailOk(forgotEmailController.text.trim())) {
-                                                            await _toast('Enter a valid email');
-                                                            return;
-                                                          }
-                                                          final r = await widget.state.requestPasswordReset(
-                                                            identity: id,
-                                                            channel: 'email',
-                                                            role: widget.cashierMode ? 'cashier' : 'customer',
-                                                          );
-                                                          if (r.notRegistered) {
-                                                            setDialogState(() {
-                                                              notReg = 'This email is not registered.';
-                                                            });
-                                                            return;
-                                                          }
-                                                          if (!r.ok) {
-                                                            await _toast(r.error ?? 'Could not send OTP');
-                                                            return;
-                                                          }
-                                                          setDialogState(() {
-                                                            step[0] = 1;
-                                                            notReg = null;
-                                                          });
-                                                          await _toast('OTP sent. Check your email.');
-                                                        },
+                                                        onPressed: busyMessage != null
+                                                            ? null
+                                                            : () async {
+                                                                notReg = null;
+                                                                final id = emailForRequest();
+                                                                if (id == null) {
+                                                                  await _toast('Enter your email');
+                                                                  setDialogState(() {});
+                                                                  return;
+                                                                }
+                                                                if (!emailOk(forgotEmailController.text.trim())) {
+                                                                  await _toast('Enter a valid email');
+                                                                  return;
+                                                                }
+                                                                setState(() => busyMessage = 'Sending OTP...');
+                                                                try {
+                                                                  final r = await widget.state.requestPasswordReset(
+                                                                    identity: id,
+                                                                    channel: 'email',
+                                                                    role: widget.cashierMode ? 'cashier' : 'customer',
+                                                                  );
+                                                                  if (!mounted) return;
+                                                                  if (r.notRegistered) {
+                                                                    setDialogState(() {
+                                                                      notReg = 'This email is not registered.';
+                                                                    });
+                                                                    return;
+                                                                  }
+                                                                  if (!r.ok) {
+                                                                    await _toast(r.error ?? 'Could not send OTP');
+                                                                    return;
+                                                                  }
+                                                                  setDialogState(() {
+                                                                    step[0] = 1;
+                                                                    notReg = null;
+                                                                  });
+                                                                  await _toast('OTP sent. Check your email.');
+                                                                } finally {
+                                                                  if (mounted) setState(() => busyMessage = null);
+                                                                }
+                                                              },
                                                         child: const Text('REQUEST RESET OTP'),
                                                       ),
                                                     ],
@@ -4849,50 +4949,66 @@ class _AuthScreenState extends State<AuthScreen> {
                                                       ),
                                                       const SizedBox(height: 8),
                                                       OutlinedButton(
-                                                        onPressed: () async {
-                                                          final id = emailForRequest();
-                                                          if (id == null) return;
-                                                          final r = await widget.state.requestPasswordReset(
-                                                            identity: id,
-                                                            channel: 'email',
-                                                            role: widget.cashierMode ? 'cashier' : 'customer',
-                                                          );
-                                                          if (r.notRegistered) {
-                                                            setDialogState(() {
-                                                              notReg = 'This email is not registered.';
-                                                            });
-                                                            return;
-                                                          }
-                                                          if (!r.ok) {
-                                                            await _toast(r.error ?? 'Could not send OTP');
-                                                            return;
-                                                          }
-                                                          forgotOtpController.clear();
-                                                          await _toast('OTP resent. Check your email.');
-                                                        },
+                                                        onPressed: busyMessage != null
+                                                            ? null
+                                                            : () async {
+                                                                final id = emailForRequest();
+                                                                if (id == null) return;
+                                                                setState(() => busyMessage = 'Sending OTP...');
+                                                                try {
+                                                                  final r = await widget.state.requestPasswordReset(
+                                                                    identity: id,
+                                                                    channel: 'email',
+                                                                    role: widget.cashierMode ? 'cashier' : 'customer',
+                                                                  );
+                                                                  if (!mounted) return;
+                                                                  if (r.notRegistered) {
+                                                                    setDialogState(() {
+                                                                      notReg = 'This email is not registered.';
+                                                                    });
+                                                                    return;
+                                                                  }
+                                                                  if (!r.ok) {
+                                                                    await _toast(r.error ?? 'Could not send OTP');
+                                                                    return;
+                                                                  }
+                                                                  forgotOtpController.clear();
+                                                                  await _toast('OTP resent. Check your email.');
+                                                                } finally {
+                                                                  if (mounted) setState(() => busyMessage = null);
+                                                                }
+                                                              },
                                                         child: const Text('RESEND OTP'),
                                                       ),
                                                       const SizedBox(height: 12),
                                                       FilledButton(
-                                                        onPressed: () async {
-                                                          final id = emailForRequest();
-                                                          if (id == null) return;
-                                                          final otp = forgotOtpController.text.replaceAll(RegExp(r'\D'), '').trim();
-                                                          if (otp.isEmpty) {
-                                                            await _toast('Enter your OTP code.');
-                                                            return;
-                                                          }
-                                                          final err = await widget.state.verifyPasswordResetOtp(
-                                                            identity: id,
-                                                            otp: otp,
-                                                            role: widget.cashierMode ? 'cashier' : 'customer',
-                                                          );
-                                                          if (err != null) {
-                                                            await _toast(err);
-                                                            return;
-                                                          }
-                                                          setDialogState(() => step[0] = 2);
-                                                        },
+                                                        onPressed: busyMessage != null
+                                                            ? null
+                                                            : () async {
+                                                                final id = emailForRequest();
+                                                                if (id == null) return;
+                                                                final otp = forgotOtpController.text.replaceAll(RegExp(r'\D'), '').trim();
+                                                                if (otp.isEmpty) {
+                                                                  await _toast('Enter your OTP code.');
+                                                                  return;
+                                                                }
+                                                                setState(() => busyMessage = 'Verifying code...');
+                                                                try {
+                                                                  final err = await widget.state.verifyPasswordResetOtp(
+                                                                    identity: id,
+                                                                    otp: otp,
+                                                                    role: widget.cashierMode ? 'cashier' : 'customer',
+                                                                  );
+                                                                  if (!mounted) return;
+                                                                  if (err != null) {
+                                                                    await _toast(err);
+                                                                    return;
+                                                                  }
+                                                                  setDialogState(() => step[0] = 2);
+                                                                } finally {
+                                                                  if (mounted) setState(() => busyMessage = null);
+                                                                }
+                                                              },
                                                         child: const Text('CONTINUE'),
                                                       ),
                                                     ],
@@ -4969,8 +5085,16 @@ class _AuthScreenState extends State<AuthScreen> {
                             signupMode ? 'ALREADY HAVE AN ACCOUNT? LOG IN' : "DON'T HAVE AN ACCOUNT? SIGN UP",
                           ),
                         ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (widget.cashierMode) ...[
+                      const SizedBox(height: 12),
+                      Image.asset(AppBrandAssets.logoCuratering, height: 44, fit: BoxFit.contain),
+                      const SizedBox(height: 12),
                     ],
-                  ),
+                  ],
                 ),
               ),
             ),
@@ -5853,37 +5977,44 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   }
 
   Widget _dishCard(BuildContext context, MenuItemData item) {
-    return Container(
-      decoration: BoxDecoration(
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: AppColors.border),
-        color: Colors.white,
-      ),
-      child: Column(
-        children: [
-          Expanded(
-            child: Container(
-              margin: const EdgeInsets.all(10),
-              color: AppColors.canvas,
-              child: _MenuThumb(item: item),
-            ),
+        onTap: () => showDishAllergensDialog(context, dishName: item.name, allergens: item.allergens),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: AppColors.border),
           ),
-          Text(item.name.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
-          if (_dishCardDescription(item).isNotEmpty)
-            Text(
-              _dishCardDescription(item).toUpperCase(),
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 12),
-            ),
-          Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
-          const SizedBox(height: 8),
-          FilledButton(
-            onPressed: () => _addToTray(context, item),
-            style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-            child: const Text('ADD TO TRAY'),
+          child: Column(
+            children: [
+              Expanded(
+                child: Container(
+                  margin: const EdgeInsets.all(10),
+                  color: AppColors.canvas,
+                  child: _MenuThumb(item: item),
+                ),
+              ),
+              Text(item.name.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
+              if (_dishCardDescription(item).isNotEmpty)
+                Text(
+                  _dishCardDescription(item).toUpperCase(),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 12),
+                ),
+              Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              FilledButton(
+                onPressed: () => _addToTray(context, item),
+                style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
+                child: const Text('ADD TO TRAY'),
+              ),
+              const SizedBox(height: 8),
+            ],
           ),
-          const SizedBox(height: 8),
-        ],
+        ),
       ),
     );
   }
@@ -8821,7 +8952,7 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(order.orderNo, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+                        Text(uiOrderNo(order.orderNo), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
                         const SizedBox(height: 8),
                         Text('Status: ${statusReadable(order.status)}'),
                         Text('Total: ₱${order.total.toStringAsFixed(2)}'),
@@ -8846,7 +8977,7 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
                             onPressed: () async {
                               final err = await state.submitHelpRequest(
                                 area: 'Order Follow-up',
-                                problem: 'Follow-up on pending order ${order.orderNo}',
+                                problem: 'Follow-up on pending order ${uiOrderNo(order.orderNo)}',
                                 desiredOutcome: 'Please review this order and update the payment/order confirmation status.',
                               );
                               if (!context.mounted) return;
@@ -10778,12 +10909,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
   bool _attemptedSubmit = false;
   static const int _minSelectedDishesRequired = 4;
   String _themeDesignChoice = '';
+  String _themeDesignSessionId = 'inquiry-${DateTime.now().microsecondsSinceEpoch}';
   Map<String, dynamic>? _aiThemeDesignPayload;
-  SeatingPlanData? _seatingPlanPayload;
   String menuSuggestionNote = '';
   String themeSuggestionNote = '';
   final themeNotesController = TextEditingController();
   final List<String> _themeReferenceImagesB64 = <String>[];
+  final Set<String> _selectedGuestAllergens = {};
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
@@ -10841,7 +10973,15 @@ class _InquiryScreenState extends State<InquiryScreen> {
         ? p.contactEmail.trim()
         : (widget.state.isGuestSession ? '' : (widget.state.userEmail ?? ''));
     eventCity.addListener(_onVenueChanged);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleConflictRefresh());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await Future.wait([
+        widget.state.loadMenu(force: true),
+        widget.state.loadSetMenus(force: true),
+        widget.state.loadAllergenCatalog(force: true),
+      ]);
+      _scheduleConflictRefresh();
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -10872,8 +11012,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
       _menuChoicePicked = false;
       _attemptedSubmit = false;
       _themeDesignChoice = '';
+      _themeDesignSessionId = 'inquiry-${DateTime.now().microsecondsSinceEpoch}';
       _aiThemeDesignPayload = null;
-      _seatingPlanPayload = null;
       menuSuggestionNote = '';
       themeSuggestionNote = '';
       selectedSetMenu = 'All Dishes';
@@ -10884,6 +11024,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
       formalityLevel = 'casual';
       foodTastingRequested = false;
       _themeReferenceImagesB64.clear();
+      _selectedGuestAllergens.clear();
       _eventWindows
         ..clear()
         ..add(_InquiryEventWindow());
@@ -11211,7 +11352,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
         _themeDesignChoice == 'create_own' &&
         (_aiThemeDesignPayload == null ||
             '${_aiThemeDesignPayload!['generatedImageUrl'] ?? ''}'.trim().isEmpty)) {
-      return 'Create your theme design with AI before submitting.';
+      return 'Create your theme design before submitting.';
     }
     if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
     if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
@@ -11278,8 +11419,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
           Expanded(
             child: RefreshIndicator(
               onRefresh: () async {
-                await state.loadMenu(force: true);
-                await state.loadSetMenus(force: true);
+                await Future.wait([
+                  state.loadMenu(force: true),
+                  state.loadSetMenus(force: true),
+                  state.loadAllergenCatalog(force: true),
+                ]);
                 if (mounted) setState(() {});
               },
               child: ListView(
@@ -11323,19 +11467,19 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       if (inquiryType == 'CATERING AND EVENT') ...[
                         _buildEventTypePicker(),
                         const SizedBox(height: 8),
-                        Text('Formality level', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
-                        const SizedBox(height: 6),
-                        SegmentedButton<String>(
-                          segments: const [
-                            ButtonSegment(value: 'casual', label: Text('Casual')),
-                            ButtonSegment(value: 'semiformal', label: Text('Semiformal')),
-                            ButtonSegment(value: 'formal', label: Text('Formal')),
-                          ],
-                          selected: {formalityLevel},
-                          onSelectionChanged: (s) => setState(() => formalityLevel = s.first),
-                        ),
-                        const SizedBox(height: 12),
                       ],
+                      Text('Formality level', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 6),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(value: 'casual', label: Text('Casual')),
+                          ButtonSegment(value: 'semiformal', label: Text('Semiformal')),
+                          ButtonSegment(value: 'formal', label: Text('Formal')),
+                        ],
+                        selected: {formalityLevel},
+                        onSelectionChanged: (s) => setState(() => formalityLevel = s.first),
+                      ),
+                      const SizedBox(height: 12),
                       TextField(
                         controller: contactPerson,
                         decoration: _requiredDecoration(
@@ -11673,7 +11817,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                   ? inquiryEmail.text.trim()
                                   : (widget.state.userEmail ?? '');
                               if (email.isEmpty) {
-                                appSnack(context, 'Enter your email before using AI design.');
+                                appSnack(context, 'Enter your email before opening theme design.');
                                 return;
                               }
                               final result = await Navigator.push<Map<String, dynamic>?>(
@@ -11682,8 +11826,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                   builder: (_) => EventThemeDesignScreen(
                                     apiBase: widget.state.apiBase,
                                     userEmail: email,
+                                    designSessionId: _themeDesignSessionId,
                                     initialEventType: _resolvedEventType(),
                                     initialThemeDesign: _aiThemeDesignPayload,
+                                    eventTitle: eventTitle.text.trim(),
+                                    formalityLevel: formalityLevel,
+                                    eventSetting: eventSetting,
                                   ),
                                 ),
                               );
@@ -11738,56 +11886,48 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       ],
                     ),
                   ),
-                  const SizedBox(height: 10),
-                  ToggleSection(
-                    title: 'SEATING LAYOUT',
-                    expanded: true,
-                    onToggle: () {},
-                    hideToggleIcon: true,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Text(
-                          'Plan tables and chairs now, or edit later from My Catering Inquiries.',
-                          style: TextStyle(color: Colors.grey.shade700, fontSize: 13, height: 1.35),
-                        ),
-                        const SizedBox(height: 10),
-                        OutlinedButton.icon(
-                          onPressed: () async {
-                            final email = inquiryEmail.text.trim().isNotEmpty
-                                ? inquiryEmail.text.trim()
-                                : (widget.state.userEmail ?? '');
-                            if (email.isEmpty) {
-                              appSnack(context, 'Enter your email before editing seating.');
-                              return;
-                            }
-                            final result = await Navigator.push<SeatingPlanData?>(
-                              context,
-                              MaterialPageRoute<SeatingPlanData?>(
-                                builder: (_) => SeatingLayoutEditorScreen(
-                                  apiBase: widget.state.apiBase,
-                                  userEmail: email,
-                                  orderKind: 'event',
-                                  draftOnly: true,
-                                  initialPlan: _seatingPlanPayload,
-                                ),
-                              ),
-                            );
-                            if (result != null && mounted) {
-                              setState(() => _seatingPlanPayload = result);
-                            }
-                          },
-                          icon: const Icon(Icons.table_restaurant),
-                          label: Text(
-                            _seatingPlanPayload == null || _seatingPlanPayload!.isEffectivelyEmpty
-                                ? 'Edit seating layout'
-                                : 'Edit seating layout (draft saved)',
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
                 ],
+                const SizedBox(height: 10),
+                ToggleSection(
+                  title: 'ALLERGENS',
+                  expanded: true,
+                  onToggle: () {},
+                  hideToggleIcon: true,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        'Select all allergens your guests must avoid (optional).',
+                        style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.35),
+                      ),
+                      const SizedBox(height: 10),
+                      if (state.allergenCatalog.isEmpty)
+                        Text(
+                          'Loading allergen list… Pull down to refresh if empty.',
+                          style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                        )
+                      else
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            for (final name in state.allergenCatalog)
+                              FilterChip(
+                                label: Text(name, style: const TextStyle(fontSize: 12)),
+                                selected: _selectedGuestAllergens.contains(name),
+                                onSelected: (sel) => setState(() {
+                                  if (sel) {
+                                    _selectedGuestAllergens.add(name);
+                                  } else {
+                                    _selectedGuestAllergens.remove(name);
+                                  }
+                                }),
+                              ),
+                          ],
+                        ),
+                    ],
+                  ),
+                ),
                 const SizedBox(height: 10),
                 ToggleSection(
                   title: 'MENU',
@@ -11833,6 +11973,44 @@ class _InquiryScreenState extends State<InquiryScreen> {
                             style: TextStyle(color: Colors.red.shade700, fontSize: 12),
                           ),
                         ),
+                      if (_menuChoicePicked) ...[
+                        const SizedBox(height: 10),
+                        Text('Set menu', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 6),
+                        DropdownButtonFormField<String>(
+                          value: effectiveSetMenu,
+                          decoration: const InputDecoration(
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            helperText: 'Choose a preset set menu or All Dishes',
+                          ),
+                          items: setMenuNames.map((name) => DropdownMenuItem(value: name, child: Text(name))).toList(),
+                          onChanged: (v) {
+                            final next = v ?? 'All Dishes';
+                            setState(() {
+                              final prev = selectedSetMenu;
+                              if (curateOwn && prev != next && prev != 'All Dishes') {
+                                final prevRows = state.setMenus.where((m) => m.name == prev).toList();
+                                if (prevRows.isNotEmpty) {
+                                  for (final d in prevRows.first.dishes) {
+                                    selectedDishes.remove(d);
+                                  }
+                                }
+                              }
+                              selectedSetMenu = next;
+                              if (curateOwn && next != 'All Dishes') {
+                                final rows = state.setMenus.where((m) => m.name == next).toList();
+                                if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
+                              }
+                              if (!curateOwn && next != 'All Dishes') {
+                                menuSuggestionNote = 'Preferred set menu: $next';
+                              } else if (!curateOwn) {
+                                menuSuggestionNote = 'No, suggest me a menu instead.';
+                              }
+                            });
+                          },
+                        ),
+                      ],
                       if (curateOwn) ...[
                         CheckboxListTile(
                           dense: true,
@@ -11903,30 +12081,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           onChanged: (_) => setState(() {}),
                         ),
                         const SizedBox(height: 8),
-                        DropdownButtonFormField<String>(
-                          value: effectiveSetMenu,
-                          items: setMenuNames.map((name) => DropdownMenuItem(value: name, child: Text(name))).toList(),
-                          onChanged: (v) {
-                            final next = v ?? 'All Dishes';
-                            setState(() {
-                              final prev = selectedSetMenu;
-                              if (prev != next && prev != 'All Dishes') {
-                                final prevRows = state.setMenus.where((m) => m.name == prev).toList();
-                                if (prevRows.isNotEmpty) {
-                                  for (final d in prevRows.first.dishes) {
-                                    selectedDishes.remove(d);
-                                  }
-                                }
-                              }
-                              selectedSetMenu = next;
-                              if (next != 'All Dishes') {
-                                final rows = state.setMenus.where((m) => m.name == next).toList();
-                                if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
-                              }
-                            });
-                          },
-                        ),
-                        const SizedBox(height: 8),
                         Align(
                           alignment: Alignment.centerLeft,
                           child: Text(
@@ -11975,7 +12129,15 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                               : const Icon(Icons.fastfood, size: 22),
                                         ),
                                       ),
-                                      title: Text(dishName, style: const TextStyle(fontSize: 13)),
+                                      title: InkWell(
+                                        onTap: () => showDishAllergensDialog(
+                                          context,
+                                          dishName: dishName,
+                                          allergens: dish?.allergens ?? const [],
+                                        ),
+                                        child: Text(dishName, style: const TextStyle(fontSize: 13, decoration: TextDecoration.underline)),
+                                      ),
+                                      subtitle: const Text('Tap dish name for allergens', style: TextStyle(fontSize: 11)),
                                       value: sel,
                                       onChanged: (_) => setState(() {
                                         if (sel) {
@@ -11984,6 +12146,15 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                           selectedDishes.add(dishName);
                                         }
                                       }),
+                                      trailing: IconButton(
+                                        icon: const Icon(Icons.info_outline, size: 22),
+                                        tooltip: 'View allergens',
+                                        onPressed: () => showDishAllergensDialog(
+                                          context,
+                                          dishName: dishName,
+                                          allergens: dish?.allergens ?? const [],
+                                        ),
+                                      ),
                                       controlAffinity: ListTileControlAffinity.leading,
                                     ),
                                   );
@@ -12118,14 +12289,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           'note': themeNotesController.text.trim(),
                           'reference_images': _themeReferenceImagesB64,
                         },
-                if (inquiryType == 'CATERING AND EVENT' &&
-                    _seatingPlanPayload != null &&
-                    !_seatingPlanPayload!.isEffectivelyEmpty)
-                  'seating_plan': _seatingPlanPayload!.toJson(),
                 'event_city': eventCity.text.trim(),
                 'event_setting': eventSetting,
                 'service_included': serviceIncluded,
-                'formality_level': inquiryType == 'CATERING AND EVENT' ? formalityLevel : '',
+                'formality_level': formalityLevel,
+                if (_selectedGuestAllergens.isNotEmpty) 'guest_allergens': _selectedGuestAllergens.toList(),
                 'food_tasting_requested': foodTastingRequested,
                 'food_tasting_date': foodTastingDate.text.trim(),
                 'food_tasting_time': foodTastingTime.text.trim(),
@@ -12279,9 +12447,15 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     if (r.eventType.trim().isNotEmpty) {
       lines.add(line('Event type: ${r.eventType}'));
     }
+    if (r.formalityLevel.trim().isNotEmpty) {
+      lines.add(line('Formality: ${r.formalityLevel}'));
+    }
+    final guestAllergens = r.themeDesign['guest_allergens'];
+    if (guestAllergens is List && guestAllergens.isNotEmpty) {
+      lines.add(line('Guest allergens to avoid: ${guestAllergens.map((e) => '$e').join(', ')}'));
+    }
     if (isFullEvent) {
       if (r.eventTitle.trim().isNotEmpty) lines.add(line('Event title: ${r.eventTitle}'));
-      if (r.formalityLevel.trim().isNotEmpty) lines.add(line('Formality: ${r.formalityLevel}'));
       if (r.eventCity.trim().isNotEmpty) lines.add(line('City: ${r.eventCity}'));
       if (r.eventSetting.trim().isNotEmpty) lines.add(line('Setting: ${r.eventSetting}'));
       if (r.themeSuggestionNote.trim().isNotEmpty) lines.add(line('Theme / styling: ${r.themeSuggestionNote}'));
@@ -12452,55 +12626,6 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     appSnack(context, err ?? 'Feedback submitted');
   }
 
-  Future<void> _openThemeDesign(InquiryRecord r) async {
-    final email = widget.state.userEmail?.trim() ?? r.inquiryEmail.trim();
-    if (email.isEmpty) {
-      appSnack(context, 'Sign in to edit theme design');
-      return;
-    }
-    await Navigator.push<void>(
-      context,
-      MaterialPageRoute<void>(
-        builder: (_) => EventThemeDesignScreen(
-          apiBase: widget.state.apiBase,
-          userEmail: email,
-          orderId: r.id,
-          orderKind: r.orderKind,
-          initialEventType: r.eventType.isNotEmpty ? r.eventType : 'Birthday',
-          initialThemeDesign: r.themeDesign,
-          persistToOrder: r.canEditThemeDesign,
-        ),
-      ),
-    );
-    if (!mounted) return;
-    await widget.state.loadInquiries(force: true);
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _openSeatingLayout(InquiryRecord r) async {
-    final email = widget.state.userEmail?.trim() ?? r.inquiryEmail.trim();
-    if (email.isEmpty) {
-      appSnack(context, 'Sign in to open seating layout');
-      return;
-    }
-    await Navigator.push<SeatingPlanData?>(
-      context,
-      MaterialPageRoute<SeatingPlanData?>(
-        builder: (_) => SeatingLayoutEditorScreen(
-          apiBase: widget.state.apiBase,
-          userEmail: email,
-          orderId: r.id,
-          orderKind: r.orderKind,
-          initialPlan: r.seatingPlan.isNotEmpty ? SeatingPlanData.fromJson(r.seatingPlan) : null,
-          readOnly: !r.canEditSeating,
-        ),
-      ),
-    );
-    if (!mounted) return;
-    await widget.state.loadInquiries(force: true);
-    if (mounted) setState(() {});
-  }
-
   void _showDetail(InquiryRecord r, {required bool allowFollowUp}) {
     _markCompletedInquiryRead(r);
     final feedback = _feedbackByInquiryId[r.id];
@@ -12515,20 +12640,18 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               ..._inquiryDetailLines(r),
-              if (r.isCateringPlusEvent && (hasEventThemeDesign(r.themeDesign) || r.canShowSeating)) ...[
+              if (r.isCateringPlusEvent && hasEventThemeDesign(r.themeDesign)) ...[
                 const SizedBox(height: 12),
                 const Divider(height: 16),
                 Text(
-                  'Event theme design & seating',
+                  'Event theme design',
                   style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
                 ),
-                if (hasEventThemeDesign(r.themeDesign)) ...[
-                  const SizedBox(height: 6),
-                  Text(
-                    eventDesignSourceLabel(r.themeDesign),
-                    style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
-                  ),
-                ],
+                const SizedBox(height: 6),
+                Text(
+                  eventDesignSourceLabel(r.themeDesign),
+                  style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
+                ),
                 const SizedBox(height: 8),
                 if (themeImg.isNotEmpty)
                   ClipRRect(
@@ -12552,37 +12675,6 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
                       errorBuilder: (_, __, ___) => const SizedBox.shrink(),
                     ),
                   ),
-                if (themeImg.isNotEmpty ||
-                    '${r.themeDesign['venuePhotoBase64'] ?? ''}'.trim().isNotEmpty)
-                  const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    if (r.canEditThemeDesign || hasEventThemeDesign(r.themeDesign))
-                      FilledButton.icon(
-                        onPressed: () {
-                          Navigator.pop(ctx);
-                          _openThemeDesign(r);
-                        },
-                        icon: const Icon(Icons.auto_awesome, size: 18),
-                        label: Text(
-                          hasEventThemeDesign(r.themeDesign)
-                              ? 'Edit theme design'
-                              : 'Create my own theme design',
-                        ),
-                      ),
-                    if (r.canShowSeating)
-                      OutlinedButton.icon(
-                        onPressed: () {
-                          Navigator.pop(ctx);
-                          _openSeatingLayout(r);
-                        },
-                        icon: const Icon(Icons.table_restaurant, size: 18),
-                        label: Text(r.canEditSeating ? 'Edit seating layout' : 'View seating layout'),
-                      ),
-                  ],
-                ),
               ],
               if (feedback != null) ...[
                 const SizedBox(height: 8),
@@ -13790,6 +13882,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   final List<_InquiryEventWindow> _forProcessingWindows = [];
   bool _forProcessingWindowsLoading = false;
   bool _forProcessingWindowsLoaded = false;
+  final Set<String> _selectedGuestAllergens = {};
+  String _newEventThemeSessionId = 'manager-ne-${DateTime.now().microsecondsSinceEpoch}';
+  Map<String, dynamic>? _newEventThemeDesign;
+  SeatingPlanData? _newEventSeatingPlan;
 
   void _syncCustomerFromContactIfChecked() {
     if (!_customerSameAsContact) return;
@@ -13816,6 +13912,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     eventSetting = 'open';
     serviceIncluded = 'no';
     formalityLevel = 'casual';
+    _selectedGuestAllergens.clear();
+    _newEventThemeSessionId = 'manager-ne-${DateTime.now().microsecondsSinceEpoch}';
+    _newEventThemeDesign = null;
+    _newEventSeatingPlan = null;
     foodTastingRequested = false;
     foodTastingDate.clear();
     foodTastingTime.clear();
@@ -13840,7 +13940,9 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     super.initState();
     _resetNewEventFormKeepContactOnly();
     contactPerson.addListener(_syncCustomerFromContactIfChecked);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await widget.state.loadAllergenCatalog();
       if (!mounted) return;
       _loadForProcessingWindowsIfNeeded();
     });
@@ -14266,6 +14368,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final guestsSaved = _guestCountForSubmit();
       final menuPayload = selectedDishes.toList();
       final themeDesign = <String, dynamic>{
+        ...?_newEventThemeDesign,
         'note': note.text.trim(),
         'pax_buffer': _paxBufferForPricing(),
         'event_setting': eventSetting,
@@ -14277,6 +14380,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         'additional_costs': additionalCosts,
         'labor_manual_costs': laborManualCosts,
         'formality_level': formalityLevel,
+        if (_selectedGuestAllergens.isNotEmpty) 'guest_allergens': _selectedGuestAllergens.toList(),
         if (inquiryType == 'CATERING AND EVENT') 'theme_suggestion_note': themeSuggestionNote,
       };
       final costBreakdown = <Map<String, dynamic>>[
@@ -14349,6 +14453,11 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             menu: menuPayload,
             themeDesign: themeDesign,
             formalityLevel: formalityLevel,
+            seatingPlan: orderKind == 'event' &&
+                    _newEventSeatingPlan != null &&
+                    !_newEventSeatingPlan!.isEffectivelyEmpty
+                ? _newEventSeatingPlan!.toJson()
+                : null,
           );
           if (createErr != null) return createErr;
           await widget.state.loadManagerCateringByStage('new_event', force: true);
@@ -14517,6 +14626,19 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 ],
                 selected: {formalityLevel},
                 onSelectionChanged: (s) => setState(() => formalityLevel = s.first),
+              ),
+              const SizedBox(height: 12),
+              const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 6),
+              buildGuestAllergenSelector(
+                catalog: state.allergenCatalog,
+                selected: _selectedGuestAllergens,
+                enabled: true,
+                onChanged: (next) => setState(() {
+                  _selectedGuestAllergens
+                    ..clear()
+                    ..addAll(next);
+                }),
               ),
               const SizedBox(height: 12),
               const Text('Event setting', style: TextStyle(fontWeight: FontWeight.w600)),
@@ -14918,31 +15040,79 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             expanded: true,
             onToggle: () {},
             hideToggleIcon: true,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const SizedBox(height: 8),
-                Text(
-                  'Theme design cost and notes for manager costing. Use order detail after save for AI theme and seating tools.',
-                  style: TextStyle(color: Colors.blueGrey.shade700, fontWeight: FontWeight.w600, fontSize: 13),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: note,
-                  maxLines: 4,
-                  decoration: const InputDecoration(labelText: 'Theme design notes'),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: themeCostController,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    labelText: 'Theme design cost (estimate)',
-                    helperText: 'Included in estimated total — matches Online Inquiries + manager costing.',
+            child: buildManagerThemeDesignBlock(
+              themeDesign: _newEventThemeDesign ?? const {},
+              openEditorLabel: _newEventThemeDesign == null ? 'Create my own theme design' : 'Edit theme design',
+              onOpenEditor: () async {
+                final email = inquiryEmail.text.trim().isNotEmpty
+                    ? inquiryEmail.text.trim()
+                    : (widget.state.userEmail ?? '');
+                if (email.isEmpty) {
+                  appSnack(context, 'Enter customer email before opening theme design.');
+                  return;
+                }
+                final result = await Navigator.push<Map<String, dynamic>?>(
+                  context,
+                  MaterialPageRoute<Map<String, dynamic>?>(
+                    builder: (_) => EventThemeDesignScreen(
+                      apiBase: widget.state.apiBase,
+                      userEmail: email,
+                      designSessionId: _newEventThemeSessionId,
+                      initialEventType: _resolvedEventType(),
+                      initialThemeDesign: _newEventThemeDesign,
+                      eventTitle: eventTitle.text.trim(),
+                      formalityLevel: formalityLevel,
+                      eventSetting: eventSetting,
+                      cashierEmail: widget.state.userEmail,
+                      cashierPassword: widget.state.loginPassword,
+                    ),
                   ),
-                  onChanged: (_) => setState(() {}),
-                ),
-              ],
+                );
+                if (result != null && mounted) {
+                  setState(() => _newEventThemeDesign = result);
+                }
+              },
+              showCostFields: true,
+              noteController: note,
+              costController: themeCostController,
+            ),
+          ),
+          const SizedBox(height: 10),
+          ToggleSection(
+            title: 'Seating layout',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: buildManagerSeatingLayoutBlock(
+              seatingPlanJson: _newEventSeatingPlan?.toJson() ?? const {},
+              helperText: 'Plan tables and chairs for this event (optional). Saved with the new event.',
+              buttonLabel: _newEventSeatingPlan == null || _newEventSeatingPlan!.isEffectivelyEmpty
+                  ? 'Edit seating layout'
+                  : 'Edit seating layout (draft saved)',
+              onOpenEditor: () async {
+                final email = inquiryEmail.text.trim().isNotEmpty
+                    ? inquiryEmail.text.trim()
+                    : (widget.state.userEmail ?? '');
+                if (email.isEmpty) {
+                  appSnack(context, 'Enter customer email before editing seating.');
+                  return;
+                }
+                final result = await Navigator.push<SeatingPlanData?>(
+                  context,
+                  MaterialPageRoute<SeatingPlanData?>(
+                    builder: (_) => SeatingLayoutEditorScreen(
+                      apiBase: widget.state.apiBase,
+                      userEmail: email,
+                      orderKind: 'event',
+                      draftOnly: true,
+                      initialPlan: _newEventSeatingPlan,
+                    ),
+                  ),
+                );
+                if (result != null && mounted) {
+                  setState(() => _newEventSeatingPlan = result);
+                }
+              },
             ),
           ),
         ],
@@ -15530,6 +15700,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   Uint8List? _managerAdditionalCostsProofBytes;
   String _managerDownPaymentMethod = 'Cash';
   String _managerFullPaymentMethod = 'Cash';
+  final Set<String> managerGuestAllergens = {};
+  final List<String> _managerVenueSuggestions = [];
+  Timer? _managerVenueDebounce;
 
   double _sumCostRows(List<Map<String, dynamic>> rows) {
     double sum = 0;
@@ -16544,6 +16717,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   void initState() {
     super.initState();
     managerContactPersonController.addListener(_maybeCopyContactToCustomerForCheckbox);
+    managerAddressController.addListener(_onManagerVenueChanged);
     for (final c in [
       managerDraftEventTitleController,
       managerCustomerNameController,
@@ -16559,7 +16733,59 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (mounted) setState(() {});
       });
     }
-    Future.microtask(_bootstrapDetail);
+    Future.microtask(() async {
+      await widget.state.loadAllergenCatalog();
+      if (!mounted) return;
+      await _bootstrapDetail();
+    });
+  }
+
+  void _onManagerVenueChanged() {
+    _managerVenueDebounce?.cancel();
+    final q = managerAddressController.text.trim();
+    if (q.length < 3) {
+      if (_managerVenueSuggestions.isNotEmpty && mounted) {
+        setState(() => _managerVenueSuggestions.clear());
+      }
+      return;
+    }
+    _managerVenueDebounce = Timer(const Duration(milliseconds: 300), () async {
+      try {
+        final uri = Uri.parse(
+          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(q)}&format=json&limit=5',
+        );
+        final res = await http.get(uri, headers: {'User-Agent': kNominatimUserAgent}).timeout(_apiTimeout);
+        if (res.statusCode != 200 || !mounted) return;
+        final body = jsonDecode(res.body);
+        if (body is! List) return;
+        final next = body
+            .whereType<Map>()
+            .map((e) => '${e['display_name'] ?? ''}'.trim())
+            .where((s) => s.isNotEmpty)
+            .take(5)
+            .toList();
+        if (mounted) {
+          setState(() {
+            _managerVenueSuggestions
+              ..clear()
+              ..addAll(next);
+          });
+        }
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _pickManagerVenueOnMap() async {
+    final res = await Navigator.of(context).push<MapPinResult>(
+      MaterialPageRoute(
+        builder: (_) => _MapPinPickerDialog(initialSearchQuery: managerAddressController.text.trim()),
+      ),
+    );
+    if (res == null || !mounted) return;
+    setState(() {
+      managerAddressController.text = res.address.trim();
+      _managerVenueSuggestions.clear();
+    });
   }
 
   String get _localDraftKey => '$_managerDraftDetailKeyPrefix${widget.row.id}_${widget.stage}';
@@ -16616,6 +16842,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     managerPaxBufferController.text = '${_paxBufferCount(row) <= 0 ? '' : _paxBufferCount(row)}';
     managerInquiryNoteController.text = '${tdInit['note'] ?? ''}';
     managerEventSetting = '${tdInit['event_setting'] ?? 'open'}'.trim().isEmpty ? 'open' : tdInit['event_setting'].toString().trim();
+    managerGuestAllergens.clear();
+    final gaRaw = tdInit['guest_allergens'] ?? row.postAnalysis['guest_allergens'];
+    if (gaRaw is List) {
+      for (final e in gaRaw) {
+        final s = '$e'.trim();
+        if (s.isNotEmpty) managerGuestAllergens.add(s);
+      }
+    }
     _draftOrderKind = row.orderKind;
     if (widget.stage == 'new_event' || widget.stage == 'online_inquiries') {
       _eventWindows
@@ -16808,6 +17042,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       'proof_fp': _managerFullPaymentProofBytes?.length ?? 0,
       'proof_ac': _managerAdditionalCostsProofBytes?.length ?? 0,
       'actual_images': imgList,
+      'guest_allergens': (managerGuestAllergens.toList()..sort()),
     });
   }
 
@@ -16852,6 +17087,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   @override
   void dispose() {
+    _managerVenueDebounce?.cancel();
+    managerAddressController.removeListener(_onManagerVenueChanged);
     managerContactPersonController.removeListener(_maybeCopyContactToCustomerForCheckbox);
     downPaymentController.dispose();
     downPaymentPaidController.dispose();
@@ -17519,15 +17756,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           'event_title': managerDraftEventTitleController.text.trim(),
           'event_type': et,
           'event_setting': managerEventSetting,
-          'formality_level': (isDraftStageHere && widget.stage == 'new_event') || rowBase.orderKind == 'event'
-              ? managerFormalityLevel
-              : '',
+          'formality_level': managerFormalityLevel,
+          if (managerGuestAllergens.isNotEmpty) 'guest_allergens': managerGuestAllergens.toList(),
         };
 
         if (isDraftStageHere) {
           final gc = int.tryParse(managerGuestCountController.text.trim());
-          final formalityOut =
-              widget.stage == 'new_event' || _draftOrderKind == 'event' ? managerFormalityLevel : '';
+          final formalityOut = managerFormalityLevel;
           final err = await widget.state.managerSaveCateringDraft(
             id: rowBase.id,
             orderKind: rowBase.orderKind,
@@ -18205,9 +18440,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         'event_type':
             managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice,
         'event_setting': managerEventSetting,
-        'formality_level': widget.stage == 'new_event' || rowSubmit.orderKind == 'event'
-            ? managerFormalityLevel
-            : '',
+        'formality_level': managerFormalityLevel,
+        if (managerGuestAllergens.isNotEmpty) 'guest_allergens': managerGuestAllergens.toList(),
       };
       final costBreakdown = <Map<String, dynamic>>[
         {'label': 'Base food cost', 'amount': _baseFoodCost()},
@@ -18338,7 +18572,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           return;
         }
         if (choice == 'save') {
-          await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+          final ok = await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+          if (!context.mounted) return;
+          if (ok && Navigator.of(context).canPop()) Navigator.of(context).pop();
         }
       },
       child: Scaffold(
@@ -19184,14 +19420,40 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           : () => showEventVenueMapPreview(context, managerAddressController.text),
                       decoration: InputDecoration(
                         labelText: 'Event venue',
-                        helperText: 'Tap the map icon or address preview to open the location',
+                        helperText: canEditStage
+                            ? 'Type to search, pin on map, or pick a suggestion'
+                            : 'Tap the map icon or address preview to open the location',
                         suffixIcon: IconButton(
-                          tooltip: 'View on map',
-                          icon: const Icon(Icons.map_outlined),
-                          onPressed: () => showEventVenueMapPreview(context, managerAddressController.text),
+                          tooltip: canEditStage ? 'Pin on map' : 'View on map',
+                          icon: Icon(canEditStage ? Icons.place_outlined : Icons.map_outlined),
+                          onPressed: canEditStage
+                              ? _pickManagerVenueOnMap
+                              : () => showEventVenueMapPreview(context, managerAddressController.text),
                         ),
                       ),
                     ),
+                    if (canEditStage && _managerVenueSuggestions.isNotEmpty)
+                      Container(
+                        margin: const EdgeInsets.only(top: 6),
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.grey.shade300),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Column(
+                          children: _managerVenueSuggestions
+                              .map(
+                                (s) => ListTile(
+                                  dense: true,
+                                  title: Text(s, maxLines: 2, overflow: TextOverflow.ellipsis),
+                                  onTap: () => setState(() {
+                                    managerAddressController.text = s;
+                                    _managerVenueSuggestions.clear();
+                                  }),
+                                ),
+                              )
+                              .toList(),
+                        ),
+                      ),
                     if (!isAllowedCateringAddressInCoverage(managerAddressController.text.trim()))
                       Padding(
                         padding: const EdgeInsets.only(top: 6),
@@ -19280,7 +19542,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       ],
                     ),
                     const SizedBox(height: 8),
-                    if (widget.stage == 'new_event') ...[
+                    if (_isManagerDraftDetailStage) ...[
                       const SizedBox(height: 6),
                       const Text('Formality level', style: TextStyle(fontWeight: FontWeight.w600)),
                       const SizedBox(height: 6),
@@ -19296,6 +19558,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                   managerFormalityLevel = s.first;
                                 })
                             : null,
+                      ),
+                      const SizedBox(height: 8),
+                      const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      buildGuestAllergenSelector(
+                        catalog: widget.state.allergenCatalog,
+                        selected: managerGuestAllergens,
+                        enabled: canEditStage,
+                        onChanged: (next) => setState(() {
+                          managerGuestAllergens
+                            ..clear()
+                            ..addAll(next);
+                        }),
                       ),
                       const SizedBox(height: 8),
                     ],
@@ -19516,122 +19791,63 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   children: [
                     const Text('Event Theme Design', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        FilledButton.icon(
-                          onPressed: () async {
-                            final email = managerEmailController.text.trim().isNotEmpty
-                                ? managerEmailController.text.trim()
-                                : row.emailAddress;
-                            final updated = await Navigator.push<Map<String, dynamic>?>(
-                              context,
-                              MaterialPageRoute<Map<String, dynamic>?>(
-                                builder: (_) => EventThemeDesignScreen(
-                                  apiBase: widget.state.apiBase,
-                                  userEmail: email,
-                                  orderId: row.id,
-                                  orderKind: row.orderKind,
-                                  initialEventType: row.eventType,
-                                  initialThemeDesign: row.themeDesign,
-                                  cashierEmail: widget.state.userEmail,
-                                  cashierPassword: widget.state.loginPassword,
-                                  persistToOrder: true,
+                    buildManagerThemeDesignBlock(
+                      themeDesign: row.themeDesign,
+                      openEditorLabel: hasEventThemeDesign(row.themeDesign)
+                          ? 'Edit theme design'
+                          : 'Create my own theme design',
+                      onOpenEditor: !isPost && !isCompleted
+                          ? () async {
+                              final email = managerEmailController.text.trim().isNotEmpty
+                                  ? managerEmailController.text.trim()
+                                  : row.emailAddress;
+                              final updated = await Navigator.push<Map<String, dynamic>?>(
+                                context,
+                                MaterialPageRoute<Map<String, dynamic>?>(
+                                  builder: (_) => EventThemeDesignScreen(
+                                    apiBase: widget.state.apiBase,
+                                    userEmail: email,
+                                    orderId: row.id,
+                                    orderKind: row.orderKind,
+                                    initialEventType:
+                                        row.eventType.isNotEmpty ? row.eventType : 'Birthday',
+                                    initialThemeDesign: row.themeDesign,
+                                    eventTitle: row.eventTitle,
+                                    formalityLevel: managerFormalityLevel,
+                                    eventSetting: managerEventSetting,
+                                    cashierEmail: widget.state.userEmail,
+                                    cashierPassword: widget.state.loginPassword,
+                                    persistToOrder: true,
+                                  ),
                                 ),
-                              ),
-                            );
-                            if (updated != null && mounted) {
-                              final m = await widget.state.loadManagerCateringItem(
-                                id: row.id,
-                                orderKind: row.orderKind,
                               );
-                              if (m != null) setState(() => _loadedDetailRow = m);
+                              if (updated != null && mounted) {
+                                final m = await widget.state.loadManagerCateringItem(
+                                  id: row.id,
+                                  orderKind: row.orderKind,
+                                );
+                                if (m != null) setState(() => _loadedDetailRow = m);
+                              }
                             }
-                          },
-                          icon: const Icon(Icons.auto_awesome),
-                          label: const Text('Create my own theme design'),
-                        ),
-                      ],
+                          : null,
+                      showCostFields: isDraftStage,
+                      noteController: managerInquiryNoteController,
+                      costController: themeCostAmountController,
+                      readOnlyCostFields: isThemeReadOnly || !canEditStage,
                     ),
-                    if (isDraftStage) ...[
-                      const SizedBox(height: 10),
-                      TextField(
-                        controller: managerInquiryNoteController,
-                        readOnly: isThemeReadOnly || !canEditStage,
-                        maxLines: 4,
-                        decoration: const InputDecoration(labelText: 'Theme notes'),
-                      ),
+                    if (!isDraftStage && themeDesignCosts.isNotEmpty) ...[
                       const SizedBox(height: 8),
-                      TextField(
-                        controller: themeCostAmountController,
-                        keyboardType: TextInputType.number,
-                        readOnly: isThemeReadOnly || !canEditStage,
-                        decoration: const InputDecoration(labelText: 'Theme design cost'),
-                      ),
-                    ] else ...[
-                      const SizedBox(height: 8),
-                      Builder(
-                        builder: (context) {
-                          final webImage = '${row.themeDesign['image'] ?? row.themeDesign['imageBase64'] ?? row.themeDesign['output'] ?? ''}'.trim();
-                          final webImageUrl =
-                              '${row.themeDesign['generatedImageUrl'] ?? row.themeDesign['imageUrl'] ?? row.themeDesign['url'] ?? ''}'.trim();
-                          if (webImage.isNotEmpty) {
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.memory(
-                                  base64Decode(webImage),
-                                  height: 160,
-                                  fit: BoxFit.contain,
-                                  errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
-                                ),
-                              ),
-                            );
-                          }
-                          if (webImageUrl.isNotEmpty) {
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.network(
-                                  webImageUrl,
-                                  height: 160,
-                                  fit: BoxFit.contain,
-                                  errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
-                                ),
-                              ),
-                            );
-                          }
-                          return Text(
-                            'No web theme design output found in this order.',
-                            style: TextStyle(color: Colors.grey.shade700),
-                          );
-                        },
-                      ),
-                      if (managerInquiryNoteController.text.trim().isNotEmpty ||
-                          '${row.themeDesign['note'] ?? ''}'.trim().isNotEmpty)
-                        Text(
-                          'Notes: ${managerInquiryNoteController.text.trim().isNotEmpty ? managerInquiryNoteController.text.trim() : '${row.themeDesign['note'] ?? ''}'}',
-                        ),
-                      if (themeDesignCosts.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        ...themeDesignCosts.map(
-                          (e) => ListTile(
-                            dense: true,
-                            contentPadding: EdgeInsets.zero,
-                            title: Text('${e['label'] ?? ''}'.trim().isEmpty ? 'Theme cost' : '${e['label']}'),
-                            trailing: Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
+                      ...themeDesignCosts.map(
+                        (e) => ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(
+                            '${e['label'] ?? ''}'.trim().isEmpty ? 'Theme cost' : '${e['label']}',
                           ),
+                          trailing: Text('₱${jsonToDouble(e['amount']).toStringAsFixed(2)}'),
                         ),
-                      ],
-                      if ('${row.themeDesign['note'] ?? ''}'.trim().isEmpty &&
-                          managerInquiryNoteController.text.trim().isEmpty &&
-                          themeDesignCosts.isEmpty)
-                        const SizedBox.shrink(),
+                      ),
                     ],
-                    const SizedBox(height: 8),
                   ],
                 ),
               ),
@@ -19645,15 +19861,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   children: [
                     const Text('Seating layout', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
-                    Text(
-                      widget.stage == 'for_processing'
+                    buildManagerSeatingLayoutBlock(
+                      seatingPlanJson: row.seatingPlan,
+                      helperText: widget.stage == 'for_processing'
                           ? 'Edit table and chair placement while this order is in For Processing.'
-                          : 'View the saved seating layout for this event.',
-                      style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
-                    ),
-                    const SizedBox(height: 10),
-                    OutlinedButton.icon(
-                      onPressed: () async {
+                          : 'View the seating layout submitted with this inquiry.',
+                      buttonLabel:
+                          canEditSeatingLayout(row.status) ? 'Edit seating layout' : 'View seating layout',
+                      onOpenEditor: () async {
+                        final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
                         await Navigator.push<SeatingPlanData?>(
                           context,
                           MaterialPageRoute<SeatingPlanData?>(
@@ -19662,6 +19878,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               userEmail: row.emailAddress,
                               orderId: row.id,
                               orderKind: row.orderKind,
+                              initialPlan: initialPlan.isEffectivelyEmpty ? null : initialPlan,
                               cashierEmail: widget.state.userEmail,
                               cashierPassword: widget.state.loginPassword,
                               readOnly: !canEditSeatingLayout(row.status),
@@ -19675,8 +19892,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         );
                         if (m != null) setState(() => _loadedDetailRow = m);
                       },
-                      icon: const Icon(Icons.table_restaurant),
-                      label: Text(canEditSeatingLayout(row.status) ? 'Edit seating layout' : 'View seating layout'),
                     ),
                   ],
                 ),
@@ -20826,6 +21041,17 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
       builder: (context, _) {
         return Column(
           children: [
+            if (widget.state.cashierDataLoadError != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    widget.state.cashierDataLoadError!,
+                    style: TextStyle(color: Colors.red.shade800, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
               child: Row(
@@ -21332,6 +21558,17 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
       builder: (context, _) {
         return Column(
           children: [
+            if (widget.state.cashierDataLoadError != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    widget.state.cashierDataLoadError!,
+                    style: TextStyle(color: Colors.red.shade800, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
               child: Row(

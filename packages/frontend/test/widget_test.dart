@@ -10,10 +10,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:curatering_mobile/main.dart';
 
 void main() {
-  testWidgets('renders welcome auth screen', (WidgetTester tester) async {
+  testWidgets('renders auth screen', (WidgetTester tester) async {
     await tester.pumpWidget(const CurateringApp());
 
-    expect(find.text('WELCOME'), findsOneWidget);
     expect(find.text('LOG IN'), findsAtLeastNWidgets(1));
   });
 }

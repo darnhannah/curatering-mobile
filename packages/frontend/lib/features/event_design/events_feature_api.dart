@@ -15,8 +15,18 @@ class EventsFeatureApi {
     return Uri.parse('$base$path').replace(queryParameters: query);
   }
 
-  Future<List<Map<String, dynamic>>> listAiGenerations(String userEmail) async {
-    final res = await http.get(_uri('/api/mobile/ai-generations', {'user_email': userEmail}));
+  Future<List<Map<String, dynamic>>> listAiGenerations(
+    String userEmail, {
+    String? orderId,
+    String? designSessionId,
+  }) async {
+    final query = <String, String>{'user_email': userEmail};
+    if (orderId != null && orderId.trim().isNotEmpty) {
+      query['order_id'] = orderId.trim();
+    } else if (designSessionId != null && designSessionId.trim().isNotEmpty) {
+      query['design_session_id'] = designSessionId.trim();
+    }
+    final res = await http.get(_uri('/api/mobile/ai-generations', query));
     if (res.statusCode != 200) return [];
     final body = jsonDecode(res.body);
     if (body is! List) return [];
@@ -73,11 +83,18 @@ class EventsFeatureApi {
     String? cashierEmail,
     String? cashierPassword,
   }) async {
+    final query = <String, String>{
+      'order_kind': orderKind,
+      'user_email': userEmail,
+    };
+    if (cashierEmail != null && cashierEmail.trim().isNotEmpty) {
+      query['cashier_email'] = cashierEmail.trim();
+    }
+    if (cashierPassword != null && cashierPassword.isNotEmpty) {
+      query['cashier_password'] = cashierPassword;
+    }
     final res = await http.get(
-      _uri('/api/mobile/events/$orderId/seating-plan', {
-        'order_kind': orderKind,
-        'user_email': userEmail,
-      }),
+      _uri('/api/mobile/events/$orderId/seating-plan', query),
     );
     if (res.statusCode != 200) {
       throw Exception(_errorFromBody(res.body) ?? 'Could not load seating plan');

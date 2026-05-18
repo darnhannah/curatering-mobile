@@ -989,6 +989,15 @@ async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_confirmed_initial BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_confirmed_balance BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_status TEXT`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS contact_number TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_address TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_amount_received_initial NUMERIC(12,2)`,
+  );
+  await pool.query(
+    `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_amount_received_balance NUMERIC(12,2)`,
+  );
   await pool.query(
     `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS loyalty_points_restaurant_obtained INTEGER NOT NULL DEFAULT 0`,
   );

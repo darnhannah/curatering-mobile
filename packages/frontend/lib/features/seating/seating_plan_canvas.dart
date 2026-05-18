@@ -83,7 +83,8 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
     });
     for (final t in widget.plan.tables) {
       final c = _labelCtrls[t.id];
-      if (c != null && c.text != t.label) {
+      // Do not overwrite the field while this table is selected (user may be typing).
+      if (c != null && c.text != t.label && t.id != _selectedTableId) {
         c.value = TextEditingValue(
           text: t.label,
           selection: TextSelection.collapsed(offset: t.label.length),
@@ -100,7 +101,7 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
     });
     for (final s in widget.plan.seats) {
       final c = _seatLabelCtrls[s.id];
-      if (c != null && c.text != s.label) {
+      if (c != null && c.text != s.label && s.id != _selectedSeatId) {
         c.value = TextEditingValue(
           text: s.label,
           selection: TextSelection.collapsed(offset: s.label.length),
@@ -380,17 +381,19 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
     _emit(widget.plan.copyWith(tables: tables, seats: allSeats));
   }
 
-  void _nudgeTable(double dxNorm, double dyNorm) {
-    final id = _selectedTableId;
-    if (id == null) return;
+  void _moveTable(String tableId, double dxNorm, double dyNorm) {
     final tables = widget.plan.tables.map((t) {
-      if (t.id != id) return t;
+      if (t.id != tableId) return t;
       return t.copyWith(
         xNorm: (t.xNorm + dxNorm).clamp(0.0, 1.0 - t.wNorm),
         yNorm: (t.yNorm + dyNorm).clamp(0.0, 1.0 - t.hNorm),
       );
     }).toList();
     _emit(widget.plan.copyWith(tables: tables));
+  }
+
+  void _onPanTable(String tableId, DragUpdateDetails d, double cw, double ch) {
+    _moveTable(tableId, d.delta.dx / cw, d.delta.dy / ch);
   }
 
   void _onResizeTable(String tableId, _TableResizeCorner corner, DragUpdateDetails d, double cw, double ch) {
@@ -578,45 +581,46 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                 label: const Text('Clear floor'),
               ),
               if (_selectedTableId != null) ...[
-                IconButton(
-                  tooltip: 'Fewer seats',
-                  onPressed: () => _bumpSeatCount(-1),
-                  icon: const Icon(Icons.remove_circle_outline),
-                ),
-                IconButton(
-                  tooltip: 'More seats',
-                  onPressed: () => _bumpSeatCount(1),
-                  icon: const Icon(Icons.add_circle_outline),
-                ),
-                IconButton(
-                  tooltip: 'Duplicate table',
-                  onPressed: _duplicateSelectedTable,
-                  icon: const Icon(Icons.copy_outlined),
-                ),
-                IconButton(
-                  tooltip: 'Nudge table left',
-                  onPressed: () => _nudgeTable(-0.008, 0),
-                  icon: const Icon(Icons.arrow_back, size: 20),
-                ),
-                IconButton(
-                  tooltip: 'Nudge table right',
-                  onPressed: () => _nudgeTable(0.008, 0),
-                  icon: const Icon(Icons.arrow_forward, size: 20),
-                ),
-                IconButton(
-                  tooltip: 'Nudge table up',
-                  onPressed: () => _nudgeTable(0, -0.008),
-                  icon: const Icon(Icons.arrow_upward, size: 20),
-                ),
-                IconButton(
-                  tooltip: 'Nudge table down',
-                  onPressed: () => _nudgeTable(0, 0.008),
-                  icon: const Icon(Icons.arrow_downward, size: 20),
-                ),
-                IconButton(
-                  tooltip: 'Delete table',
-                  onPressed: _deleteSelected,
-                  icon: const Icon(Icons.delete_outline, color: Colors.red),
+                Builder(
+                  builder: (context) {
+                    final tid = _selectedTableId!;
+                    final t = widget.plan.tables.firstWhere((e) => e.id == tid);
+                    final isChair = t.shape == 'chair';
+                    return Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (!isChair) ...[
+                          IconButton(
+                            tooltip: 'Fewer chairs',
+                            onPressed: t.seatCount <= 0 ? null : () => _bumpSeatCount(-1),
+                            icon: const Icon(Icons.remove_circle_outline),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
+                            child: Text(
+                              '${t.seatCount}',
+                              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'More chairs',
+                            onPressed: t.seatCount >= 100 ? null : () => _bumpSeatCount(1),
+                            icon: const Icon(Icons.add_circle_outline),
+                          ),
+                        ],
+                        IconButton(
+                          tooltip: 'Duplicate',
+                          onPressed: _duplicateSelectedTable,
+                          icon: const Icon(Icons.copy_outlined),
+                        ),
+                        IconButton(
+                          tooltip: 'Delete',
+                          onPressed: _deleteSelected,
+                          icon: const Icon(Icons.delete_outline, color: Colors.red),
+                        ),
+                      ],
+                    );
+                  },
                 ),
               ],
               if (_selectedSeatId != null) ...[
@@ -645,21 +649,43 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                               final t = widget.plan.tables.firstWhere((e) => e.id == tid);
                               final ctrl = _labelCtrl(tid, t.label);
                               return TextField(
-                                decoration: const InputDecoration(
-                                  labelText: 'Table label',
-                                  hintText: 'e.g. Head table, VIP 1',
-                                  border: OutlineInputBorder(),
+                                decoration: InputDecoration(
+                                  labelText: t.shape == 'chair' ? 'Chair label' : 'Table label',
+                                  hintText: t.shape == 'chair'
+                                      ? 'e.g. Bride, Guest 12'
+                                      : 'e.g. Head table, VIP 1',
+                                  border: const OutlineInputBorder(),
                                   isDense: true,
+                                  counterText: '',
                                 ),
                                 controller: ctrl,
+                                textCapitalization: TextCapitalization.sentences,
+                                keyboardType: TextInputType.text,
                                 onChanged: (v) {
                                   final tables = widget.plan.tables.map((tb) {
                                     if (tb.id != tid) return tb;
-                                    return tb.copyWith(
-                                      label: v.trim().isEmpty ? 'Table' : v.trim(),
-                                    );
+                                    return tb.copyWith(label: v);
                                   }).toList();
                                   _emit(widget.plan.copyWith(tables: tables));
+                                },
+                                onEditingComplete: () {
+                                  final trimmed = ctrl.text.trim();
+                                  if (trimmed.isEmpty) {
+                                    final fallback = t.shape == 'chair' ? 'Chair' : 'Table';
+                                    ctrl.text = fallback;
+                                    final tables = widget.plan.tables.map((tb) {
+                                      if (tb.id != tid) return tb;
+                                      return tb.copyWith(label: fallback);
+                                    }).toList();
+                                    _emit(widget.plan.copyWith(tables: tables));
+                                  } else if (trimmed != ctrl.text) {
+                                    ctrl.text = trimmed;
+                                    final tables = widget.plan.tables.map((tb) {
+                                      if (tb.id != tid) return tb;
+                                      return tb.copyWith(label: trimmed);
+                                    }).toList();
+                                    _emit(widget.plan.copyWith(tables: tables));
+                                  }
                                 },
                               );
                             },
@@ -668,8 +694,8 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                         const SizedBox(width: 12),
                         Expanded(
                           child: Text(
-                            'Drag green seats to position. Resize table with corner handles. '
-                            'Move table with arrow buttons.',
+                            'Drag tables and chairs on the floor plan. '
+                            'Drag green seat markers around a table. Resize with corner handles.',
                             style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
                           ),
                         ),
@@ -738,6 +764,7 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                           width: t.wNorm * w,
                           height: t.hNorm * h,
                           child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
                             onTap: () {
                               if (!widget.editable) return;
                               setState(() {
@@ -745,6 +772,17 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                                 _selectedSeatId = null;
                               });
                             },
+                            onPanStart: widget.editable
+                                ? (_) {
+                                    setState(() {
+                                      _selectedTableId = t.id;
+                                      _selectedSeatId = null;
+                                    });
+                                  }
+                                : null,
+                            onPanUpdate: widget.editable
+                                ? (d) => _onPanTable(t.id, d, w, h)
+                                : null,
                             child: Container(
                               alignment: Alignment.center,
                               decoration: BoxDecoration(
@@ -764,7 +802,9 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                                 ),
                               ),
                               child: Text(
-                                '${t.label}\n(${t.seatCount} seats)',
+                                t.shape == 'chair'
+                                    ? t.label
+                                    : '${t.label}\n(${t.seatCount} chairs)',
                                 textAlign: TextAlign.center,
                                 style: const TextStyle(
                                   fontSize: 11,

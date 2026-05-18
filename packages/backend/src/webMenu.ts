@@ -29,7 +29,15 @@ export const DEFAULT_PUBLIC_MENU_SQL = `
     COALESCE(md.ingredients::text, '[]') AS ingredients,
     COALESCE(TRIM(md.category), '')::text AS category,
     COALESCE(NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), '')::text AS dish_type,
-    md.image_base64::text AS image_base64
+    md.image_base64::text AS image_base64,
+    COALESCE(
+      (
+        SELECT json_agg(ma.allergen_name ORDER BY ord)::text
+        FROM unnest(COALESCE(md.allergens, '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
+        INNER JOIN public.menu_dishes_allergens ma ON ma.allergen_id = t.allergen_id
+      ),
+      '[]'
+    ) AS allergens
   FROM public.menu_dishes md
   WHERE NOT md.archived
   ORDER BY md.name
