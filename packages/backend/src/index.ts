@@ -17,6 +17,7 @@ import {
   getRestaurantOrdersCustomerIdKind,
   initDb,
 } from "./db.js";
+import { normalizeSeatingPlan, registerEventDesignSeatingRoutes } from "./eventDesignSeating.js";
 import {
   CASHIER_ONLINE_ORDER_WHERE,
   CATERING_TRANSACTION_ID,
@@ -3443,7 +3444,11 @@ app.get("/api/mobile/inquiries", async (req, res) => {
               COALESCE(NULLIF(TRIM(theme_design->>'event_setting'), ''), '') AS event_setting,
               '' AS service_included,
               COALESCE(formality_level, '') AS formality_level,
-              FALSE AS food_tasting_requested
+              FALSE AS food_tasting_requested,
+              COALESCE(theme_design, '{}'::jsonb) AS theme_design,
+              COALESCE(seating_plan, '{}'::jsonb) AS seating_plan,
+              COALESCE(NULLIF(TRIM(order_type), ''), 'catering_event') AS order_type,
+              'event'::text AS order_kind
          FROM event_orders
          WHERE LOWER(TRIM(COALESCE(customer_id::text, ''))) = $1
             OR LOWER(TRIM(email_address)) = $1
@@ -3484,7 +3489,11 @@ app.get("/api/mobile/inquiries", async (req, res) => {
                 COALESCE(NULLIF(TRIM(event_setting), ''), '') AS event_setting,
                 '' AS service_included,
                 COALESCE(NULLIF(TRIM(formality_level), ''), '') AS formality_level,
-                FALSE AS food_tasting_requested
+                FALSE AS food_tasting_requested,
+                '{}'::jsonb AS theme_design,
+                '{}'::jsonb AS seating_plan,
+                'catering'::text AS order_type,
+                'catering'::text AS order_kind
          FROM catering_orders
          WHERE LOWER(TRIM(COALESCE(customer_id::text, ''))) = $1
             OR LOWER(TRIM(email_address)) = $1
@@ -3623,12 +3632,23 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     const costBreakdown = Array.isArray(req.body?.cost_breakdown) ? req.body.cost_breakdown : [];
     const laborCost = toNum(req.body?.labor_cost, 0);
     const travelCost = toNum(req.body?.travel_cost, 0);
-    const themeDesignEvent = JSON.stringify({
+    const themeFromClient =
+      req.body?.theme_design != null && typeof req.body.theme_design === "object"
+        ? (req.body.theme_design as Record<string, unknown>)
+        : {};
+    const themeDesignMerged: Record<string, unknown> = {
       inquiry_type: inquiryType,
       service_included: serviceIncluded,
-      note: note.trim(),
       event_setting: eventSetting,
-    });
+      ...themeFromClient,
+    };
+    if (!String(themeDesignMerged.note ?? "").trim() && note.trim()) {
+      themeDesignMerged.note = note.trim();
+    }
+    const themeDesignJson = JSON.stringify(themeDesignMerged);
+    const seatingPlanJson = JSON.stringify(
+      req.body?.seating_plan != null ? normalizeSeatingPlan(req.body.seating_plan) : {},
+    );
     const sql = cateringOnly
       ? `INSERT INTO catering_orders
          (source, status, order_type, customer_name, contact_person, contact_number, email_address,
@@ -3639,10 +3659,10 @@ app.post("/api/mobile/inquiries", async (req, res) => {
          RETURNING id::text`
       : `INSERT INTO event_orders
          (source, status, order_type, event_title, event_type, formality_level, customer_name, contact_person, contact_number,
-          email_address, schedule_slots, address, guest_count, pax_buffer, menu, theme_design, checklist,
+          email_address, schedule_slots, address, guest_count, pax_buffer, menu, theme_design, seating_plan, checklist,
           total_cost, customer_id, event_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
          VALUES
-         ('online_inquiry', 'online_inquiries', 'catering_event', $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19, $20::jsonb, $21, $22, $23)
+         ('online_inquiry', 'online_inquiries', 'catering_event', $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20::jsonb, $21, $22, $23)
          RETURNING id::text`;
     const params = cateringOnly
       ? [
@@ -3685,7 +3705,8 @@ app.post("/api/mobile/inquiries", async (req, res) => {
           guestCount,
           paxBuffer,
           menuJson,
-          themeDesignEvent,
+          themeDesignJson,
+          seatingPlanJson,
           JSON.stringify({
             items: autoChecklist,
             post_analysis: { note, inquiry_type: inquiryType, pax_buffer: paxBuffer },
@@ -3908,7 +3929,8 @@ app.post("/api/mobile/pos/catering/item", async (req, res) => {
     const fullSelectEvent = `
       SELECT 'event'::text AS order_kind,
              id::text, source, status, order_type, customer_name, contact_person, contact_number, email_address,
-             schedule_slots, address, guest_count, menu, theme_design, ${POST_ANALYSIS_JSON} AS post_analysis, checklist,
+             schedule_slots, address, guest_count, menu, theme_design, COALESCE(seating_plan, '{}'::jsonb) AS seating_plan,
+             ${POST_ANALYSIS_JSON} AS post_analysis, checklist,
              down_payment_amount, down_payment_status, full_payment_amount, full_payment_status,
              total_cost, created_at, updated_at, stage_entered_at, event_title, event_type, formality_level, actual_event_images,
              COALESCE(theme_design->>'service_included', '') AS service_included,
@@ -5252,6 +5274,16 @@ async function seedCustomerSeedRow(): Promise<void> {
     console.warn("[db] customer_accounts seed skipped:", e);
   }
 }
+
+registerEventDesignSeatingRoutes(app, {
+  getPool,
+  verifyPosStaff: (email, password, roles) =>
+    verifyPosStaff(
+      email,
+      password,
+      (roles ?? ["manager", "supervisor", "cashier"]) as PosStaffRole[],
+    ),
+});
 
 async function main() {
   await initDb();

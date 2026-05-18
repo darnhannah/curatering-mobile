@@ -70,5 +70,7 @@
 	<string>Your location centers the delivery map so you can pin your address faster.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Take a photo of your payment proof for GCash checkout.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Choose venue and floor plan photos for event design and seating layout.</string>
 </dict>
 </plist>

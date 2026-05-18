@@ -19,6 +19,10 @@ import 'package:printing/printing.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'customer_local_notifications.dart';
+import 'features/event_design/event_theme_design_screen.dart';
+import 'features/seating/seating_layout_editor_screen.dart';
+import 'features/seating/seating_plan.dart';
+import 'utils/order_type_utils.dart';
 
 /// Optional logical flavor at Dart level (`customer` / `staff`).
 const String kAppFlavor = String.fromEnvironment('APP_FLAVOR', defaultValue: 'customer');
@@ -1854,6 +1858,9 @@ class InquiryRecord {
     this.transactionNo = '',
     this.downPaymentAmount = 0,
     this.fullPaymentAmount = 0,
+    this.themeDesign = const {},
+    this.seatingPlan = const {},
+    this.orderKind = 'catering',
   });
 
   final String id;
@@ -1890,6 +1897,24 @@ class InquiryRecord {
   final double downPaymentAmount;
   /// From catering/event order row (full payment toward balance).
   final double fullPaymentAmount;
+  final Map<String, dynamic> themeDesign;
+  final Map<String, dynamic> seatingPlan;
+  final String orderKind;
+
+  bool get isCateringPlusEvent =>
+      inquiryType.trim().toUpperCase() == 'CATERING AND EVENT' ||
+      orderKind == 'event' ||
+      isCateringPlusEventOrderType(orderKind, eventTitle: eventTitle);
+
+  bool get canShowSeating => isCateringPlusEvent && canShowSeatingLayout(status);
+
+  bool get canEditSeating => isCateringPlusEvent && canEditSeatingLayout(status);
+
+  bool get canEditThemeDesign {
+    if (!isCateringPlusEvent) return false;
+    const allowed = {'online_inquiries', 'new_event', 'for_processing', 'for_post_analysis'};
+    return allowed.contains(status.trim().toLowerCase());
+  }
 
   bool get isCompletedBooking {
     final s = status.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '_').replaceAll('-', '_');
@@ -1973,6 +1998,7 @@ class CateringEventRecord {
     this.scheduleSlots = const [],
     this.menu = const [],
     this.themeDesign = const {},
+    this.seatingPlan = const {},
     this.serviceIncluded = '',
     this.formalityLevel = '',
     this.eventSetting = '',
@@ -2015,6 +2041,7 @@ class CateringEventRecord {
   final List<dynamic> scheduleSlots;
   final List<dynamic> menu;
   final Map<String, dynamic> themeDesign;
+  final Map<String, dynamic> seatingPlan;
   final String serviceIncluded;
   final String formalityLevel;
   /// From `theme_design.event_setting` when list uses `summary: true`.
@@ -2118,6 +2145,27 @@ class CateringEventRecord {
       }(),
       themeDesign: () {
         final raw = m['theme_design'];
+        if (raw is Map<String, dynamic>) return raw;
+        if (raw is Map) {
+          return Map<String, dynamic>.from(
+            raw.map((key, value) => MapEntry(key.toString(), value)),
+          );
+        }
+        if (raw is String && raw.trim().startsWith('{')) {
+          try {
+            final j = jsonDecode(raw);
+            if (j is Map<String, dynamic>) return j;
+            if (j is Map) {
+              return Map<String, dynamic>.from(
+                j.map((key, value) => MapEntry(key.toString(), value)),
+              );
+            }
+          } catch (_) {}
+        }
+        return <String, dynamic>{};
+      }(),
+      seatingPlan: () {
+        final raw = m['seating_plan'];
         if (raw is Map<String, dynamic>) return raw;
         if (raw is Map) {
           return Map<String, dynamic>.from(
@@ -4078,6 +4126,17 @@ class AppState extends ChangeNotifier {
             transactionNo: '${map['transaction_no'] ?? ''}',
             downPaymentAmount: jsonToDouble(map['down_payment_amount']),
             fullPaymentAmount: jsonToDouble(map['full_payment_amount']),
+            themeDesign: () {
+              final td = map['theme_design'];
+              if (td is Map) return Map<String, dynamic>.from(td);
+              return const <String, dynamic>{};
+            }(),
+            seatingPlan: () {
+              final sp = map['seating_plan'];
+              if (sp is Map) return Map<String, dynamic>.from(sp);
+              return const <String, dynamic>{};
+            }(),
+            orderKind: '${map['order_kind'] ?? 'catering'}',
           ),
         );
       } catch (_) {}
@@ -10719,6 +10778,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
   bool _attemptedSubmit = false;
   static const int _minSelectedDishesRequired = 4;
   String _themeDesignChoice = '';
+  Map<String, dynamic>? _aiThemeDesignPayload;
+  SeatingPlanData? _seatingPlanPayload;
   String menuSuggestionNote = '';
   String themeSuggestionNote = '';
   final themeNotesController = TextEditingController();
@@ -10811,6 +10872,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
       _menuChoicePicked = false;
       _attemptedSubmit = false;
       _themeDesignChoice = '';
+      _aiThemeDesignPayload = null;
+      _seatingPlanPayload = null;
       menuSuggestionNote = '';
       themeSuggestionNote = '';
       selectedSetMenu = 'All Dishes';
@@ -11071,6 +11134,42 @@ class _InquiryScreenState extends State<InquiryScreen> {
     });
   }
 
+  Widget _eventDesignChoiceCard({
+    required String title,
+    required String subtitle,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: selected ? const Color(0xFFFFF8E1) : Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: selected ? const Color(0xFFE8B923) : Colors.grey.shade400, width: selected ? 2 : 1),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(selected ? Icons.radio_button_checked : Icons.radio_button_off, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(title, style: const TextStyle(fontWeight: FontWeight.w700))),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(subtitle, style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   /// Returns null if valid; otherwise an error message for the user.
   String? _validateInquiry() {
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
@@ -11107,6 +11206,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
     }
     if (inquiryType == 'CATERING AND EVENT' && _themeDesignChoice.isEmpty) {
       return 'Choose an event theme design option.';
+    }
+    if (inquiryType == 'CATERING AND EVENT' &&
+        _themeDesignChoice == 'create_own' &&
+        (_aiThemeDesignPayload == null ||
+            '${_aiThemeDesignPayload!['generatedImageUrl'] ?? ''}'.trim().isEmpty)) {
+      return 'Create your theme design with AI before submitting.';
     }
     if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
     if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
@@ -11486,54 +11591,115 @@ class _InquiryScreenState extends State<InquiryScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        const Text('DO YOU ALREADY HAVE A DESIGN DIRECTION IN MIND?'),
-                        const SizedBox(height: 8),
-                        RadioListTile<String>(
-                          dense: true,
-                          contentPadding: EdgeInsets.zero,
-                          value: 'suggest',
-                          groupValue: _themeDesignChoice,
-                          title: const Text('No, suggest me a design'),
-                          onChanged: (v) => setState(() => _themeDesignChoice = v ?? 'suggest'),
+                        const Text(
+                          'Before we submit, tell us how you want to approach your event look and feel.',
+                          style: TextStyle(height: 1.35),
                         ),
-                        RadioListTile<String>(
-                          dense: true,
-                          contentPadding: EdgeInsets.zero,
-                          value: 'create_own',
-                          groupValue: _themeDesignChoice,
-                          title: const Text('Yes, I would like to create my own design'),
-                          onChanged: (v) => setState(() => _themeDesignChoice = v ?? 'create_own'),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _eventDesignChoiceCard(
+                                title: "Have Macrina's design my event",
+                                subtitle: 'Share your palette and theme; our team will propose a look.',
+                                selected: _themeDesignChoice == 'suggest',
+                                onTap: () => setState(() {
+                                  _themeDesignChoice = 'suggest';
+                                  _aiThemeDesignPayload = null;
+                                }),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: _eventDesignChoiceCard(
+                                title: 'I want to design my event',
+                                subtitle: 'Use AI to explore styles, then submit with your inquiry.',
+                                selected: _themeDesignChoice == 'create_own',
+                                onTap: () => setState(() => _themeDesignChoice = 'create_own'),
+                              ),
+                            ),
+                          ],
                         ),
                         if (_attemptedSubmit && _themeDesignChoice.isEmpty)
                           Padding(
-                            padding: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.only(top: 8),
                             child: Text(
-                              'Required',
+                              'Choose how you want to handle event design.',
                               style: TextStyle(color: Colors.red.shade700, fontSize: 12),
                             ),
                           ),
-                        const SizedBox(height: 10),
-                        TextField(
-                          controller: themeNotesController,
-                          maxLines: 4,
-                          decoration: const InputDecoration(
-                            labelText: 'Theme / styling notes',
-                            hintText: 'Describe preferred look, colors, motif, and styling notes',
-                          ),
-                        ),
-                        const SizedBox(height: 10),
-                        Row(
-                          children: [
-                            OutlinedButton.icon(
-                              onPressed: _pickThemeReferenceImage,
-                              icon: const Icon(Icons.upload_file),
-                              label: const Text('Upload Reference Image'),
+                        if (_themeDesignChoice == 'suggest') ...[
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: themeNotesController,
+                            maxLines: 4,
+                            decoration: const InputDecoration(
+                              labelText: 'Theme / styling notes',
+                              hintText: 'Describe preferred look, colors, motif, and styling notes',
                             ),
-                            const SizedBox(width: 8),
-                            Text('${_themeReferenceImagesB64.length} image(s) attached'),
-                          ],
-                        ),
-                        if (_themeReferenceImagesB64.isNotEmpty) ...[
+                          ),
+                          const SizedBox(height: 10),
+                          Row(
+                            children: [
+                              OutlinedButton.icon(
+                                onPressed: _pickThemeReferenceImage,
+                                icon: const Icon(Icons.upload_file),
+                                label: const Text('Upload reference image'),
+                              ),
+                              const SizedBox(width: 8),
+                              Text('${_themeReferenceImagesB64.length} image(s)'),
+                            ],
+                          ),
+                        ],
+                        if (_themeDesignChoice == 'create_own') ...[
+                          const SizedBox(height: 12),
+                          if (_aiThemeDesignPayload != null &&
+                              '${_aiThemeDesignPayload!['generatedImageUrl'] ?? ''}'.trim().isNotEmpty)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.network(
+                                  '${_aiThemeDesignPayload!['generatedImageUrl']}',
+                                  height: 120,
+                                  width: double.infinity,
+                                  fit: BoxFit.cover,
+                                ),
+                              ),
+                            ),
+                          FilledButton.icon(
+                            onPressed: () async {
+                              final email = inquiryEmail.text.trim().isNotEmpty
+                                  ? inquiryEmail.text.trim()
+                                  : (widget.state.userEmail ?? '');
+                              if (email.isEmpty) {
+                                appSnack(context, 'Enter your email before using AI design.');
+                                return;
+                              }
+                              final result = await Navigator.push<Map<String, dynamic>?>(
+                                context,
+                                MaterialPageRoute<Map<String, dynamic>?>(
+                                  builder: (_) => EventThemeDesignScreen(
+                                    apiBase: widget.state.apiBase,
+                                    userEmail: email,
+                                    initialEventType: _resolvedEventType(),
+                                    initialThemeDesign: _aiThemeDesignPayload,
+                                  ),
+                                ),
+                              );
+                              if (result != null && mounted) {
+                                setState(() => _aiThemeDesignPayload = result);
+                              }
+                            },
+                            icon: const Icon(Icons.auto_awesome),
+                            label: Text(
+                              _aiThemeDesignPayload == null
+                                  ? 'Create my own theme design'
+                                  : 'Edit theme design',
+                            ),
+                          ),
+                        ],
+                        if (_themeReferenceImagesB64.isNotEmpty && _themeDesignChoice == 'suggest') ...[
                           const SizedBox(height: 8),
                           SizedBox(
                             height: 82,
@@ -11569,6 +11735,55 @@ class _InquiryScreenState extends State<InquiryScreen> {
                             ),
                           ),
                         ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  ToggleSection(
+                    title: 'SEATING LAYOUT',
+                    expanded: true,
+                    onToggle: () {},
+                    hideToggleIcon: true,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Text(
+                          'Plan tables and chairs now, or edit later from My Catering Inquiries.',
+                          style: TextStyle(color: Colors.grey.shade700, fontSize: 13, height: 1.35),
+                        ),
+                        const SizedBox(height: 10),
+                        OutlinedButton.icon(
+                          onPressed: () async {
+                            final email = inquiryEmail.text.trim().isNotEmpty
+                                ? inquiryEmail.text.trim()
+                                : (widget.state.userEmail ?? '');
+                            if (email.isEmpty) {
+                              appSnack(context, 'Enter your email before editing seating.');
+                              return;
+                            }
+                            final result = await Navigator.push<SeatingPlanData?>(
+                              context,
+                              MaterialPageRoute<SeatingPlanData?>(
+                                builder: (_) => SeatingLayoutEditorScreen(
+                                  apiBase: widget.state.apiBase,
+                                  userEmail: email,
+                                  orderKind: 'event',
+                                  draftOnly: true,
+                                  initialPlan: _seatingPlanPayload,
+                                ),
+                              ),
+                            );
+                            if (result != null && mounted) {
+                              setState(() => _seatingPlanPayload = result);
+                            }
+                          },
+                          icon: const Icon(Icons.table_restaurant),
+                          label: Text(
+                            _seatingPlanPayload == null || _seatingPlanPayload!.isEffectivelyEmpty
+                                ? 'Edit seating layout'
+                                : 'Edit seating layout (draft saved)',
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -11896,10 +12111,17 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'menu_suggestion_note': curateOwn ? '' : menuSuggestionNote,
                 'theme_suggestion_note': themeNotesController.text.trim(),
                 if (inquiryType == 'CATERING AND EVENT')
-                  'theme_design': {
-                    'note': themeNotesController.text.trim(),
-                    'reference_images': _themeReferenceImagesB64,
-                  },
+                  'theme_design': _themeDesignChoice == 'create_own'
+                      ? Map<String, dynamic>.from(_aiThemeDesignPayload ?? {})
+                      : {
+                          'eventDesignSource': 'macrina',
+                          'note': themeNotesController.text.trim(),
+                          'reference_images': _themeReferenceImagesB64,
+                        },
+                if (inquiryType == 'CATERING AND EVENT' &&
+                    _seatingPlanPayload != null &&
+                    !_seatingPlanPayload!.isEffectivelyEmpty)
+                  'seating_plan': _seatingPlanPayload!.toJson(),
                 'event_city': eventCity.text.trim(),
                 'event_setting': eventSetting,
                 'service_included': serviceIncluded,
@@ -12230,9 +12452,60 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     appSnack(context, err ?? 'Feedback submitted');
   }
 
+  Future<void> _openThemeDesign(InquiryRecord r) async {
+    final email = widget.state.userEmail?.trim() ?? r.inquiryEmail.trim();
+    if (email.isEmpty) {
+      appSnack(context, 'Sign in to edit theme design');
+      return;
+    }
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => EventThemeDesignScreen(
+          apiBase: widget.state.apiBase,
+          userEmail: email,
+          orderId: r.id,
+          orderKind: r.orderKind,
+          initialEventType: r.eventType.isNotEmpty ? r.eventType : 'Birthday',
+          initialThemeDesign: r.themeDesign,
+          persistToOrder: r.canEditThemeDesign,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    await widget.state.loadInquiries(force: true);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openSeatingLayout(InquiryRecord r) async {
+    final email = widget.state.userEmail?.trim() ?? r.inquiryEmail.trim();
+    if (email.isEmpty) {
+      appSnack(context, 'Sign in to open seating layout');
+      return;
+    }
+    await Navigator.push<SeatingPlanData?>(
+      context,
+      MaterialPageRoute<SeatingPlanData?>(
+        builder: (_) => SeatingLayoutEditorScreen(
+          apiBase: widget.state.apiBase,
+          userEmail: email,
+          orderId: r.id,
+          orderKind: r.orderKind,
+          initialPlan: r.seatingPlan.isNotEmpty ? SeatingPlanData.fromJson(r.seatingPlan) : null,
+          readOnly: !r.canEditSeating,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    await widget.state.loadInquiries(force: true);
+    if (mounted) setState(() {});
+  }
+
   void _showDetail(InquiryRecord r, {required bool allowFollowUp}) {
     _markCompletedInquiryRead(r);
     final feedback = _feedbackByInquiryId[r.id];
+    final themeImg =
+        '${r.themeDesign['generatedImageUrl'] ?? r.themeDesign['imageUrl'] ?? ''}'.trim();
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -12242,6 +12515,75 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               ..._inquiryDetailLines(r),
+              if (r.isCateringPlusEvent && (hasEventThemeDesign(r.themeDesign) || r.canShowSeating)) ...[
+                const SizedBox(height: 12),
+                const Divider(height: 16),
+                Text(
+                  'Event theme design & seating',
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
+                ),
+                if (hasEventThemeDesign(r.themeDesign)) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    eventDesignSourceLabel(r.themeDesign),
+                    style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                if (themeImg.isNotEmpty)
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.network(
+                      themeImg,
+                      height: 140,
+                      width: double.infinity,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                    ),
+                  )
+                else if ('${r.themeDesign['venuePhotoBase64'] ?? ''}'.trim().isNotEmpty)
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.memory(
+                      base64Decode('${r.themeDesign['venuePhotoBase64']}'),
+                      height: 140,
+                      width: double.infinity,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                    ),
+                  ),
+                if (themeImg.isNotEmpty ||
+                    '${r.themeDesign['venuePhotoBase64'] ?? ''}'.trim().isNotEmpty)
+                  const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    if (r.canEditThemeDesign || hasEventThemeDesign(r.themeDesign))
+                      FilledButton.icon(
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _openThemeDesign(r);
+                        },
+                        icon: const Icon(Icons.auto_awesome, size: 18),
+                        label: Text(
+                          hasEventThemeDesign(r.themeDesign)
+                              ? 'Edit theme design'
+                              : 'Create my own theme design',
+                        ),
+                      ),
+                    if (r.canShowSeating)
+                      OutlinedButton.icon(
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _openSeatingLayout(r);
+                        },
+                        icon: const Icon(Icons.table_restaurant, size: 18),
+                        label: Text(r.canEditSeating ? 'Edit seating layout' : 'View seating layout'),
+                      ),
+                  ],
+                ),
+              ],
               if (feedback != null) ...[
                 const SizedBox(height: 8),
                 const Divider(height: 16),
@@ -14581,8 +14923,8 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               children: [
                 const SizedBox(height: 8),
                 Text(
-                  'Customize event design in web only. Mobile manager view is notes-only.',
-                  style: TextStyle(color: Colors.blueGrey.shade700, fontWeight: FontWeight.w600),
+                  'Theme design cost and notes for manager costing. Use order detail after save for AI theme and seating tools.',
+                  style: TextStyle(color: Colors.blueGrey.shade700, fontWeight: FontWeight.w600, fontSize: 13),
                 ),
                 const SizedBox(height: 10),
                 TextField(
@@ -19173,12 +19515,46 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text('Event Theme Design', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: () async {
+                            final email = managerEmailController.text.trim().isNotEmpty
+                                ? managerEmailController.text.trim()
+                                : row.emailAddress;
+                            final updated = await Navigator.push<Map<String, dynamic>?>(
+                              context,
+                              MaterialPageRoute<Map<String, dynamic>?>(
+                                builder: (_) => EventThemeDesignScreen(
+                                  apiBase: widget.state.apiBase,
+                                  userEmail: email,
+                                  orderId: row.id,
+                                  orderKind: row.orderKind,
+                                  initialEventType: row.eventType,
+                                  initialThemeDesign: row.themeDesign,
+                                  cashierEmail: widget.state.userEmail,
+                                  cashierPassword: widget.state.loginPassword,
+                                  persistToOrder: true,
+                                ),
+                              ),
+                            );
+                            if (updated != null && mounted) {
+                              final m = await widget.state.loadManagerCateringItem(
+                                id: row.id,
+                                orderKind: row.orderKind,
+                              );
+                              if (m != null) setState(() => _loadedDetailRow = m);
+                            }
+                          },
+                          icon: const Icon(Icons.auto_awesome),
+                          label: const Text('Create my own theme design'),
+                        ),
+                      ],
+                    ),
                     if (isDraftStage) ...[
-                      const SizedBox(height: 8),
-                      Text(
-                        'Customize event design in web only. Mobile manager view is notes-only.',
-                        style: TextStyle(color: Colors.blueGrey.shade700, fontWeight: FontWeight.w600),
-                      ),
                       const SizedBox(height: 10),
                       TextField(
                         controller: managerInquiryNoteController,
@@ -19198,7 +19574,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       Builder(
                         builder: (context) {
                           final webImage = '${row.themeDesign['image'] ?? row.themeDesign['imageBase64'] ?? row.themeDesign['output'] ?? ''}'.trim();
-                          final webImageUrl = '${row.themeDesign['imageUrl'] ?? row.themeDesign['url'] ?? ''}'.trim();
+                          final webImageUrl =
+                              '${row.themeDesign['generatedImageUrl'] ?? row.themeDesign['imageUrl'] ?? row.themeDesign['url'] ?? ''}'.trim();
                           if (webImage.isNotEmpty) {
                             return Padding(
                               padding: const EdgeInsets.only(bottom: 8),
@@ -19255,6 +19632,52 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         const SizedBox.shrink(),
                     ],
                     const SizedBox(height: 8),
+                  ],
+                ),
+              ),
+            ),
+          if (row.orderKind == 'event' && canShowSeatingLayout(row.status))
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Seating layout', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    Text(
+                      widget.stage == 'for_processing'
+                          ? 'Edit table and chair placement while this order is in For Processing.'
+                          : 'View the saved seating layout for this event.',
+                      style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
+                    ),
+                    const SizedBox(height: 10),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        await Navigator.push<SeatingPlanData?>(
+                          context,
+                          MaterialPageRoute<SeatingPlanData?>(
+                            builder: (_) => SeatingLayoutEditorScreen(
+                              apiBase: widget.state.apiBase,
+                              userEmail: row.emailAddress,
+                              orderId: row.id,
+                              orderKind: row.orderKind,
+                              cashierEmail: widget.state.userEmail,
+                              cashierPassword: widget.state.loginPassword,
+                              readOnly: !canEditSeatingLayout(row.status),
+                            ),
+                          ),
+                        );
+                        if (!mounted) return;
+                        final m = await widget.state.loadManagerCateringItem(
+                          id: row.id,
+                          orderKind: row.orderKind,
+                        );
+                        if (m != null) setState(() => _loadedDetailRow = m);
+                      },
+                      icon: const Icon(Icons.table_restaurant),
+                      label: Text(canEditSeatingLayout(row.status) ? 'Edit seating layout' : 'View seating layout'),
+                    ),
                   ],
                 ),
               ),
