@@ -20,24 +20,16 @@ export const DEFAULT_PUBLIC_MENU_SQL = `
     md.id::text AS id,
     md.name::text AS name,
     CASE
-      WHEN LOWER(TRIM(COALESCE(md.meal_type, ''))) = 'restaurant'
+      WHEN LOWER(TRIM(COALESCE(md.meal_type, md.type, ''))) = 'restaurant'
         THEN NULLIF(TRIM(md.category), '')
-      ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(COALESCE(md.meal_type, '')), ''), NULLIF(TRIM(md.category), '')))
+      ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), NULLIF(TRIM(md.category), '')))
     END AS description,
     COALESCE(NULLIF(TRIM(md.price), '')::numeric, 0) AS price,
     COALESCE(md.sauces::text, '[]') AS dips,
     COALESCE(md.ingredients::text, '[]') AS ingredients,
     COALESCE(TRIM(md.category), '')::text AS category,
-    COALESCE(NULLIF(TRIM(COALESCE(md.meal_type, '')), ''), '')::text AS dish_type,
-    md.image_base64::text AS image_base64,
-    COALESCE(
-      (
-        SELECT json_agg(ma.allergen_name ORDER BY ord)::text
-        FROM unnest(COALESCE(md.allergens::bigint[], '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
-        INNER JOIN public.menu_dishes_allergens ma ON ma.allergen_id = t.allergen_id
-      ),
-      '[]'
-    ) AS allergens
+    COALESCE(NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), '')::text AS dish_type,
+    md.image_base64::text AS image_base64
   FROM public.menu_dishes md
   WHERE NOT md.archived
   ORDER BY md.name
@@ -52,8 +44,7 @@ export const DEFAULT_PUBLIC_SET_MENUS_SQL = `
       (
         SELECT json_agg(md.name ORDER BY u.ord)::text
         FROM unnest(sm.dish_ids) WITH ORDINALITY AS u(dish_id, ord)
-        LEFT JOIN public.menu_dishes md ON md.id::text = TRIM(BOTH FROM u.dish_id::text)
-        WHERE md.id IS NOT NULL
+        INNER JOIN public.menu_dishes md ON md.id::text = TRIM(BOTH FROM u.dish_id::text)
       ),
       '[]'
     ) AS dishes

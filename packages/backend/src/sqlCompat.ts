@@ -1,100 +1,43 @@
 /**
  * SQL fragments and row normalizers so APIs stay stable while the DB uses canonical column names.
  */
-import type pg from "pg";
-import { columnExists, tableExists } from "./schemaColumns.js";
 
 /** Touch timestamp on customer_accounts (legacy updated_at was pruned). */
 export const CUSTOMER_ACCOUNT_TOUCH = `updated_pw_dt_stamp = NOW()`;
 
-/** Optional touch fragment when updated_pw_dt_stamp exists. */
-export async function customerAccountTouchSet(pool: pg.Pool): Promise<string> {
-  if (await columnExists(pool, "customer_accounts", "updated_pw_dt_stamp")) {
-    return "updated_pw_dt_stamp = NOW()";
-  }
-  if (await columnExists(pool, "customer_accounts", "updated_at")) {
-    return "updated_at = NOW()";
-  }
-  return "";
-}
-
-/** Business order number ORD-****** from canonical `order_id` / `mobile_id`. */
-export const RESTAURANT_ORDER_BUSINESS_ID_SQL = `
-  COALESCE(
-    NULLIF(TRIM(order_id), ''),
-    CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END
-  )
-`.trim();
-
-/** Timestamps for restaurant_orders (canonical columns only). */
-export const RESTAURANT_ORDER_CREATED_AT_SQL = `COALESCE(
-  submitted_order_dt_stamp,
-  last_updated_order_status_dt_stamp,
-  NOW()
-)`.trim();
-
-export const RESTAURANT_ORDER_UPDATED_AT_SQL = `COALESCE(
-  last_updated_order_status_dt_stamp,
-  submitted_order_dt_stamp,
-  NOW()
-)`.trim();
-
-/** Timestamps for catering_orders / event_orders (canonical columns only). */
-export const CATERING_ORDER_CREATED_AT_SQL = `COALESCE(
-  created_at,
-  stage_entered_at,
-  NOW()
-)`.trim();
-
-export const CATERING_ORDER_UPDATED_AT_SQL = `COALESCE(
-  stage_entered_at,
-  created_at,
-  NOW()
-)`.trim();
-
-/** Touch row after restaurant_orders mutation. */
-export const RESTAURANT_ORDER_TOUCH_SET = `last_updated_order_status_dt_stamp = NOW()`;
-
-/** Touch row after catering_orders / event_orders mutation. */
-export const CATERING_ORDER_TOUCH_SET = `stage_entered_at = NOW()`;
-
-export {
-  cateringStatusesForApiStage,
-  mapManagerCateringStageToDb,
-  normalizeCateringStatusForApi,
-  CATERING_ACTIVE_SCHEDULE_STATUSES_SQL,
-  CATERING_BILLING_LATE_STATUSES_SQL,
-} from "./cateringStages.js";
-
-/** Shared SELECT for restaurant order API responses — canonical `restaurant_orders` columns only. */
+/** Shared SELECT list for restaurant order API responses (legacy aliases included). */
 export const RESTAURANT_ORDER_SELECT = `
   mobile_id,
   mobile_id AS id,
+  id AS order_uuid,
   user_email,
-  guest_contact_email,
-  customer_id,
-  ${RESTAURANT_ORDER_BUSINESS_ID_SQL} AS order_id,
-  ${RESTAURANT_ORDER_BUSINESS_ID_SQL} AS order_no,
+  COALESCE(order_id, CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END) AS order_id,
+  COALESCE(order_id, CASE WHEN mobile_id IS NOT NULL THEN 'ORD-' || LPAD(mobile_id::text, 6, '0') END) AS order_no,
   COALESCE(order_status, 'PENDING_CASHIER') AS status,
   COALESCE(order_status, 'PENDING_CASHIER') AS fulfillment_stage,
   COALESCE(total_cost, 0) AS total,
-  COALESCE(total_cost, 0) AS total_cost,
+  total_cost,
   COALESCE(delivery_notes, '') AS note,
-  COALESCE(delivery_notes, '') AS delivery_notes,
+  delivery_notes,
   payment_mode,
   COALESCE(payment_uploaded_initial, FALSE) AS payment_uploaded,
-  COALESCE(payment_uploaded_initial, FALSE) AS payment_uploaded_initial,
+  payment_uploaded_initial,
   payment_proof_initial AS payment_proof,
   payment_proof_initial,
   payment_proof_balance AS supplemental_payment_proof,
   payment_proof_balance,
   COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
   COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
+  payment_reference_initial,
+  payment_reference_balance,
   COALESCE(payment_uploaded_balance, FALSE) AS payment_uploaded_balance,
+  payment_uploaded_balance,
   COALESCE(payment_confirmed_initial, FALSE) AS payment_confirmed_initial,
   COALESCE(payment_confirmed_balance, FALSE) AS payment_confirmed_balance,
+  payment_confirmed_initial,
+  payment_confirmed_balance,
   COALESCE(loyalty_points_restaurant_obtained, 0) AS loyalty_points_restaurant_obtained,
-  COALESCE(loyalty_points_catering_obtained, 0) AS loyalty_points_catering_obtained,
+  loyalty_reward_restaurant_obtained,
   COALESCE(NULLIF(TRIM(full_name), ''), '') AS delivery_name,
   COALESCE(NULLIF(TRIM(full_name), ''), '') AS full_name,
   COALESCE(NULLIF(TRIM(contact_number), ''), '') AS delivery_contact,
@@ -103,44 +46,35 @@ export const RESTAURANT_ORDER_SELECT = `
   delivery_lat,
   delivery_lng,
   delivery_time,
-  ${RESTAURANT_ORDER_CREATED_AT_SQL} AS created_at,
+  COALESCE(submitted_order_dt_stamp, NOW()) AS created_at,
   submitted_order_dt_stamp,
-  ${RESTAURANT_ORDER_UPDATED_AT_SQL} AS updated_at,
+  COALESCE(last_updated_order_status_dt_stamp, submitted_order_dt_stamp, NOW()) AS updated_at,
   last_updated_order_status_dt_stamp,
   order_source,
-  COALESCE(NULLIF(TRIM(pos_customer_label), ''), '') AS pos_customer_label,
+  ''::text AS pos_customer_label,
   COALESCE(cashier_amount_received_initial, 0) AS cashier_amount_received,
   cashier_amount_received_initial,
   COALESCE(cashier_amount_received_balance, 0) AS cashier_secondary_amount_received,
   cashier_amount_received_balance,
-  COALESCE(amount_paid, 0) AS amount_paid,
-  COALESCE(change_given, 0) AS change_given,
-  COALESCE(change_given, 0) AS cashier_change,
+  0::numeric AS cashier_change,
   delivery_tracking_url,
   COALESCE(tray_items, '[]'::jsonb) AS order_lines_snapshot,
-  COALESCE(tray_items, '[]'::jsonb) AS tray_items,
+  tray_items,
   (upper(COALESCE(order_status, '')) LIKE '%CLAIMED%') AS pos_claimed,
-  COALESCE(balance_proof_pending_review, FALSE) AS balance_proof_pending_review,
-  feedback_stars,
-  feedback_remarks
+  FALSE AS balance_proof_pending_review,
+  guest_contact_email,
+  customer_id
 `.trim();
-
-/** Sort online/walk-in POS lists newest first. */
-export const RESTAURANT_ORDER_ORDER_BY_CREATED_DESC = `ORDER BY ${RESTAURANT_ORDER_CREATED_AT_SQL} DESC`;
-
-/** Sort walk-in queue / history by last status change. */
-export const RESTAURANT_ORDER_ORDER_BY_UPDATED_DESC = `ORDER BY ${RESTAURANT_ORDER_UPDATED_AT_SQL} DESC`;
 
 /** Minimal SELECT for cashier PATCH handlers (canonical columns only). */
 export const RESTAURANT_ORDER_PATCH_SELECT = `
   mobile_id AS id,
   user_email,
-  ${RESTAURANT_ORDER_BUSINESS_ID_SQL} AS order_no,
+  COALESCE(order_id, 'ORD-' || LPAD(mobile_id::text, 6, '0')) AS order_no,
   COALESCE(order_status, 'PENDING_CASHIER') AS status,
   COALESCE(total_cost, 0) AS total,
   order_source,
   cashier_amount_received_initial AS cashier_amount_received,
-  COALESCE(balance_proof_pending_review, FALSE) AS balance_proof_pending_review,
   payment_proof_balance AS supplemental_payment_proof,
   COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
   COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
@@ -172,17 +106,7 @@ export function restaurantLoyaltyEarnedSql(
 
 export function mapRestaurantOrderRowForApi(row: Record<string, unknown>): Record<string, unknown> {
   const total = Number(row.total ?? row.total_cost ?? row.total_amount ?? 0);
-  let orderNo = String(row.order_id ?? row.order_no ?? "").trim();
-  if (!orderNo || orderNo.toUpperCase() === "TEMP") {
-    orderNo = String(row.order_no ?? "").trim();
-  }
-  if (!orderNo || orderNo.toUpperCase() === "TEMP") {
-    const mid = row.mobile_id ?? row.id;
-    if (mid != null && `${mid}`.trim() !== "") {
-      const digits = `${mid}`.replace(/\D/g, "");
-      if (digits) orderNo = `ORD-${digits.padStart(6, "0").slice(-6)}`;
-    }
-  }
+  const orderNo = String(row.order_no ?? row.order_id ?? "").trim();
   const status = String(row.status ?? row.order_status ?? row.fulfillment_stage ?? "").trim();
   const fulfillment = String(row.fulfillment_stage ?? row.order_status ?? row.status ?? "PENDING_CASHIER").trim();
   const snap = row.order_lines_snapshot ?? row.tray_items ?? row.items;
@@ -274,365 +198,13 @@ export function postAnalysisPersistCoalesceSet(paramRef: string): string {
   return postAnalysisPersistSet(paramRef);
 }
 
-/** SET clause for storing forgot-password OTP + expiry (all column names that exist). */
-export async function buildCustomerForgotOtpUpdateSet(pool: pg.Pool): Promise<string> {
-  const parts: string[] = [];
-  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code")) {
-    parts.push("forgot_password_otp_code = $2");
-  }
-  if (await columnExists(pool, "customer_accounts", "password_reset_otp")) {
-    parts.push("password_reset_otp = $2");
-  }
-  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code_expiry")) {
-    parts.push("forgot_password_otp_code_expiry = $3::timestamptz");
-  }
-  if (await columnExists(pool, "customer_accounts", "password_reset_expires_at")) {
-    parts.push("password_reset_expires_at = $3::timestamptz");
-  }
-  const touch = await customerAccountTouchSet(pool);
-  if (touch) parts.push(touch);
-  if (parts.length === 0) {
-    throw new Error("customer_accounts has no password-reset OTP columns");
-  }
-  return parts.join(", ");
-}
-
-/** SET clause to clear forgot-password OTP after a successful reset. */
-export async function buildCustomerForgotOtpClearSet(pool: pg.Pool): Promise<string> {
-  const parts: string[] = [];
-  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code")) {
-    parts.push("forgot_password_otp_code = NULL");
-  }
-  if (await columnExists(pool, "customer_accounts", "password_reset_otp")) {
-    parts.push("password_reset_otp = NULL");
-  }
-  if (await columnExists(pool, "customer_accounts", "forgot_password_otp_code_expiry")) {
-    parts.push("forgot_password_otp_code_expiry = NULL");
-  }
-  if (await columnExists(pool, "customer_accounts", "password_reset_expires_at")) {
-    parts.push("password_reset_expires_at = NULL");
-  }
-  const touch = await customerAccountTouchSet(pool);
-  if (touch) parts.push(touch);
-  return parts.join(", ");
-}
-
-/** WHERE fragment: OTP matches and not expired (any column set that exists). */
-export async function buildCustomerForgotOtpValidWhere(pool: pg.Pool, otpParam: string): Promise<string> {
-  const checks: string[] = [];
-  const hasCanonOtp = await columnExists(pool, "customer_accounts", "forgot_password_otp_code");
-  const hasCanonExp = await columnExists(pool, "customer_accounts", "forgot_password_otp_code_expiry");
-  const hasLegacyOtp = await columnExists(pool, "customer_accounts", "password_reset_otp");
-  const hasLegacyExp = await columnExists(pool, "customer_accounts", "password_reset_expires_at");
-
-  if (hasCanonOtp && hasCanonExp) {
-    checks.push(
-      `(${sqlOtpMatches("forgot_password_otp_code", otpParam)} AND forgot_password_otp_code_expiry > NOW())`,
-    );
-  } else if (hasCanonOtp) {
-    checks.push(sqlOtpMatches("forgot_password_otp_code", otpParam));
-  }
-  if (hasLegacyOtp && hasLegacyExp) {
-    checks.push(`(${sqlOtpMatches("password_reset_otp", otpParam)} AND password_reset_expires_at > NOW())`);
-  } else if (hasLegacyOtp) {
-    checks.push(sqlOtpMatches("password_reset_otp", otpParam));
-  }
-  if (checks.length === 0) return "FALSE";
-  return `(${checks.join(" OR ")})`;
-}
-
-/** @deprecated Use [buildCustomerForgotOtpUpdateSet]. */
 export function customerForgotOtpUpdateSql(): { set: string; clear: string } {
   return {
     set: `forgot_password_otp_code = $2,
-          forgot_password_otp_code_expiry = $3::timestamptz,
-          password_reset_otp = $2,
-          password_reset_expires_at = $3::timestamptz,
+          forgot_password_otp_code_expiry = $3,
           updated_pw_dt_stamp = NOW()`,
     clear: `forgot_password_otp_code = NULL,
             forgot_password_otp_code_expiry = NULL,
-            password_reset_otp = NULL,
-            password_reset_expires_at = NULL,
             updated_pw_dt_stamp = NOW()`,
   };
-}
-
-/** Strip spaces/dashes so "123 456" and "123456" match stored OTP. */
-export function normalizeOtpDigits(raw: unknown): string {
-  return String(raw ?? "").replace(/\D/g, "");
-}
-
-/** SQL expression: normalized OTP column equals normalized parameter. */
-export function sqlOtpMatches(columnRef: string, paramRef: string): string {
-  return `REGEXP_REPLACE(COALESCE(${columnRef}, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(${paramRef}::text, ''), '[^0-9]', '', 'g')`;
-}
-
-/** True when Postgres reports a missing column (SQLSTATE 42703). */
-export function isPgUndefinedColumn(err: unknown): boolean {
-  const e = err as { code?: string };
-  return e?.code === "42703";
-}
-
-let restaurantOrderSelectSqlCache: string | null = null;
-let restaurantOrderPatchSelectSqlCache: string | null = null;
-let cashierOnlineWhereSqlCache: string | null = null;
-let restaurantCreatedAtSqlCache: string | null = null;
-let restaurantUpdatedAtSqlCache: string | null = null;
-let restaurantChangedSinceSqlCache: string | null = null;
-
-/** Resolve customer email for a restaurant_orders row (column or customer_accounts join). */
-export async function restaurantOrderEmailExpr(pool: pg.Pool, alias = ""): Promise<string> {
-  const p = alias ? `${alias}.` : "";
-  if (await columnExists(pool, "restaurant_orders", "user_email")) {
-    return `COALESCE(NULLIF(TRIM(${p}user_email), ''), '')`;
-  }
-  return `COALESCE((
-    SELECT NULLIF(TRIM(ca.email), '')
-    FROM customer_accounts ca
-    WHERE ca.customer_id IS NOT NULL
-      AND TRIM(ca.customer_id::text) <> ''
-      AND TRIM(ca.customer_id::text) = TRIM(COALESCE(${p}customer_id::text, ''))
-    LIMIT 1
-  ), '')`;
-}
-
-/** WHERE: restaurant order belongs to customer email ($n). */
-export async function restaurantOrderMatchesEmailWhere(
-  pool: pg.Pool,
-  alias: string,
-  emailParam: string,
-): Promise<string> {
-  const p = alias ? `${alias}.` : "";
-  const parts = [
-    `EXISTS (
-      SELECT 1 FROM customer_accounts ca
-      WHERE LOWER(TRIM(ca.email)) = LOWER(${emailParam})
-        AND ca.customer_id IS NOT NULL
-        AND TRIM(ca.customer_id::text) <> ''
-        AND TRIM(ca.customer_id::text) = TRIM(COALESCE(${p}customer_id::text, ''))
-    )`,
-  ];
-  if (await columnExists(pool, "restaurant_orders", "user_email")) {
-    parts.unshift(`LOWER(TRIM(COALESCE(${p}user_email, ''))) = LOWER(${emailParam})`);
-  }
-  return `(${parts.join(" OR ")})`;
-}
-
-async function buildRestaurantTimestampSql(
-  pool: pg.Pool,
-  alias: string,
-  preferUpdated: boolean,
-): Promise<string> {
-  const p = alias ? `${alias}.` : "";
-  const cols: string[] = [];
-  if (preferUpdated && (await columnExists(pool, "restaurant_orders", "last_updated_order_status_dt_stamp"))) {
-    cols.push(`${p}last_updated_order_status_dt_stamp`);
-  }
-  if (await columnExists(pool, "restaurant_orders", "submitted_order_dt_stamp")) {
-    cols.push(`${p}submitted_order_dt_stamp`);
-  }
-  if (!preferUpdated && (await columnExists(pool, "restaurant_orders", "last_updated_order_status_dt_stamp"))) {
-    cols.push(`${p}last_updated_order_status_dt_stamp`);
-  }
-  if (await columnExists(pool, "restaurant_orders", "created_at")) {
-    cols.push(`${p}created_at`);
-  }
-  if (await columnExists(pool, "restaurant_orders", "updated_at")) {
-    cols.push(`${p}updated_at`);
-  }
-  return cols.length > 0 ? `COALESCE(${cols.join(", ")}, NOW())` : "NOW()";
-}
-
-export async function getRestaurantOrderCreatedAtSql(pool: pg.Pool, alias = ""): Promise<string> {
-  if (!alias && restaurantCreatedAtSqlCache) return restaurantCreatedAtSqlCache;
-  const sql = await buildRestaurantTimestampSql(pool, alias, false);
-  if (!alias) restaurantCreatedAtSqlCache = sql;
-  return sql;
-}
-
-export async function getRestaurantOrderUpdatedAtSql(pool: pg.Pool, alias = ""): Promise<string> {
-  if (!alias && restaurantUpdatedAtSqlCache) return restaurantUpdatedAtSqlCache;
-  const sql = await buildRestaurantTimestampSql(pool, alias, true);
-  if (!alias) restaurantUpdatedAtSqlCache = sql;
-  return sql;
-}
-
-export async function getRestaurantOrderChangedSinceSql(pool: pg.Pool, alias = ""): Promise<string> {
-  if (!alias && restaurantChangedSinceSqlCache) return restaurantChangedSinceSqlCache;
-  const sql = await getRestaurantOrderUpdatedAtSql(pool, alias);
-  if (!alias) restaurantChangedSinceSqlCache = sql;
-  return sql;
-}
-
-/** Catering/event order created_at expression (only existing columns). */
-export async function getCateringOrderCreatedAtSql(
-  pool: pg.Pool,
-  table: "event_orders" | "catering_orders",
-  alias: string,
-): Promise<string> {
-  const p = `${alias}.`;
-  const cols: string[] = [];
-  if (await columnExists(pool, table, "stage_entered_at")) cols.push(`${p}stage_entered_at`);
-  if (await columnExists(pool, table, "last_updated_order_status_dt_stamp")) {
-    cols.push(`${p}last_updated_order_status_dt_stamp`);
-  }
-  if (await columnExists(pool, table, "submitted_order_dt_stamp")) cols.push(`${p}submitted_order_dt_stamp`);
-  if (await columnExists(pool, table, "created_at")) cols.push(`${p}created_at`);
-  if (await columnExists(pool, table, "updated_at")) cols.push(`${p}updated_at`);
-  return cols.length > 0 ? `COALESCE(${cols.join(", ")}, NOW())` : "NOW()";
-}
-
-export async function getRestaurantOrderSelectSql(pool: pg.Pool): Promise<string> {
-  if (restaurantOrderSelectSqlCache) return restaurantOrderSelectSqlCache;
-  const emailExpr = await restaurantOrderEmailExpr(pool, "");
-  const createdAt = await getRestaurantOrderCreatedAtSql(pool, "");
-  const updatedAt = await getRestaurantOrderUpdatedAtSql(pool, "");
-  const touchCol = (await columnExists(pool, "restaurant_orders", "last_updated_order_status_dt_stamp"))
-    ? "last_updated_order_status_dt_stamp"
-    : (await columnExists(pool, "restaurant_orders", "submitted_order_dt_stamp"))
-      ? "submitted_order_dt_stamp AS last_updated_order_status_dt_stamp"
-      : "NULL::timestamptz AS last_updated_order_status_dt_stamp";
-  restaurantOrderSelectSqlCache = `
-  mobile_id,
-  mobile_id AS id,
-  ${emailExpr} AS user_email,
-  ${emailExpr} AS email,
-  guest_contact_email,
-  customer_id,
-  ${RESTAURANT_ORDER_BUSINESS_ID_SQL} AS order_id,
-  ${RESTAURANT_ORDER_BUSINESS_ID_SQL} AS order_no,
-  COALESCE(order_status, 'PENDING_CASHIER') AS status,
-  COALESCE(order_status, 'PENDING_CASHIER') AS fulfillment_stage,
-  COALESCE(total_cost, 0) AS total,
-  COALESCE(total_cost, 0) AS total_cost,
-  COALESCE(delivery_notes, '') AS note,
-  COALESCE(delivery_notes, '') AS delivery_notes,
-  payment_mode,
-  COALESCE(payment_uploaded_initial, FALSE) AS payment_uploaded,
-  COALESCE(payment_uploaded_initial, FALSE) AS payment_uploaded_initial,
-  payment_proof_initial AS payment_proof,
-  payment_proof_initial,
-  payment_proof_balance AS supplemental_payment_proof,
-  payment_proof_balance,
-  COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
-  COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
-  COALESCE(payment_uploaded_balance, FALSE) AS payment_uploaded_balance,
-  COALESCE(payment_confirmed_initial, FALSE) AS payment_confirmed_initial,
-  COALESCE(payment_confirmed_balance, FALSE) AS payment_confirmed_balance,
-  COALESCE(loyalty_points_restaurant_obtained, 0) AS loyalty_points_restaurant_obtained,
-  COALESCE(loyalty_points_catering_obtained, 0) AS loyalty_points_catering_obtained,
-  COALESCE(NULLIF(TRIM(full_name), ''), '') AS delivery_name,
-  COALESCE(NULLIF(TRIM(full_name), ''), '') AS full_name,
-  COALESCE(NULLIF(TRIM(contact_number), ''), '') AS delivery_contact,
-  COALESCE(NULLIF(TRIM(contact_number), ''), '') AS contact_number,
-  delivery_address,
-  delivery_lat,
-  delivery_lng,
-  delivery_time,
-  ${createdAt} AS created_at,
-  submitted_order_dt_stamp,
-  ${updatedAt} AS updated_at,
-  ${touchCol},
-  order_source,
-  COALESCE(NULLIF(TRIM(pos_customer_label), ''), '') AS pos_customer_label,
-  COALESCE(cashier_amount_received_initial, 0) AS cashier_amount_received,
-  cashier_amount_received_initial,
-  COALESCE(cashier_amount_received_balance, 0) AS cashier_secondary_amount_received,
-  cashier_amount_received_balance,
-  COALESCE(amount_paid, 0) AS amount_paid,
-  COALESCE(change_given, 0) AS change_given,
-  COALESCE(change_given, 0) AS cashier_change,
-  delivery_tracking_url,
-  COALESCE(tray_items, '[]'::jsonb) AS order_lines_snapshot,
-  COALESCE(tray_items, '[]'::jsonb) AS tray_items,
-  (upper(COALESCE(order_status, '')) LIKE '%CLAIMED%') AS pos_claimed,
-  COALESCE(balance_proof_pending_review, FALSE) AS balance_proof_pending_review,
-  feedback_stars,
-  feedback_remarks
-`.trim();
-  return restaurantOrderSelectSqlCache;
-}
-
-export async function getRestaurantOrderPatchSelectSql(pool: pg.Pool): Promise<string> {
-  if (restaurantOrderPatchSelectSqlCache) return restaurantOrderPatchSelectSqlCache;
-  const emailExpr = await restaurantOrderEmailExpr(pool, "");
-  restaurantOrderPatchSelectSqlCache = `
-  mobile_id AS id,
-  ${emailExpr} AS user_email,
-  ${RESTAURANT_ORDER_BUSINESS_ID_SQL} AS order_no,
-  COALESCE(order_status, 'PENDING_CASHIER') AS status,
-  COALESCE(total_cost, 0) AS total,
-  order_source,
-  cashier_amount_received_initial AS cashier_amount_received,
-  COALESCE(balance_proof_pending_review, FALSE) AS balance_proof_pending_review,
-  payment_proof_balance AS supplemental_payment_proof,
-  COALESCE(NULLIF(TRIM(payment_reference_balance), ''), '') AS payment_reference_balance,
-  COALESCE(NULLIF(TRIM(payment_reference_initial), ''), '') AS payment_reference_initial,
-  guest_contact_email,
-  contact_number AS delivery_contact
-`.trim();
-  return restaurantOrderPatchSelectSqlCache;
-}
-
-export async function getCashierOnlineOrderWhereSql(pool: pg.Pool): Promise<string> {
-  if (cashierOnlineWhereSqlCache) return cashierOnlineWhereSqlCache;
-  const emailExpr = await restaurantOrderEmailExpr(pool, "mo");
-  const parts = [
-    `(${emailExpr} <> '' OR (mo.guest_contact_email IS NOT NULL AND TRIM(mo.guest_contact_email) <> ''))`,
-  ];
-  cashierOnlineWhereSqlCache = `
-  mo.order_source <> 'POS'
-  AND (${parts.join(" OR ")})
-`.trim();
-  return cashierOnlineWhereSqlCache;
-}
-
-export async function restaurantLoyaltyEarnedSqlAsync(
-  pool: pg.Pool,
-  restaurantStepAmount: number,
-  restaurantStepPoints: number,
-  alias = "",
-): Promise<string> {
-  const emailExpr = await restaurantOrderEmailExpr(pool, alias);
-  return `CASE
-    WHEN LOWER(${emailExpr}) LIKE '%@guest.curatering.internal' THEN 0
-    WHEN upper(COALESCE(order_status, '')) LIKE '%ORDER CONFIRMED%'
-      OR upper(COALESCE(order_status, '')) LIKE '%OVERPAYMENT%'
-      THEN FLOOR(COALESCE(total_cost, 0)::numeric / ${restaurantStepAmount}::numeric)::int * ${restaurantStepPoints}
-    ELSE COALESCE(loyalty_points_restaurant_obtained, 0)
-  END AS loyalty_points_earned`;
-}
-
-export type TrayDraftColumns = { emailCol: string; linesCol: string };
-
-let trayDraftColumnsCache: TrayDraftColumns | null = null;
-
-export async function getTrayDraftColumns(pool: pg.Pool): Promise<TrayDraftColumns> {
-  if (trayDraftColumnsCache) return trayDraftColumnsCache;
-  if (!(await tableExists(pool, "customer_tray_drafts"))) {
-    trayDraftColumnsCache = { emailCol: "email", linesCol: "tray_lines" };
-    return trayDraftColumnsCache;
-  }
-  const emailCol = (await columnExists(pool, "customer_tray_drafts", "email"))
-    ? "email"
-    : (await columnExists(pool, "customer_tray_drafts", "user_email"))
-      ? "user_email"
-      : "email";
-  const linesCol = (await columnExists(pool, "customer_tray_drafts", "tray_lines"))
-    ? "tray_lines"
-    : (await columnExists(pool, "customer_tray_drafts", "tray_items"))
-      ? "tray_items"
-      : "tray_lines";
-  trayDraftColumnsCache = { emailCol, linesCol };
-  return trayDraftColumnsCache;
-}
-
-/** Strip data-URI prefix and whitespace from client payment proof payloads. */
-export function normalizePaymentProofBase64(raw: unknown): string {
-  let s = String(raw ?? "").trim();
-  const comma = s.indexOf(",");
-  if (s.toLowerCase().startsWith("data:") && comma >= 0) {
-    s = s.slice(comma + 1).trim();
-  }
-  return s.replace(/\s+/g, "");
 }

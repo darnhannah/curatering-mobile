@@ -3,17 +3,15 @@
  */
 import type { Express, Request, Response } from "express";
 import type pg from "pg";
-import { CATERING_ORDER_TOUCH_SET } from "./sqlCompat.js";
 
 const VENUE_FLOOR_SHAPES = new Set(["banquet_rect", "theater", "round_hall", "u_shape", "l_shape"]);
 const TABLE_SHAPES = new Set(["rect", "round", "chair"]);
-const SEATING_EDIT_STATUSES = new Set(["for_ongoing"]);
+const SEATING_EDIT_STATUSES = new Set(["for_processing"]);
 const THEME_EDIT_STATUSES = new Set([
   "online_inquiries",
   "new_event",
-  "for_down_payment",
-  "for_ongoing",
-  "for_full_payment",
+  "for_processing",
+  "for_post_analysis",
 ]);
 
 type Deps = {
@@ -267,24 +265,6 @@ async function authorizeEventAccess(
   return null;
 }
 
-/** Seating layout is manager-only (POS manager credentials required). */
-async function authorizeManagerSeatingAccess(
-  req: Request,
-  pool: pg.Pool,
-  orderId: string,
-  orderKind: string | undefined,
-  deps: Deps,
-): Promise<{ table: "event_orders" | "catering_orders"; row: Record<string, unknown> } | null> {
-  const cashierEmail = String(req.body?.cashier_email ?? req.query?.cashier_email ?? "")
-    .trim()
-    .toLowerCase();
-  const cashierPassword = String(req.body?.cashier_password ?? req.query?.cashier_password ?? "");
-  if (!cashierEmail || !cashierPassword) return null;
-  const auth = await deps.verifyPosStaff(cashierEmail, cashierPassword, ["manager", "supervisor"]);
-  if (!auth.ok) return null;
-  return resolveEventOrderRow(pool, orderId, orderKind);
-}
-
 export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void {
   const pool = deps.getPool;
 
@@ -330,20 +310,14 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
       if (mapped.status === "COMPLETED") {
         const url = imageUrlFromRunpodOutput(mapped.output);
         const out = mapped.output as Record<string, unknown> | null;
-        const jobInput =
-          data.input && typeof data.input === "object" && !Array.isArray(data.input)
-            ? (data.input as Record<string, unknown>)
-            : {};
-        const userId = String(
-          jobInput.user_id ?? jobInput.user_email ?? out?.user_id ?? out?.user_email ?? "",
-        ).trim().toLowerCase();
+        const userId = out?.user_id != null ? String(out.user_id) : "";
         if (url && userId) {
           await recordAiGeneration(pool(), {
             userEmail: userId,
             imageUrl: url,
-            prompt: String(jobInput.prompt ?? out?.prompt ?? ""),
+            prompt: String(out?.prompt ?? ""),
             jobId,
-            designMeta: { ...jobInput, ...(out ?? {}) },
+            designMeta: out ?? {},
           });
         }
       }
@@ -356,36 +330,19 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
 
   app.get("/api/mobile/ai-generations", async (req, res) => {
     const userEmail = String(req.query.user_email ?? "").trim().toLowerCase();
-    const orderId = String(req.query.order_id ?? "").trim();
-    const designSessionId = String(req.query.design_session_id ?? "").trim();
     if (!userEmail) {
       res.status(400).json({ error: "user_email is required" });
       return;
     }
     try {
       await ensureAiGenerationsTable(pool());
-      const params: string[] = [userEmail];
-      let scopeSql = "";
-      if (orderId) {
-        params.push(orderId);
-        scopeSql = ` AND (
-          TRIM(COALESCE(design_meta->>'order_id', '')) = $2
-          OR TRIM(COALESCE(design_meta->>'orderId', '')) = $2
-        )`;
-      } else if (designSessionId) {
-        params.push(designSessionId);
-        scopeSql = ` AND (
-          TRIM(COALESCE(design_meta->>'design_session_id', '')) = $2
-          OR TRIM(COALESCE(design_meta->>'designSessionId', '')) = $2
-        )`;
-      }
       const { rows } = await pool().query(
         `SELECT id::text, image_url, prompt, design_meta, job_id, created_at
          FROM ai_generations
-         WHERE LOWER(TRIM(user_email)) = $1${scopeSql}
+         WHERE LOWER(TRIM(user_email)) = $1
          ORDER BY created_at DESC
-         LIMIT 48`,
-        params,
+         LIMIT 24`,
+        [userEmail],
       );
       res.json(rows);
     } catch (err) {
@@ -448,7 +405,7 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
           : {};
       const merged = { ...existing, ...(themeDesign as Record<string, unknown>) };
       await pool().query(
-        `UPDATE event_orders SET theme_design = $2::jsonb, ${CATERING_ORDER_TOUCH_SET} WHERE id::text = $1`,
+        `UPDATE event_orders SET theme_design = $2::jsonb, updated_at = NOW() WHERE id::text = $1`,
         [orderId, JSON.stringify(merged)],
       );
       res.json({ ok: true, theme_design: merged });
@@ -462,12 +419,12 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
     const orderId = String(req.params.id ?? "").trim();
     const orderKind = String(req.query.order_kind ?? "").trim().toLowerCase();
     try {
-      const access = await authorizeManagerSeatingAccess(req, pool(), orderId, orderKind || undefined, deps);
+      const access = await authorizeEventAccess(req, pool(), orderId, orderKind || undefined, deps);
       if (!access) {
-        res.status(403).json({ error: "manager credentials required for seating layout" });
+        res.status(403).json({ error: "forbidden" });
         return;
       }
-      if (access.table !== "event_orders" || !isCateringPlusEvent(access.row, access.table)) {
+      if (!isCateringPlusEvent(access.row, access.table)) {
         res.status(400).json({ error: "seating applies to catering + event orders only" });
         return;
       }
@@ -491,19 +448,12 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
       return;
     }
     try {
-      const cashierEmail = String(req.body?.cashier_email ?? "").trim().toLowerCase();
-      const cashierPassword = String(req.body?.cashier_password ?? "");
-      const auth = await deps.verifyPosStaff(cashierEmail, cashierPassword, ["manager"]);
-      if (!auth.ok) {
-        res.status(403).json({ error: "manager credentials required to edit seating layout" });
-        return;
-      }
-      const access = await resolveEventOrderRow(pool(), orderId, orderKind || undefined);
+      const access = await authorizeEventAccess(req, pool(), orderId, orderKind || undefined, deps);
       if (!access) {
-        res.status(404).json({ error: "order not found" });
+        res.status(403).json({ error: "forbidden" });
         return;
       }
-      if (access.table !== "event_orders" || !isCateringPlusEvent(access.row, access.table)) {
+      if (!isCateringPlusEvent(access.row, access.table)) {
         res.status(400).json({ error: "seating applies to catering + event orders only" });
         return;
       }
@@ -514,7 +464,7 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
       }
       const normalized = normalizeSeatingPlan(rawPlan);
       await pool().query(
-        `UPDATE event_orders SET seating_plan = $2::jsonb, ${CATERING_ORDER_TOUCH_SET} WHERE id::text = $1`,
+        `UPDATE event_orders SET seating_plan = $2::jsonb, updated_at = NOW() WHERE id::text = $1`,
         [orderId, JSON.stringify(normalized)],
       );
       res.json({ ok: true, seating_plan: normalized });
