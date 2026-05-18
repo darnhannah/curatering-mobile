@@ -1729,7 +1729,7 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
     const { rows } = await getPool().query(
       `SELECT ${restaurantOrderSelectSql("mo")},
               COALESCE(NULLIF(TRIM(cp.full_name), ''), NULLIF(TRIM(mo.full_name), ''), NULLIF(TRIM(mo.pos_customer_label), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
-              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")} AS loyalty_points_earned
+              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")}
        FROM restaurant_orders mo
        LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
        WHERE ${CASHIER_ONLINE_ORDER_WHERE}

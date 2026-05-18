@@ -398,11 +398,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                   child: appState.isCashier
                       ? PosShellScreen(state: appState)
                       : appState.isSupervisor
-                          ? ManagerCateringShellScreen(
-                              state: appState,
-                              supervisorMode: true,
-                              initialTabIndex: 3,
-                            )
+                          ? SupervisorOngoingShellScreen(state: appState)
                           : appState.isManager
                               ? ManagerDashboardScreen(state: appState)
                               : CustomerDashboardScreen(state: appState),
@@ -2135,6 +2131,29 @@ class CateringEventRecord {
 
   int get cateringLoyaltyEligiblePointsIfCompleted => cateringLoyaltyPointsForOrderTotal(totalCost);
 
+  /// Human-readable schedule for list cards (summary preview or first slot).
+  String get scheduleWhenDisplay {
+    if (schedulePreview.trim().isNotEmpty) return schedulePreview.trim();
+    if (scheduleSlots.isEmpty) return '';
+    final first = scheduleSlots.first;
+    if (first is! Map) return '';
+    final m = Map<String, dynamic>.from(first as Map);
+    final date = '${m['date'] ?? ''}'.trim();
+    final from = '${m['from'] ?? ''}'.trim();
+    final to = '${m['to'] ?? ''}'.trim();
+    final label = '${m['label'] ?? ''}'.trim();
+    if (label.isNotEmpty) return label;
+    final parts = <String>[];
+    if (date.isNotEmpty) parts.add(date);
+    if (from.isNotEmpty) {
+      parts.add(to.isNotEmpty ? '$from – $to' : from);
+    }
+    return parts.join(' · ');
+  }
+
+  String get orderTypeLabel =>
+      orderTypeDisplayLabel(orderType, eventTitle: eventTitle);
+
   factory CateringEventRecord.fromApiMap(Map<String, dynamic> m) {
     final status = normalizeCateringPipelineStatus('${m['status'] ?? ''}');
     return CateringEventRecord(
@@ -2428,13 +2447,7 @@ class AppState extends ChangeNotifier {
         _managerActiveStage = kStageForOngoing;
         await Future.wait([
           loadMenu(force: true),
-          loadSetMenus(force: true),
-          loadManagerCateringByStage('online_inquiries', force: true),
-          loadManagerCateringByStage(kStageForDownPayment, force: true),
           loadManagerCateringByStage(kStageForOngoing, force: true),
-          loadManagerCateringByStage(kStageForFullPayment, force: true),
-          loadManagerCateringByStage('for_processing', force: true),
-          loadManagerCateringByStage('for_post_analysis', force: true),
         ]);
         await loadNotifications(force: true);
       } else if (isManager) {
@@ -5110,11 +5123,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                       final Widget landing = st.isCashier
                                           ? PosShellScreen(state: st)
                                           : st.isSupervisor
-                                              ? ManagerCateringShellScreen(
-                                                  state: st,
-                                                  supervisorMode: true,
-                                                  initialTabIndex: 3,
-                                                )
+                                              ? SupervisorOngoingShellScreen(state: st)
                                               : st.isManager
                                                   ? ManagerDashboardScreen(state: st)
                                                   : CustomerDashboardScreen(state: st);
@@ -5996,13 +6005,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
             state: state,
             onOngoing: () {
               Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => ManagerCateringShellScreen(
-                    state: state,
-                    supervisorMode: true,
-                    initialTabIndex: 3,
-                  ),
-                ),
+                MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
               );
             },
           ),
@@ -6036,13 +6039,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
                       borderRadius: BorderRadius.circular(12),
                       onTap: () {
                         Navigator.of(context).push(
-                          MaterialPageRoute<void>(
-                            builder: (_) => ManagerCateringShellScreen(
-                              state: state,
-                              supervisorMode: true,
-                              initialTabIndex: 3,
-                            ),
-                          ),
+                          MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
                         );
                       },
                       child: Padding(
@@ -6080,6 +6077,48 @@ class SupervisorDashboardScreen extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class SupervisorOngoingShellScreen extends StatefulWidget {
+  const SupervisorOngoingShellScreen({super.key, required this.state});
+  final AppState state;
+
+  @override
+  State<SupervisorOngoingShellScreen> createState() => _SupervisorOngoingShellScreenState();
+}
+
+class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScreen> {
+  @override
+  void initState() {
+    super.initState();
+    widget.state.setManagerActiveStage(kStageForOngoing);
+    widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
+    widget.state.loadAllergenCatalog(force: true);
+    widget.state.loadMenu(force: true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF242424),
+        foregroundColor: const Color(0xFFFFC024),
+        leading: _buildManagerHamburgerLeading(context, widget.state, menuOnly: true),
+        title: const Text('ON GOING', style: kManagerAppBarTitleStyle),
+        centerTitle: true,
+      ),
+      drawer: SupervisorStaffDrawer(
+        state: widget.state,
+        onOngoing: () {},
+      ),
+      body: _ManagerStageListTab(
+        state: widget.state,
+        stage: kStageForOngoing,
+        isReadOnly: false,
+        supervisorMode: true,
+      ),
     );
   }
 }
@@ -14323,8 +14362,7 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
           drawer: widget.supervisorMode
               ? SupervisorStaffDrawer(
                   state: widget.state,
-                  onOngoing: () => _tab.animateTo(3),
-                  onManageEvents: () => _tab.animateTo(0),
+                  onOngoing: () {},
                 )
               : ManagerRoleDrawer(
                   state: widget.state,
@@ -16132,6 +16170,21 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                         return '';
                       }();
                       final subtitleWidgets = <Widget>[
+                        if (widget.supervisorMode && stage == kStageForOngoing) ...[
+                          Text(
+                            r.scheduleWhenDisplay.isNotEmpty
+                                ? 'Event date/time: ${r.scheduleWhenDisplay}'
+                                : 'Event date/time: —',
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          Text(
+                            r.eventType.trim().isNotEmpty
+                                ? 'Event type: ${r.eventType.trim()}'
+                                : 'Event type: —',
+                          ),
+                          Text('Order type: ${r.orderTypeLabel}'),
+                          const SizedBox(height: 4),
+                        ],
                         Text(r.contactPerson),
                         Text('${managerStageListTimestampLabel(stage)}: $whenStr'),
                         if (scheduleLine.isNotEmpty) Text(scheduleLine),
