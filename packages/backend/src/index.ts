@@ -167,6 +167,60 @@ function ensureNewEventSchemaOnce(): Promise<void> {
   return ensureNewEventSchemaPromise;
 }
 
+let ensureRestaurantOrderApiColumnsPromise: Promise<void> | null = null;
+
+/** Ensure columns referenced by [RESTAURANT_ORDER_SELECT] exist (production may have been pruned). */
+function ensureRestaurantOrderApiColumnsOnce(): Promise<void> {
+  if (ensureRestaurantOrderApiColumnsPromise != null) return ensureRestaurantOrderApiColumnsPromise;
+  ensureRestaurantOrderApiColumnsPromise = (async () => {
+    const p = getPool();
+    const cols: Array<[string, string]> = [
+      ["id", "UUID"],
+      ["order_no", "TEXT"],
+      ["order_id", "TEXT"],
+      ["user_email", "TEXT"],
+      ["guest_contact_email", "TEXT"],
+      ["order_status", "TEXT DEFAULT 'WAITING FOR ORDER CONFIRMATION'"],
+      ["total_cost", "NUMERIC DEFAULT 0"],
+      ["delivery_notes", "TEXT"],
+      ["payment_mode", "TEXT DEFAULT 'GCASH ONLY'"],
+      ["payment_uploaded_initial", "BOOLEAN NOT NULL DEFAULT FALSE"],
+      ["payment_proof_initial", "TEXT"],
+      ["payment_proof_balance", "TEXT"],
+      ["payment_reference_initial", "TEXT"],
+      ["payment_reference_balance", "TEXT"],
+      ["payment_uploaded_balance", "BOOLEAN NOT NULL DEFAULT FALSE"],
+      ["payment_confirmed_initial", "BOOLEAN NOT NULL DEFAULT FALSE"],
+      ["payment_confirmed_balance", "BOOLEAN NOT NULL DEFAULT FALSE"],
+      ["loyalty_points_restaurant_obtained", "INTEGER NOT NULL DEFAULT 0"],
+      ["loyalty_reward_restaurant_obtained", "TEXT"],
+      ["full_name", "TEXT"],
+      ["contact_number", "TEXT NOT NULL DEFAULT ''"],
+      ["delivery_address", "TEXT"],
+      ["delivery_lat", "DOUBLE PRECISION"],
+      ["delivery_lng", "DOUBLE PRECISION"],
+      ["delivery_time", "TEXT DEFAULT 'NOW'"],
+      ["submitted_order_dt_stamp", "TIMESTAMPTZ"],
+      ["last_updated_order_status_dt_stamp", "TIMESTAMPTZ"],
+      ["order_source", "TEXT NOT NULL DEFAULT 'MOBILE_APP'"],
+      ["pos_customer_label", "TEXT"],
+      ["cashier_amount_received_initial", "NUMERIC"],
+      ["cashier_amount_received_balance", "NUMERIC"],
+      ["delivery_tracking_url", "TEXT"],
+      ["tray_items", "JSONB NOT NULL DEFAULT '[]'::jsonb"],
+      ["customer_id", "TEXT"],
+    ];
+    for (const [name, typ] of cols) {
+      await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS ${name} ${typ}`);
+    }
+    await p.query(`UPDATE restaurant_orders SET id = gen_random_uuid() WHERE id IS NULL`);
+  })().catch((err) => {
+    ensureRestaurantOrderApiColumnsPromise = null;
+    throw err;
+  });
+  return ensureRestaurantOrderApiColumnsPromise;
+}
+
 /** Parse menu_dishes.allergens (TEXT: JSON array, comma-separated, or empty). */
 function parseMenuAllergens(raw: unknown): string[] {
   if (raw == null) return [];
@@ -1671,10 +1725,11 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
     return;
   }
   try {
+    await ensureRestaurantOrderApiColumnsOnce();
     const { rows } = await getPool().query(
       `SELECT ${restaurantOrderSelectSql("mo")},
               COALESCE(NULLIF(TRIM(cp.full_name), ''), NULLIF(TRIM(mo.full_name), ''), NULLIF(TRIM(mo.pos_customer_label), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
-              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")}
+              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")} AS loyalty_points_earned
        FROM restaurant_orders mo
        LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
        WHERE ${CASHIER_ONLINE_ORDER_WHERE}
@@ -1684,7 +1739,9 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
     res.json(out);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "database error" });
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "database error",
+    });
   }
 });
 
@@ -2345,6 +2402,7 @@ app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
     return;
   }
   try {
+    await ensureRestaurantOrderApiColumnsOnce();
     if (filter === "cancelled") {
       const { rows } = await getPool().query(
         `SELECT ${RESTAURANT_ORDER_SELECT},
@@ -2378,7 +2436,9 @@ app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
     res.json(out);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "database error" });
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "database error",
+    });
   }
 });
 
@@ -4217,7 +4277,7 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
             schedule_slots, address, guest_count, pax_buffer, menu, event_setting, checklist,
             total_cost, created_by, updated_by, customer_id, catering_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
            VALUES
-           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16, $16, NULLIF($17, ''), $18, $19, $20::jsonb, $21, $22, $23)
+           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13, $14::jsonb, $15, $16, $16, NULLIF($17, ''), $18, $19, $20::jsonb, $21, $22, $23)
            RETURNING id::text`
         : `INSERT INTO event_orders
            (source, status, order_type, customer_name, contact_person, contact_number, email_address,
@@ -4989,13 +5049,28 @@ app.put("/api/mobile/customer/tray-draft", async (req, res) => {
     return;
   }
   try {
-    const { rows } = await getPool().query(
-      `INSERT INTO customer_tray_drafts (user_email, tray_lines, updated_at)
-       VALUES ($1, $2::jsonb, NOW())
-       ON CONFLICT (user_email)
-       DO UPDATE SET tray_lines = EXCLUDED.tray_lines, updated_at = NOW()
+    const pool = getPool();
+    let customerId = userEmail;
+    const { rows: acct } = await pool.query(
+      `SELECT COALESCE(NULLIF(TRIM(customer_id), ''), id::text) AS cid
+       FROM customer_accounts
+       WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+       LIMIT 1`,
+      [userEmail],
+    );
+    if (acct[0]?.cid) customerId = String(acct[0].cid);
+    const linesJson = JSON.stringify(trayLines);
+    await pool.query(
+      `DELETE FROM customer_tray_drafts
+       WHERE customer_id = $1
+          OR LOWER(TRIM(COALESCE(user_email, ''))) = LOWER(TRIM($2))`,
+      [customerId, userEmail],
+    );
+    const { rows } = await pool.query(
+      `INSERT INTO customer_tray_drafts (customer_id, user_email, tray_lines, tray_items, updated_at)
+       VALUES ($1, $2, $3::jsonb, $3::jsonb, NOW())
        RETURNING updated_at`,
-      [userEmail, JSON.stringify(trayLines)],
+      [customerId, userEmail, linesJson],
     );
     res.json({
       ok: true,

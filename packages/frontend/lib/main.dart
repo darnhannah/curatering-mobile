@@ -398,7 +398,11 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                   child: appState.isCashier
                       ? PosShellScreen(state: appState)
                       : appState.isSupervisor
-                          ? SupervisorOngoingShellScreen(state: appState)
+                          ? ManagerCateringShellScreen(
+                              state: appState,
+                              supervisorMode: true,
+                              initialTabIndex: 3,
+                            )
                           : appState.isManager
                               ? ManagerDashboardScreen(state: appState)
                               : CustomerDashboardScreen(state: appState),
@@ -2424,7 +2428,13 @@ class AppState extends ChangeNotifier {
         _managerActiveStage = kStageForOngoing;
         await Future.wait([
           loadMenu(force: true),
+          loadSetMenus(force: true),
+          loadManagerCateringByStage('online_inquiries', force: true),
+          loadManagerCateringByStage(kStageForDownPayment, force: true),
           loadManagerCateringByStage(kStageForOngoing, force: true),
+          loadManagerCateringByStage(kStageForFullPayment, force: true),
+          loadManagerCateringByStage('for_processing', force: true),
+          loadManagerCateringByStage('for_post_analysis', force: true),
         ]);
         await loadNotifications(force: true);
       } else if (isManager) {
@@ -3767,6 +3777,47 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  void applyLocalPaymentProofUpload(int orderId, {required String proofBase64, String? orderNo}) {
+    final idx = orders.indexWhere((o) => o.id == orderId);
+    if (idx < 0) return;
+    final o = orders[idx];
+    orders[idx] = OrderData(
+      id: o.id,
+      orderNo: (orderNo ?? o.orderNo).trim().isNotEmpty ? (orderNo ?? o.orderNo) : o.orderNo,
+      status: o.status,
+      total: o.total,
+      createdAt: o.createdAt,
+      updatedAt: DateTime.now(),
+      paymentUploaded: true,
+      paymentProofBase64: proofBase64,
+      lines: o.lines,
+      userEmail: o.userEmail,
+      note: o.note,
+      paymentMode: o.paymentMode,
+      deliveryName: o.deliveryName,
+      deliveryContact: o.deliveryContact,
+      deliveryAddress: o.deliveryAddress,
+      deliveryTime: o.deliveryTime,
+      orderSource: o.orderSource,
+      posCustomerLabel: o.posCustomerLabel,
+      cashierAmountReceived: o.cashierAmountReceived,
+      cashierChange: o.cashierChange,
+      fulfillmentStage: o.fulfillmentStage,
+      deliveryTrackingUrl: o.deliveryTrackingUrl,
+      supplementalPaymentProofBase64: o.supplementalPaymentProofBase64,
+      cashierSecondaryAmountReceived: o.cashierSecondaryAmountReceived,
+      balanceProofPendingReview: o.balanceProofPendingReview,
+      customerDisplayName: o.customerDisplayName,
+      loyaltyPointsEarned: o.loyaltyPointsEarned,
+      paymentReferenceInitial: o.paymentReferenceInitial,
+      paymentReferenceBalance: o.paymentReferenceBalance,
+      guestContactEmail: o.guestContactEmail,
+      orderFullName: o.orderFullName,
+      orderContactNumber: o.orderContactNumber,
+    );
+    notifyListeners();
+  }
+
   Future<String?> uploadPaymentProof(int orderId, XFile file, {String? paymentProofBase64}) async {
     try {
       var encoded = paymentProofBase64 ?? base64Encode(await file.readAsBytes());
@@ -3788,7 +3839,12 @@ class AppState extends ChangeNotifier {
           return 'Could not upload payment proof (${res.statusCode})';
         }
       }
-      await loadOrders(force: true);
+      String? orderNo;
+      try {
+        final body = jsonDecode(res.body);
+        if (body is Map) orderNo = '${body['order_no'] ?? ''}'.trim();
+      } catch (_) {}
+      applyLocalPaymentProofUpload(orderId, proofBase64: encoded, orderNo: orderNo);
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -5054,7 +5110,11 @@ class _AuthScreenState extends State<AuthScreen> {
                                       final Widget landing = st.isCashier
                                           ? PosShellScreen(state: st)
                                           : st.isSupervisor
-                                              ? SupervisorOngoingShellScreen(state: st)
+                                              ? ManagerCateringShellScreen(
+                                                  state: st,
+                                                  supervisorMode: true,
+                                                  initialTabIndex: 3,
+                                                )
                                               : st.isManager
                                                   ? ManagerDashboardScreen(state: st)
                                                   : CustomerDashboardScreen(state: st);
@@ -5845,9 +5905,11 @@ class SupervisorStaffDrawer extends StatelessWidget {
     super.key,
     required this.state,
     required this.onOngoing,
+    this.onManageEvents,
   });
   final AppState state;
   final VoidCallback onOngoing;
+  final VoidCallback? onManageEvents;
 
   @override
   Widget build(BuildContext context) {
@@ -5885,6 +5947,15 @@ class SupervisorStaffDrawer extends StatelessWidget {
               onOngoing();
             },
           ),
+          if (onManageEvents != null)
+            ListTile(
+              leading: const Icon(Icons.list_alt_outlined),
+              title: const Text('Manage Events'),
+              onTap: () {
+                Navigator.pop(context);
+                onManageEvents!();
+              },
+            ),
           ListTile(
             leading: const Icon(Icons.settings),
             title: const Text('Settings'),
@@ -5925,7 +5996,13 @@ class SupervisorDashboardScreen extends StatelessWidget {
             state: state,
             onOngoing: () {
               Navigator.of(context).push(
-                MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
+                MaterialPageRoute<void>(
+                  builder: (_) => ManagerCateringShellScreen(
+                    state: state,
+                    supervisorMode: true,
+                    initialTabIndex: 3,
+                  ),
+                ),
               );
             },
           ),
@@ -5959,7 +6036,13 @@ class SupervisorDashboardScreen extends StatelessWidget {
                       borderRadius: BorderRadius.circular(12),
                       onTap: () {
                         Navigator.of(context).push(
-                          MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
+                          MaterialPageRoute<void>(
+                            builder: (_) => ManagerCateringShellScreen(
+                              state: state,
+                              supervisorMode: true,
+                              initialTabIndex: 3,
+                            ),
+                          ),
                         );
                       },
                       child: Padding(
@@ -5997,48 +6080,6 @@ class SupervisorDashboardScreen extends StatelessWidget {
           ),
         );
       },
-    );
-  }
-}
-
-class SupervisorOngoingShellScreen extends StatefulWidget {
-  const SupervisorOngoingShellScreen({super.key, required this.state});
-  final AppState state;
-
-  @override
-  State<SupervisorOngoingShellScreen> createState() => _SupervisorOngoingShellScreenState();
-}
-
-class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScreen> {
-  @override
-  void initState() {
-    super.initState();
-    widget.state.setManagerActiveStage(kStageForOngoing);
-    widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
-    widget.state.loadAllergenCatalog(force: true);
-    widget.state.loadMenu(force: true);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF242424),
-        foregroundColor: const Color(0xFFFFC024),
-        leading: _buildManagerHamburgerLeading(context, widget.state, menuOnly: true),
-        title: const Text('ON GOING', style: kManagerAppBarTitleStyle),
-        centerTitle: true,
-      ),
-      drawer: SupervisorStaffDrawer(
-        state: widget.state,
-        onOngoing: () {},
-      ),
-      body: _ManagerStageListTab(
-        state: widget.state,
-        stage: kStageForOngoing,
-        isReadOnly: false,
-        supervisorMode: true,
-      ),
     );
   }
 }
@@ -8835,9 +8876,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
     final picker = ImagePicker();
     final file = await picker.pickImage(
       source: source,
-      imageQuality: 48,
-      maxWidth: 1024,
-      maxHeight: 1024,
+      imageQuality: 40,
+      maxWidth: 900,
+      maxHeight: 900,
     );
     if (file == null) return;
     final bytes = await file.readAsBytes();
@@ -8866,7 +8907,6 @@ class _PaymentScreenState extends State<PaymentScreen> {
         appSnack(context, err);
         return;
       }
-      await s.loadOrders(force: true);
       final syncedAfterPlace = s.orders.where((o) => o.id == newOrder.id).toList();
       setState(() {
         _placedOrder = syncedAfterPlace.isNotEmpty ? syncedAfterPlace.first : newOrder;
@@ -8897,7 +8937,6 @@ class _PaymentScreenState extends State<PaymentScreen> {
       _localProofBytes = bytes;
       localProofUploaded = true;
     });
-    await s.loadOrders(force: true);
     final syPin = _syncedOrder(s);
     if (syPin != null && mounted) {
       setState(() => _placedOrder = syPin);
@@ -10864,7 +10903,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                           children: [
                             const Expanded(
                               child: Text(
-                                'Total Restaurant Points',
+                                'Total Loyalty Restaurant Points',
                                 style: TextStyle(fontWeight: FontWeight.w800),
                               ),
                             ),
@@ -10879,7 +10918,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                           children: [
                             const Expanded(
                               child: Text(
-                                'Total Catering Points',
+                                'Total Catering Loyalty Points',
                                 style: TextStyle(fontWeight: FontWeight.w800),
                               ),
                             ),
@@ -10888,44 +10927,6 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                               style: const TextStyle(fontWeight: FontWeight.w900),
                             ),
                           ],
-                        ),
-                        const Divider(height: 16),
-                        const SizedBox(height: 10),
-                        SizedBox(
-                          height: 140,
-                          child: () {
-                            final history = widget.state.loyaltyHistory.toList();
-                            if (history.isEmpty) {
-                              return const Align(
-                                alignment: Alignment.topLeft,
-                                child: Text('No loyalty history yet.'),
-                              );
-                            }
-                            return ListView.separated(
-                              padding: EdgeInsets.zero,
-                              shrinkWrap: true,
-                              itemCount: history.length,
-                              separatorBuilder: (_, _) => const SizedBox(height: 10),
-                              itemBuilder: (context, index) {
-                                final h = history[index];
-                                final rawNo = h.orderNo.trim();
-                                final label = rawNo.isEmpty
-                                    ? '—'
-                                    : (h.source == 'catering' ? rawNo : uiOrderNo(rawNo));
-                                final src = h.source == 'catering' ? 'Catering / Event' : 'Restaurant';
-                                return Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      '$label · $src · +${h.pointsDelta} pts',
-                                      style: const TextStyle(fontWeight: FontWeight.w700),
-                                    ),
-                                    Text(formatDateTimeLocal(h.createdAt)),
-                                  ],
-                                );
-                              },
-                            );
-                          }(),
                         ),
                       ],
                     ),
@@ -14219,9 +14220,15 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
 // --- Manager/Supervisor Catering POS ---
 
 class ManagerCateringShellScreen extends StatefulWidget {
-  const ManagerCateringShellScreen({super.key, required this.state, this.initialTabIndex = 0});
+  const ManagerCateringShellScreen({
+    super.key,
+    required this.state,
+    this.initialTabIndex = 0,
+    this.supervisorMode = false,
+  });
   final AppState state;
   final int initialTabIndex;
+  final bool supervisorMode;
   @override
   State<ManagerCateringShellScreen> createState() => _ManagerCateringShellScreenState();
 }
@@ -14313,28 +14320,64 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
               ),
             ),
           ),
-          drawer: ManagerRoleDrawer(
-            state: widget.state,
-            onDashboard: () {
-              Navigator.of(context).pushAndRemoveUntil(
-                MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
-                (_) => false,
-              );
-            },
-            onManageEvents: () {
-              _tab.animateTo(0);
-            },
-          ),
+          drawer: widget.supervisorMode
+              ? SupervisorStaffDrawer(
+                  state: widget.state,
+                  onOngoing: () => _tab.animateTo(3),
+                  onManageEvents: () => _tab.animateTo(0),
+                )
+              : ManagerRoleDrawer(
+                  state: widget.state,
+                  onDashboard: () {
+                    Navigator.of(context).pushAndRemoveUntil(
+                      MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
+                      (_) => false,
+                    );
+                  },
+                  onManageEvents: () {
+                    _tab.animateTo(0);
+                  },
+                ),
           body: TabBarView(
             controller: _tab,
             children: [
-              _ManagerNewEventListTab(state: widget.state),
-              _ManagerStageListTab(state: widget.state, stage: 'online_inquiries', isReadOnly: false),
-              _ManagerStageListTab(state: widget.state, stage: kStageForDownPayment, isReadOnly: false),
-              _ManagerStageListTab(state: widget.state, stage: kStageForOngoing, isReadOnly: false),
-              _ManagerStageListTab(state: widget.state, stage: kStageForFullPayment, isReadOnly: false),
-              _ManagerStageListTab(state: widget.state, stage: 'completed', isReadOnly: true),
-              _ManagerStageListTab(state: widget.state, stage: 'cancelled', isReadOnly: true),
+              _ManagerNewEventListTab(state: widget.state, supervisorMode: widget.supervisorMode),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: 'online_inquiries',
+                isReadOnly: false,
+                supervisorMode: widget.supervisorMode,
+              ),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: kStageForDownPayment,
+                isReadOnly: false,
+                supervisorMode: widget.supervisorMode,
+              ),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: kStageForOngoing,
+                isReadOnly: false,
+                supervisorMode: widget.supervisorMode,
+              ),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: kStageForFullPayment,
+                isReadOnly: false,
+                supervisorMode: widget.supervisorMode,
+              ),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: 'completed',
+                isReadOnly: true,
+                supervisorMode: widget.supervisorMode,
+              ),
+              _ManagerStageListTab(
+                state: widget.state,
+                stage: 'cancelled',
+                isReadOnly: true,
+                supervisorMode: widget.supervisorMode,
+              ),
             ],
           ),
         );
@@ -14344,28 +14387,37 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
 }
 
 class _ManagerNewEventListTab extends StatelessWidget {
-  const _ManagerNewEventListTab({required this.state});
+  const _ManagerNewEventListTab({required this.state, this.supervisorMode = false});
   final AppState state;
+  final bool supervisorMode;
   @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
-          child: FilledButton.icon(
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (ctx) => ManagerNewEventCreateScreen(state: state),
-                ),
-              );
-            },
-            icon: const Icon(Icons.add_circle_outline),
-            label: const Text('NEW EVENT'),
+        if (!supervisorMode)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+            child: FilledButton.icon(
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (ctx) => ManagerNewEventCreateScreen(state: state),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.add_circle_outline),
+              label: const Text('NEW EVENT'),
+            ),
+          ),
+        Expanded(
+          child: _ManagerStageListTab(
+            state: state,
+            stage: 'new_event',
+            isReadOnly: supervisorMode,
+            supervisorMode: supervisorMode,
           ),
         ),
-        Expanded(child: _ManagerStageListTab(state: state, stage: 'new_event', isReadOnly: false)),
       ],
     );
   }
