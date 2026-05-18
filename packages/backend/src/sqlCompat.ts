@@ -5,6 +5,10 @@
 /** Touch timestamp on customer_accounts (legacy updated_at was pruned). */
 export const CUSTOMER_ACCOUNT_TOUCH = `updated_pw_dt_stamp = NOW()`;
 
+/** Change-detection timestamps (production DB may not have updated_at on all tables). */
+export const MENU_CHANGED_AT_SQL = `COALESCE(created_at, NOW())`;
+export const CATERING_ORDER_CHANGED_AT_SQL = `COALESCE(stage_entered_at, created_at, NOW())`;
+
 /** Shared SELECT list for restaurant order API responses (legacy aliases included). */
 export const RESTAURANT_ORDER_SELECT = `
   mobile_id,

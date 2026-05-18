@@ -4926,7 +4926,25 @@ class _AuthScreenState extends State<AuthScreen> {
                                       passwordController.text,
                                     );
                                     if (!mounted) return;
-                                    if (err != null) await _toast(err);
+                                    if (err != null) {
+                                      await _toast(err);
+                                      return;
+                                    }
+                                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                                      if (!mounted) return;
+                                      final st = widget.state;
+                                      if (st.userEmail == null) return;
+                                      final Widget landing = st.isCashier
+                                          ? PosShellScreen(state: st)
+                                          : st.isSupervisor
+                                              ? SupervisorOngoingShellScreen(state: st)
+                                              : st.isManager
+                                                  ? ManagerDashboardScreen(state: st)
+                                                  : CustomerDashboardScreen(state: st);
+                                      Navigator.of(context).pushReplacement(
+                                        MaterialPageRoute<void>(builder: (_) => landing),
+                                      );
+                                    });
                                   } finally {
                                     if (mounted) setState(() => busyMessage = null);
                                   }

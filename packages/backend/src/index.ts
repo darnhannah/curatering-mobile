@@ -23,6 +23,8 @@ import {
   CATERING_TRANSACTION_ID,
   CUSTOMER_ACCOUNT_TOUCH,
   CUSTOMER_FORGOT_OTP_SELECT,
+  CATERING_ORDER_CHANGED_AT_SQL,
+  MENU_CHANGED_AT_SQL,
   EVENT_TRANSACTION_ID,
   POST_ANALYSIS_JSON,
   RESTAURANT_ORDER_PATCH_SELECT,
@@ -4876,18 +4878,33 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
     return;
   }
   try {
+    let trayStampExpr = `''::text`;
+    try {
+      const { rows: trayCols } = await getPool().query(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'customer_tray_drafts'
+           AND column_name IN ('updated_at', 'email', 'user_email')`,
+      );
+      const names = new Set((trayCols as Array<{ column_name: string }>).map((r) => r.column_name));
+      const emailCol = names.has("email") ? "email" : names.has("user_email") ? "user_email" : null;
+      if (emailCol && names.has("updated_at")) {
+        trayStampExpr = `COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(TRIM(${emailCol})) = $1), '')`;
+      }
+    } catch {
+      /* tray drafts optional */
+    }
     const { rows } = await getPool().query(
       `SELECT
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM menu_dishes), '') AS menu_stamp,
-         COALESCE((SELECT MAX(COALESCE(last_updated_order_status_dt_stamp, submitted_order_dt_stamp))::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
+         COALESCE((SELECT MAX((${MENU_CHANGED_AT_SQL}))::text FROM menu_dishes), '') AS menu_stamp,
+         COALESCE((SELECT MAX(COALESCE(last_updated_order_status_dt_stamp, submitted_order_dt_stamp, created_at))::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_pw_dt_stamp, created_account_dt_stamp))::text FROM customer_accounts), '') AS profile_stamp,
          COALESCE((SELECT MAX(created_at)::text FROM notifications WHERE user_id = $1), '') AS notifications_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM catering_orders WHERE LOWER(email_address) = $1), '') AS catering_inquiries_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM event_orders WHERE LOWER(email_address) = $1), '') AS event_inquiries_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM catering_orders), '') AS manager_catering_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM event_orders), '') AS manager_event_stamp,
+         COALESCE((SELECT MAX((${CATERING_ORDER_CHANGED_AT_SQL}))::text FROM catering_orders WHERE LOWER(email_address) = $1), '') AS catering_inquiries_stamp,
+         COALESCE((SELECT MAX((${CATERING_ORDER_CHANGED_AT_SQL}))::text FROM event_orders WHERE LOWER(email_address) = $1), '') AS event_inquiries_stamp,
+         COALESCE((SELECT MAX((${CATERING_ORDER_CHANGED_AT_SQL}))::text FROM catering_orders), '') AS manager_catering_stamp,
+         COALESCE((SELECT MAX((${CATERING_ORDER_CHANGED_AT_SQL}))::text FROM event_orders), '') AS manager_event_stamp,
          COALESCE((SELECT MAX(COALESCE(updated_pw_dt_stamp, created_account_dt_stamp))::text FROM customer_accounts), '') AS loyalty_stamp,
-         COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(user_email) = $1), '') AS tray_stamp`,
+         ${trayStampExpr} AS tray_stamp`,
       [userEmail],
     );
     const row = (rows[0] ?? {}) as Record<string, unknown>;
@@ -4905,7 +4922,18 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "database error" });
+    res.json({
+      role,
+      server_time: new Date().toISOString(),
+      menu: "",
+      restaurant_orders: "",
+      profile: "",
+      notifications: "",
+      inquiries: "",
+      manager_catering: "",
+      loyalty: "",
+      tray: "",
+    });
   }
 });
 
@@ -4924,11 +4952,11 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
   const parsed = sinceRaw ? new Date(sinceRaw) : null;
   const since = parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date(Date.now() - 5 * 60 * 1000);
   try {
-    const menuChanged = (( 
+    const menuChanged = ((
       await getPool().query(
         `SELECT 1
          FROM menu_dishes
-         WHERE COALESCE(updated_at, created_at) > $1
+         WHERE (${MENU_CHANGED_AT_SQL}) > $1
          LIMIT 1`,
         [since.toISOString()],
       )
@@ -4958,24 +4986,25 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
                    )
                  )
                ) = $1
-           AND COALESCE(updated_at, created_at) > $2
+           AND COALESCE(updated_pw_dt_stamp, created_account_dt_stamp) > $2
          LIMIT 1`,
         [userEmail, since.toISOString()],
       )
     ).rowCount ?? 0) > 0;
 
+    const roChangedAt = `COALESCE(last_updated_order_status_dt_stamp, submitted_order_dt_stamp, created_at, NOW())`;
     const orderRows = await getPool().query(
       role === "customer"
         ? `SELECT mobile_id::text AS id
            FROM restaurant_orders
            WHERE LOWER(TRIM(user_email)) = $1
-             AND COALESCE(updated_at, created_at) > $2
-           ORDER BY COALESCE(updated_at, created_at) DESC
+             AND ${roChangedAt} > $2
+           ORDER BY ${roChangedAt} DESC
            LIMIT 200`
         : `SELECT mobile_id::text AS id
            FROM restaurant_orders
-           WHERE COALESCE(updated_at, created_at) > $1
-           ORDER BY COALESCE(updated_at, created_at) DESC
+           WHERE ${roChangedAt} > $1
+           ORDER BY ${roChangedAt} DESC
            LIMIT 200`,
       role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
     );
@@ -4984,11 +5013,11 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
       role === "customer"
         ? `SELECT id::text AS id
            FROM (
-             SELECT id, COALESCE(updated_at, created_at) AS ts
+             SELECT id, (${CATERING_ORDER_CHANGED_AT_SQL}) AS ts
              FROM catering_orders
              WHERE LOWER(TRIM(email_address)) = $1
              UNION ALL
-             SELECT id, COALESCE(updated_at, created_at) AS ts
+             SELECT id, (${CATERING_ORDER_CHANGED_AT_SQL}) AS ts
              FROM event_orders
              WHERE LOWER(TRIM(email_address)) = $1
            ) t
@@ -4997,9 +5026,9 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
            LIMIT 200`
         : `SELECT id::text AS id
            FROM (
-             SELECT id, COALESCE(updated_at, created_at) AS ts FROM catering_orders
+             SELECT id, (${CATERING_ORDER_CHANGED_AT_SQL}) AS ts FROM catering_orders
              UNION ALL
-             SELECT id, COALESCE(updated_at, created_at) AS ts FROM event_orders
+             SELECT id, (${CATERING_ORDER_CHANGED_AT_SQL}) AS ts FROM event_orders
            ) t
            WHERE t.ts > $1
            ORDER BY t.ts DESC
@@ -5011,13 +5040,13 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
         ? `SELECT id::text AS id
            FROM catering_orders
            WHERE LOWER(TRIM(email_address)) = $1
-             AND COALESCE(updated_at, created_at) > $2
-           ORDER BY COALESCE(updated_at, created_at) DESC
+             AND (${CATERING_ORDER_CHANGED_AT_SQL}) > $2
+           ORDER BY (${CATERING_ORDER_CHANGED_AT_SQL}) DESC
            LIMIT 200`
         : `SELECT id::text AS id
            FROM catering_orders
-           WHERE COALESCE(updated_at, created_at) > $1
-           ORDER BY COALESCE(updated_at, created_at) DESC
+           WHERE (${CATERING_ORDER_CHANGED_AT_SQL}) > $1
+           ORDER BY (${CATERING_ORDER_CHANGED_AT_SQL}) DESC
            LIMIT 200`,
       role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
     );
@@ -5026,13 +5055,13 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
         ? `SELECT id::text AS id
            FROM event_orders
            WHERE LOWER(TRIM(email_address)) = $1
-             AND COALESCE(updated_at, created_at) > $2
-           ORDER BY COALESCE(updated_at, created_at) DESC
+             AND (${CATERING_ORDER_CHANGED_AT_SQL}) > $2
+           ORDER BY (${CATERING_ORDER_CHANGED_AT_SQL}) DESC
            LIMIT 200`
         : `SELECT id::text AS id
            FROM event_orders
-           WHERE COALESCE(updated_at, created_at) > $1
-           ORDER BY COALESCE(updated_at, created_at) DESC
+           WHERE (${CATERING_ORDER_CHANGED_AT_SQL}) > $1
+           ORDER BY (${CATERING_ORDER_CHANGED_AT_SQL}) DESC
            LIMIT 200`,
       role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
     );
