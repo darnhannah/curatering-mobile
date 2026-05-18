@@ -138,6 +138,12 @@ class _SeatingLayoutEditorScreenState extends State<SeatingLayoutEditorScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Seating layout saved.')),
       );
+      await previewSeatingLayoutPdf(
+        plan: _plan,
+        eventTitle: widget.eventTitle,
+        transactionNo: widget.transactionNo,
+      );
+      if (!mounted) return;
       Navigator.pop(context, _plan);
     } catch (e) {
       if (mounted) {
@@ -175,18 +181,24 @@ class _SeatingLayoutEditorScreenState extends State<SeatingLayoutEditorScreen> {
                 ),
               ),
               IconButton(
-                tooltip: 'Download PDF',
-                icon: const Icon(Icons.download_outlined),
-                onPressed: () => shareSeatingLayoutPdf(
-                  plan: _plan,
-                  eventTitle: widget.eventTitle,
-                  transactionNo: widget.transactionNo,
-                ),
-              ),
-              IconButton(
                 tooltip: 'Download image',
                 icon: const Icon(Icons.image_outlined),
-                onPressed: () => shareSeatingLayoutImage(context: context, plan: _plan),
+                onPressed: () async {
+                  try {
+                    await saveSeatingLayoutImageToGallery(context: context, plan: _plan);
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Image saved to your gallery.')),
+                      );
+                    }
+                  } catch (e) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('$e'), backgroundColor: Colors.red.shade700),
+                      );
+                    }
+                  }
+                },
               ),
             ],
             if (_saving)

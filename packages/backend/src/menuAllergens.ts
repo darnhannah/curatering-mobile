@@ -1,6 +1,41 @@
 /**
  * Allergen SQL helpers for menu_dishes (BIGINT[] allergen_id → menu_dishes_allergens.allergen_name).
  */
+import type pg from "pg";
+import { columnExists, tableExists } from "./schemaColumns.js";
+
+/** Load allergen catalog for manager/menu editors. */
+export async function queryAllergensCatalog(
+  pool: pg.Pool,
+): Promise<Array<{ id: string; name: string }>> {
+  if (!(await tableExists(pool, "menu_dishes_allergens"))) return [];
+  if (await columnExists(pool, "menu_dishes_allergens", "allergen_id")) {
+    const { rows } = await pool.query(
+      `SELECT allergen_id::text AS id, allergen_name AS name
+       FROM menu_dishes_allergens
+       ORDER BY allergen_name`,
+    );
+    return rows.map((r) => ({
+      id: String((r as { id: string }).id ?? ""),
+      name: String((r as { name: string }).name ?? "").trim(),
+    }));
+  }
+  if (await columnExists(pool, "menu_dishes_allergens", "id")) {
+    const nameCol = (await columnExists(pool, "menu_dishes_allergens", "allergen_name"))
+      ? "allergen_name"
+      : "name";
+    const { rows } = await pool.query(
+      `SELECT id::text AS id, ${nameCol} AS name
+       FROM menu_dishes_allergens
+       ORDER BY ${nameCol}`,
+    );
+    return rows.map((r) => ({
+      id: String((r as { id: string }).id ?? ""),
+      name: String((r as { name: string }).name ?? "").trim(),
+    }));
+  }
+  return [];
+}
 
 /** Subquery expression: JSON text array of allergen names for a menu_dishes row alias `md`. */
 export const MENU_DISH_ALLERGEN_NAMES_JSON_SQL = `

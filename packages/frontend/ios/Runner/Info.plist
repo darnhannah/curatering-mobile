@@ -72,5 +72,7 @@
 	<string>Take a photo of your payment proof for GCash checkout.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose venue and floor plan photos for event design and seating layout.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save seating layout images to your photo library.</string>
 </dict>
 </plist>

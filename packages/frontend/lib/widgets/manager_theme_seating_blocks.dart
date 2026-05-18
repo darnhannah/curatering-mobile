@@ -74,13 +74,7 @@ Widget buildManagerSeatingLayoutBlock({
         transactionNo: transactionNo,
       );
 
-  Future<void> downloadPdf() => shareSeatingLayoutPdf(
-        plan: plan,
-        eventTitle: eventTitle,
-        transactionNo: transactionNo,
-      );
-
-  Future<void> downloadImage() => shareSeatingLayoutImage(context: context, plan: plan);
+  Future<void> downloadImage() => saveSeatingLayoutImageToGallery(context: context, plan: plan);
 
   return Column(
     crossAxisAlignment: CrossAxisAlignment.start,
@@ -130,12 +124,22 @@ Widget buildManagerSeatingLayoutBlock({
               label: const Text('Preview PDF'),
             ),
             OutlinedButton.icon(
-              onPressed: () => downloadPdf(),
-              icon: const Icon(Icons.download_outlined),
-              label: const Text('Download PDF'),
-            ),
-            OutlinedButton.icon(
-              onPressed: () => downloadImage(),
+              onPressed: () async {
+                try {
+                  await downloadImage();
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Image saved to your gallery.')),
+                    );
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('$e'), backgroundColor: Colors.red.shade700),
+                    );
+                  }
+                }
+              },
               icon: const Icon(Icons.image_outlined),
               label: const Text('Download image'),
             ),

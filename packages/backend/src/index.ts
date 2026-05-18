@@ -65,8 +65,14 @@ import {
   sendGuestOrderProofConfirmation,
 } from "./guestNotify.js";
 import { ensureIdCounterRow, nextCusIdFromCounter, nextTrIdFromCounter } from "./idCounters.js";
-import { parseAllergenNamesFromRow } from "./menuAllergens.js";
+import { parseAllergenNamesFromRow, queryAllergensCatalog } from "./menuAllergens.js";
 import { buildMenuSql, MINIMAL_PUBLIC_MENU_SQL } from "./menuQuery.js";
+import {
+  CUSTOMER_ACCOUNT_STAMP_SQL,
+  menuDishesChangedSinceSql,
+  menuDishesMaxStampExpr,
+  RESTAURANT_ORDER_CHANGED_SINCE_SQL,
+} from "./schemaColumns.js";
 import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
 
 if (isMailConfigured()) {
@@ -1272,7 +1278,10 @@ app.get("/api/mobile/menu", async (_req, res) => {
       const result = await pool.query(sql);
       rows = result.rows as Array<Record<string, unknown>>;
     } catch (err) {
-      if (!isPgUndefinedColumn(err) || sql === MINIMAL_PUBLIC_MENU_SQL) throw err;
+      const pgCode = (err as { code?: string })?.code;
+      const canFallback =
+        sql !== MINIMAL_PUBLIC_MENU_SQL && (isPgUndefinedColumn(err) || pgCode === "42804");
+      if (!canFallback) throw err;
       console.warn("[menu] primary query failed, using minimal menu SQL", err);
       const result = await pool.query(MINIMAL_PUBLIC_MENU_SQL);
       rows = result.rows as Array<Record<string, unknown>>;
@@ -1288,17 +1297,7 @@ app.get("/api/mobile/menu", async (_req, res) => {
 
 app.get("/api/mobile/allergens", async (_req, res) => {
   try {
-    const { rows } = await getPool().query(
-      `SELECT allergen_id::text AS id, allergen_name AS name
-       FROM menu_dishes_allergens
-       ORDER BY allergen_name`,
-    );
-    res.json(
-      rows.map((r) => ({
-        id: String((r as { id: string }).id ?? ""),
-        name: String((r as { name: string }).name ?? "").trim(),
-      })),
-    );
+    res.json(await queryAllergensCatalog(getPool()));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "could not load allergens" });
@@ -1448,6 +1447,35 @@ app.post("/api/mobile/auth/signup/complete", async (req, res) => {
     void sendMailSafe(email, "Welcome to Curatering", `Your account ${email} was created at ${ts}.`).catch((mailErr) => {
       console.warn("[mail] welcome email failed (signup still succeeded):", mailErr);
     });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
+/** Validates signup OTP before showing password fields (does not consume the OTP). */
+app.post("/api/mobile/auth/signup/check-otp", async (req, res) => {
+  const email = String(req.body?.email ?? "").trim().toLowerCase();
+  const otp = normalizeOtpDigits(req.body?.otp);
+  if (!email || !otp) {
+    res.status(400).json({ error: "email and otp are required" });
+    return;
+  }
+  try {
+    const { rows } = await getPool().query(
+      `SELECT 1 AS ok FROM customer_accounts
+       WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+         AND ${sqlOtpMatches("signup_otp_code", "$2")}
+         AND signup_otp_code_expiry > NOW()
+         AND COALESCE(is_verified, FALSE) = FALSE
+       LIMIT 1`,
+      [email, otp],
+    );
+    if (!rows.length) {
+      res.status(400).json({ error: "invalid or expired code" });
+      return;
+    }
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -5336,17 +5364,19 @@ app.get("/api/mobile/realtime/sync-stamps", async (req, res) => {
     return;
   }
   try {
-    const { rows } = await getPool().query(
+    const pool = getPool();
+    const menuStampExpr = await menuDishesMaxStampExpr(pool);
+    const { rows } = await pool.query(
       `SELECT
-         COALESCE((SELECT MAX(COALESCE(updated_at, created_at))::text FROM menu_dishes), '') AS menu_stamp,
-         COALESCE((SELECT MAX(COALESCE(last_updated_order_status_dt_stamp, submitted_order_dt_stamp))::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_pw_dt_stamp, created_account_dt_stamp))::text FROM customer_accounts), '') AS profile_stamp,
+         ${menuStampExpr} AS menu_stamp,
+         COALESCE((SELECT MAX(${RESTAURANT_ORDER_CHANGED_SINCE_SQL})::text FROM restaurant_orders), '') AS restaurant_orders_stamp,
+         COALESCE((SELECT MAX(${CUSTOMER_ACCOUNT_STAMP_SQL})::text FROM customer_accounts), '') AS profile_stamp,
          COALESCE((SELECT MAX(created_at)::text FROM notifications WHERE user_id = $1), '') AS notifications_stamp,
          COALESCE((SELECT MAX((${CATERING_ORDER_UPDATED_AT_SQL}))::text FROM catering_orders WHERE LOWER(email_address) = $1), '') AS catering_inquiries_stamp,
          COALESCE((SELECT MAX((${CATERING_ORDER_UPDATED_AT_SQL}))::text FROM event_orders WHERE LOWER(email_address) = $1), '') AS event_inquiries_stamp,
          COALESCE((SELECT MAX((${CATERING_ORDER_UPDATED_AT_SQL}))::text FROM catering_orders), '') AS manager_catering_stamp,
          COALESCE((SELECT MAX((${CATERING_ORDER_UPDATED_AT_SQL}))::text FROM event_orders), '') AS manager_event_stamp,
-         COALESCE((SELECT MAX(COALESCE(updated_pw_dt_stamp, created_account_dt_stamp))::text FROM customer_accounts), '') AS loyalty_stamp,
+         COALESCE((SELECT MAX(${CUSTOMER_ACCOUNT_STAMP_SQL})::text FROM customer_accounts), '') AS loyalty_stamp,
          COALESCE((SELECT MAX(updated_at)::text FROM customer_tray_drafts WHERE LOWER(user_email) = $1), '') AS tray_stamp`,
       [userEmail],
     );
@@ -5384,58 +5414,45 @@ app.get("/api/mobile/realtime/deltas", async (req, res) => {
   const parsed = sinceRaw ? new Date(sinceRaw) : null;
   const since = parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date(Date.now() - 5 * 60 * 1000);
   try {
-    const menuChanged = (( 
-      await getPool().query(
-        `SELECT 1
-         FROM menu_dishes
-         WHERE COALESCE(updated_at, created_at) > $1
-         LIMIT 1`,
-        [since.toISOString()],
-      )
-    ).rowCount ?? 0) > 0;
+    const pool = getPool();
+    const menuChangedSql = await menuDishesChangedSinceSql(pool);
+    const menuChanged =
+      ((await pool.query(menuChangedSql, [since.toISOString()])).rowCount ?? 0) > 0;
 
     const profileChanged = ((
-      await getPool().query(
+      await pool.query(
         `SELECT 1
          FROM customer_accounts
          WHERE LOWER(TRIM(email)) = $1
-           AND COALESCE(updated_pw_dt_stamp, created_account_dt_stamp) > $2
+           AND ${CUSTOMER_ACCOUNT_STAMP_SQL} > $2
          LIMIT 1`,
         [userEmail, since.toISOString()],
       )
     ).rowCount ?? 0) > 0;
 
     const loyaltyChanged = ((
-      await getPool().query(
+      await pool.query(
         `SELECT 1
          FROM customer_accounts
-         WHERE LOWER(
-                 TRIM(
-                   COALESCE(
-                     to_jsonb(customer_accounts)->>'email',
-                     to_jsonb(customer_accounts)->>'user_email',
-                     ''
-                   )
-                 )
-               ) = $1
-           AND COALESCE(updated_at, created_at) > $2
+         WHERE LOWER(TRIM(email)) = $1
+           AND ${CUSTOMER_ACCOUNT_STAMP_SQL} > $2
          LIMIT 1`,
         [userEmail, since.toISOString()],
       )
     ).rowCount ?? 0) > 0;
 
-    const orderRows = await getPool().query(
+    const orderRows = await pool.query(
       role === "customer"
         ? `SELECT mobile_id::text AS id
            FROM restaurant_orders
            WHERE LOWER(TRIM(user_email)) = $1
-             AND COALESCE(updated_at, created_at) > $2
-           ORDER BY COALESCE(updated_at, created_at) DESC
+             AND ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} > $2
+           ORDER BY ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} DESC
            LIMIT 200`
         : `SELECT mobile_id::text AS id
            FROM restaurant_orders
-           WHERE COALESCE(updated_at, created_at) > $1
-           ORDER BY COALESCE(updated_at, created_at) DESC
+           WHERE ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} > $1
+           ORDER BY ${RESTAURANT_ORDER_CHANGED_SINCE_SQL} DESC
            LIMIT 200`,
       role === "customer" ? [userEmail, since.toISOString()] : [since.toISOString()],
     );

@@ -398,7 +398,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                   child: appState.isCashier
                       ? PosShellScreen(state: appState)
                       : appState.isSupervisor
-                          ? SupervisorDashboardScreen(state: appState)
+                          ? SupervisorOngoingShellScreen(state: appState)
                           : appState.isManager
                               ? ManagerDashboardScreen(state: appState)
                               : CustomerDashboardScreen(state: appState),
@@ -2436,9 +2436,7 @@ class AppState extends ChangeNotifier {
       await bootstrapRealtimeSync();
       showLoginWelcomeDialog = true;
       reopenAuthAsStaff = false;
-      if (userRole == 'customer') {
-        authSessionKey++;
-      }
+      authSessionKey++;
       notifyListeners();
       return null;
     } catch (e) {
@@ -2484,6 +2482,36 @@ class AppState extends ChangeNotifier {
           return '${err['error'] ?? 'Could not send code'}';
         } catch (_) {
           return 'Could not send code (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  /// Returns null when signup OTP is valid (does not complete signup).
+  Future<String?> verifySignupOtp({
+    required String email,
+    required String otp,
+  }) async {
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/auth/signup/check-otp'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'email': email.trim(),
+              'otp': otp.replaceAll(RegExp(r'\D'), '').trim(),
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Invalid OTP'}';
+        } catch (_) {
+          return 'Invalid OTP (${res.statusCode})';
         }
       }
       return null;
@@ -4640,6 +4668,7 @@ class _AuthScreenState extends State<AuthScreen> {
   final forgotConfirmPasswordController = TextEditingController();
   bool signupMode = false;
   bool otpSent = false;
+  bool signupOtpVerified = false;
   /// Non-null while a blocking auth action runs (login, signup OTP, etc.).
   String? busyMessage;
 
@@ -4726,7 +4755,13 @@ class _AuthScreenState extends State<AuthScreen> {
                                       await _toast(err);
                                       return;
                                     }
-                                    setState(() => otpSent = true);
+                                    setState(() {
+                                      otpSent = true;
+                                      signupOtpVerified = false;
+                                      otpController.clear();
+                                      passwordController.clear();
+                                      confirmPasswordController.clear();
+                                    });
                                     await _toast('Check your email for the OTP code.');
                                   } finally {
                                     if (mounted) setState(() => busyMessage = null);
@@ -4741,56 +4776,105 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                         if (otpSent) ...[
                           const SizedBox(height: 14),
-                          _LabeledInput(label: 'OTP CODE', controller: otpController),
-                          const SizedBox(height: 10),
-                          _LabeledInput(label: 'PASSWORD (min 8)', controller: passwordController, obscure: true),
-                          const SizedBox(height: 10),
-                          _LabeledInput(label: 'CONFIRM PASSWORD', controller: confirmPasswordController, obscure: true),
-                          const SizedBox(height: 14),
-                          FilledButton(
-                            onPressed: busyMessage != null
-                                ? null
-                                : () async {
-                                    if (passwordController.text != confirmPasswordController.text) {
-                                      await _toast('Passwords do not match');
-                                      return;
-                                    }
-                                    setState(() => busyMessage = 'Creating account...');
-                                    try {
-                                      final fromGuest = widget.state.signupFromGuestPrompt;
-                                      final err = await widget.state.completeSignup(
-                                        email: emailController.text,
-                                        otp: otpController.text,
-                                        password: passwordController.text,
-                                        loginAfter: !fromGuest,
-                                      );
-                                      if (!mounted) return;
-                                      if (err != null) {
-                                        await _toast(err);
+                          _LabeledInput(
+                            label: 'OTP CODE',
+                            controller: otpController,
+                            enabled: !signupOtpVerified,
+                          ),
+                          if (!signupOtpVerified) ...[
+                            const SizedBox(height: 12),
+                            FilledButton(
+                              onPressed: busyMessage != null
+                                  ? null
+                                  : () async {
+                                      final otp = otpController.text.replaceAll(RegExp(r'\D'), '').trim();
+                                      if (otp.isEmpty) {
+                                        await _toast('Enter your OTP code.');
                                         return;
                                       }
-                                      if (fromGuest) {
-                                        widget.state.signupFromGuestPrompt = false;
-                                        setState(() {
-                                          signupMode = false;
-                                          otpSent = false;
-                                          otpController.clear();
-                                          confirmPasswordController.clear();
-                                          passwordController.clear();
-                                        });
-                                        await _toast('Account created! Please log in with your new email and password.');
+                                      setState(() => busyMessage = 'Verifying code...');
+                                      try {
+                                        final err = await widget.state.verifySignupOtp(
+                                          email: emailController.text,
+                                          otp: otp,
+                                        );
+                                        if (!mounted) return;
+                                        if (err != null) {
+                                          await _toast(err);
+                                          return;
+                                        }
+                                        setState(() => signupOtpVerified = true);
+                                        await _toast('Code verified. Set your password below.');
+                                      } finally {
+                                        if (mounted) setState(() => busyMessage = null);
                                       }
-                                    } finally {
-                                      if (mounted) setState(() => busyMessage = null);
-                                    }
-                                  },
-                            style: FilledButton.styleFrom(
-                              backgroundColor: Colors.white,
-                              foregroundColor: AppColors.ink,
-                              side: const BorderSide(color: AppColors.ink),
+                                    },
+                              style: FilledButton.styleFrom(
+                                backgroundColor: Colors.white,
+                                foregroundColor: AppColors.ink,
+                                side: const BorderSide(color: AppColors.ink),
+                              ),
+                              child: const Text('VERIFY OTP'),
                             ),
-                            child: const Text('CREATE ACCOUNT'),
-                          ),
+                          ],
+                          if (signupOtpVerified) ...[
+                            const SizedBox(height: 14),
+                            _LabeledInput(label: 'PASSWORD (min 8)', controller: passwordController, obscure: true),
+                            const SizedBox(height: 10),
+                            _LabeledInput(
+                              label: 'CONFIRM PASSWORD',
+                              controller: confirmPasswordController,
+                              obscure: true,
+                            ),
+                            const SizedBox(height: 14),
+                            FilledButton(
+                              onPressed: busyMessage != null
+                                  ? null
+                                  : () async {
+                                      if (passwordController.text != confirmPasswordController.text) {
+                                        await _toast('Passwords do not match');
+                                        return;
+                                      }
+                                      setState(() => busyMessage = 'Creating account...');
+                                      try {
+                                        final fromGuest = widget.state.signupFromGuestPrompt;
+                                        final err = await widget.state.completeSignup(
+                                          email: emailController.text,
+                                          otp: otpController.text,
+                                          password: passwordController.text,
+                                          loginAfter: !fromGuest,
+                                        );
+                                        if (!mounted) return;
+                                        if (err != null) {
+                                          await _toast(err);
+                                          return;
+                                        }
+                                        if (fromGuest) {
+                                          widget.state.signupFromGuestPrompt = false;
+                                          setState(() {
+                                            signupMode = false;
+                                            otpSent = false;
+                                            signupOtpVerified = false;
+                                            otpController.clear();
+                                            confirmPasswordController.clear();
+                                            passwordController.clear();
+                                          });
+                                          await _toast(
+                                            'Account created! Please log in with your new email and password.',
+                                          );
+                                        }
+                                      } finally {
+                                        if (mounted) setState(() => busyMessage = null);
+                                      }
+                                    },
+                              style: FilledButton.styleFrom(
+                                backgroundColor: Colors.white,
+                                foregroundColor: AppColors.ink,
+                                side: const BorderSide(color: AppColors.ink),
+                              ),
+                              child: const Text('CREATE ACCOUNT'),
+                            ),
+                          ],
                         ],
                       ],
                       if (!signupMode) ...[
@@ -5079,8 +5163,15 @@ class _AuthScreenState extends State<AuthScreen> {
                                                             await _toast(err);
                                                             return;
                                                           }
-                                                          if (dCtx.mounted) Navigator.pop(dCtx);
-                                                          await _toast('Password updated. Log in with your new password.');
+                                                          setDialogState(() {
+                                                            step[0] = 0;
+                                                            forgotOtpController.clear();
+                                                            forgotNewPasswordController.clear();
+                                                            forgotConfirmPasswordController.clear();
+                                                          });
+                                                          await _toast(
+                                                            'Password updated. You can reset again or close this dialog.',
+                                                          );
                                                         },
                                                         child: const Text('RESET PASSWORD'),
                                                       ),
@@ -5108,8 +5199,10 @@ class _AuthScreenState extends State<AuthScreen> {
                               : () => setState(() {
                                     signupMode = !signupMode;
                                     otpSent = false;
+                                    signupOtpVerified = false;
                                     otpController.clear();
                                     confirmPasswordController.clear();
+                                    passwordController.clear();
                                   }),
                           child: Text(
                             signupMode ? 'ALREADY HAVE AN ACCOUNT? LOG IN' : "DON'T HAVE AN ACCOUNT? SIGN UP",
@@ -5168,16 +5261,22 @@ class _AuthScreenState extends State<AuthScreen> {
 }
 
 class _LabeledInput extends StatelessWidget {
-  const _LabeledInput({required this.label, required this.controller, this.obscure = false});
+  const _LabeledInput({
+    required this.label,
+    required this.controller,
+    this.obscure = false,
+    this.enabled = true,
+  });
   final String label;
   final TextEditingController controller;
   final bool obscure;
+  final bool enabled;
   @override
   Widget build(BuildContext context) {
     return Row(
       children: [
         SizedBox(width: 130, child: Text(label, style: const TextStyle(fontWeight: FontWeight.w700))),
-        Expanded(child: TextField(controller: controller, obscureText: obscure)),
+        Expanded(child: TextField(controller: controller, obscureText: obscure, enabled: enabled)),
       ],
     );
   }
@@ -5569,16 +5668,14 @@ class CashierRoleDrawer extends StatelessWidget {
   }
 }
 
-/// Supervisor staff drawer: settings, help, and on-going work only.
+/// Supervisor staff drawer: on-going work and settings only.
 class SupervisorStaffDrawer extends StatelessWidget {
   const SupervisorStaffDrawer({
     super.key,
     required this.state,
-    required this.onDashboard,
     required this.onOngoing,
   });
   final AppState state;
-  final VoidCallback onDashboard;
   final VoidCallback onOngoing;
 
   @override
@@ -5608,14 +5705,6 @@ class SupervisorStaffDrawer extends StatelessWidget {
                   ),
               ],
             ),
-          ),
-          ListTile(
-            leading: const Icon(Icons.dashboard_outlined),
-            title: const Text('Dashboard'),
-            onTap: () {
-              Navigator.pop(context);
-              onDashboard();
-            },
           ),
           ListTile(
             leading: const Icon(Icons.event_note_outlined),
@@ -5663,7 +5752,6 @@ class SupervisorDashboardScreen extends StatelessWidget {
           ),
           drawer: SupervisorStaffDrawer(
             state: state,
-            onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
             onOngoing: () {
               Navigator.of(context).push(
                 MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
@@ -5770,7 +5858,6 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
       ),
       drawer: SupervisorStaffDrawer(
         state: widget.state,
-        onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
         onOngoing: () {},
       ),
       body: _ManagerStageListTab(
@@ -6050,7 +6137,10 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
       drawer: ManagerRoleDrawer(
         state: state,
         onDashboard: () {
-          Navigator.of(context).popUntil((route) => route.isFirst);
+          Navigator.of(context).pushAndRemoveUntil(
+            MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: state)),
+            (_) => false,
+          );
         },
         onManageEvents: () {
           Navigator.of(context).push(
@@ -13464,7 +13554,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 drawer: ManagerRoleDrawer(
                   state: s,
-                  onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+                  onDashboard: () {
+                    Navigator.of(context).pushAndRemoveUntil(
+                      MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: s)),
+                      (_) => false,
+                    );
+                  },
                   onManageEvents: () => Navigator.of(context).pop(),
                 ),
                 body: _settingsContent(),
@@ -14006,7 +14101,10 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
           drawer: ManagerRoleDrawer(
             state: widget.state,
             onDashboard: () {
-              Navigator.of(context).popUntil((route) => route.isFirst);
+              Navigator.of(context).pushAndRemoveUntil(
+                MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
+                (_) => false,
+              );
             },
             onManageEvents: () {
               _tab.animateTo(0);
@@ -14821,7 +14919,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       ),
       drawer: ManagerRoleDrawer(
         state: widget.state,
-        onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+        onDashboard: () {
+          Navigator.of(context).pushAndRemoveUntil(
+            MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
+            (_) => false,
+          );
+        },
         onManageEvents: () => Navigator.of(context).pop(),
       ),
       body: ListView(
@@ -17870,7 +17973,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         ),
         drawer: ManagerRoleDrawer(
           state: widget.state,
-          onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+          onDashboard: () {
+            Navigator.of(context).pushAndRemoveUntil(
+              MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
+              (_) => false,
+            );
+          },
           onManageEvents: () {
             Navigator.of(context).popUntil((route) => route.isFirst);
             Navigator.of(context).push(
@@ -18634,8 +18742,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         ),
         drawer: SupervisorStaffDrawer(
           state: widget.state,
-          onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
-          onOngoing: () {},
+          onOngoing: () => Navigator.of(context).popUntil((route) => route.isFirst),
         ),
         body: ListView(
           padding: const EdgeInsets.all(12),
@@ -19004,7 +19111,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       ),
       drawer: ManagerRoleDrawer(
         state: widget.state,
-        onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+        onDashboard: () {
+          Navigator.of(context).pushAndRemoveUntil(
+            MaterialPageRoute<void>(builder: (_) => ManagerDashboardScreen(state: widget.state)),
+            (_) => false,
+          );
+        },
         onManageEvents: () => Navigator.of(context).pop(),
       ),
       body: Column(

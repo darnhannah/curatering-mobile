@@ -3,14 +3,29 @@
  */
 import type pg from "pg";
 import { MENU_DISH_ALLERGEN_NAMES_JSON_SQL } from "./menuAllergens.js";
+import { columnExists, columnUdtName } from "./schemaColumns.js";
 
-async function columnExists(pool: pg.Pool, table: string, column: string): Promise<boolean> {
-  const { rows } = await pool.query(
-    `SELECT 1 FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2 LIMIT 1`,
-    [table, column],
-  );
-  return rows.length > 0;
+/** Allergen JSON text for menu row alias `md` — bigint[] ids, text[] names, or scalar text/json. */
+export async function menuDishAllergensSelectExpr(pool: pg.Pool): Promise<string> {
+  const hasAllergens = await columnExists(pool, "menu_dishes", "allergens");
+  if (!hasAllergens) return `'[]'::text`;
+
+  const udt = await columnUdtName(pool, "menu_dishes", "allergens");
+  if (udt === "_int8") {
+    const hasJoinTable = await columnExists(pool, "menu_dishes_allergens", "allergen_id");
+    if (hasJoinTable) return MENU_DISH_ALLERGEN_NAMES_JSON_SQL;
+  }
+  if (udt === "_text") {
+    return `COALESCE(
+      (
+        SELECT json_agg(x ORDER BY ord)::text
+        FROM unnest(COALESCE(md.allergens, '{}'::text[])) WITH ORDINALITY AS t(x, ord)
+        WHERE NULLIF(TRIM(x), '') IS NOT NULL
+      ),
+      '[]'
+    )`;
+  }
+  return `COALESCE(NULLIF(TRIM(md.allergens::text), ''), '[]')`;
 }
 
 /** Minimal menu query when full query hits missing columns. */
@@ -54,7 +69,7 @@ export async function buildMenuSql(pool: pg.Pool): Promise<string> {
   const dipsExpr = hasSauces ? `COALESCE(md.sauces::text, '[]')` : `'[]'::text`;
   const ingredientsExpr = hasIngredients ? `COALESCE(md.ingredients::text, '[]')` : `'[]'::text`;
   const imageExpr = hasImage ? `md.image_base64::text` : `NULL::text`;
-  const allergensExpr = hasAllergens ? MENU_DISH_ALLERGEN_NAMES_JSON_SQL : `'[]'::text`;
+  const allergensExpr = hasAllergens ? await menuDishAllergensSelectExpr(pool) : `'[]'::text`;
   const whereClause = hasArchived ? `WHERE NOT COALESCE(md.archived, false)` : "";
 
   return `

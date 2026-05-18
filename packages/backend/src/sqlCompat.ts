@@ -36,7 +36,6 @@ export const CATERING_ORDER_CREATED_AT_SQL = `COALESCE(
 )`.trim();
 
 export const CATERING_ORDER_UPDATED_AT_SQL = `COALESCE(
-  updated_at,
   stage_entered_at,
   created_at,
   NOW()
@@ -46,7 +45,7 @@ export const CATERING_ORDER_UPDATED_AT_SQL = `COALESCE(
 export const RESTAURANT_ORDER_TOUCH_SET = `last_updated_order_status_dt_stamp = NOW()`;
 
 /** Touch row after catering_orders / event_orders mutation. */
-export const CATERING_ORDER_TOUCH_SET = `updated_at = NOW()`;
+export const CATERING_ORDER_TOUCH_SET = `stage_entered_at = NOW()`;
 
 /** Map manager API tab stage to DB status (for_post_analysis → for_full_payment). */
 export function mapManagerCateringStageToDb(apiStage: string): string {

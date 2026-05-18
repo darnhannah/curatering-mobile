@@ -3,10 +3,11 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:gal/gal.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:printing/printing.dart';
-import 'package:share_plus/share_plus.dart';
 
 import 'seating_plan.dart';
 import 'seating_plan_canvas.dart';
@@ -94,70 +95,70 @@ Future<void> previewSeatingLayoutPdf({
   await Printing.layoutPdf(onLayout: (_) async => bytes);
 }
 
-Future<void> shareSeatingLayoutPdf({
-  required SeatingPlanData plan,
-  String eventTitle = '',
-  String transactionNo = '',
-  String filename = 'seating-layout.pdf',
-}) async {
-  final bytes = await buildSeatingLayoutPdfBytes(
-    plan: plan,
-    eventTitle: eventTitle,
-    transactionNo: transactionNo,
-  );
-  await Printing.sharePdf(bytes: bytes, filename: filename);
-}
-
-/// Capture the interactive canvas as PNG and open the system share sheet.
-Future<void> shareSeatingLayoutImage({
+Future<Uint8List> _captureSeatingLayoutPng({
   required BuildContext context,
   required SeatingPlanData plan,
-  String filename = 'seating-layout.png',
 }) async {
-  if (!context.mounted) return;
   final boundaryKey = GlobalKey();
-  await showDialog<void>(
-    context: context,
-    barrierDismissible: false,
-    builder: (dialogCtx) {
-      WidgetsBinding.instance.addPostFrameCallback((_) async {
-        await Future<void>.delayed(const Duration(milliseconds: 80));
-        try {
-          final boundary = boundaryKey.currentContext?.findRenderObject();
-          if (boundary is! RenderRepaintBoundary) {
-            throw StateError('Could not capture seating layout image');
-          }
-          final image = await boundary.toImage(pixelRatio: 2);
-          final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-          if (byteData == null) throw StateError('Could not encode seating layout PNG');
-          final bytes = byteData.buffer.asUint8List();
-          if (dialogCtx.mounted) Navigator.of(dialogCtx).pop();
-          final xfile = XFile.fromData(bytes, mimeType: 'image/png', name: filename);
-          await Share.shareXFiles([xfile], text: 'Seating layout');
-        } catch (e) {
-          if (dialogCtx.mounted) {
-            Navigator.of(dialogCtx).pop();
-            ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-              SnackBar(content: Text('$e'), backgroundColor: Colors.red.shade700),
-            );
-          }
-        }
-      });
-      return Center(
-        child: Material(
-          color: Colors.transparent,
-          child: RepaintBoundary(
-            key: boundaryKey,
-            child: Container(
-              width: 900,
-              height: 620,
-              color: Colors.white,
-              padding: const EdgeInsets.all(8),
-              child: SeatingPlanInteractive(plan: plan, editable: false),
-            ),
+  final overlay = Overlay.of(context);
+  late OverlayEntry entry;
+  entry = OverlayEntry(
+    builder: (ctx) => Positioned(
+      left: -10000,
+      top: 0,
+      child: Material(
+        color: Colors.transparent,
+        child: RepaintBoundary(
+          key: boundaryKey,
+          child: Container(
+            width: 900,
+            height: 620,
+            color: Colors.white,
+            padding: const EdgeInsets.all(8),
+            child: SeatingPlanInteractive(plan: plan, editable: false),
           ),
         ),
-      );
-    },
+      ),
+    ),
   );
+  overlay.insert(entry);
+  await Future<void>.delayed(const Duration(milliseconds: 120));
+  try {
+    final boundary = boundaryKey.currentContext?.findRenderObject();
+    if (boundary is! RenderRepaintBoundary) {
+      throw StateError('Could not capture seating layout image');
+    }
+    final image = await boundary.toImage(pixelRatio: 2);
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    if (byteData == null) throw StateError('Could not encode seating layout PNG');
+    return byteData.buffer.asUint8List();
+  } finally {
+    entry.remove();
+  }
+}
+
+Future<bool> _ensureGalleryPermission() async {
+  if (!await Gal.hasAccess()) {
+    await Gal.requestAccess();
+  }
+  if (await Gal.hasAccess()) return true;
+  final photos = await Permission.photos.request();
+  if (photos.isGranted || photos.isLimited) return true;
+  final storage = await Permission.storage.request();
+  return storage.isGranted;
+}
+
+/// Save seating layout PNG directly to the device photo gallery.
+Future<void> saveSeatingLayoutImageToGallery({
+  required BuildContext context,
+  required SeatingPlanData plan,
+  String album = 'Curatering',
+}) async {
+  if (!context.mounted) return;
+  final granted = await _ensureGalleryPermission();
+  if (!granted) {
+    throw StateError('Photo library permission is required to save the image.');
+  }
+  final bytes = await _captureSeatingLayoutPng(context: context, plan: plan);
+  await Gal.putImageBytes(bytes, album: album);
 }
