@@ -20,15 +20,15 @@ export const DEFAULT_PUBLIC_MENU_SQL = `
     md.id::text AS id,
     md.name::text AS name,
     CASE
-      WHEN LOWER(TRIM(COALESCE(md.meal_type, md.type, ''))) = 'restaurant'
+      WHEN LOWER(TRIM(COALESCE(md.meal_type, ''))) = 'restaurant'
         THEN NULLIF(TRIM(md.category), '')
-      ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), NULLIF(TRIM(md.category), '')))
+      ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(COALESCE(md.meal_type, '')), ''), NULLIF(TRIM(md.category), '')))
     END AS description,
     COALESCE(NULLIF(TRIM(md.price), '')::numeric, 0) AS price,
     COALESCE(md.sauces::text, '[]') AS dips,
     COALESCE(md.ingredients::text, '[]') AS ingredients,
     COALESCE(TRIM(md.category), '')::text AS category,
-    COALESCE(NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), '')::text AS dish_type,
+    COALESCE(NULLIF(TRIM(COALESCE(md.meal_type, '')), ''), '')::text AS dish_type,
     md.image_base64::text AS image_base64,
     COALESCE(
       (

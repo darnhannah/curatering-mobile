@@ -279,7 +279,7 @@ async function authorizeManagerSeatingAccess(
     .toLowerCase();
   const cashierPassword = String(req.body?.cashier_password ?? req.query?.cashier_password ?? "");
   if (!cashierEmail || !cashierPassword) return null;
-  const auth = await deps.verifyPosStaff(cashierEmail, cashierPassword, ["manager"]);
+  const auth = await deps.verifyPosStaff(cashierEmail, cashierPassword, ["manager", "supervisor"]);
   if (!auth.ok) return null;
   return resolveEventOrderRow(pool, orderId, orderKind);
 }
@@ -490,9 +490,16 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
       return;
     }
     try {
-      const access = await authorizeManagerSeatingAccess(req, pool(), orderId, orderKind || undefined, deps);
+      const cashierEmail = String(req.body?.cashier_email ?? "").trim().toLowerCase();
+      const cashierPassword = String(req.body?.cashier_password ?? "");
+      const auth = await deps.verifyPosStaff(cashierEmail, cashierPassword, ["manager"]);
+      if (!auth.ok) {
+        res.status(403).json({ error: "manager credentials required to edit seating layout" });
+        return;
+      }
+      const access = await resolveEventOrderRow(pool(), orderId, orderKind || undefined);
       if (!access) {
-        res.status(403).json({ error: "manager credentials required for seating layout" });
+        res.status(404).json({ error: "order not found" });
         return;
       }
       if (access.table !== "event_orders" || !isCateringPlusEvent(access.row, access.table)) {

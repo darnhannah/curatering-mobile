@@ -528,7 +528,7 @@ export async function initDb(): Promise<void> {
       ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
       CHECK (status = ANY (ARRAY[
         'new_event'::text, 'online_inquiries'::text, 'for_processing'::text,
-        'for_post_analysis'::text, 'completed'::text, 'cancelled'::text
+        'for_full_payment'::text, 'completed'::text, 'cancelled'::text
       ]))
     `);
   } catch {

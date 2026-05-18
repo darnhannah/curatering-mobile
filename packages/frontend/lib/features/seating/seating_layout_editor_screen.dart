@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../event_design/events_feature_api.dart';
+import 'seating_layout_export.dart';
 import 'seating_plan.dart';
 import 'seating_plan_canvas.dart';
 
@@ -17,6 +18,8 @@ class SeatingLayoutEditorScreen extends StatefulWidget {
     this.cashierPassword,
     this.readOnly = false,
     this.draftOnly = false,
+    this.eventTitle = '',
+    this.transactionNo = '',
   });
 
   final String apiBase;
@@ -29,6 +32,8 @@ class SeatingLayoutEditorScreen extends StatefulWidget {
   final bool readOnly;
   /// When true, layout is kept locally (e.g. inquiry submit) — no API load/save.
   final bool draftOnly;
+  final String eventTitle;
+  final String transactionNo;
 
   @override
   State<SeatingLayoutEditorScreen> createState() => _SeatingLayoutEditorScreenState();
@@ -157,8 +162,33 @@ class _SeatingLayoutEditorScreenState extends State<SeatingLayoutEditorScreen> {
       },
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('Edit seating layout'),
+          title: Text(widget.readOnly ? 'Seating layout' : 'Edit seating layout'),
           actions: [
+            if (widget.readOnly && !_plan.isEffectivelyEmpty) ...[
+              IconButton(
+                tooltip: 'Preview PDF',
+                icon: const Icon(Icons.picture_as_pdf_outlined),
+                onPressed: () => previewSeatingLayoutPdf(
+                  plan: _plan,
+                  eventTitle: widget.eventTitle,
+                  transactionNo: widget.transactionNo,
+                ),
+              ),
+              IconButton(
+                tooltip: 'Download PDF',
+                icon: const Icon(Icons.download_outlined),
+                onPressed: () => shareSeatingLayoutPdf(
+                  plan: _plan,
+                  eventTitle: widget.eventTitle,
+                  transactionNo: widget.transactionNo,
+                ),
+              ),
+              IconButton(
+                tooltip: 'Download image',
+                icon: const Icon(Icons.image_outlined),
+                onPressed: () => shareSeatingLayoutImage(context: context, plan: _plan),
+              ),
+            ],
             if (_saving)
               const Padding(
                 padding: EdgeInsets.all(16),

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../features/seating/seating_layout_export.dart';
 import '../features/seating/seating_plan.dart';
 import '../features/seating/seating_plan_canvas.dart';
 import '../utils/allergen_ui.dart';
@@ -53,14 +54,34 @@ Widget buildManagerThemeDesignBlock({
   );
 }
 
-/// Seating preview canvas + open editor (manager catering+event orders only).
+/// Seating preview canvas + open editor or export-only actions.
 Widget buildManagerSeatingLayoutBlock({
+  required BuildContext context,
   required Map<String, dynamic> seatingPlanJson,
   required String helperText,
   required String buttonLabel,
-  required VoidCallback onOpenEditor,
+  VoidCallback? onOpenEditor,
+  bool exportOnly = false,
+  String eventTitle = '',
+  String transactionNo = '',
 }) {
   final plan = SeatingPlanData.fromJson(seatingPlanJson);
+  final hasPlan = !plan.isEffectivelyEmpty;
+
+  Future<void> previewPdf() => previewSeatingLayoutPdf(
+        plan: plan,
+        eventTitle: eventTitle,
+        transactionNo: transactionNo,
+      );
+
+  Future<void> downloadPdf() => shareSeatingLayoutPdf(
+        plan: plan,
+        eventTitle: eventTitle,
+        transactionNo: transactionNo,
+      );
+
+  Future<void> downloadImage() => shareSeatingLayoutImage(context: context, plan: plan);
+
   return Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
@@ -69,7 +90,7 @@ Widget buildManagerSeatingLayoutBlock({
         style: TextStyle(color: Colors.grey.shade700, fontSize: 13, height: 1.35),
       ),
       const SizedBox(height: 10),
-      if (!plan.isEffectivelyEmpty) ...[
+      if (hasPlan) ...[
         SizedBox(
           height: 220,
           child: SeatingPlanInteractive(
@@ -86,10 +107,40 @@ Widget buildManagerSeatingLayoutBlock({
             style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
           ),
         ),
-      OutlinedButton.icon(
-        onPressed: onOpenEditor,
-        icon: const Icon(Icons.table_restaurant),
-        label: Text(buttonLabel),
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          if (!exportOnly && onOpenEditor != null)
+            OutlinedButton.icon(
+              onPressed: onOpenEditor,
+              icon: const Icon(Icons.table_restaurant),
+              label: Text(buttonLabel),
+            ),
+          if (exportOnly && onOpenEditor != null)
+            OutlinedButton.icon(
+              onPressed: onOpenEditor,
+              icon: const Icon(Icons.visibility_outlined),
+              label: Text(buttonLabel),
+            ),
+          if (hasPlan) ...[
+            OutlinedButton.icon(
+              onPressed: () => previewPdf(),
+              icon: const Icon(Icons.picture_as_pdf_outlined),
+              label: const Text('Preview PDF'),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => downloadPdf(),
+              icon: const Icon(Icons.download_outlined),
+              label: const Text('Download PDF'),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => downloadImage(),
+              icon: const Icon(Icons.image_outlined),
+              label: const Text('Download image'),
+            ),
+          ],
+        ],
       ),
     ],
   );

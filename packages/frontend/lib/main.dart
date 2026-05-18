@@ -397,9 +397,11 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                   state: appState,
                   child: appState.isCashier
                       ? PosShellScreen(state: appState)
-                      : appState.isManagerOrSupervisor
-                          ? ManagerDashboardScreen(state: appState)
-                          : CustomerDashboardScreen(state: appState),
+                      : appState.isSupervisor
+                          ? SupervisorDashboardScreen(state: appState)
+                          : appState.isManager
+                              ? ManagerDashboardScreen(state: appState)
+                              : CustomerDashboardScreen(state: appState),
                 ),
         );
       },
@@ -1463,6 +1465,7 @@ String inquiryStatusReadable(String status) {
     case 'for_processing':
       return 'For Down Payment';
     case 'for_post_analysis':
+    case 'for_full_payment':
       return 'For Full Payment';
     default:
       return s
@@ -1494,6 +1497,7 @@ String cateringManagerDetailTabTitle(
     case 'new_event':
       return 'New Event';
     case 'for_post_analysis':
+    case 'for_full_payment':
       return 'For Full Payment';
     case 'completed':
       return 'Completed';
@@ -2100,10 +2104,12 @@ class CateringEventRecord {
   int get cateringLoyaltyEligiblePointsIfCompleted => cateringLoyaltyPointsForOrderTotal(totalCost);
 
   factory CateringEventRecord.fromApiMap(Map<String, dynamic> m) {
+    final rawStatus = '${m['status'] ?? ''}'.trim().toLowerCase();
+    final status = rawStatus == 'for_full_payment' ? 'for_post_analysis' : '${m['status'] ?? ''}';
     return CateringEventRecord(
       id: '${m['id']}',
       orderKind: '${m['order_kind'] ?? 'event'}',
-      status: '${m['status'] ?? ''}',
+      status: status,
       source: '${m['source'] ?? ''}',
       customerName: '${m['customer_name'] ?? ''}',
       contactPerson: '${m['contact_person'] ?? ''}',
@@ -2350,6 +2356,7 @@ class AppState extends ChangeNotifier {
     return em.endsWith('@guest.curatering.internal');
   }
   bool get isManager => userRole == 'manager';
+  bool get isSupervisor => userRole == 'supervisor';
   bool get isManagerOrSupervisor => userRole == 'manager' || userRole == 'supervisor';
 
   String get managerActiveStage => _managerActiveStage;
@@ -2400,7 +2407,14 @@ class AppState extends ChangeNotifier {
         await loadCashierOnlineOrders(force: true);
         await loadCashierWalkInQueues(force: true);
         await loadNotifications(force: true);
-      } else if (isManagerOrSupervisor) {
+      } else if (isSupervisor) {
+        _managerActiveStage = 'for_processing';
+        await Future.wait([
+          loadMenu(force: true),
+          loadManagerCateringByStage('for_processing', force: true),
+        ]);
+        await loadNotifications(force: true);
+      } else if (isManager) {
         await Future.wait([
           loadMenu(force: true),
           loadSetMenus(force: true),
@@ -3071,6 +3085,9 @@ class AppState extends ChangeNotifier {
               (changedOrderIds is List && changedOrderIds.isNotEmpty);
           if (allow) {
             jobs.add(loadManagerCateringByStage(managerActiveStage, force: true));
+            if (isSupervisor) {
+              jobs.add(loadManagerCateringByStage('for_processing', force: true));
+            }
           }
         }
         if (_stampChanged(previous, next, 'notifications')) {
@@ -3121,7 +3138,10 @@ class AppState extends ChangeNotifier {
     _loadMenuInFlight = true;
     try {
       final res = await http.get(_uri('/api/mobile/menu'));
-      if (res.statusCode != 200) return;
+      if (res.statusCode != 200) {
+        debugPrint('loadMenu failed: ${res.statusCode} ${res.body}');
+        return;
+      }
       final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
       menu
         ..clear()
@@ -3710,14 +3730,21 @@ class AppState extends ChangeNotifier {
             }),
           )
           .timeout(_managerCateringListTimeout);
-      if (res.statusCode != 200) return;
+      if (res.statusCode != 200) {
+        debugPrint('loadManagerCateringByStage($stage): HTTP ${res.statusCode} ${res.body}');
+        return;
+      }
       final body = jsonDecode(res.body);
-      if (body is! List) return;
+      if (body is! List) {
+        debugPrint('loadManagerCateringByStage($stage): expected List, got ${body.runtimeType}');
+        return;
+      }
       _managerCateringByStage[stage] =
           body.whereType<Map<String, dynamic>>().map(CateringEventRecord.fromApiMap).toList();
       _managerCateringLoadedAt[stage] = DateTime.now();
       notifyListeners();
-    } catch (_) {
+    } catch (e) {
+      debugPrint('loadManagerCateringByStage($stage): $e');
     } finally {
       _managerCateringInFlightStages.remove(stage);
     }
@@ -4160,7 +4187,10 @@ class AppState extends ChangeNotifier {
     _loadInquiriesInFlight = true;
     try {
       final res = await http.get(_uri('/api/mobile/inquiries', {'user_email': userEmail!}));
-      if (res.statusCode != 200) return;
+      if (res.statusCode != 200) {
+        debugPrint('loadInquiries failed: ${res.statusCode} ${res.body}');
+        return;
+      }
       final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
     final parsed = <InquiryRecord>[];
     for (final e in body) {
@@ -5534,6 +5564,221 @@ class CashierRoleDrawer extends StatelessWidget {
             },
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Supervisor staff drawer: settings, help, and on-going work only.
+class SupervisorStaffDrawer extends StatelessWidget {
+  const SupervisorStaffDrawer({
+    super.key,
+    required this.state,
+    required this.onDashboard,
+    required this.onOngoing,
+  });
+  final AppState state;
+  final VoidCallback onDashboard;
+  final VoidCallback onOngoing;
+
+  @override
+  Widget build(BuildContext context) {
+    final who = state.cashierDisplayName.trim().isNotEmpty
+        ? state.cashierDisplayName.trim()
+        : (state.userEmail ?? '');
+    return Drawer(
+      child: ListView(
+        children: [
+          DrawerHeader(
+            decoration: const BoxDecoration(color: Color(0xFF242424)),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                Image.asset(AppBrandAssets.logo, height: 52, fit: BoxFit.contain),
+                const SizedBox(height: 10),
+                const Text(
+                  'Supervisor',
+                  style: TextStyle(color: Color(0xFFFFC024), fontWeight: FontWeight.w700, fontSize: 14),
+                ),
+                if (who.isNotEmpty)
+                  Text(
+                    'Hi, $who!',
+                    style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18, color: Color(0xFFFFC024)),
+                  ),
+              ],
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.dashboard_outlined),
+            title: const Text('Dashboard'),
+            onTap: () {
+              Navigator.pop(context);
+              onDashboard();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.event_note_outlined),
+            title: const Text('On Going'),
+            onTap: () {
+              Navigator.pop(context);
+              onOngoing();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.settings),
+            title: const Text('Settings'),
+            onTap: () {
+              Navigator.pop(context);
+              Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)));
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SupervisorDashboardScreen extends StatelessWidget {
+  const SupervisorDashboardScreen({super.key, required this.state});
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final who = state.cashierDisplayName.trim().isNotEmpty
+        ? state.cashierDisplayName.trim()
+        : (state.userEmail ?? '').trim();
+    return AnimatedBuilder(
+      animation: state,
+      builder: (context, _) {
+        final count = state.managerRowsForStage('for_processing').where((e) => e.processingSubstageLabel == 'ongoing').length;
+        return Scaffold(
+          backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+          appBar: AppBar(
+            backgroundColor: const Color(0xFF242424),
+            foregroundColor: const Color(0xFFFFC024),
+            leading: _buildManagerHamburgerLeading(context, state),
+            title: const Text('DASHBOARD', style: kManagerAppBarTitleStyle),
+            centerTitle: true,
+          ),
+          drawer: SupervisorStaffDrawer(
+            state: state,
+            onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+            onOngoing: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
+              );
+            },
+          ),
+          body: Column(
+            children: [
+              Container(
+                width: double.infinity,
+                color: const Color(0xFF242424),
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                child: Column(
+                  children: [
+                    Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain),
+                    if (who.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        'Hi, $who!',
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Colors.white),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Material(
+                    color: Colors.white,
+                    elevation: 2,
+                    borderRadius: BorderRadius.circular(12),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        Navigator.of(context).push(
+                          MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
+                        );
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.all(20),
+                        child: Row(
+                          children: [
+                            Icon(Icons.event_note_outlined, size: 40, color: AppColors.brand),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text('On Going', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
+                                  Text(
+                                    '$count active ${count == 1 ? 'order' : 'orders'}',
+                                    style: TextStyle(color: Colors.grey.shade700),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Checklist (status) and task assignment',
+                                    style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            if (count > 0) _managerTabCountBadge(count),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class SupervisorOngoingShellScreen extends StatefulWidget {
+  const SupervisorOngoingShellScreen({super.key, required this.state});
+  final AppState state;
+
+  @override
+  State<SupervisorOngoingShellScreen> createState() => _SupervisorOngoingShellScreenState();
+}
+
+class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScreen> {
+  @override
+  void initState() {
+    super.initState();
+    widget.state.setManagerActiveStage('for_processing');
+    widget.state.loadManagerCateringByStage('for_processing', force: true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF242424),
+        foregroundColor: const Color(0xFFFFC024),
+        leading: _buildManagerHamburgerLeading(context, widget.state),
+        title: const Text('ON GOING', style: kManagerAppBarTitleStyle),
+        centerTitle: true,
+      ),
+      drawer: SupervisorStaffDrawer(
+        state: widget.state,
+        onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+        onOngoing: () {},
+      ),
+      body: _ManagerStageListTab(
+        state: widget.state,
+        stage: 'for_processing',
+        isReadOnly: false,
+        processingSubstageFilter: 'ongoing',
+        supervisorMode: true,
       ),
     );
   }
@@ -12146,15 +12391,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                           selectedDishes.add(dishName);
                                         }
                                       }),
-                                      trailing: IconButton(
-                                        icon: const Icon(Icons.info_outline, size: 22),
-                                        tooltip: 'View allergens',
-                                        onPressed: () => showDishAllergensDialog(
-                                          context,
-                                          dishName: dishName,
-                                          allergens: dish?.allergens ?? const [],
-                                        ),
-                                      ),
                                       controlAffinity: ListTileControlAffinity.leading,
                                     ),
                                   );
@@ -15084,6 +15320,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             onToggle: () {},
             hideToggleIcon: true,
             child: buildManagerSeatingLayoutBlock(
+              context: context,
               seatingPlanJson: _newEventSeatingPlan?.toJson() ?? const {},
               helperText: 'Plan tables and chairs for this event (optional). Saved with the new event.',
               buttonLabel: _newEventSeatingPlan == null || _newEventSeatingPlan!.isEffectivelyEmpty
@@ -15327,12 +15564,14 @@ class _ManagerStageListTab extends StatefulWidget {
     required this.stage,
     required this.isReadOnly,
     this.processingSubstageFilter,
+    this.supervisorMode = false,
   });
   final AppState state;
   final String stage;
   final bool isReadOnly;
   /// When [stage] is `for_processing`, keep only `down_payment` or `ongoing` rows.
   final String? processingSubstageFilter;
+  final bool supervisorMode;
 
   @override
   State<_ManagerStageListTab> createState() => _ManagerStageListTabState();
@@ -15574,6 +15813,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                   row: r,
                                   stage: stage,
                                   processingSubstage: widget.processingSubstageFilter,
+                                  supervisorMode: widget.supervisorMode,
                                 ),
                               ),
                             );
@@ -15596,12 +15836,14 @@ class ManagerCateringDetailScreen extends StatefulWidget {
     required this.row,
     required this.stage,
     this.processingSubstage,
+    this.supervisorMode = false,
   });
   final AppState state;
   final CateringEventRecord row;
   final String stage;
   /// Tab context for `for_processing` (`down_payment` | `ongoing`).
   final String? processingSubstage;
+  final bool supervisorMode;
   @override
   State<ManagerCateringDetailScreen> createState() => _ManagerCateringDetailScreenState();
 }
@@ -15610,6 +15852,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   static const String _managerDraftDetailKeyPrefix = 'manager_draft_detail_unsaved_v1_';
   CateringEventRecord? _loadedDetailRow;
   bool _detailReady = false;
+  Timer? _detailLivePoll;
 
   CateringEventRecord get d => _loadedDetailRow ?? widget.row;
 
@@ -16737,7 +16980,76 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       await widget.state.loadAllergenCatalog();
       if (!mounted) return;
       await _bootstrapDetail();
+      _startDetailLivePollIfNeeded();
     });
+  }
+
+  void _startDetailLivePollIfNeeded() {
+    final ongoing =
+        widget.stage == 'for_processing' && _processingSubstageForUi == 'ongoing';
+    if (!ongoing && !widget.supervisorMode) return;
+    _detailLivePoll?.cancel();
+    _detailLivePoll = Timer.periodic(const Duration(seconds: 3), (_) => _pollDetailLive());
+  }
+
+  Future<void> _pollDetailLive() async {
+    if (!mounted || !_detailReady) return;
+    final fresh = await widget.state.loadManagerCateringItem(
+      id: d.id,
+      orderKind: d.orderKind,
+    );
+    if (fresh == null || !mounted) return;
+    _mergeChecklistAndTasksFromRow(fresh);
+    setState(() => _loadedDetailRow = fresh);
+  }
+
+  void _mergeChecklistAndTasksFromRow(CateringEventRecord row) {
+    final nextChecklist = <Map<String, dynamic>>[];
+    for (final c in row.checklist) {
+      if (c is Map) {
+        nextChecklist.add({
+          'item': '${c['item'] ?? ''}',
+          'description': '${c['description'] ?? ''}',
+          'quantity': '${c['quantity'] ?? ''}',
+          'cost': '${c['cost'] ?? ''}',
+          'status': '${c['status'] ?? 'not done'}',
+        });
+      } else if ('$c'.trim().isNotEmpty) {
+        nextChecklist.add({'item': '$c', 'description': '', 'quantity': '', 'cost': '', 'status': 'not done'});
+      }
+    }
+    final nextTasks = <Map<String, dynamic>>[];
+    final tar = row.postAnalysis['task_assignment_rows'];
+    if (tar is List) {
+      for (final t in tar) {
+        if (t is! Map) continue;
+        nextTasks.add({
+          'employee': '${t['employee'] ?? ''}',
+          'tasks': '${t['tasks'] ?? ''}',
+          'schedule_of_tasks': '${t['schedule_of_tasks'] ?? ''}',
+          'budget': '${t['budget'] ?? ''}',
+          'status': '${t['status'] ?? 'not done'}',
+        });
+      }
+    }
+    final checklistSig = jsonEncode(checklistRows);
+    final nextChecklistSig = jsonEncode(nextChecklist);
+    final taskSig = jsonEncode(taskRows);
+    final nextTaskSig = jsonEncode(nextTasks);
+    if (checklistSig != nextChecklistSig || taskSig != nextTaskSig) {
+      checklistRows
+        ..clear()
+        ..addAll(nextChecklist);
+      checklistRowsOriginal
+        ..clear()
+        ..addAll(nextChecklist.map((e) => Map<String, dynamic>.from(e)));
+      taskRows
+        ..clear()
+        ..addAll(nextTasks);
+      taskRowsOriginal
+        ..clear()
+        ..addAll(nextTasks.map((e) => Map<String, dynamic>.from(e)));
+    }
   }
 
   void _onManagerVenueChanged() {
@@ -17087,6 +17399,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   @override
   void dispose() {
+    _detailLivePoll?.cancel();
     _managerVenueDebounce?.cancel();
     managerAddressController.removeListener(_onManagerVenueChanged);
     managerContactPersonController.removeListener(_maybeCopyContactToCustomerForCheckbox);
@@ -17984,13 +18297,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       );
       await Printing.layoutPdf(onLayout: (_) async => bytes);
     }
-    Future<void> _openChecklistEditor() async {
+    Future<void> _openChecklistEditor({bool statusOnly = false}) async {
       final draft = checklistRows.map((e) => Map<String, dynamic>.from(e)).toList();
       final saved = await showDialog<bool>(
         context: context,
         builder: (ctx) => StatefulBuilder(
           builder: (ctx, setDialogState) => AlertDialog(
-            title: const Text('Checklist Editor'),
+            title: Text(statusOnly ? 'Update checklist status' : 'Checklist Editor'),
             content: SizedBox(
               width: 760,
               child: SingleChildScrollView(
@@ -18008,15 +18321,17 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               TextFormField(
                                 key: ValueKey('checklist_item_$i'),
                                 initialValue: '${r['item'] ?? ''}',
+                                readOnly: statusOnly,
                                 decoration: const InputDecoration(labelText: 'Item'),
-                                onChanged: (v) => r['item'] = v,
+                                onChanged: statusOnly ? null : (v) => r['item'] = v,
                               ),
                               const SizedBox(height: 6),
                               TextFormField(
                                 key: ValueKey('checklist_desc_$i'),
                                 initialValue: '${r['description'] ?? ''}',
+                                readOnly: statusOnly,
                                 decoration: const InputDecoration(labelText: 'Description'),
-                                onChanged: (v) => r['description'] = v,
+                                onChanged: statusOnly ? null : (v) => r['description'] = v,
                               ),
                               const SizedBox(height: 6),
                               Row(
@@ -18025,8 +18340,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                     child: TextFormField(
                                       key: ValueKey('checklist_qty_$i'),
                                       initialValue: '${r['quantity'] ?? ''}',
+                                      readOnly: statusOnly,
                                       decoration: const InputDecoration(labelText: 'Quantity'),
-                                      onChanged: (v) => r['quantity'] = v,
+                                      onChanged: statusOnly ? null : (v) => r['quantity'] = v,
                                     ),
                                   ),
                                   const SizedBox(width: 8),
@@ -18034,8 +18350,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                     child: TextFormField(
                                       key: ValueKey('checklist_cost_$i'),
                                       initialValue: '${r['cost'] ?? ''}',
+                                      readOnly: statusOnly,
                                       decoration: const InputDecoration(labelText: 'Cost'),
-                                      onChanged: (v) => r['cost'] = v,
+                                      onChanged: statusOnly ? null : (v) => r['cost'] = v,
                                     ),
                                   ),
                                 ],
@@ -18049,28 +18366,30 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 ],
                                 onChanged: (v) => setDialogState(() => r['status'] = v ?? 'not done'),
                               ),
-                              Align(
-                                alignment: Alignment.centerRight,
-                                child: IconButton(
-                                  onPressed: () => setDialogState(() => draft.removeAt(i)),
-                                  icon: const Icon(Icons.delete_outline),
+                              if (!statusOnly)
+                                Align(
+                                  alignment: Alignment.centerRight,
+                                  child: IconButton(
+                                    onPressed: () => setDialogState(() => draft.removeAt(i)),
+                                    icon: const Icon(Icons.delete_outline),
+                                  ),
                                 ),
-                              ),
                             ],
                           ),
                         ),
                       );
                     }),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: TextButton.icon(
-                        onPressed: () => setDialogState(() {
-                          draft.add({'item': '', 'description': '', 'quantity': '', 'cost': '', 'status': 'not done'});
-                        }),
-                        icon: const Icon(Icons.add),
-                        label: const Text('Add row'),
+                    if (!statusOnly)
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          onPressed: () => setDialogState(() {
+                            draft.add({'item': '', 'description': '', 'quantity': '', 'cost': '', 'status': 'not done'});
+                          }),
+                          icon: const Icon(Icons.add),
+                          label: const Text('Add row'),
+                        ),
                       ),
-                    ),
                   ],
                 ),
               ),
@@ -18226,7 +18545,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
     }
 
-    List<Widget> checklistAndTaskToolsSection({required bool allowEditors}) {
+    List<Widget> checklistAndTaskToolsSection({
+      required bool allowChecklistEditor,
+      required bool allowTaskEditor,
+      bool checklistStatusOnly = false,
+    }) {
       return [
         Card(
           child: Padding(
@@ -18237,8 +18560,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 const Text('Checklist', style: TextStyle(fontWeight: FontWeight.w800)),
                 const SizedBox(height: 8),
                 Text(
-                  allowEditors
-                      ? 'Update the checklist, save, then generate the PDF. Saved rows appear in the PDF.'
+                  allowChecklistEditor
+                      ? (checklistStatusOnly
+                          ? 'Update item status only. Changes sync to the manager view within a few seconds.'
+                          : 'Update the checklist, save, then generate the PDF. Saved rows appear in the PDF.')
                       : isPost
                           ? 'Checklist from On Going. Generate a PDF export here.'
                           : 'PDF generation is available for this record.',
@@ -18248,9 +18573,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   spacing: 8,
                   runSpacing: 8,
                   children: [
-                    if (allowEditors)
-                      OutlinedButton(onPressed: _openChecklistEditor, child: const Text('Checklist Editor')),
-                    OutlinedButton(onPressed: _generateChecklistPdf, child: const Text('Generate Checklist PDF')),
+                    if (allowChecklistEditor)
+                      OutlinedButton(
+                        onPressed: () => _openChecklistEditor(statusOnly: checklistStatusOnly),
+                        child: Text(checklistStatusOnly ? 'Update status' : 'Checklist Editor'),
+                      ),
+                    if (!widget.supervisorMode)
+                      OutlinedButton(onPressed: _generateChecklistPdf, child: const Text('Generate Checklist PDF')),
                   ],
                 ),
               ],
@@ -18266,8 +18595,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 const Text('Task Assignment', style: TextStyle(fontWeight: FontWeight.w800)),
                 const SizedBox(height: 8),
                 Text(
-                  allowEditors
-                      ? 'Update task assignments, save, then generate the PDF. Saved rows appear in the PDF.'
+                  allowTaskEditor
+                      ? 'Update task assignments and save. Changes sync to the manager view within a few seconds.'
                       : isPost
                           ? 'Task assignment from On Going. Generate a PDF export here.'
                           : 'PDF generation is available for this record.',
@@ -18277,9 +18606,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   spacing: 8,
                   runSpacing: 8,
                   children: [
-                    if (allowEditors)
+                    if (allowTaskEditor)
                       OutlinedButton(onPressed: _openTaskEditor, child: const Text('Task Assignment Editor')),
-                    OutlinedButton(onPressed: _generateTaskPdf, child: const Text('Generate Task Assignment PDF')),
+                    if (!widget.supervisorMode)
+                      OutlinedButton(onPressed: _generateTaskPdf, child: const Text('Generate Task Assignment PDF')),
                   ],
                 ),
               ],
@@ -18287,6 +18617,87 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           ),
         ),
       ];
+    }
+
+    if (widget.supervisorMode) {
+      return Scaffold(
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+        appBar: AppBar(
+          backgroundColor: const Color(0xFF242424),
+          foregroundColor: const Color(0xFFFFC024),
+          leading: _buildManagerHamburgerLeading(context, widget.state),
+          title: Text(
+            cateringManagerDetailTabTitle(row, widget.stage, processingSubstageOverride: widget.processingSubstage),
+            style: kManagerAppBarTitleStyle,
+          ),
+          centerTitle: true,
+        ),
+        drawer: SupervisorStaffDrawer(
+          state: widget.state,
+          onDashboard: () => Navigator.of(context).popUntil((route) => route.isFirst),
+          onOngoing: () {},
+        ),
+        body: ListView(
+          padding: const EdgeInsets.all(12),
+          children: [
+            Card(
+              child: ListTile(
+                title: Text(row.eventTitle.isEmpty ? row.customerName : row.eventTitle),
+                subtitle: Text(
+                  '${row.transactionNo.isEmpty ? row.id : row.transactionNo} · ${row.customerName}',
+                ),
+              ),
+            ),
+            ...checklistAndTaskToolsSection(
+              allowChecklistEditor: true,
+              allowTaskEditor: true,
+              checklistStatusOnly: true,
+            ),
+            if (row.orderKind == 'event' && canShowSeatingLayout(row.status))
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Seating layout', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 8),
+                      buildManagerSeatingLayoutBlock(
+                        context: context,
+                        seatingPlanJson: row.seatingPlan,
+                        exportOnly: true,
+                        eventTitle: row.eventTitle,
+                        transactionNo: row.transactionNo,
+                        helperText: 'View seating layout output. Download as image or PDF.',
+                        buttonLabel: 'View seating layout',
+                        onOpenEditor: () async {
+                          final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
+                          await Navigator.push<SeatingPlanData?>(
+                            context,
+                            MaterialPageRoute<SeatingPlanData?>(
+                              builder: (_) => SeatingLayoutEditorScreen(
+                                apiBase: widget.state.apiBase,
+                                userEmail: row.emailAddress,
+                                orderId: row.id,
+                                orderKind: row.orderKind,
+                                initialPlan: initialPlan.isEffectivelyEmpty ? null : initialPlan,
+                                cashierEmail: widget.state.userEmail,
+                                cashierPassword: widget.state.loginPassword,
+                                readOnly: true,
+                                eventTitle: row.eventTitle,
+                                transactionNo: row.transactionNo,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
     }
 
     Future<void> submitNext() async {
@@ -18637,7 +19048,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ),
           if (isOngoingSubstage || isPost || isCompleted)
             ...checklistAndTaskToolsSection(
-              allowEditors: isOngoingSubstage && canEditStage && widget.state.isManager,
+              allowChecklistEditor: isOngoingSubstage &&
+                  canEditStage &&
+                  (widget.state.isManager || widget.state.isSupervisor),
+              allowTaskEditor:
+                  isOngoingSubstage && canEditStage && (widget.state.isManager || widget.state.isSupervisor),
+              checklistStatusOnly: widget.state.isSupervisor,
             ),
           if (isDownPaymentSubstage)
             Card(
@@ -19862,12 +20278,20 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     const Text('Seating layout', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
                     buildManagerSeatingLayoutBlock(
+                      context: context,
                       seatingPlanJson: row.seatingPlan,
-                      helperText: widget.stage == 'for_processing'
-                          ? 'Edit table and chair placement while this order is in For Processing.'
-                          : 'View the seating layout submitted with this inquiry.',
+                      exportOnly: widget.supervisorMode || !canEditSeatingLayout(row.status),
+                      eventTitle: row.eventTitle,
+                      transactionNo: row.transactionNo,
+                      helperText: widget.supervisorMode
+                          ? 'View seating layout output. Download as image or PDF.'
+                          : widget.stage == 'for_processing'
+                              ? 'Edit table and chair placement while this order is in For Processing.'
+                              : 'View the seating layout submitted with this inquiry.',
                       buttonLabel:
-                          canEditSeatingLayout(row.status) ? 'Edit seating layout' : 'View seating layout',
+                          (widget.supervisorMode || !canEditSeatingLayout(row.status))
+                              ? 'View seating layout'
+                              : 'Edit seating layout',
                       onOpenEditor: () async {
                         final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
                         await Navigator.push<SeatingPlanData?>(
@@ -19881,7 +20305,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               initialPlan: initialPlan.isEffectivelyEmpty ? null : initialPlan,
                               cashierEmail: widget.state.userEmail,
                               cashierPassword: widget.state.loginPassword,
-                              readOnly: !canEditSeatingLayout(row.status),
+                              readOnly: widget.supervisorMode || !canEditSeatingLayout(row.status),
+                              eventTitle: row.eventTitle,
+                              transactionNo: row.transactionNo,
                             ),
                           ),
                         );

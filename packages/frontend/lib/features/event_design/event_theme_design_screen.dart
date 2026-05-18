@@ -242,12 +242,10 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       if (_decorOther.text.trim().isNotEmpty) 'decor_other': _decorOther.text.trim(),
       if (_notes.text.trim().isNotEmpty) 'custom_instructions': _notes.text.trim(),
       if (widget.eventTitle != null && widget.eventTitle!.trim().isNotEmpty) 'event_title': widget.eventTitle!.trim(),
-      if (widget.formalityLevel != null && widget.formalityLevel!.trim().isNotEmpty) {
+      if (widget.formalityLevel != null && widget.formalityLevel!.trim().isNotEmpty)
         'formality_level': widget.formalityLevel!.trim(),
-      },
-      if (widget.eventSetting != null && widget.eventSetting!.trim().isNotEmpty) {
+      if (widget.eventSetting != null && widget.eventSetting!.trim().isNotEmpty)
         'event_setting': widget.eventSetting!.trim(),
-      },
     };
   }
 

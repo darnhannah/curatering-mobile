@@ -166,6 +166,7 @@ const RESTAURANT_ORDERS_COLUMNS = new Set([
   "payment_confirmed_balance",
   "order_status",
   "loyalty_points_restaurant_obtained",
+  "loyalty_points_catering_obtained",
   "loyalty_reward_restaurant_obtained",
   "delivery_tracking_url",
   "submitted_order_dt_stamp",
@@ -176,6 +177,12 @@ const RESTAURANT_ORDERS_COLUMNS = new Set([
   "user_email",
   "guest_contact_email",
   "payment_mode",
+  "pos_customer_label",
+  "balance_proof_pending_review",
+  "feedback_stars",
+  "feedback_remarks",
+  "amount_paid",
+  "change_given",
   "created_at",
   "updated_at",
 ]);
@@ -196,31 +203,35 @@ const CATERING_ORDERS_COLUMNS = new Set([
   "contact_number",
   "email_address",
   "address",
+  "address_lat",
+  "address_lng",
   "schedule_slots",
   "guest_count",
   "pax_buffer",
   "menu",
+  "allergens",
+  "checklist",
   "created_at",
   "updated_at",
   "stage_entered_at",
   "down_payment_amount",
   "down_payment_status",
+  "down_payment_reference",
   "down_payment_proof",
   "full_payment_amount",
   "full_payment_status",
+  "full_payment_reference",
   "full_payment_proof",
-  "additional_costs",
   "inquiry_additional_costs",
   "stage_additional_costs",
   "total_cost",
   "estimated_cost",
+  "final_status",
   "labor_cost",
   "travel_cost",
-  "cost_breakdown",
   "loyalty_points_catering_obtained",
   "loyalty_reward_catering_obtained",
   "payment_method",
-  "checklist",
   "full_payment_due_at",
   "created_by",
   "updated_by",
@@ -231,7 +242,6 @@ const EVENT_ORDERS_COLUMNS = new Set([
   "event_id",
   "theme_design",
   "seating_plan",
-  "actual_event_images",
 ]);
 
 /** Idempotent schema alignment: merge duplicates, preserve row data. */
@@ -1001,9 +1011,24 @@ async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
   await pool.query(
     `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS loyalty_points_restaurant_obtained INTEGER NOT NULL DEFAULT 0`,
   );
+  await pool.query(
+    `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS loyalty_points_catering_obtained INTEGER NOT NULL DEFAULT 0`,
+  );
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS loyalty_reward_restaurant_obtained TEXT`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS submitted_order_dt_stamp TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS last_updated_order_status_dt_stamp TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS feedback_stars INTEGER`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS feedback_remarks TEXT`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(12,2)`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS change_given NUMERIC(12,2)`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_lat DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_lng DOUBLE PRECISION`);
+  await pool.query(
+    `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT NOT NULL DEFAULT ''`,
+  );
+  await pool.query(
+    `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS balance_proof_pending_review BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
 
   await copyColumnIfBothExist(pool, "restaurant_orders", "order_id", "order_no");
   await copyColumnIfBothExist(pool, "restaurant_orders", "total_cost", "total_amount");
@@ -1134,6 +1159,20 @@ async function normalizeCateringOrders(pool: pg.Pool): Promise<void> {
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS loyalty_reward_catering_obtained TEXT`);
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS down_payment_proof TEXT`);
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS full_payment_proof TEXT`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS allergens JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS address_lat DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS address_lng DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS final_status TEXT`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS down_payment_reference TEXT`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS full_payment_reference TEXT`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await safeExec(
+    pool,
+    `UPDATE catering_orders SET status = 'for_full_payment' WHERE LOWER(TRIM(status)) = 'for_post_analysis'`,
+  );
 
   await copyColumnIfBothExist(pool, "catering_orders", "catering_id", "transaction_no");
   await copyColumnIfBothExist(pool, "catering_orders", "catering_id", "inquiry_id");
@@ -1180,6 +1219,20 @@ async function normalizeEventOrders(pool: pg.Pool): Promise<void> {
     `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS loyalty_points_catering_obtained INTEGER NOT NULL DEFAULT 0`,
   );
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS loyalty_reward_catering_obtained TEXT`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS allergens JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS address_lat DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS address_lng DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS final_status TEXT`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS down_payment_reference TEXT`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS full_payment_reference TEXT`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await safeExec(
+    pool,
+    `UPDATE event_orders SET status = 'for_full_payment' WHERE LOWER(TRIM(status)) = 'for_post_analysis'`,
+  );
 
   await copyColumnIfBothExist(pool, "event_orders", "event_id", "transaction_no");
   await copyColumnIfBothExist(pool, "event_orders", "event_id", "inquiry_id");
