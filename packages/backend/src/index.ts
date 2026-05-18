@@ -87,14 +87,14 @@ import {
 import { ensureIdCounterRow, nextCusIdFromCounter, nextTrIdFromCounter } from "./idCounters.js";
 import { parseAllergenNamesFromRow, queryAllergensCatalog } from "./menuAllergens.js";
 import { buildMenuSql, buildSetMenusSql, MINIMAL_PUBLIC_MENU_SQL } from "./menuQuery.js";
-import { DEFAULT_PUBLIC_MENU_SQL, DEFAULT_PUBLIC_SET_MENUS_SQL } from "./webMenu.js";
+import { DEFAULT_PUBLIC_SET_MENUS_SQL } from "./webMenu.js";
 import {
   columnExists,
   CUSTOMER_ACCOUNT_STAMP_SQL,
   menuDishesChangedSinceSql,
   menuDishesMaxStampExpr,
 } from "./schemaColumns.js";
-import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
+import { resolveSetMenusSql } from "./webMenu.js";
 
 if (isMailConfigured()) {
   if (mailUsesResend()) {
@@ -1072,16 +1072,14 @@ function loyaltyPointsFor(kind: LoyaltyEarnKind, totalAmount: number): number {
 async function refreshLoyaltyTotalsForUser(userEmailRaw: string): Promise<void> {
   const email = userEmailRaw.trim().toLowerCase();
   if (!email || email.endsWith("@guest.curatering.internal")) return;
+  const pool = getPool();
+  const roMatch = await restaurantOrderMatchesEmailWhere(pool, "ro", "$1");
   const subFrom = `(
      SELECT
        COALESCE((
          SELECT SUM(COALESCE(ro.loyalty_points_restaurant_obtained, 0))::int
          FROM restaurant_orders ro
-         LEFT JOIN customer_accounts ca ON (
-           ca.customer_id = ro.customer_id::text
-           OR LOWER(TRIM(ca.email)) = LOWER(TRIM(COALESCE(ro.user_email, '')))
-         )
-         WHERE LOWER(TRIM(COALESCE(ca.email, ro.user_email, ''))) = $1
+         WHERE ${roMatch}
            AND COALESCE(ro.delivery_notes, '') NOT LIKE '%Catering event loyalty%'
        ), 0) AS r,
        (
@@ -1335,8 +1333,8 @@ app.post("/api/items", async (_req, res) => {
 });
 
 app.get("/api/mobile/menu", async (_req, res) => {
-  const envSql = resolveMenuSql();
-  if (!envSql && process.env.DISABLE_DEFAULT_PUBLIC_MENU === "true") {
+  const customMenuSql = process.env.WEB_MENU_SQL?.trim() || "";
+  if (!customMenuSql && process.env.DISABLE_DEFAULT_PUBLIC_MENU === "true") {
     res.status(503).json({
       error:
         "Menu query disabled or not configured. Remove DISABLE_DEFAULT_PUBLIC_MENU or set WEB_MENU_SQL / WEB_MENU_TABLE — see .env.example.",
@@ -1360,7 +1358,7 @@ app.get("/api/mobile/menu", async (_req, res) => {
   try {
     await ensureRestaurantOrdersApiSchemaOnce();
     const pool = getPool();
-    let sql = envSql;
+    let sql = customMenuSql;
     if (!sql) {
       try {
         sql = await buildMenuSql(pool);
@@ -1384,25 +1382,15 @@ app.get("/api/mobile/menu", async (_req, res) => {
       try {
         rows = await runMenuQuery(await buildMenuSql(pool, { skipAllergens: true }));
       } catch (err2) {
-        console.warn("[menu] safe buildMenuSql failed, trying default public menu SQL", err2);
-        try {
-          if (sql !== DEFAULT_PUBLIC_MENU_SQL) {
-            rows = await runMenuQuery(DEFAULT_PUBLIC_MENU_SQL);
-          } else {
-            throw err2;
-          }
-        } catch (err3) {
-          console.warn("[menu] default public menu SQL failed, using minimal menu SQL", err3);
-          rows = await runMenuQuery(MINIMAL_PUBLIC_MENU_SQL);
-        }
+        console.warn("[menu] safe buildMenuSql failed, using minimal menu SQL", err2);
+        rows = await runMenuQuery(MINIMAL_PUBLIC_MENU_SQL);
       }
     }
     res.json(mapMenuRows(rows));
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: "menu query failed — check menu_dishes schema and WEB_MENU_* env",
-    });
+    // Do not block app login/session — return empty menu so clients can still authenticate.
+    res.json([]);
   }
 });
 
@@ -1416,10 +1404,10 @@ app.get("/api/mobile/allergens", async (_req, res) => {
 });
 
 app.get("/api/mobile/set-menus", async (_req, res) => {
-  const envSql = resolveSetMenusSql();
+  const customSetSql = process.env.WEB_SET_MENUS_SQL?.trim() || "";
   try {
     const pool = getPool();
-    let sql = envSql;
+    let sql = customSetSql || null;
     if (!sql) {
       try {
         sql = await buildSetMenusSql(pool);

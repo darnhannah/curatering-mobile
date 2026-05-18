@@ -86,11 +86,11 @@ export async function buildMenuSql(pool: pg.Pool, opts?: { skipAllergens?: boole
        END`
     : `NULLIF(TRIM(md.category), '')`;
   const dipsExpr = hasSauces
-    ? `COALESCE(md.sauces::text, '[]')`
+    ? `COALESCE(to_jsonb(md.sauces)::text, '[]')`
     : hasDips
-      ? `COALESCE(md.dips::text, '[]')`
+      ? `COALESCE(to_jsonb(md.dips)::text, '[]')`
       : `'[]'::text`;
-  const ingredientsExpr = hasIngredients ? `COALESCE(md.ingredients::text, '[]')` : `'[]'::text`;
+  const ingredientsExpr = hasIngredients ? `COALESCE(to_jsonb(md.ingredients)::text, '[]')` : `'[]'::text`;
   let allergensExpr = `'[]'::text`;
   if (hasAllergens && !opts?.skipAllergens) {
     try {

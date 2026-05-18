@@ -42,7 +42,7 @@ export const MENU_DISH_ALLERGEN_NAMES_JSON_SQL = `
   COALESCE(
     (
       SELECT json_agg(ma.allergen_name ORDER BY ord)::text
-      FROM unnest(COALESCE(md.allergens, '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
+      FROM unnest(COALESCE(md.allergens::bigint[], '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
       INNER JOIN public.menu_dishes_allergens ma ON ma.allergen_id = t.allergen_id
     ),
     '[]'
