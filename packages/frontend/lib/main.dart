@@ -1282,7 +1282,7 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
   final contactNum = '${map['contact_number'] ?? ''}'.trim();
   return OrderData(
     id: jsonToInt(map['id']),
-    orderNo: '${map['order_no']}',
+    orderNo: orderNoFromApiMap(map),
     status: '${map['status']}',
     total: jsonToDouble(map['total']),
     createdAt: jsonToDateTime(map['created_at'], DateTime.now()),
@@ -1351,6 +1351,13 @@ bool orderShowsDeliveryTrackingLink(OrderData o) {
   final st = o.status.toUpperCase();
   if (st.contains('FOR DELIVERY') || st.contains('OUT FOR DELIVERY')) return true;
   return false;
+}
+
+/// Prefer business `order_id` (ORD-******) over legacy `order_no` alias.
+String orderNoFromApiMap(Map<String, dynamic> map) {
+  final orderId = '${map['order_id'] ?? ''}'.trim();
+  if (orderId.isNotEmpty) return orderId;
+  return '${map['order_no'] ?? ''}'.trim();
 }
 
 /// UI-only formatting for customer-facing order numbers.
@@ -1581,6 +1588,7 @@ Future<void> showEventVenueMapPreview(BuildContext context, String address) asyn
 }
 
 int paxBufferFromCateringRow(CateringEventRecord row) {
+  if (row.paxBuffer > 0) return row.paxBuffer;
   final td = row.themeDesign;
   final raw = td['pax_buffer'] ?? row.postAnalysis['pax_buffer'];
   if (raw is num) return raw.toInt().clamp(0, 999999);
@@ -1942,6 +1950,8 @@ class CateringEventRecord {
     required this.emailAddress,
     required this.address,
     required this.guestCount,
+    this.paxBuffer = 0,
+    this.orderType = '',
     required this.totalCost,
     required this.eventTitle,
     required this.eventType,
@@ -1982,6 +1992,8 @@ class CateringEventRecord {
   final String emailAddress;
   final String address;
   final int guestCount;
+  final int paxBuffer;
+  final String orderType;
   final double totalCost;
   final String eventTitle;
   final String eventType;
@@ -2055,6 +2067,8 @@ class CateringEventRecord {
       emailAddress: '${m['email_address'] ?? ''}',
       address: '${m['address'] ?? ''}',
       guestCount: jsonToInt(m['guest_count']),
+      paxBuffer: jsonToInt(m['pax_buffer']),
+      orderType: '${m['order_type'] ?? ''}',
       totalCost: jsonToDouble(m['total_cost']),
       eventTitle: '${m['event_title'] ?? ''}',
       eventType: '${m['event_type'] ?? ''}',
@@ -3156,7 +3170,7 @@ class AppState extends ChangeNotifier {
         ..addAll(
           body.whereType<Map<String, dynamic>>().map(
             (m) => LoyaltyHistoryItem(
-              orderNo: '${m['order_no'] ?? ''}',
+              orderNo: orderNoFromApiMap(m),
               pointsDelta: jsonToInt(m['points_delta']),
               createdAt: jsonToDateTime(m['created_at'], DateTime.now()),
               source: '${m['source'] ?? 'restaurant'}'.toLowerCase().contains('catering') ? 'catering' : 'restaurant',
@@ -3425,7 +3439,7 @@ class AppState extends ChangeNotifier {
           .toList();
       final order = OrderData(
         id: jsonToInt(map['id']),
-        orderNo: '${map['order_no']}',
+        orderNo: orderNoFromApiMap(map),
         status: 'WAITING FOR PAYMENT CONFIRMATION',
         total: jsonToDouble(map['total']),
         createdAt: DateTime.now(),
@@ -15038,63 +15052,6 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                         },
                                         child: Text('Cancel', style: TextStyle(color: Colors.red.shade800)),
                                       ),
-                                    FilledButton(
-                                      onPressed: () async {
-                                        final target = _next(stage);
-                                        if (!state.isManager && target == 'completed') {
-                                          appSnack(context, 'Supervisor cannot complete orders.');
-                                          return;
-                                        }
-                                        if (target == 'for_post_analysis') {
-                                          if (stage == 'for_processing' && listSubstage != 'ongoing') {
-                                            appSnack(
-                                              context,
-                                              'Open the order and move it to On Going before advancing to For Full Payment.',
-                                            );
-                                            return;
-                                          }
-                                          final dueHalf = r.totalCost * 0.5;
-                                          if (!cateringDownPaymentConfirmed(r, dueHalf)) {
-                                            appSnack(
-                                              context,
-                                              'Open the order and confirm down payment before advancing.',
-                                            );
-                                            return;
-                                          }
-                                        }
-                                        if (target == 'completed') {
-                                          final double tc = r.totalCost > 0 ? r.totalCost : 1.0;
-                                          if (!cateringFullPaymentConfirmed(r, tc)) {
-                                            appSnack(context, 'Full payment confirmation is required before completing this order.');
-                                            return;
-                                          }
-                                          final addlSum = cateringCompiledAdditionalCostsTotal(r);
-                                          if (addlSum > 0.01 && r.postAnalysis['additional_costs_payment_confirmed'] != true) {
-                                            appSnack(
-                                              context,
-                                              'Confirm additional costs payment in order detail before completing.',
-                                            );
-                                            return;
-                                          }
-                                        }
-                                        final err = await state.managerAdvanceCateringStage(
-                                          id: r.id,
-                                          orderKind: r.orderKind,
-                                          status: target,
-                                          downPaymentAmount: stage == 'for_processing' ? (r.totalCost * 0.5) : null,
-                                          fullPaymentAmount: null,
-                                          postAnalysis: stage == 'for_post_analysis' ? {'completed_by': state.userEmail} : null,
-                                        );
-                                        if (!context.mounted) return;
-                                        if (err != null) {
-                                          appSnack(context, err);
-                                          return;
-                                        }
-                                        appSnack(context, 'Moved to next stage');
-                                        await state.loadManagerCateringByStage(stage, force: true);
-                                      },
-                                      child: const Text('Next'),
-                                    ),
                                   ],
                                 ),
                           onTap: () {
@@ -15185,6 +15142,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   final managerEmailController = TextEditingController();
   final managerAddressController = TextEditingController();
   final managerGuestCountController = TextEditingController();
+  final managerPaxBufferController = TextEditingController();
   final managerInquiryNoteController = TextEditingController();
   bool _managerCustomerSameAsContact = false;
   String managerEventTypeChoice = 'Birthday';
@@ -16313,6 +16271,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     managerAddressController.text = row.address.trim();
     _managerCustomerSameAsContact = false;
     managerGuestCountController.text = '${row.guestCount <= 0 ? '' : row.guestCount}';
+    managerPaxBufferController.text = '${_paxBufferCount(row) <= 0 ? '' : _paxBufferCount(row)}';
     managerInquiryNoteController.text = '${tdInit['note'] ?? ''}';
     managerEventSetting = '${tdInit['event_setting'] ?? 'open'}'.trim().isEmpty ? 'open' : tdInit['event_setting'].toString().trim();
     _draftOrderKind = row.orderKind;
@@ -16583,6 +16542,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     managerEmailController.dispose();
     managerAddressController.dispose();
     managerGuestCountController.dispose();
+    managerPaxBufferController.dispose();
     managerInquiryNoteController.dispose();
     super.dispose();
   }
@@ -17256,6 +17216,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
               ],
               if (gc != null && gc >= 0) 'guest_count': gc,
+              'pax_buffer': int.tryParse(managerPaxBufferController.text.trim()) ?? 0,
             },
           );
           if (!mounted) return false;
@@ -17935,7 +17896,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (advancingToFullPayment) {
         _snapshotAdditionalCostsForCurrentStage(clearWorking: true, refreshTimestamp: true);
       }
-      if (target == 'for_post_analysis') {
+      if (target == 'for_post_analysis' && !advancingToFullPayment) {
         final dueHalf = invoiceTotalSubmit * 0.5;
         if (!cateringDownPaymentConfirmed(rowSubmit, dueHalf)) {
           appSnack(
@@ -18698,7 +18659,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   const Text('Event Information', style: TextStyle(fontWeight: FontWeight.w800)),
                   const SizedBox(height: 8),
                   if (!isDraftStage) ...[
-                    Text('Order type: ${row.orderKind == 'catering' ? 'Catering Only' : 'Catering + Event'}'),
+                    Text(
+                      'Order type: ${row.orderType == 'catering_event' || row.orderKind == 'event' ? 'Catering + Event' : 'Catering Only'}',
+                    ),
                     if (row.transactionNo.trim().isNotEmpty)
                       Padding(
                         padding: const EdgeInsets.only(bottom: 2),
@@ -19000,6 +18963,18 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       readOnly: !canEditStage,
                       decoration: const InputDecoration(labelText: 'Number of guests'),
                     ),
+                    if (_isManagerDraftDetailStage) ...[
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: managerPaxBufferController,
+                        keyboardType: TextInputType.number,
+                        readOnly: !canEditStage,
+                        decoration: const InputDecoration(
+                          labelText: 'Pax Buffer (optional)',
+                          helperText: 'Extra pax for estimates only (₱500 per pax)',
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 8),
                     const SizedBox(height: 6),
                     const Text('Service', style: TextStyle(fontWeight: FontWeight.w600)),

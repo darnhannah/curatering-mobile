@@ -721,6 +721,12 @@ async function generateChecklistFromMenu(menuRaw: unknown): Promise<ChecklistIte
   }
 }
 
+function additionalCostsDbColumnForStatus(status: string): "inquiry_additional_costs" | "stage_additional_costs" {
+  const s = String(status ?? "").trim().toLowerCase();
+  if (s === "new_event" || s === "online_inquiries") return "inquiry_additional_costs";
+  return "stage_additional_costs";
+}
+
 function defaultTaskAssignmentRows(): TaskAssignmentRow[] {
   return Array.from({ length: 5 }).map(() => ({
     employee: "",
@@ -1237,7 +1243,7 @@ app.post("/api/mobile/auth/login", async (req, res) => {
       return;
     }
     const { rows } = await getPool().query(
-      "SELECT password_hash, full_name, is_verified FROM customer_accounts WHERE email = $1",
+      "SELECT password_hash, full_name, is_verified FROM customer_accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))",
       [email],
     );
     let row = rows[0] as { password_hash: string; full_name: string; is_verified: boolean } | undefined;
@@ -1319,7 +1325,7 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
       targetEmail = account.email;
       const otpSql = customerForgotOtpUpdateSql();
       await getPool().query(
-        `UPDATE customer_accounts SET ${otpSql.set} WHERE email = $1`,
+        `UPDATE customer_accounts SET ${otpSql.set} WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))`,
         [targetEmail, otp, expiresAt.toISOString()],
       );
     }
@@ -1386,19 +1392,17 @@ app.post("/api/mobile/auth/check-password-reset-otp", async (req, res) => {
       if (account) {
         email = account.email;
         const { rows } = await getPool().query(
-          `SELECT ${CUSTOMER_FORGOT_OTP_SELECT} FROM customer_accounts WHERE email = $1`,
-          [email],
+          `SELECT 1 AS ok FROM customer_accounts
+           WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+             AND TRIM(forgot_password_otp_code) = TRIM($2)
+             AND forgot_password_otp_code_expiry > NOW()
+           LIMIT 1`,
+          [email, otp],
         );
-        row = rows[0] as { password_reset_otp: string | null; password_reset_expires_at: Date | null } | undefined;
+        row = rows[0] ? { password_reset_otp: otp, password_reset_expires_at: new Date(Date.now() + 3600000) } : undefined;
       }
     }
-    if (
-      !email ||
-      !row?.password_reset_otp ||
-      row.password_reset_otp !== otp ||
-      !row.password_reset_expires_at ||
-      new Date(row.password_reset_expires_at) < new Date()
-    ) {
+    if (!email || !row) {
       res.status(400).json({ error: "invalid or expired reset OTP" });
       return;
     }
@@ -1439,28 +1443,31 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
       const account = await resolveCustomerAccountByIdentity(identity);
       if (account) {
         email = account.email;
-        const { rows } = await getPool().query(
-          `SELECT ${CUSTOMER_FORGOT_OTP_SELECT} FROM customer_accounts WHERE email = $1`,
-          [email],
-        );
-        row = rows[0] as { password_reset_otp: string | null; password_reset_expires_at: Date | null } | undefined;
       }
     }
     if (!email) {
       res.status(400).json({ error: "invalid or expired reset OTP" });
       return;
     }
-    if (
-      !row?.password_reset_otp ||
-      row.password_reset_otp !== otp ||
-      !row.password_reset_expires_at ||
-      new Date(row.password_reset_expires_at) < new Date()
-    ) {
-      res.status(400).json({ error: "invalid or expired reset OTP" });
-      return;
-    }
     const hash = await bcrypt.hash(password, 10);
     if (role === "cashier") {
+      const { rows: staffRows } = await getPool().query(
+        `SELECT email, password_reset_otp, password_reset_expires_at FROM users WHERE LOWER(email) = $1`,
+        [identity],
+      );
+      const sr = staffRows[0] as
+        | { email: string; password_reset_otp: string | null; password_reset_expires_at: Date | null }
+        | undefined;
+      if (
+        !sr?.password_reset_otp ||
+        String(sr.password_reset_otp).trim() !== otp ||
+        !sr.password_reset_expires_at ||
+        new Date(sr.password_reset_expires_at) < new Date()
+      ) {
+        res.status(400).json({ error: "invalid or expired reset OTP" });
+        return;
+      }
+      email = sr.email;
       await getPool().query(
         `UPDATE users
          SET password_hash = $2, password_reset_otp = NULL, password_reset_expires_at = NULL
@@ -1468,11 +1475,22 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
         [email, hash],
       );
     } else {
-      const otpSql = customerForgotOtpUpdateSql();
-      await getPool().query(
-        `UPDATE customer_accounts SET password_hash = $2, ${otpSql.clear} WHERE email = $1`,
-        [email, hash],
+      const { rows: updated } = await getPool().query(
+        `UPDATE customer_accounts
+         SET password_hash = $2,
+             forgot_password_otp_code = NULL,
+             forgot_password_otp_code_expiry = NULL,
+             updated_pw_dt_stamp = NOW()
+         WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+           AND TRIM(forgot_password_otp_code) = TRIM($3)
+           AND forgot_password_otp_code_expiry > NOW()
+         RETURNING email`,
+        [email, hash, otp],
       );
+      if (!updated.length) {
+        res.status(400).json({ error: "invalid or expired reset OTP" });
+        return;
+      }
     }
     await logActionBestEffort("auth.reset.complete", email, "Password reset completed", {});
     const ts = new Date().toISOString();
@@ -2011,22 +2029,24 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
+    const posNote =
+      [note.trim(), customerLabel ? `Customer: ${customerLabel}` : ""].filter((x) => x.length > 0).join(" · ") || "";
     const { rows } = await client.query(
       `INSERT INTO restaurant_orders
         (user_email, order_id, delivery_notes, payment_mode, payment_uploaded_initial, payment_proof_initial,
          full_name, contact_number, delivery_address, delivery_time, total_cost,
-         order_source, pos_customer_label, cashier_amount_received_initial, order_status)
+         order_source, cashier_amount_received_initial, order_status)
        VALUES
-        (NULL, 'TEMP', $1, $2, $3, $4, '', '', '', 'NOW', $5,
-         'POS', $6, $7, 'ORDER CONFIRMED')
+        (NULL, 'TEMP', $1, $2, $3, $4, $5, '', '', 'NOW', $6,
+         'POS', $7, 'ORDER CONFIRMED')
        RETURNING mobile_id AS id`,
       [
-        note,
+        posNote,
         paymentMethod,
         proofUploaded,
         proofVal,
+        customerLabel || "Walk-in",
         total,
-        customerLabel,
         !Number.isNaN(amountReceived) ? amountReceived : null,
       ],
     );
@@ -2384,6 +2404,22 @@ app.get("/api/mobile/loyalty-history", async (req, res) => {
              OR POSITION(LOWER($1) IN LOWER(COALESCE(ro.delivery_notes, ''))) > 0
            )
          UNION ALL
+         SELECT COALESCE(NULLIF(TRIM(ro.order_id), ''), 'ORD-' || LPAD(ro.mobile_id::text, 6, '0')) AS order_no,
+                COALESCE(
+                  ro.loyalty_points_restaurant_obtained,
+                  FLOOR(COALESCE(ro.total_cost, 0)::numeric / ${RESTAURANT_LOYALTY_STEP_AMOUNT}::numeric)::int * ${RESTAURANT_LOYALTY_STEP_POINTS}
+                ) AS points_delta,
+                COALESCE(ro.submitted_order_dt_stamp, ro.last_updated_order_status_dt_stamp) AS created_at,
+                'restaurant' AS source
+         FROM restaurant_orders ro
+         WHERE LOWER(TRIM(COALESCE(ro.user_email, ''))) = LOWER($1)
+           AND COALESCE(ro.order_source, '') NOT IN ('POS', 'LOYALTY_SYNC')
+           AND (
+             upper(COALESCE(ro.order_status, '')) LIKE '%ORDER CONFIRMED%'
+             OR upper(COALESCE(ro.order_status, '')) LIKE '%OVERPAYMENT%'
+           )
+           AND COALESCE(ro.loyalty_points_restaurant_obtained, 0) > 0
+         UNION ALL
          SELECT COALESCE(NULLIF(TRIM(${EVENT_TRANSACTION_ID}), ''), 'EVT-' || eo.id::text) AS order_no,
                 COALESCE(eo.loyalty_points_catering_obtained, 0) AS points_delta,
                 COALESCE(eo.stage_entered_at, eo.updated_at, eo.created_at) AS created_at,
@@ -2490,7 +2526,8 @@ app.get("/api/mobile/orders", async (req, res) => {
       `SELECT ${RESTAURANT_ORDER_SELECT},
               ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders
-       WHERE user_email = $1
+       WHERE LOWER(TRIM(COALESCE(user_email, ''))) = LOWER(TRIM($1))
+          OR LOWER(TRIM(COALESCE(guest_contact_email, ''))) = LOWER(TRIM($1))
        ORDER BY COALESCE(submitted_order_dt_stamp, last_updated_order_status_dt_stamp) DESC`,
       [userEmail],
     );
@@ -2697,7 +2734,10 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
       }
     }
     const { rows } = await getPool().query(
-      `SELECT mobile_id AS id, order_no, payment_uploaded FROM restaurant_orders WHERE mobile_id = $1`,
+      `SELECT mobile_id AS id,
+              COALESCE(order_id, 'ORD-' || LPAD(mobile_id::text, 6, '0')) AS order_no,
+              COALESCE(payment_uploaded_initial, FALSE) AS payment_uploaded
+       FROM restaurant_orders WHERE mobile_id = $1`,
       [id],
     );
     const orderNo = String((rows[0] as { order_no?: string } | undefined)?.order_no ?? "");
@@ -3508,11 +3548,9 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     res.status(400).json({ error: "event_city is required" });
     return;
   }
-  if (!note) {
-    res.status(400).json({ error: "note is required" });
-    return;
-  }
   const minGuests = inquiryType === "CATERING AND EVENT" ? CATERING_EVENT_MIN_GUESTS : CATERING_ONLY_MIN_GUESTS;
+  const paxBufferRaw = Number(req.body?.pax_buffer ?? 0);
+  const paxBuffer = Number.isFinite(paxBufferRaw) ? Math.max(0, Math.floor(paxBufferRaw)) : 0;
   if (guestCount < minGuests) {
     res.status(400).json({ error: `minimum guests for ${inquiryType} is ${minGuests}` });
     return;
@@ -3577,6 +3615,7 @@ app.post("/api/mobile/inquiries", async (req, res) => {
   }
   try {
     const cateringOnly = inquiryType.trim().toUpperCase() == "CATERING";
+    const customerId = (await customerBusinessIdForEmail(inquiryEmail)) ?? "";
     const txNo = await nextTransactionNo(cateringOnly ? "catering" : "event");
     const paymentMethod = String(req.body?.payment_method ?? "cash").trim().toLowerCase();
     const menuJson = JSON.stringify(selectedDishes);
@@ -3593,17 +3632,17 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     const sql = cateringOnly
       ? `INSERT INTO catering_orders
          (source, status, order_type, customer_name, contact_person, contact_number, email_address,
-          schedule_slots, address, guest_count, menu, event_title, event_type, formality_level, event_setting, checklist,
+          schedule_slots, address, guest_count, pax_buffer, menu, event_title, event_type, formality_level, event_setting, checklist,
           total_cost, customer_id, catering_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
          VALUES
-         ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19::jsonb, $20, $21, $22)
+         ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18, $19, $20::jsonb, $21, $22, $23)
          RETURNING id::text`
       : `INSERT INTO event_orders
          (source, status, order_type, event_title, event_type, formality_level, customer_name, contact_person, contact_number,
-          email_address, schedule_slots, address, guest_count, menu, theme_design, checklist,
+          email_address, schedule_slots, address, guest_count, pax_buffer, menu, theme_design, checklist,
           total_cost, customer_id, event_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
          VALUES
-         ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16, $17, $18, $19::jsonb, $20, $21, $22)
+         ('online_inquiry', 'online_inquiries', 'catering_event', $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19, $20::jsonb, $21, $22, $23)
          RETURNING id::text`;
     const params = cateringOnly
       ? [
@@ -3614,6 +3653,7 @@ app.post("/api/mobile/inquiries", async (req, res) => {
           JSON.stringify(scheduleSlots),
           eventCity,
           guestCount,
+          paxBuffer,
           menuJson,
           eventTitle.trim(),
           eventType.trim(),
@@ -3621,10 +3661,10 @@ app.post("/api/mobile/inquiries", async (req, res) => {
           eventSetting,
           JSON.stringify({
             items: autoChecklist,
-            post_analysis: { note, inquiry_type: inquiryType, service_included: serviceIncluded },
+            post_analysis: { note, inquiry_type: inquiryType, service_included: serviceIncluded, pax_buffer: paxBuffer },
           }),
           estimatedTotal + laborCost + travelCost,
-          userEmail,
+          customerId || null,
           txNo,
           paymentMethod,
           JSON.stringify(costBreakdown),
@@ -3643,14 +3683,15 @@ app.post("/api/mobile/inquiries", async (req, res) => {
           JSON.stringify(scheduleSlots),
           eventCity,
           guestCount,
+          paxBuffer,
           menuJson,
           themeDesignEvent,
           JSON.stringify({
             items: autoChecklist,
-            post_analysis: { note, inquiry_type: inquiryType },
+            post_analysis: { note, inquiry_type: inquiryType, pax_buffer: paxBuffer },
           }),
           estimatedTotal + laborCost + travelCost,
-          userEmail,
+          customerId || null,
           txNo,
           paymentMethod,
           JSON.stringify(costBreakdown),
@@ -3710,7 +3751,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
               CASE
                 WHEN ($2::boolean AND $1::text <> 'for_processing') THEN '[]'::jsonb
                 ELSE COALESCE(schedule_slots, '[]'::jsonb)
-              END AS schedule_slots, address, guest_count,
+              END AS schedule_slots, address, guest_count, COALESCE(pax_buffer, 0) AS pax_buffer,
               CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(menu, '[]'::jsonb) END AS menu,
               CASE WHEN $2::boolean THEN '{}'::jsonb ELSE COALESCE(theme_design, '{}'::jsonb) END AS theme_design,
               CASE WHEN ($2::boolean AND $1::text NOT IN ('for_post_analysis')) THEN '{}'::jsonb ELSE ${POST_ANALYSIS_JSON} END AS post_analysis,
@@ -3720,7 +3761,13 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                 COALESCE(theme_design->>'service_included', '') AS service_included,
                 ${EVENT_TRANSACTION_ID} AS transaction_no, payment_method,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(cost_breakdown, '[]'::jsonb) END AS cost_breakdown,
-                labor_cost, travel_cost, additional_costs, full_payment_due_at,
+                labor_cost, travel_cost,
+                CASE
+                  WHEN $1::text IN ('new_event', 'online_inquiries')
+                    THEN COALESCE(inquiry_additional_costs, additional_costs, '[]'::jsonb)
+                  ELSE COALESCE(stage_additional_costs, additional_costs, '[]'::jsonb)
+                END AS additional_costs,
+                full_payment_due_at,
                 COALESCE(NULLIF(TRIM(theme_design->>'event_setting'), ''), '') AS event_setting,
                 (
                   CASE
@@ -3757,7 +3804,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                 CASE
                   WHEN ($2::boolean AND $1::text <> 'for_processing') THEN '[]'::jsonb
                   ELSE COALESCE(schedule_slots, '[]'::jsonb)
-                END AS schedule_slots, address, guest_count,
+                END AS schedule_slots, address, guest_count, COALESCE(pax_buffer, 0) AS pax_buffer,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(menu, '[]'::jsonb) END AS menu,
                 '{}'::jsonb AS theme_design,
                 CASE WHEN ($2::boolean AND $1::text NOT IN ('for_post_analysis')) THEN '{}'::jsonb ELSE ${POST_ANALYSIS_JSON} END AS post_analysis,
@@ -3771,7 +3818,13 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                 COALESCE(event_setting, '') AS service_included,
                 ${CATERING_TRANSACTION_ID} AS transaction_no, payment_method,
                 CASE WHEN $2::boolean THEN '[]'::jsonb ELSE COALESCE(cost_breakdown, '[]'::jsonb) END AS cost_breakdown,
-                labor_cost, travel_cost, additional_costs, full_payment_due_at,
+                labor_cost, travel_cost,
+                CASE
+                  WHEN $1::text IN ('new_event', 'online_inquiries')
+                    THEN COALESCE(inquiry_additional_costs, additional_costs, '[]'::jsonb)
+                  ELSE COALESCE(stage_additional_costs, additional_costs, '[]'::jsonb)
+                END AS additional_costs,
+                full_payment_due_at,
                 COALESCE(NULLIF(TRIM(event_setting), ''), '') AS event_setting,
                 (
                   CASE
@@ -3816,11 +3869,12 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
         const table = String(r.order_kind) === "catering" ? "catering_orders" : "event_orders";
         const id = String(r.id ?? "").trim();
         if (!id) continue;
+        const packed = packChecklistWithPost(autoChecklist, null, r.checklist);
         await getPool().query(`UPDATE ${table} SET checklist = $2::jsonb, updated_at = NOW() WHERE id::text = $1`, [
           id,
-          JSON.stringify(autoChecklist),
+          JSON.stringify(packed ?? { items: autoChecklist }),
         ]);
-        r.checklist = autoChecklist;
+        r.checklist = packed ?? { items: autoChecklist };
       }
     }
     if (stage === "for_processing") {
@@ -3888,11 +3942,12 @@ app.post("/api/mobile/pos/catering/item", async (req, res) => {
         const autoChecklist = await generateChecklistFromMenu(r.menu);
         if (autoChecklist.length > 0) {
           const table = orderKind === "catering" ? "catering_orders" : "event_orders";
+          const packed = packChecklistWithPost(autoChecklist, null, r.checklist);
           await getPool().query(`UPDATE ${table} SET checklist = $2::jsonb, updated_at = NOW() WHERE id::text = $1`, [
             id,
-            JSON.stringify(autoChecklist),
+            JSON.stringify(packed ?? { items: autoChecklist }),
           ]);
-          r.checklist = autoChecklist;
+          r.checklist = packed ?? { items: autoChecklist };
         }
       }
     }
@@ -3933,6 +3988,8 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
   }
   const orderKind = String(req.body?.order_kind ?? "event").trim().toLowerCase();
   const guestCount = Math.max(0, Number(req.body?.guest_count ?? 0));
+  const paxBufferRaw = Number(req.body?.pax_buffer ?? 0);
+  const paxBuffer = Number.isFinite(paxBufferRaw) ? Math.max(0, Math.floor(paxBufferRaw)) : 0;
   const paymentMethod = String(req.body?.payment_method ?? "cash").trim().toLowerCase();
   const costBreakdown = Array.isArray(req.body?.cost_breakdown) ? req.body.cost_breakdown : [];
   const laborMale = Math.max(0, toNum(req.body?.labor_male_count, 0));
@@ -3978,7 +4035,7 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
   const payload = {
     source: "new_event",
     status: "new_event",
-    order_type: "catering",
+    order_type: orderKind === "catering" ? "catering" : "catering_event",
     customer_name: String(req.body?.customer_name ?? "").trim(),
     contact_person: String(req.body?.contact_person ?? "").trim(),
     contact_number: String(req.body?.contact_number ?? "").trim(),
@@ -3998,6 +4055,7 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
   try {
     await ensureNewEventSchemaOnce();
     const autoChecklist = await generateChecklistFromMenu(menuArr);
+    const checklistPacked = packChecklistWithPost(autoChecklist, { pax_buffer: paxBuffer }, null);
     const scheduleJson = JSON.stringify(payload.schedule_slots ?? []);
     const menuJson = JSON.stringify(menuArr);
     const themeJson = JSON.stringify(themeDesign ?? {});
@@ -4005,17 +4063,17 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
       orderKind === "catering"
         ? `INSERT INTO catering_orders
            (source, status, order_type, customer_name, contact_person, contact_number, email_address,
-            schedule_slots, address, guest_count, menu, event_setting, checklist,
+            schedule_slots, address, guest_count, pax_buffer, menu, event_setting, checklist,
             total_cost, created_by, updated_by, customer_id, catering_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
            VALUES
-           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $15, NULLIF($16, ''), $17, $18, $19::jsonb, $20, $21, $22)
+           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16, $16, NULLIF($17, ''), $18, $19, $20::jsonb, $21, $22, $23)
            RETURNING id::text`
         : `INSERT INTO event_orders
            (source, status, order_type, customer_name, contact_person, contact_number, email_address,
-            schedule_slots, address, guest_count, menu, theme_design, event_title, event_type, formality_level, checklist,
+            schedule_slots, address, guest_count, pax_buffer, menu, theme_design, event_title, event_type, formality_level, checklist,
             total_cost, created_by, updated_by, customer_id, event_id, payment_method, cost_breakdown, labor_cost, travel_cost, full_payment_due_at)
            VALUES
-           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17, $18, $19, NULLIF($20, ''), $21, $22, $23::jsonb, $24, $25, $26)
+           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16, $17::jsonb, $18, $19, $20, NULLIF($21, ''), $22, $23, $24::jsonb, $25, $26, $27)
            RETURNING id::text`;
     const params =
       orderKind === "catering"
@@ -4030,9 +4088,10 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
             scheduleJson,
             payload.address,
             payload.guest_count,
+            paxBuffer,
             menuJson,
             String((themeDesign as Record<string, unknown>)?.event_setting ?? "").trim(),
-            JSON.stringify(autoChecklist),
+            JSON.stringify(checklistPacked ?? { items: autoChecklist }),
             payload.total_cost,
             payload.created_by,
             payload.customer_id,
@@ -4054,12 +4113,13 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
             scheduleJson,
             payload.address,
             payload.guest_count,
+            paxBuffer,
             menuJson,
             themeJson,
             payload.event_title,
             payload.event_type,
             payload.formality_level,
-            JSON.stringify(autoChecklist),
+            JSON.stringify(checklistPacked ?? { items: autoChecklist }),
             payload.total_cost,
             payload.created_by,
             payload.created_by,
@@ -4193,6 +4253,7 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
         : mergedPost;
     const bumpStageEnteredAt = before.status !== nextStatus;
     const checklistPayload = packChecklistWithPost(checklistToSave, postToSave, before.checklist);
+    const addlCol = additionalCostsDbColumnForStatus(String(before.status ?? ""));
     const themeClause =
       orderKind === "event" ? "theme_design = COALESCE($12::jsonb, theme_design)," : "";
     const { rows } = await getPool().query(
@@ -4205,7 +4266,7 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
            full_payment_amount = COALESCE($5, full_payment_amount),
            full_payment_status = CASE WHEN $5 IS NULL THEN full_payment_status ELSE 'paid' END,
            checklist = COALESCE($6::jsonb, checklist),
-           additional_costs = COALESCE($7::jsonb, additional_costs),
+           ${addlCol} = COALESCE($7::jsonb, ${addlCol}),
            labor_cost = COALESCE($8, labor_cost),
            travel_cost = COALESCE($9, travel_cost),
            total_cost = COALESCE($10, total_cost),
@@ -4367,6 +4428,8 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
   const costBreakdown = Array.isArray(req.body?.cost_breakdown) ? req.body.cost_breakdown : null;
   const downPaymentAmount = Number(req.body?.down_payment_amount ?? NaN);
   const guestCount = Number(req.body?.guest_count ?? NaN);
+  const paxBufferRaw = Number(req.body?.pax_buffer ?? NaN);
+  const paxBuffer = Number.isFinite(paxBufferRaw) ? Math.max(0, Math.floor(paxBufferRaw)) : null;
   const address = req.body?.address != null ? String(req.body.address) : null;
   const scheduleSlots = req.body?.schedule_slots ?? null;
   const eventTitle = req.body?.event_title != null ? String(req.body.event_title) : null;
@@ -4391,19 +4454,20 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           checklist = COALESCE($3::jsonb, checklist),
           menu = COALESCE($4::jsonb, menu),
           theme_design = COALESCE($5::jsonb, theme_design),
-          additional_costs = COALESCE($6::jsonb, additional_costs),
+          inquiry_additional_costs = COALESCE($6::jsonb, inquiry_additional_costs),
           labor_cost = COALESCE($7, labor_cost),
           travel_cost = COALESCE($8, travel_cost),
           total_cost = COALESCE($9, total_cost),
           cost_breakdown = COALESCE($10::jsonb, cost_breakdown),
           down_payment_amount = COALESCE($11, down_payment_amount),
           guest_count = COALESCE($12, guest_count),
-          address = COALESCE($13, address),
-          schedule_slots = COALESCE($14::jsonb, schedule_slots),
-          customer_name = COALESCE($15, customer_name),
-          contact_person = COALESCE($16, contact_person),
-          contact_number = COALESCE($17, contact_number),
-          email_address = COALESCE($18, email_address)
+          pax_buffer = COALESCE($13, pax_buffer),
+          address = COALESCE($14, address),
+          schedule_slots = COALESCE($15::jsonb, schedule_slots),
+          customer_name = COALESCE($16, customer_name),
+          contact_person = COALESCE($17, contact_person),
+          contact_number = COALESCE($18, contact_number),
+          email_address = COALESCE($19, email_address)
         WHERE id::text = $1 AND status IN ('new_event', 'online_inquiries')`,
         [
           id,
@@ -4418,6 +4482,7 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           costBreakdown ? JSON.stringify(costBreakdown) : null,
           Number.isFinite(downPaymentAmount) ? downPaymentAmount : null,
           Number.isFinite(guestCount) ? Math.max(0, Math.floor(guestCount)) : null,
+          paxBuffer,
           address,
           scheduleSlots ? JSON.stringify(scheduleSlots) : null,
           customerName || null,
@@ -4434,22 +4499,23 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           checklist = COALESCE($3::jsonb, checklist),
           menu = COALESCE($4::jsonb, menu),
           theme_design = COALESCE($5::jsonb, theme_design),
-          additional_costs = COALESCE($6::jsonb, additional_costs),
+          inquiry_additional_costs = COALESCE($6::jsonb, inquiry_additional_costs),
           labor_cost = COALESCE($7, labor_cost),
           travel_cost = COALESCE($8, travel_cost),
           total_cost = COALESCE($9, total_cost),
           cost_breakdown = COALESCE($10::jsonb, cost_breakdown),
           down_payment_amount = COALESCE($11, down_payment_amount),
           guest_count = COALESCE($12, guest_count),
-          address = COALESCE($13, address),
-          schedule_slots = COALESCE($14::jsonb, schedule_slots),
-          event_title = COALESCE($15, event_title),
-          event_type = COALESCE($16, event_type),
-          formality_level = COALESCE($17, formality_level),
-          customer_name = COALESCE($18, customer_name),
-          contact_person = COALESCE($19, contact_person),
-          contact_number = COALESCE($20, contact_number),
-          email_address = COALESCE($21, email_address)
+          pax_buffer = COALESCE($13, pax_buffer),
+          address = COALESCE($14, address),
+          schedule_slots = COALESCE($15::jsonb, schedule_slots),
+          event_title = COALESCE($16, event_title),
+          event_type = COALESCE($17, event_type),
+          formality_level = COALESCE($18, formality_level),
+          customer_name = COALESCE($19, customer_name),
+          contact_person = COALESCE($20, contact_person),
+          contact_number = COALESCE($21, contact_number),
+          email_address = COALESCE($22, email_address)
         WHERE id::text = $1 AND status IN ('new_event', 'online_inquiries')`,
         [
           id,
@@ -4464,6 +4530,7 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           costBreakdown ? JSON.stringify(costBreakdown) : null,
           Number.isFinite(downPaymentAmount) ? downPaymentAmount : null,
           Number.isFinite(guestCount) ? Math.max(0, Math.floor(guestCount)) : null,
+          paxBuffer,
           address,
           scheduleSlots ? JSON.stringify(scheduleSlots) : null,
           eventTitle,

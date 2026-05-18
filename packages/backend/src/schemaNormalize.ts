@@ -210,6 +210,8 @@ const CATERING_ORDERS_COLUMNS = new Set([
   "full_payment_status",
   "full_payment_proof",
   "additional_costs",
+  "inquiry_additional_costs",
+  "stage_additional_costs",
   "total_cost",
   "estimated_cost",
   "labor_cost",
@@ -1110,6 +1112,12 @@ async function normalizeCateringOrders(pool: pg.Pool): Promise<void> {
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS formality_level TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS event_setting TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS pax_buffer INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(
+    `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS inquiry_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`,
+  );
+  await pool.query(
+    `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS stage_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`,
+  );
   await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(12,2)`);
   await pool.query(
     `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS loyalty_points_catering_obtained INTEGER NOT NULL DEFAULT 0`,
@@ -1152,6 +1160,12 @@ async function normalizeEventOrders(pool: pg.Pool): Promise<void> {
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS event_id TEXT`);
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`);
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS pax_buffer INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(
+    `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS inquiry_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`,
+  );
+  await pool.query(
+    `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS stage_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`,
+  );
   await pool.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(12,2)`);
   await pool.query(
     `ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS loyalty_points_catering_obtained INTEGER NOT NULL DEFAULT 0`,
