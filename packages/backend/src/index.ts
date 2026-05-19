@@ -28,11 +28,13 @@ import {
   EVENT_TRANSACTION_ID,
   POST_ANALYSIS_JSON,
   RESTAURANT_ORDER_PATCH_SELECT,
+  RESTAURANT_ORDER_LIST_SELECT,
   RESTAURANT_ORDER_SELECT,
   customerForgotOtpUpdateSql,
   mapProfileRowForApi,
   mapRestaurantOrderRowForApi,
   restaurantLoyaltyEarnedSql,
+  restaurantOrderListSelectSql,
   restaurantOrderSelectSql,
 } from "./sqlCompat.js";
 
@@ -1727,7 +1729,7 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
   try {
     await ensureRestaurantOrderApiColumnsOnce();
     const { rows } = await getPool().query(
-      `SELECT ${restaurantOrderSelectSql("mo")},
+      `SELECT ${restaurantOrderListSelectSql("mo")},
               COALESCE(NULLIF(TRIM(cp.full_name), ''), NULLIF(TRIM(mo.full_name), ''), NULLIF(TRIM(mo.pos_customer_label), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
               ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")}
        FROM restaurant_orders mo
@@ -1737,6 +1739,44 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
     res.json(out);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "database error",
+    });
+  }
+});
+
+/** Full row including payment proof images (open from cashier order detail). */
+app.post("/api/mobile/pos/online-orders/:id/detail", async (req, res) => {
+  const id = Number(req.params.id);
+  const cashierEmail = String(req.body?.cashier_email ?? "").trim().toLowerCase();
+  const cashierPassword = String(req.body?.cashier_password ?? "");
+  if (!id || !cashierEmail || !cashierPassword) {
+    res.status(400).json({ error: "id and cashier credentials are required" });
+    return;
+  }
+  if (!(await verifyPosStaff(cashierEmail, cashierPassword, ["cashier"])).ok) {
+    res.status(403).json({ error: "invalid cashier credentials" });
+    return;
+  }
+  try {
+    await ensureRestaurantOrderApiColumnsOnce();
+    const { rows } = await getPool().query(
+      `SELECT ${restaurantOrderSelectSql("mo")},
+              COALESCE(NULLIF(TRIM(cp.full_name), ''), NULLIF(TRIM(mo.full_name), ''), NULLIF(TRIM(mo.pos_customer_label), ''), mo.user_email, mo.guest_contact_email) AS customer_display_name,
+              ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")}
+       FROM restaurant_orders mo
+       LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
+       WHERE mo.mobile_id = $1 AND ${CASHIER_ONLINE_ORDER_WHERE}`,
+      [id],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "online order not found" });
+      return;
+    }
+    const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
+    res.json(out[0] ?? null);
   } catch (err) {
     console.error(err);
     res.status(500).json({
@@ -2366,7 +2406,7 @@ app.post("/api/mobile/pos/order-history", async (req, res) => {
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT ${RESTAURANT_ORDER_SELECT},
+      `SELECT ${RESTAURANT_ORDER_LIST_SELECT},
               ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders
        WHERE (
@@ -2405,7 +2445,7 @@ app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
     await ensureRestaurantOrderApiColumnsOnce();
     if (filter === "cancelled") {
       const { rows } = await getPool().query(
-        `SELECT ${RESTAURANT_ORDER_SELECT},
+        `SELECT ${RESTAURANT_ORDER_LIST_SELECT},
                 COALESCE(NULLIF(TRIM(pos_customer_label), ''), NULLIF(TRIM(full_name), ''), '') AS customer_display_name,
                 0::int AS loyalty_points_earned
          FROM restaurant_orders
@@ -2422,7 +2462,7 @@ app.post("/api/mobile/pos/walkin-queue", async (req, res) => {
       ? `upper(COALESCE(order_status, '')) LIKE '%CLAIMED%'`
       : `upper(COALESCE(order_status, '')) NOT LIKE '%CLAIMED%'`;
     const { rows } = await getPool().query(
-      `SELECT ${RESTAURANT_ORDER_SELECT},
+      `SELECT ${RESTAURANT_ORDER_LIST_SELECT},
               COALESCE(NULLIF(TRIM(pos_customer_label), ''), NULLIF(TRIM(full_name), ''), '') AS customer_display_name,
               0::int AS loyalty_points_earned
        FROM restaurant_orders

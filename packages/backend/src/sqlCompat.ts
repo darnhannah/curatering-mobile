@@ -81,6 +81,68 @@ export function restaurantOrderSelectSql(alias?: string): string {
 /** Shared SELECT list for restaurant order API responses (legacy aliases included). */
 export const RESTAURANT_ORDER_SELECT = restaurantOrderSelectSql();
 
+/** List/cashier queue SELECT: omits large payment proof blobs; references + flags remain. */
+export function restaurantOrderListSelectSql(alias?: string): string {
+  const a = alias;
+  const idRef = col(a, "id");
+  return `
+  ${col(a, "mobile_id")},
+  ${col(a, "mobile_id")} AS id,
+  ${idRef} AS order_uuid,
+  ${col(a, "user_email")},
+  COALESCE(NULLIF(TRIM(${col(a, "order_no")}), ''), NULLIF(TRIM(${col(a, "order_id")}), ''), CASE WHEN ${col(a, "mobile_id")} IS NOT NULL THEN 'ORD-' || LPAD(${col(a, "mobile_id")}::text, 6, '0') END) AS order_no,
+  COALESCE(NULLIF(TRIM(${col(a, "order_id")}), ''), NULLIF(TRIM(${col(a, "order_no")}), ''), CASE WHEN ${col(a, "mobile_id")} IS NOT NULL THEN 'ORD-' || LPAD(${col(a, "mobile_id")}::text, 6, '0') END) AS order_id,
+  COALESCE(${col(a, "order_status")}, 'PENDING_CASHIER') AS status,
+  COALESCE(${col(a, "order_status")}, 'PENDING_CASHIER') AS fulfillment_stage,
+  COALESCE(${col(a, "total_cost")}, 0) AS total,
+  ${col(a, "total_cost")},
+  COALESCE(${col(a, "delivery_notes")}, '') AS note,
+  ${col(a, "delivery_notes")},
+  ${col(a, "payment_mode")},
+  COALESCE(${col(a, "payment_uploaded_initial")}, FALSE) AS payment_uploaded,
+  ${col(a, "payment_uploaded_initial")},
+  NULL::text AS payment_proof,
+  NULL::text AS payment_proof_initial,
+  NULL::text AS supplemental_payment_proof,
+  NULL::text AS payment_proof_balance,
+  COALESCE(NULLIF(TRIM(${col(a, "payment_reference_initial")}), ''), '') AS payment_reference_initial,
+  COALESCE(NULLIF(TRIM(${col(a, "payment_reference_balance")}), ''), '') AS payment_reference_balance,
+  COALESCE(${col(a, "payment_uploaded_balance")}, FALSE) AS payment_uploaded_balance,
+  COALESCE(${col(a, "payment_confirmed_initial")}, FALSE) AS payment_confirmed_initial,
+  COALESCE(${col(a, "payment_confirmed_balance")}, FALSE) AS payment_confirmed_balance,
+  COALESCE(${col(a, "loyalty_points_restaurant_obtained")}, 0) AS loyalty_points_restaurant_obtained,
+  ${col(a, "loyalty_reward_restaurant_obtained")},
+  COALESCE(NULLIF(TRIM(${col(a, "full_name")}), ''), '') AS delivery_name,
+  COALESCE(NULLIF(TRIM(${col(a, "full_name")}), ''), '') AS full_name,
+  COALESCE(NULLIF(TRIM(${col(a, "contact_number")}), ''), '') AS delivery_contact,
+  COALESCE(NULLIF(TRIM(${col(a, "contact_number")}), ''), '') AS contact_number,
+  ${col(a, "delivery_address")},
+  ${col(a, "delivery_lat")},
+  ${col(a, "delivery_lng")},
+  ${col(a, "delivery_time")},
+  COALESCE(${col(a, "submitted_order_dt_stamp")}, NOW()) AS created_at,
+  ${col(a, "submitted_order_dt_stamp")},
+  COALESCE(${col(a, "last_updated_order_status_dt_stamp")}, ${col(a, "submitted_order_dt_stamp")}, NOW()) AS updated_at,
+  ${col(a, "last_updated_order_status_dt_stamp")},
+  ${col(a, "order_source")},
+  COALESCE(NULLIF(TRIM(${col(a, "pos_customer_label")}), ''), '') AS pos_customer_label,
+  COALESCE(${col(a, "cashier_amount_received_initial")}, 0) AS cashier_amount_received,
+  ${col(a, "cashier_amount_received_initial")},
+  COALESCE(${col(a, "cashier_amount_received_balance")}, 0) AS cashier_secondary_amount_received,
+  ${col(a, "cashier_amount_received_balance")},
+  0::numeric AS cashier_change,
+  ${col(a, "delivery_tracking_url")},
+  COALESCE(${col(a, "tray_items")}, '[]'::jsonb) AS order_lines_snapshot,
+  ${col(a, "tray_items")},
+  (upper(COALESCE(${col(a, "order_status")}, '')) LIKE '%CLAIMED%') AS pos_claimed,
+  FALSE AS balance_proof_pending_review,
+  ${col(a, "guest_contact_email")},
+  ${col(a, "customer_id")}
+`.trim();
+}
+
+export const RESTAURANT_ORDER_LIST_SELECT = restaurantOrderListSelectSql();
+
 /** Minimal SELECT for cashier PATCH handlers (canonical columns only). */
 export const RESTAURANT_ORDER_PATCH_SELECT = `
   mobile_id AS id,

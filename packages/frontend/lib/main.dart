@@ -458,6 +458,7 @@ class _PostLoginWelcomeScopeState extends State<_PostLoginWelcomeScope> {
 const Duration _apiTimeout = Duration(seconds: 30);
 /// Manager catering list can return many rows; allow a longer read than generic APIs.
 const Duration _managerCateringListTimeout = Duration(seconds: 120);
+const Duration _cashierOrdersCacheDuration = Duration(seconds: 20);
 
 /// Local Node backend is HTTP-only; [https] to these hosts breaks TLS handshakes.
 bool _devBackendHttpHost(String host) {
@@ -1207,8 +1208,9 @@ class OrderData {
   final String? customerDisplayName;
   /// Points earned for this order once confirmed (floor of total); from API `loyalty_points_earned`.
   final int loyaltyPointsEarned;
-  /// GCash / bank reference entered on web checkout (not an image).
+  /// `restaurant_orders.payment_reference_initial` (GCash ref, not an image).
   final String? paymentReferenceInitial;
+  /// `restaurant_orders.payment_reference_balance` when applicable.
   final String? paymentReferenceBalance;
   final String? guestContactEmail;
   /// Canonical name on the order row (`full_name`), when set by web or checkout.
@@ -1229,20 +1231,16 @@ bool looksLikeBase64ImageProof(String? raw) {
   }
 }
 
+/// GCash reference from `restaurant_orders.payment_reference_initial` only.
 String? orderPaymentReferenceInitial(OrderData o) {
   final r = o.paymentReferenceInitial?.trim();
-  if (r != null && r.isNotEmpty) return r;
-  final p = o.paymentProofBase64?.trim();
-  if (p != null && p.isNotEmpty && !looksLikeBase64ImageProof(p)) return p;
-  return null;
+  return (r != null && r.isNotEmpty) ? r : null;
 }
 
+/// GCash reference from `restaurant_orders.payment_reference_balance` only.
 String? orderPaymentReferenceBalance(OrderData o) {
   final r = o.paymentReferenceBalance?.trim();
-  if (r != null && r.isNotEmpty) return r;
-  final p = o.supplementalPaymentProofBase64?.trim();
-  if (p != null && p.isNotEmpty && !looksLikeBase64ImageProof(p)) return p;
-  return null;
+  return (r != null && r.isNotEmpty) ? r : null;
 }
 
 bool orderHasInitialPaymentProofImage(OrderData o) => looksLikeBase64ImageProof(o.paymentProofBase64);
@@ -1252,6 +1250,29 @@ bool orderHasBalancePaymentProofImage(OrderData o) => looksLikeBase64ImageProof(
 bool orderHasPaymentOnFile(OrderData o) =>
     o.paymentUploaded || orderPaymentReferenceInitial(o) != null || orderHasInitialPaymentProofImage(o);
 
+bool orderHasBalancePaymentOnFile(OrderData o) =>
+    orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o);
+
+Widget cashierPaymentReferenceCard(String label, String reference) {
+  return Card(
+    color: Colors.blueGrey.shade50,
+    child: Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(label, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
+          const SizedBox(height: 6),
+          SelectableText(
+            reference,
+            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16, letterSpacing: 0.3),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 List<Widget> cashierPaymentProofAndReferenceSection(
   BuildContext context,
   OrderData o, {
@@ -1259,18 +1280,8 @@ List<Widget> cashierPaymentProofAndReferenceSection(
 }) {
   final widgets = <Widget>[];
   final initRef = orderPaymentReferenceInitial(o);
-  if (initRef != null) {
-    widgets.add(LockedField(label: 'PAYMENT REFERENCE (full)', value: initRef));
-    widgets.add(const SizedBox(height: 8));
-  }
-  if (includeBalance) {
-    final balRef = orderPaymentReferenceBalance(o);
-    if (balRef != null) {
-      widgets.add(LockedField(label: 'PAYMENT REFERENCE (balance)', value: balRef));
-      widgets.add(const SizedBox(height: 8));
-    }
-  }
-  if (orderHasInitialPaymentProofImage(o)) {
+  final hasInitImage = orderHasInitialPaymentProofImage(o);
+  if (hasInitImage) {
     widgets.add(
       OutlinedButton(
         onPressed: () {
@@ -1284,30 +1295,39 @@ List<Widget> cashierPaymentProofAndReferenceSection(
         child: const Text('VIEW PROOF OF PAYMENT'),
       ),
     );
+  } else if (initRef != null) {
+    widgets.add(cashierPaymentReferenceCard('PAYMENT REFERENCE (full payment)', initRef));
   }
-  if (includeBalance && orderHasBalancePaymentProofImage(o)) {
-    if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 8));
-    widgets.add(
-      OutlinedButton(
-        onPressed: () {
-          try {
-            final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
-            showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
-          } catch (_) {
-            appSnack(context, 'Could not display image');
-          }
-        },
-        child: const Text('VIEW BALANCE PAYMENT PROOF'),
-      ),
-    );
+  if (includeBalance) {
+    final balRef = orderPaymentReferenceBalance(o);
+    final hasBalImage = orderHasBalancePaymentProofImage(o);
+    if (hasBalImage) {
+      if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 8));
+      widgets.add(
+        OutlinedButton(
+          onPressed: () {
+            try {
+              final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+              showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
+            } catch (_) {
+              appSnack(context, 'Could not display image');
+            }
+          },
+          child: const Text('VIEW BALANCE PAYMENT PROOF'),
+        ),
+      );
+    } else if (balRef != null) {
+      if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 8));
+      widgets.add(cashierPaymentReferenceCard('PAYMENT REFERENCE (balance)', balRef));
+    }
   }
   return widgets;
 }
 
 OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> lines) {
-  final proofRaw = map['payment_proof'];
+  final proofRaw = map['payment_proof'] ?? map['payment_proof_initial'];
   final proofStr = proofRaw != null ? '$proofRaw'.trim() : '';
-  final supRaw = map['supplemental_payment_proof'];
+  final supRaw = map['supplemental_payment_proof'] ?? map['payment_proof_balance'];
   final supStr = supRaw != null ? '$supRaw'.trim() : '';
   final refInit = '${map['payment_reference_initial'] ?? ''}'.trim();
   final refBal = '${map['payment_reference_balance'] ?? ''}'.trim();
@@ -1322,7 +1342,8 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
     createdAt: jsonToDateTime(map['created_at'], DateTime.now()),
     updatedAt: map['updated_at'] != null ? jsonToDateTime(map['updated_at'], DateTime.now()) : null,
     paymentUploaded: jsonToBool(map['payment_uploaded']),
-    paymentProofBase64: proofStr.isNotEmpty ? proofStr : null,
+    paymentProofBase64:
+        proofStr.isNotEmpty && looksLikeBase64ImageProof(proofStr) ? proofStr : null,
     lines: lines,
     userEmail: map['user_email'] != null && '${map['user_email']}'.trim().isNotEmpty ? '${map['user_email']}' : null,
     note: '${map['note'] ?? ''}',
@@ -1337,7 +1358,8 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
     cashierChange: map['cashier_change'] != null ? jsonToDouble(map['cashier_change']) : null,
     fulfillmentStage: '${map['fulfillment_stage'] ?? 'PENDING_CASHIER'}'.trim(),
     deliveryTrackingUrl: '${map['delivery_tracking_url'] ?? ''}'.trim(),
-    supplementalPaymentProofBase64: supStr.isNotEmpty ? supStr : null,
+    supplementalPaymentProofBase64:
+        supStr.isNotEmpty && looksLikeBase64ImageProof(supStr) ? supStr : null,
     cashierSecondaryAmountReceived:
         map['cashier_secondary_amount_received'] != null ? jsonToDouble(map['cashier_secondary_amount_received']) : null,
     balanceProofPendingReview: jsonToBool(map['balance_proof_pending_review']),
@@ -2440,8 +2462,10 @@ class AppState extends ChangeNotifier {
     try {
       if (isCashier) {
         await loadMenu(force: true);
-        await loadCashierOnlineOrders(force: true);
-        await loadCashierWalkInQueues(force: true);
+        await Future.wait([
+          loadCashierOnlineOrders(force: true),
+          loadCashierWalkInQueues(force: true),
+        ]);
         await loadNotifications(force: true);
       } else if (isSupervisor) {
         _managerActiveStage = kStageForOngoing;
@@ -3234,8 +3258,8 @@ class AppState extends ChangeNotifier {
           final orderIds = delta?['restaurant_order_ids'];
           final allow = delta == null || (orderIds is List && orderIds.isNotEmpty);
           if (allow) {
-            jobs.add(loadCashierOnlineOrders(force: true));
-            jobs.add(loadCashierWalkInQueues(force: true));
+            jobs.add(loadCashierOnlineOrders());
+            jobs.add(loadCashierWalkInQueues());
           }
         }
         if (_stampChanged(previous, next, 'notifications')) {
@@ -3258,7 +3282,7 @@ class AppState extends ChangeNotifier {
           if (allow) {
             jobs.add(loadManagerCateringByStage(managerActiveStage, force: true));
             if (isSupervisor) {
-              jobs.add(loadManagerCateringByStage(kStageForOngoing, force: true));
+              jobs.add(loadManagerCateringByStage(kStageForOngoing));
             }
           }
         }
@@ -4507,7 +4531,7 @@ class AppState extends ChangeNotifier {
     if (userEmail == null || !isCashier) return;
     if (!force &&
         _cashierOnlineOrdersLoadedAt != null &&
-        DateTime.now().difference(_cashierOnlineOrdersLoadedAt!) < const Duration(seconds: 4)) {
+        DateTime.now().difference(_cashierOnlineOrdersLoadedAt!) < _cashierOrdersCacheDuration) {
       return;
     }
     if (_loadCashierOnlineOrdersInFlight) {
@@ -4560,11 +4584,51 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Merge full order row (with payment proof images) into [cashierOnlineOrders] after opening detail.
+  Future<void> loadCashierOrderDetail(int orderId) async {
+    if (userEmail == null || !isCashier) return;
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/pos/online-orders/$orderId/detail'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'cashier_email': userEmail,
+              'cashier_password': loginPassword,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return;
+      final map = body;
+      final lines = orderLinesFromApiMap(map);
+      final parsed = orderDataFromApiMap(map, lines);
+      final idx = cashierOnlineOrders.indexWhere((o) => o.id == orderId);
+      if (idx >= 0) {
+        cashierOnlineOrders[idx] = parsed;
+      } else {
+        cashierOnlineOrders.add(parsed);
+      }
+      notifyListeners();
+    } catch (e) {
+      debugPrint('loadCashierOrderDetail($orderId): $e');
+    }
+  }
+
+  void patchCashierOnlineOrderLocally(int orderId, OrderData updated) {
+    final idx = cashierOnlineOrders.indexWhere((o) => o.id == orderId);
+    if (idx >= 0) {
+      cashierOnlineOrders[idx] = updated;
+      notifyListeners();
+    }
+  }
+
   Future<void> loadCashierOrderHistory({bool force = false}) async {
     if (userEmail == null || !isCashier || _loadCashierOrderHistoryInFlight) return;
     if (!force &&
         _cashierOrderHistoryLoadedAt != null &&
-        DateTime.now().difference(_cashierOrderHistoryLoadedAt!) < const Duration(seconds: 4)) {
+        DateTime.now().difference(_cashierOrderHistoryLoadedAt!) < _cashierOrdersCacheDuration) {
       return;
     }
     _loadCashierOrderHistoryInFlight = true;
@@ -4601,7 +4665,7 @@ class AppState extends ChangeNotifier {
     if (userEmail == null || !isCashier || _loadCashierWalkInQueuesInFlight) return;
     if (!force &&
         _cashierWalkInQueuesLoadedAt != null &&
-        DateTime.now().difference(_cashierWalkInQueuesLoadedAt!) < const Duration(seconds: 4)) {
+        DateTime.now().difference(_cashierWalkInQueuesLoadedAt!) < _cashierOrdersCacheDuration) {
       return;
     }
     _loadCashierWalkInQueuesInFlight = true;
@@ -4782,7 +4846,7 @@ class AppState extends ChangeNotifier {
           return 'Update failed (${res.statusCode})';
         }
       }
-      await loadCashierOnlineOrders(force: true);
+      await loadCashierOnlineOrders();
       notifyListeners();
       return null;
     } catch (e) {
@@ -21041,16 +21105,18 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
       setState(() {});
       if (!_tab.indexIsChanging) {
         if (_tab.index == 1) {
-          widget.state.loadCashierOnlineOrders(force: true);
+          widget.state.loadCashierOnlineOrders();
         }
         if (_tab.index == 2) {
-          widget.state.loadCashierWalkInQueues(force: true);
+          widget.state.loadCashierWalkInQueues();
         }
       }
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      widget.state.loadCashierOnlineOrders(force: true);
-      widget.state.loadCashierWalkInQueues(force: true);
+      unawaited(Future.wait([
+        widget.state.loadCashierOnlineOrders(),
+        widget.state.loadCashierWalkInQueues(),
+      ]));
     });
   }
 
@@ -22793,6 +22859,9 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
     amountReceived.text = o.cashierAmountReceived?.toStringAsFixed(2) ?? '';
     supplementalAmount.text = o.cashierSecondaryAmountReceived?.toStringAsFixed(2) ?? '';
     trackingUrl.text = o.deliveryTrackingUrl;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.state.loadCashierOrderDetail(widget.order.id);
+    });
   }
 
   @override
@@ -23039,8 +23108,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         final trackingReadOnly = o.deliveryTrackingUrl.trim().isNotEmpty;
         final statusUp = o.status.toUpperCase();
         final insufficientStatus = statusUp.contains('INSUFFICIENT');
-        final hasSupProof =
-            orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o);
+        final hasSupProof = orderHasBalancePaymentOnFile(o);
         final awaitingBalanceConfirm =
             statusUp.contains('WAITING FOR BALANCE') || statusUp.contains('BALANCE PAYMENT CONFIRMATION');
         final pendingBalReview = hasSupProof && (o.balanceProofPendingReview || awaitingBalanceConfirm);
@@ -23128,10 +23196,16 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                         ] else if (pendingBalReview) ...[
                           Card(
                             color: Colors.deepOrange.shade50,
-                            child: const ListTile(
-                              leading: Icon(Icons.mark_email_unread, color: Colors.deepOrange),
-                              title: Text('Customer uploaded balance payment proof'),
-                              subtitle: Text('Verify the supplemental proof and enter how much they paid for the balance.'),
+                            child: ListTile(
+                              leading: const Icon(Icons.mark_email_unread, color: Colors.deepOrange),
+                              title: Text(
+                                orderHasBalancePaymentProofImage(o)
+                                    ? 'Customer uploaded balance payment proof'
+                                    : 'Customer submitted balance payment reference',
+                              ),
+                              subtitle: const Text(
+                                'Verify the supplemental payment and enter how much they paid for the balance.',
+                              ),
                             ),
                           ),
                           const SizedBox(height: 10),
@@ -23149,7 +23223,11 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
+                          const SizedBox(height: 10),
+                          ...cashierPaymentProofAndReferenceSection(context, o),
                         ] else ...[
+                          ...cashierPaymentProofAndReferenceSection(context, o, includeBalance: false),
+                          const SizedBox(height: 10),
                           TextField(
                             controller: amountReceived,
                             keyboardType: TextInputType.number,
@@ -23157,7 +23235,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             decoration: InputDecoration(
                               labelText: 'AMOUNT RECEIVED',
                               helperText: waitingCustomerBalance
-                                  ? 'Waiting for customer balance proof in the app.'
+                                  ? 'Waiting for customer balance proof or reference in the app.'
                                   : (insufficientStatus
                                       ? 'Adjust if needed, then mark insufficient or overpayment.'
                                       : null),
@@ -23173,7 +23251,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           Padding(
                             padding: const EdgeInsets.only(top: 10),
                             child: Text(
-                              'Waiting for the customer to upload balance payment proof in the app.',
+                              'Waiting for the customer to upload balance payment proof or reference in the app.',
                               style: TextStyle(color: Colors.deepOrange.shade900, fontWeight: FontWeight.w700),
                             ),
                           ),
@@ -23183,7 +23261,6 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
                         const SizedBox(height: 10),
-                        ...cashierPaymentProofAndReferenceSection(context, o),
                         if (!paymentLocked && !waitingCustomerBalance) ...[
                           const SizedBox(height: 8),
                           FilledButton(
@@ -23409,10 +23486,16 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                         ] else if (pendingBalReview) ...[
                           Card(
                             color: Colors.deepOrange.shade50,
-                            child: const ListTile(
-                              leading: Icon(Icons.mark_email_unread, color: Colors.deepOrange),
-                              title: Text('Customer uploaded balance payment proof'),
-                              subtitle: Text('Verify the supplemental proof and enter how much they paid for the balance.'),
+                            child: ListTile(
+                              leading: const Icon(Icons.mark_email_unread, color: Colors.deepOrange),
+                              title: Text(
+                                orderHasBalancePaymentProofImage(o)
+                                    ? 'Customer uploaded balance payment proof'
+                                    : 'Customer submitted balance payment reference',
+                              ),
+                              subtitle: const Text(
+                                'Verify the supplemental payment and enter how much they paid for the balance.',
+                              ),
                             ),
                           ),
                           const SizedBox(height: 10),
@@ -23430,7 +23513,11 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
+                          const SizedBox(height: 10),
+                          ...cashierPaymentProofAndReferenceSection(context, o),
                         ] else ...[
+                          ...cashierPaymentProofAndReferenceSection(context, o, includeBalance: false),
+                          const SizedBox(height: 10),
                           TextField(
                             controller: amountReceived,
                             keyboardType: TextInputType.number,
@@ -23438,7 +23525,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             decoration: InputDecoration(
                               labelText: 'AMOUNT RECEIVED',
                               helperText: waitingCustomerBalance
-                                  ? 'Waiting for customer balance proof in the app.'
+                                  ? 'Waiting for customer balance proof or reference in the app.'
                                   : (insufficientStatus
                                       ? 'Adjust if needed, then mark insufficient or overpayment.'
                                       : null),
@@ -23454,7 +23541,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           Padding(
                             padding: const EdgeInsets.only(top: 10),
                             child: Text(
-                              'Waiting for the customer to upload balance payment proof in the app.',
+                              'Waiting for the customer to upload balance payment proof or reference in the app.',
                               style: TextStyle(color: Colors.deepOrange.shade900, fontWeight: FontWeight.w700),
                             ),
                           ),
@@ -23464,7 +23551,6 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
                         const SizedBox(height: 10),
-                        ...cashierPaymentProofAndReferenceSection(context, o),
                         if (!paymentLocked && !waitingCustomerBalance) ...[
                           const SizedBox(height: 8),
                           FilledButton(
@@ -23540,7 +23626,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                 child: Column(
                   children: [
                     Text(
-                      'Waiting for the customer to upload balance payment proof in the app. You can confirm once it appears above.',
+                      'Waiting for the customer to upload balance payment proof or reference in the app. You can confirm once it appears above.',
                       textAlign: TextAlign.center,
                       style: TextStyle(fontWeight: FontWeight.w700, color: Colors.orange.shade900),
                     ),
@@ -23627,7 +23713,10 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           return;
                         }
                         if (isGcash && !proofOk) {
-                          appSnack(context, 'Customer payment proof must be received before confirming.');
+                          appSnack(
+                            context,
+                            'Customer payment proof or reference must be received before confirming.',
+                          );
                           return;
                         }
                         if (!await _confirmDialog(
