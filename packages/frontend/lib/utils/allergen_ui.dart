@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -87,29 +88,67 @@ Widget managerThemeDesignImagePreview(Map<String, dynamic> themeDesign, {double 
   );
 }
 
-/// Read-only dish sheet: image, description, allergens (Inquire Catering / menu browse).
+Widget _dishDetailSection(String title, String body) {
+  if (body.trim().isEmpty) return const SizedBox.shrink();
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+        const SizedBox(height: 4),
+        Text(body.trim(), style: TextStyle(height: 1.35, fontSize: 13, color: Colors.grey.shade800)),
+      ],
+    ),
+  );
+}
+
+Widget _dishDetailAllergenColumn(List<String> allergens) {
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+      const SizedBox(height: 6),
+      if (allergens.isEmpty)
+        Text('None listed', style: TextStyle(fontSize: 12, color: Colors.grey.shade700))
+      else
+        ...allergens.map(
+          (a) => Padding(
+            padding: const EdgeInsets.only(bottom: 3),
+            child: Text('• $a', style: const TextStyle(fontSize: 12, height: 1.3)),
+          ),
+        ),
+    ],
+  );
+}
+
+/// Read-only dish sheet: image left, description/ingredients center, allergens right.
 Future<void> showMenuDishDetailDialog(
   BuildContext context, {
   required String dishName,
   String description = '',
+  List<String> ingredients = const [],
   List<String> allergens = const [],
   String? imageBase64,
+  String? lineNote,
 }) {
   final desc = description.trim();
+  final ing = ingredients.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
   final list = allergens.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+  final note = lineNote?.trim() ?? '';
   final raw = imageBase64?.trim();
   Widget? imageWidget;
   if (raw != null && raw.isNotEmpty) {
     try {
       final bytes = Uint8List.fromList(base64Decode(raw));
       imageWidget = ClipRRect(
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(8),
         child: Image.memory(
           bytes,
-          height: 200,
+          width: 96,
+          height: 96,
           fit: BoxFit.cover,
-          width: double.infinity,
-          cacheWidth: 480,
+          cacheWidth: 240,
           errorBuilder: (_, __, ___) => const SizedBox.shrink(),
         ),
       );
@@ -120,43 +159,36 @@ Future<void> showMenuDishDetailDialog(
   return showDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
-      title: Text(dishName, maxLines: 3),
-      content: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (imageWidget != null) ...[
-              imageWidget,
-              const SizedBox(height: 12),
-            ],
-            if (desc.isNotEmpty) ...[
-              const Text('Description', style: TextStyle(fontWeight: FontWeight.w800)),
-              const SizedBox(height: 6),
-              Text(desc, style: TextStyle(height: 1.35, color: Colors.grey.shade800)),
-              const SizedBox(height: 12),
-            ],
-            const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
-            const SizedBox(height: 8),
-            if (list.isEmpty)
-              Text(
-                'No allergens listed for this dish.',
-                style: TextStyle(color: Colors.grey.shade700),
-              )
-            else
-              ...list.map(
-                (a) => Padding(
-                  padding: const EdgeInsets.only(bottom: 4),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('• '),
-                      Expanded(child: Text(a)),
-                    ],
-                  ),
+      title: Text(dishName, maxLines: 3, style: const TextStyle(fontSize: 16)),
+      content: SizedBox(
+        width: math.min(MediaQuery.sizeOf(ctx).width * 0.92, 520),
+        child: SingleChildScrollView(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (imageWidget != null) ...[
+                imageWidget,
+                const SizedBox(width: 12),
+              ],
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _dishDetailSection('Description', desc),
+                    if (ing.isNotEmpty)
+                      _dishDetailSection(
+                        'Ingredients',
+                        ing.join(', '),
+                      ),
+                    if (note.isNotEmpty) _dishDetailSection('Notes', note),
+                  ],
                 ),
               ),
-          ],
+              const SizedBox(width: 12),
+              SizedBox(width: 108, child: _dishDetailAllergenColumn(list)),
+            ],
+          ),
         ),
       ),
       actions: [
@@ -166,48 +198,11 @@ Future<void> showMenuDishDetailDialog(
   );
 }
 
-/// Dialog listing allergens for a dish (Order Now / Inquire Catering menu).
+/// Dialog listing allergens for a dish (legacy — prefer [showMenuDishDetailDialog]).
 Future<void> showDishAllergensDialog(
   BuildContext context, {
   required String dishName,
   required List<String> allergens,
 }) {
-  final list = allergens.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-  return showDialog<void>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      title: Text(dishName),
-      content: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
-            const SizedBox(height: 8),
-            if (list.isEmpty)
-              Text(
-                'No allergens listed for this dish.',
-                style: TextStyle(color: Colors.grey.shade700),
-              )
-            else
-              ...list.map(
-                (a) => Padding(
-                  padding: const EdgeInsets.only(bottom: 4),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('• '),
-                      Expanded(child: Text(a)),
-                    ],
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
-      ],
-    ),
-  );
+  return showMenuDishDetailDialog(context, dishName: dishName, allergens: allergens);
 }

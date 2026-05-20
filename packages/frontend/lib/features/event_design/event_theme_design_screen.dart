@@ -68,7 +68,12 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
   final PageController _pageController = PageController();
   int _pageIndex = 0;
 
-  static const _pageTitles = ['Style & mood', 'Colors & decor', 'Venue photos', 'Generate & save'];
+  static const _pageTitles = [
+    'Step 1: Set Style and Mood',
+    'Step 2: Set Colors and Decor',
+    'Step 3: Add your actual venue photos',
+    'Step 4: Generate your dream event style!',
+  ];
 
   @override
   void initState() {
@@ -628,6 +633,11 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
+                            Text(
+                              _pageTitles[0],
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                            ),
+                            const SizedBox(height: 12),
                             _lockedEventTypeField(),
                             _chipSection(
                               title: 'Style',
@@ -650,6 +660,11 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
+                            Text(
+                              _pageTitles[1],
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                            ),
+                            const SizedBox(height: 12),
                             _chipSection(
                               title: 'Color palette',
                               options: _categories.palettes,
@@ -690,6 +705,11 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
+                            Text(
+                              _pageTitles[2],
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                            ),
+                            const SizedBox(height: 12),
                             Text('Venue reference photos', style: Theme.of(context).textTheme.titleSmall),
                             const SizedBox(height: 6),
                             Text(
@@ -754,6 +774,11 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
+                            Text(
+                              _pageTitles[3],
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                            ),
+                            const SizedBox(height: 12),
                             if (_generatedUrl != null) ...[
                               Text('Selected design', style: Theme.of(context).textTheme.titleMedium),
                               const SizedBox(height: 8),

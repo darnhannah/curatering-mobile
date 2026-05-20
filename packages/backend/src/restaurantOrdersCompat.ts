@@ -76,7 +76,11 @@ export function restaurantOrderSelectSql(alias?: string): string {
   ${col(a, "note")} AS walk_in_note,
   ${col(a, "delivery_tracking_url")},
   ${col(a, "delivery_time")},
-  COALESCE(${col(a, "payment_mode")}, 'GCASH ONLY') AS payment_mode,
+  CASE
+    WHEN upper(COALESCE(${col(a, "order_source")}, '')) IN ('POS', 'POS_MOBILE', 'POS_WEB')
+      THEN COALESCE(NULLIF(TRIM(${col(a, "payment_method")}), ''), '')
+    ELSE COALESCE(${col(a, "payment_mode")}, 'GCASH ONLY')
+  END AS payment_mode,
   ${col(a, "payment_method")},
   COALESCE(NULLIF(TRIM(${col(a, "payment_reference_initial")}), ''), '') AS payment_reference_initial,
   COALESCE(NULLIF(TRIM(${col(a, "payment_reference_balance")}), ''), '') AS payment_reference_balance,
@@ -102,7 +106,11 @@ export function restaurantOrderSelectSql(alias?: string): string {
   COALESCE(${col(a, "payment_confirmed_initial")}, FALSE) AS payment_confirmed_initial,
   COALESCE(${col(a, "payment_confirmed_balance")}, FALSE) AS payment_confirmed_balance,
   ${col(a, "cashier_amount_received_initial")},
-  COALESCE(${col(a, "cashier_amount_received_initial")}, 0) AS cashier_amount_received,
+  CASE
+    WHEN upper(COALESCE(${col(a, "order_source")}, '')) IN ('POS', 'POS_MOBILE', 'POS_WEB')
+      THEN ${col(a, "amount_paid")}
+    ELSE COALESCE(${col(a, "cashier_amount_received_initial")}, 0)
+  END AS cashier_amount_received,
   ${col(a, "cashier_amount_received_balance")},
   COALESCE(${col(a, "cashier_amount_received_balance")}, 0) AS cashier_secondary_amount_received,
   ${col(a, "amount_paid")},
@@ -158,7 +166,11 @@ export function restaurantOrderListSelectSql(alias?: string): string {
   ${col(a, "note")} AS walk_in_note,
   ${col(a, "delivery_tracking_url")},
   ${col(a, "delivery_time")},
-  COALESCE(${col(a, "payment_mode")}, 'GCASH ONLY') AS payment_mode,
+  CASE
+    WHEN upper(COALESCE(${col(a, "order_source")}, '')) IN ('POS', 'POS_MOBILE', 'POS_WEB')
+      THEN COALESCE(NULLIF(TRIM(${col(a, "payment_method")}), ''), '')
+    ELSE COALESCE(${col(a, "payment_mode")}, 'GCASH ONLY')
+  END AS payment_mode,
   ${col(a, "payment_method")},
   COALESCE(NULLIF(TRIM(${col(a, "payment_reference_initial")}), ''), '') AS payment_reference_initial,
   COALESCE(NULLIF(TRIM(${col(a, "payment_reference_balance")}), ''), '') AS payment_reference_balance,
@@ -176,7 +188,11 @@ export function restaurantOrderListSelectSql(alias?: string): string {
   COALESCE(${col(a, "payment_confirmed_initial")}, FALSE) AS payment_confirmed_initial,
   COALESCE(${col(a, "payment_confirmed_balance")}, FALSE) AS payment_confirmed_balance,
   ${col(a, "cashier_amount_received_initial")},
-  COALESCE(${col(a, "cashier_amount_received_initial")}, 0) AS cashier_amount_received,
+  CASE
+    WHEN upper(COALESCE(${col(a, "order_source")}, '')) IN ('POS', 'POS_MOBILE', 'POS_WEB')
+      THEN ${col(a, "amount_paid")}
+    ELSE COALESCE(${col(a, "cashier_amount_received_initial")}, 0)
+  END AS cashier_amount_received,
   ${col(a, "cashier_amount_received_balance")},
   COALESCE(${col(a, "cashier_amount_received_balance")}, 0) AS cashier_secondary_amount_received,
   ${col(a, "amount_paid")},

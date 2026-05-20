@@ -18,17 +18,43 @@ Future<Uint8List> buildSeatingLayoutPdfBytes({
   required SeatingPlanData plan,
   String eventTitle = '',
   String transactionNo = '',
+  String eventDateTime = '',
+  String venueAddress = '',
 }) async {
   final png = await _captureSeatingLayoutPng(context: context, plan: plan);
   final doc = pw.Document();
   final image = pw.MemoryImage(png);
+  final orderLine = [
+    if (transactionNo.trim().isNotEmpty) transactionNo.trim(),
+    if (eventTitle.trim().isNotEmpty) eventTitle.trim(),
+  ].join(' — ');
+  final headerLines = <String>[
+    if (orderLine.isNotEmpty) orderLine,
+    if (eventDateTime.trim().isNotEmpty) eventDateTime.trim(),
+    if (venueAddress.trim().isNotEmpty) venueAddress.trim(),
+  ];
 
   doc.addPage(
     pw.Page(
       pageFormat: PdfPageFormat.a4.landscape,
-      margin: pw.EdgeInsets.zero,
-      build: (_) => pw.Center(
-        child: pw.Image(image, fit: pw.BoxFit.contain),
+      margin: const pw.EdgeInsets.fromLTRB(24, 20, 24, 16),
+      build: (_) => pw.Column(
+        crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+        children: [
+          if (headerLines.isNotEmpty) ...[
+            for (final line in headerLines)
+              pw.Padding(
+                padding: const pw.EdgeInsets.only(bottom: 4),
+                child: pw.Text(line, style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold)),
+              ),
+            pw.SizedBox(height: 8),
+          ],
+          pw.Expanded(
+            child: pw.Center(
+              child: pw.Image(image, fit: pw.BoxFit.contain),
+            ),
+          ),
+        ],
       ),
     ),
   );
@@ -40,12 +66,16 @@ Future<void> previewSeatingLayoutPdf({
   required SeatingPlanData plan,
   String eventTitle = '',
   String transactionNo = '',
+  String eventDateTime = '',
+  String venueAddress = '',
 }) async {
   final bytes = await buildSeatingLayoutPdfBytes(
     context: context,
     plan: plan,
     eventTitle: eventTitle,
     transactionNo: transactionNo,
+    eventDateTime: eventDateTime,
+    venueAddress: venueAddress,
   );
   await Printing.layoutPdf(onLayout: (_) async => bytes);
 }

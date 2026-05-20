@@ -1038,6 +1038,7 @@ class CartItem {
     this.dip = '',
     this.dipQty = 1,
     this.qty = 1,
+    this.lineNote = '',
   });
 
   final MenuItemData menu;
@@ -1045,6 +1046,8 @@ class CartItem {
   /// Portions of add-on when a dip/sauce is selected; first unit has no extra charge.
   int dipQty;
   int qty;
+  /// Per-line note stored in `restaurant_orders.tray_items` JSON.
+  String lineNote;
 }
 
 class ProfileData {
@@ -1104,6 +1107,7 @@ class OrderLineItem {
     this.dipQty = 1,
     required this.qty,
     required this.price,
+    this.lineNote = '',
   });
 
   final String itemName;
@@ -1111,6 +1115,7 @@ class OrderLineItem {
   final int dipQty;
   final int qty;
   final double price;
+  final String lineNote;
 }
 
 double orderLineSubtotal(OrderLineItem line) {
@@ -1139,21 +1144,25 @@ double orderLineAddonExtraSubtotal(OrderLineItem line) {
 String cartLineDetailSubtitle(CartItem e) {
   final main = 'Main ×${e.qty} @ ₱${e.menu.price.toStringAsFixed(2)}';
   final dip = e.dip.trim();
-  if (dip.isEmpty) return '$main · ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
+  final note = e.lineNote.trim();
+  final noteLine = note.isNotEmpty ? '\nNote: $note' : '';
+  if (dip.isEmpty) return '$main · ₱${cartLineSubtotal(e).toStringAsFixed(2)}$noteLine';
   final extra = cartAddonExtraSubtotal(e);
   final addOn =
       'Add-on: $dip × ${e.dipQty}${extra > 0 ? ' · +₱${extra.toStringAsFixed(0)} extra' : (e.dipQty == 0 ? ' · no extra portions' : ' · included')}';
-  return '$main\n$addOn · ₱${cartLineSubtotal(e).toStringAsFixed(2)}';
+  return '$main\n$addOn · ₱${cartLineSubtotal(e).toStringAsFixed(2)}$noteLine';
 }
 
 String orderLineDetailSubtitle(OrderLineItem l) {
   final main = 'Main ×${l.qty} @ ₱${l.price.toStringAsFixed(2)}';
   final dip = l.dip.trim();
-  if (dip.isEmpty) return '$main · ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
+  final note = l.lineNote.trim();
+  final noteLine = note.isNotEmpty ? '\nNote: $note' : '';
+  if (dip.isEmpty) return '$main · ₱${orderLineSubtotal(l).toStringAsFixed(2)}$noteLine';
   final extra = orderLineAddonExtraSubtotal(l);
   final addOn =
       'Add-on: $dip × ${l.dipQty}${extra > 0 ? ' · +₱${extra.toStringAsFixed(0)} extra' : (l.dipQty == 0 ? ' · no extra portions' : ' · included')}';
-  return '$main\n$addOn · ₱${orderLineSubtotal(l).toStringAsFixed(2)}';
+  return '$main\n$addOn · ₱${orderLineSubtotal(l).toStringAsFixed(2)}$noteLine';
 }
 
 /// Builds line items from API `items` or fallback JSON snapshot on the order row.
@@ -1171,6 +1180,7 @@ List<OrderLineItem> orderLinesFromApiMap(Map<String, dynamic> map) {
           dipQty: math.max(0, jsonToInt(m['dip_qty'], 1)),
           qty: jsonToInt(m['qty'], 0),
           price: jsonToDouble(m['price']),
+          lineNote: '${m['notes'] ?? m['line_note'] ?? ''}'.trim(),
         ),
       );
     }
@@ -1401,14 +1411,20 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
     lines: lines,
     userEmail: map['user_email'] != null && '${map['user_email']}'.trim().isNotEmpty ? '${map['user_email']}' : null,
     note: note,
-    paymentMode: '${map['payment_mode'] ?? map['payment_method'] ?? ''}',
+    paymentMode: isWalkIn
+        ? '${map['payment_method'] ?? ''}'.trim()
+        : '${map['payment_mode'] ?? map['payment_method'] ?? ''}',
     deliveryName: fullName.isNotEmpty ? fullName : '${map['delivery_name'] ?? ''}',
     deliveryContact: contactNum.isNotEmpty ? contactNum : '${map['delivery_contact'] ?? ''}',
     deliveryAddress: '${map['delivery_address'] ?? ''}',
     deliveryTime: '${map['delivery_time'] ?? ''}',
     orderSource: orderSource,
     posCustomerLabel: '${map['pos_customer_label'] ?? ''}',
-    cashierAmountReceived: map['cashier_amount_received'] != null ? jsonToDouble(map['cashier_amount_received']) : null,
+    cashierAmountReceived: isWalkIn && map['amount_paid'] != null
+        ? jsonToDouble(map['amount_paid'])
+        : map['cashier_amount_received'] != null
+            ? jsonToDouble(map['cashier_amount_received'])
+            : null,
     cashierChange: map['cashier_change'] != null ? jsonToDouble(map['cashier_change']) : null,
     fulfillmentStage: '${map['fulfillment_stage'] ?? 'PENDING_CASHIER'}'.trim(),
     deliveryTrackingUrl: '${map['delivery_tracking_url'] ?? ''}'.trim(),
@@ -2405,6 +2421,8 @@ class AppState extends ChangeNotifier {
   bool signupFromGuestPrompt = false;
   /// First bottom-nav tab on [GuestCustomerShell] after [enterGuestCheckoutSession] (0–3).
   int guestShellInitialTabIndex = 0;
+  /// When true, [GuestCustomerShell] shows the landing tiles instead of a tab page.
+  bool guestShellOpenLanding = true;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
   final Set<String> _readAttentionOrderNos = <String>{};
@@ -2889,6 +2907,7 @@ class AppState extends ChangeNotifier {
             'dip': e.dip,
             'dip_qty': e.dipQty,
             'qty': e.qty,
+            'notes': e.lineNote,
           },
         )
         .toList();
@@ -2914,6 +2933,7 @@ class AppState extends ChangeNotifier {
             'dip': e.dip,
             'dip_qty': e.dipQty,
             'qty': e.qty,
+            'notes': e.lineNote,
           },
         )
         .toList();
@@ -2957,6 +2977,7 @@ class AppState extends ChangeNotifier {
       final dip = '${e['dip'] ?? ''}';
       final dipQty = math.max(0, jsonToInt(e['dip_qty'], 1));
       final qty = jsonToInt(e['qty']);
+      final lineNote = '${e['notes'] ?? e['line_note'] ?? ''}'.trim();
       if (qty <= 0) continue;
       MenuItemData? foundItem;
       for (final x in menu) {
@@ -2966,9 +2987,9 @@ class AppState extends ChangeNotifier {
         }
       }
       if (foundItem != null) {
-        next.add(CartItem(menu: foundItem, dip: dip, dipQty: dipQty, qty: qty));
+        next.add(CartItem(menu: foundItem, dip: dip, dipQty: dipQty, qty: qty, lineNote: lineNote));
       } else {
-        pending.add({'id': id, 'dip': dip, 'dip_qty': dipQty, 'qty': qty});
+        pending.add({'id': id, 'dip': dip, 'dip_qty': dipQty, 'qty': qty, 'notes': lineNote});
       }
     }
     if (next.isNotEmpty || pending.isEmpty) {
@@ -3212,8 +3233,10 @@ class AppState extends ChangeNotifier {
   }
 
   /// Local-only session for ordering without an account (see [isGuestSession]).
-  Future<void> enterGuestCheckoutSession({int initialShellTabIndex = 0}) async {
-    guestShellInitialTabIndex = initialShellTabIndex.clamp(0, 3);
+  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly; omit to show landing first.
+  Future<void> enterGuestCheckoutSession({int? initialShellTabIndex}) async {
+    guestShellOpenLanding = initialShellTabIndex == null;
+    guestShellInitialTabIndex = (initialShellTabIndex ?? 0).clamp(0, 3);
     final salt = DateTime.now().millisecondsSinceEpoch;
     final r = math.Random().nextInt(1 << 30);
     userEmail = 'guest_${salt}_$r@guest.curatering.internal'.toLowerCase();
@@ -3626,11 +3649,14 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  void addToTray(MenuItemData menuItem, {String dip = '', int dipQty = 1}) {
+  void addToTray(MenuItemData menuItem, {String dip = '', int dipQty = 1, String lineNote = ''}) {
     final dq = dip.trim().isEmpty ? 1 : math.max(0, dipQty);
-    final existing = tray.where((e) => e.menu.id == menuItem.id && e.dip == dip && e.dipQty == dq).toList();
+    final note = lineNote.trim();
+    final existing = tray
+        .where((e) => e.menu.id == menuItem.id && e.dip == dip && e.dipQty == dq && e.lineNote.trim() == note)
+        .toList();
     if (existing.isEmpty) {
-      tray.add(CartItem(menu: menuItem, dip: dip, dipQty: dq, qty: 1));
+      tray.add(CartItem(menu: menuItem, dip: dip, dipQty: dq, qty: 1, lineNote: note));
     } else {
       existing.first.qty += 1;
     }
@@ -3662,9 +3688,11 @@ class AppState extends ChangeNotifier {
   Future<void> promptAndAddRestaurantDish(BuildContext context, MenuItemData item) async {
     var selectedDip = '';
     var addonQty = 1;
+    final lineNoteCtl = TextEditingController();
     final dipChoices = item.dips.isNotEmpty ? <String>['None', ...item.dips] : <String>['None'];
     selectedDip = 'None';
     final desc = item.description.trim();
+    final ingLines = item.ingredients.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
     final allergenLines = item.allergens.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
     final rawImg = item.imageBase64?.trim();
     Widget? headerImage;
@@ -3706,6 +3734,12 @@ class AppState extends ChangeNotifier {
                       const Text('Description', style: TextStyle(fontWeight: FontWeight.w800)),
                       const SizedBox(height: 6),
                       Text(desc, style: TextStyle(height: 1.35, color: Colors.grey.shade800)),
+                      const SizedBox(height: 12),
+                    ],
+                    if (ingLines.isNotEmpty) ...[
+                      const Text('Ingredients', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      Text(ingLines.join(', '), style: TextStyle(height: 1.35, color: Colors.grey.shade800)),
                       const SizedBox(height: 12),
                     ],
                     const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
@@ -3757,6 +3791,15 @@ class AppState extends ChangeNotifier {
                         ),
                       ],
                     ],
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: lineNoteCtl,
+                      maxLines: 2,
+                      decoration: const InputDecoration(
+                        labelText: 'Notes (optional)',
+                        hintText: 'Special requests for this dish',
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -3769,10 +3812,12 @@ class AppState extends ChangeNotifier {
         );
       },
     );
+    final note = lineNoteCtl.text.trim();
+    lineNoteCtl.dispose();
     if (ok != true) return;
     final dip = selectedDip == 'None' || selectedDip.isEmpty ? '' : selectedDip;
     final dq = dip.isEmpty ? 1 : addonQty;
-    addToTray(item, dip: dip, dipQty: dq);
+    addToTray(item, dip: dip, dipQty: dq, lineNote: note);
   }
 
   void clearTray() {
@@ -3845,6 +3890,7 @@ class AppState extends ChangeNotifier {
                       'dip_qty': e.dipQty,
                       'qty': e.qty,
                       'price': e.menu.price,
+                      if (e.lineNote.trim().isNotEmpty) 'notes': e.lineNote.trim(),
                     },
                   )
                   .toList(),
@@ -3871,6 +3917,7 @@ class AppState extends ChangeNotifier {
               dipQty: e.dipQty,
               qty: e.qty,
               price: e.menu.price,
+              lineNote: e.lineNote,
             ),
           )
           .toList();
@@ -3961,7 +4008,12 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<String?> uploadPaymentProof(int orderId, XFile file, {String? paymentProofBase64}) async {
+  Future<String?> uploadPaymentProof(
+    int orderId,
+    XFile file, {
+    String? paymentProofBase64,
+    String? paymentReferenceInitial,
+  }) async {
     try {
       var encoded = paymentProofBase64 ?? base64Encode(await file.readAsBytes());
       final comma = encoded.indexOf(',');
@@ -3972,7 +4024,11 @@ class AppState extends ChangeNotifier {
       final res = await http.patch(
         _uri('/api/mobile/orders/$orderId/payment'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'payment_proof': encoded}),
+        body: jsonEncode({
+          'payment_proof': encoded,
+          if (paymentReferenceInitial != null && paymentReferenceInitial.trim().isNotEmpty)
+            'payment_reference_initial': paymentReferenceInitial.trim(),
+        }),
       );
       if (res.statusCode != 200) {
         try {
@@ -4941,9 +4997,8 @@ class AppState extends ChangeNotifier {
           return 'Could not update (${res.statusCode})';
         }
       }
-      await loadCashierWalkInQueues(force: true);
-      await loadCashierOrderHistory(force: true);
-      notifyListeners();
+      unawaited(loadCashierWalkInQueues(force: true));
+      unawaited(loadCashierOrderHistory(force: true));
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -5085,6 +5140,7 @@ class AppState extends ChangeNotifier {
     String note = '',
     String posCustomerLabel = '',
     String paymentProofBase64 = '',
+    String paymentReference = '',
   }) async {
     if (userEmail == null || !isCashier) return 'Not signed in';
     if (tray.isEmpty) return 'Tray is empty';
@@ -5101,6 +5157,7 @@ class AppState extends ChangeNotifier {
               'note': note,
               'pos_customer_label': posCustomerLabel,
               if (paymentProofBase64.isNotEmpty) 'payment_proof': paymentProofBase64,
+              if (paymentReference.trim().isNotEmpty) 'payment_reference_initial': paymentReference.trim(),
               'items': tray
                   .map(
                     (e) => {
@@ -5109,6 +5166,7 @@ class AppState extends ChangeNotifier {
                       'dip_qty': e.dipQty,
                       'qty': e.qty,
                       'price': e.menu.price,
+                      if (e.lineNote.trim().isNotEmpty) 'notes': e.lineNote.trim(),
                     },
                   )
                   .toList(),
@@ -5194,10 +5252,10 @@ class _AuthScreenState extends State<AuthScreen> {
               children: [
             const SizedBox(height: 36),
             if (widget.cashierMode)
-              Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain)
+              Image.asset(AppBrandAssets.logoDashboard, height: _staffLogoHeight(context), fit: BoxFit.contain)
             else
               SizedBox(
-                height: 140,
+                height: _staffLogoHeight(context) + 64,
                 width: double.infinity,
                 child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
               ),
@@ -6306,7 +6364,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
                 child: Column(
                   children: [
-                    Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain),
+                    Image.asset(AppBrandAssets.logoDashboard, height: _staffLogoHeight(context), fit: BoxFit.contain),
                     if (who.isNotEmpty) ...[
                       const SizedBox(height: 10),
                       Text(
@@ -6481,6 +6539,220 @@ class ManagerRoleDrawer extends StatelessWidget {
   }
 }
 
+const _kCustomerLandingBg = Color(0xFF242424);
+
+double _customerLandingLogoHeight(BuildContext context) {
+  final w = MediaQuery.sizeOf(context).width;
+  if (w >= 900) return 120;
+  if (w >= 600) return 96;
+  return 72;
+}
+
+double _staffLogoHeight(BuildContext context) {
+  final w = MediaQuery.sizeOf(context).width;
+  if (w >= 900) return 100;
+  if (w >= 600) return 88;
+  return 76;
+}
+
+/// Tray / checkout line with label and qty controls on one row.
+Widget _trayLineQtyRow({
+  required String label,
+  required int qty,
+  required VoidCallback onDec,
+  required VoidCallback onInc,
+  bool decEnabled = true,
+}) {
+  return Padding(
+    padding: const EdgeInsets.only(top: 6),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(
+          child: Text(label, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+        ),
+        IconButton(
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+          icon: const Icon(Icons.remove_circle_outline, size: 22),
+          onPressed: decEnabled ? onDec : null,
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text('$qty', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+        ),
+        IconButton(
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+          icon: const Icon(Icons.add_circle_outline, size: 22),
+          onPressed: onInc,
+        ),
+      ],
+    ),
+  );
+}
+
+Widget _buildTrayLineCard(AppState state, CartItem item, {VoidCallback? onChanged}) {
+  void refresh() => onChanged?.call();
+  return Card(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(item.menu.name, style: const TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 4),
+          Text(
+            cartLineDetailSubtitle(item),
+            style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade800),
+          ),
+          _trayLineQtyRow(
+            label: 'Main qty',
+            qty: item.qty,
+            onDec: () {
+              state.changeQty(item, -1);
+              refresh();
+            },
+            onInc: () {
+              state.changeQty(item, 1);
+              refresh();
+            },
+          ),
+          if (item.dip.trim().isNotEmpty)
+            _trayLineQtyRow(
+              label: 'Add-on qty',
+              qty: item.dipQty,
+              decEnabled: item.dipQty > 0,
+              onDec: () {
+                state.changeDipQty(item, -1);
+                refresh();
+              },
+              onInc: () {
+                state.changeDipQty(item, 1);
+                refresh();
+              },
+            ),
+        ],
+      ),
+    ),
+  );
+}
+
+Widget _orderDetailLineWidget(String label, String value) {
+  final v = value.trim().isEmpty ? '—' : value.trim();
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 4),
+        SelectableText(v, style: const TextStyle(height: 1.35)),
+      ],
+    ),
+  );
+}
+
+Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppState state, OrderData o) async {
+  await state.loadRestaurantOrderDetail(o.id);
+  if (!context.mounted) return;
+  OrderData od = o;
+  try {
+    od = state.orders.firstWhere((e) => e.id == o.id);
+  } catch (_) {}
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(uiOrderNo(od.orderNo)),
+      content: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _orderDetailLineWidget('Order no.', uiOrderNo(od.orderNo)),
+            _orderDetailLineWidget('Status', statusReadableForOrder(od)),
+            _orderDetailLineWidget('Fulfillment stage', fulfillmentStageReadable(od.fulfillmentStage)),
+            _orderDetailLineWidget('Placed', formatDateTimeLocal(od.createdAt)),
+            const Divider(height: 24),
+            const Text('Delivery & contact', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+            const SizedBox(height: 8),
+            _orderDetailLineWidget('Recipient name', od.deliveryName),
+            _orderDetailLineWidget('Contact number', od.deliveryContact),
+            _orderDetailLineWidget('Delivery address', od.deliveryAddress),
+            _orderDetailLineWidget(
+              'Requested delivery time',
+              od.deliveryTime.isEmpty || od.deliveryTime == 'NOW' ? 'As soon as possible' : od.deliveryTime,
+            ),
+            _orderDetailLineWidget('Payment method', od.paymentMode.isEmpty ? 'GCASH ONLY' : od.paymentMode),
+            if (od.note.trim().isNotEmpty) _orderDetailLineWidget('Your note', od.note.trim()),
+            const SizedBox(height: 16),
+            const Text('Dishes ordered', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+            const SizedBox(height: 8),
+            if (od.lines.isEmpty)
+              const Text('No line items from server — pull down to refresh.')
+            else
+              ...od.lines.map(
+                (l) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    '• ${l.itemName}${l.dip.isEmpty ? '' : ' — ${l.dip} ×${l.dipQty}'} ×${l.qty}  ₱${orderLineSubtotal(l).toStringAsFixed(2)}',
+                    style: const TextStyle(height: 1.35),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 16),
+            Text('Total: ₱${od.total.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+          ],
+        ),
+      ),
+      actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+    ),
+  );
+}
+
+bool _guestTrackCanFollowUp(OrderData o) {
+  final u = o.status.toUpperCase();
+  if (u.contains('PAYMENT INSUFFICIENT') || u.contains('INSUFFICIENT')) return false;
+  return u.contains('WAITING FOR PAYMENT CONFIRMATION') ||
+      u.contains('WAITING FOR BALANCE PAYMENT CONFIRMATION') ||
+      u.contains('WAITING FOR ORDER CONFIRMATION') ||
+      u.contains('WAITING FOR ORDER');
+}
+
+bool _guestTrackCanCancel(OrderData o) {
+  if (customerOrderCancelled(o) || orderLooksCompleted(o)) return false;
+  final u = o.status.toUpperCase();
+  return u.contains('WAITING FOR PAYMENT') ||
+      u.contains('WAITING FOR ORDER') ||
+      u.contains('INSUFFICIENT');
+}
+
+Future<void> _guestTrackFollowUp(BuildContext context, AppState state, OrderData o) async {
+  final err = await state.submitHelpRequest(
+    area: 'Order Follow-up',
+    problem: 'Follow-up on pending order ${uiOrderNo(o.orderNo)}',
+    desiredOutcome: 'Please update this order status or next action.',
+  );
+  if (context.mounted) appSnack(context, err ?? 'Follow-up sent');
+}
+
+Future<void> _guestTrackConfirmCancel(BuildContext context, AppState state, OrderData o) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Cancel this order?'),
+      content: Text('Cancel ${uiOrderNo(o.orderNo)}? It will appear under Cancelled orders.'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes, cancel')),
+      ],
+    ),
+  );
+  if (ok != true || !context.mounted) return;
+  final err = await state.cancelOrderAsCustomer(orderId: o.id);
+  if (context.mounted) appSnack(context, err ?? 'Order cancelled');
+}
+
 /// Guest order tracking: verify contact email with OTP, then show restaurant orders for that email.
 class GuestTrackOrdersScreen extends StatefulWidget {
   const GuestTrackOrdersScreen({super.key, required this.state});
@@ -6610,15 +6882,24 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
                               '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}',
                             ),
                             isThreeLine: true,
-                            onTap: () async {
-                              await widget.state.loadRestaurantOrderDetail(o.id);
-                              if (!context.mounted) return;
-                              OrderData od = o;
-                              try {
-                                od = widget.state.orders.firstWhere((e) => e.id == o.id);
-                              } catch (_) {}
-                              appSnack(context, '${uiOrderNo(od.orderNo)}: ${statusReadableForOrder(od)}');
-                            },
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (_guestTrackCanFollowUp(o))
+                                  IconButton(
+                                    tooltip: 'Follow up',
+                                    icon: const Icon(Icons.reply_outlined, size: 20),
+                                    onPressed: () => _guestTrackFollowUp(context, widget.state, o),
+                                  ),
+                                if (_guestTrackCanCancel(o))
+                                  IconButton(
+                                    tooltip: 'Cancel order',
+                                    icon: Icon(Icons.cancel_outlined, size: 20, color: Colors.red.shade800),
+                                    onPressed: () => _guestTrackConfirmCancel(context, widget.state, o),
+                                  ),
+                              ],
+                            ),
+                            onTap: () => showRestaurantOrderConfirmationDialog(context, widget.state, o),
                           ),
                         );
                       },
@@ -6726,12 +7007,19 @@ class _CustomerLoginDialogBody extends StatefulWidget {
 class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
   final emailController = TextEditingController();
   final passwordController = TextEditingController();
+  final confirmPasswordController = TextEditingController();
+  final otpController = TextEditingController();
+  bool signupMode = false;
+  bool otpSent = false;
+  bool signupOtpVerified = false;
   String? busy;
 
   @override
   void dispose() {
     emailController.dispose();
     passwordController.dispose();
+    confirmPasswordController.dispose();
+    otpController.dispose();
     super.dispose();
   }
 
@@ -6745,51 +7033,158 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
   Widget build(BuildContext context) {
     final state = widget.state;
     return Padding(
-      padding: const EdgeInsets.all(18),
+      padding: const EdgeInsets.fromLTRB(18, 8, 8, 18),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text('Log in', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900, color: Colors.grey.shade900)),
+            Row(
+              children: [
+                const Expanded(child: SizedBox.shrink()),
+                IconButton(
+                  tooltip: 'Close',
+                  onPressed: busy != null ? null : () => Navigator.of(context).pop(),
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            Text(
+              signupMode ? 'Sign Up' : 'Log In',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900, color: Colors.grey.shade900),
+            ),
             const SizedBox(height: 14),
             _LabeledInput(label: 'EMAIL ADDRESS', controller: emailController),
             const SizedBox(height: 10),
-            _LabeledInput(label: 'PASSWORD', controller: passwordController, obscure: true),
-            const SizedBox(height: 18),
-            FilledButton(
-              onPressed: busy != null
-                  ? null
-                  : () async {
-                      setState(() => busy = 'Logging in…');
-                      try {
-                        final err = await state.login(emailController.text, passwordController.text);
-                        if (!context.mounted) return;
-                        if (err != null) {
-                          await _toast(err);
-                          return;
+            if (!signupMode)
+              _LabeledInput(label: 'PASSWORD', controller: passwordController, obscure: true),
+            if (signupMode) ...[
+              FilledButton(
+                onPressed: busy != null
+                    ? null
+                    : () async {
+                        setState(() => busy = 'Sending code…');
+                        try {
+                          final err = await state.requestSignupOtp(emailController.text);
+                          if (!context.mounted) return;
+                          if (err != null) {
+                            await _toast(err);
+                            return;
+                          }
+                          setState(() {
+                            otpSent = true;
+                            signupOtpVerified = false;
+                            otpController.clear();
+                            passwordController.clear();
+                            confirmPasswordController.clear();
+                          });
+                          await _toast('Check your email for the OTP code.');
+                        } finally {
+                          if (mounted) setState(() => busy = null);
                         }
-                        Navigator.of(context).pop();
-                      } finally {
-                        if (mounted) setState(() => busy = null);
-                      }
-                    },
-              child: Text(busy ?? 'LOG IN'),
-            ),
+                      },
+                child: Text(busy ?? 'SEND OTP TO EMAIL'),
+              ),
+              if (otpSent) ...[
+                const SizedBox(height: 10),
+                _LabeledInput(label: 'OTP CODE', controller: otpController, enabled: !signupOtpVerified),
+                if (!signupOtpVerified) ...[
+                  const SizedBox(height: 10),
+                  FilledButton(
+                    onPressed: busy != null
+                        ? null
+                        : () async {
+                            final otp = otpController.text.replaceAll(RegExp(r'\D'), '').trim();
+                            if (otp.isEmpty) {
+                              await _toast('Enter your OTP code.');
+                              return;
+                            }
+                            setState(() => busy = 'Verifying code…');
+                            try {
+                              final err = await state.verifySignupOtp(email: emailController.text, otp: otp);
+                              if (!context.mounted) return;
+                              if (err != null) {
+                                await _toast(err);
+                                return;
+                              }
+                              setState(() => signupOtpVerified = true);
+                              await _toast('Code verified. Set your password below.');
+                            } finally {
+                              if (mounted) setState(() => busy = null);
+                            }
+                          },
+                    child: Text(busy ?? 'VERIFY OTP'),
+                  ),
+                ],
+                if (signupOtpVerified) ...[
+                  const SizedBox(height: 10),
+                  _LabeledInput(label: 'PASSWORD (min 8)', controller: passwordController, obscure: true),
+                  const SizedBox(height: 10),
+                  _LabeledInput(label: 'CONFIRM PASSWORD', controller: confirmPasswordController, obscure: true),
+                  const SizedBox(height: 10),
+                  FilledButton(
+                    onPressed: busy != null
+                        ? null
+                        : () async {
+                            if (passwordController.text != confirmPasswordController.text) {
+                              await _toast('Passwords do not match');
+                              return;
+                            }
+                            setState(() => busy = 'Creating account…');
+                            try {
+                              final err = await state.completeSignup(
+                                email: emailController.text,
+                                otp: otpController.text,
+                                password: passwordController.text,
+                                loginAfter: true,
+                              );
+                              if (!context.mounted) return;
+                              if (err != null) {
+                                await _toast(err);
+                                return;
+                              }
+                              Navigator.of(context).pop();
+                            } finally {
+                              if (mounted) setState(() => busy = null);
+                            }
+                          },
+                    child: Text(busy ?? 'CREATE ACCOUNT'),
+                  ),
+                ],
+              ],
+            ],
+            if (!signupMode) ...[
+              const SizedBox(height: 18),
+              FilledButton(
+                onPressed: busy != null
+                    ? null
+                    : () async {
+                        setState(() => busy = 'Logging in…');
+                        try {
+                          final err = await state.login(emailController.text, passwordController.text);
+                          if (!context.mounted) return;
+                          if (err != null) {
+                            await _toast(err);
+                            return;
+                          }
+                          Navigator.of(context).pop();
+                        } finally {
+                          if (mounted) setState(() => busy = null);
+                        }
+                      },
+                child: Text(busy ?? 'LOG IN'),
+              ),
+            ],
             TextButton(
               onPressed: busy != null
                   ? null
-                  : () {
-                      state.openAuthInSignupMode = true;
-                      Navigator.of(context).pop();
-                      Navigator.of(context).push(
-                        MaterialPageRoute<void>(
-                          fullscreenDialog: true,
-                          builder: (_) => AuthScreen(state: state, cashierMode: false),
-                        ),
-                      );
-                    },
-              child: const Text('Create an account'),
+                  : () => setState(() {
+                        signupMode = !signupMode;
+                        otpSent = false;
+                        signupOtpVerified = false;
+                      }),
+              child: Text(signupMode ? 'Already have an account? Log In' : 'Sign Up'),
             ),
             if (widget.offerGuestContinue) ...[
               const SizedBox(height: 8),
@@ -6821,7 +7216,6 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
                 child: const Text('CONTINUE AS GUEST'),
               ),
             ],
-            TextButton(onPressed: busy != null ? null : () => Navigator.of(context).pop(), child: const Text('Cancel')),
           ],
         ),
       ),
@@ -6931,7 +7325,7 @@ class CustomerPreAuthShell extends StatefulWidget {
 }
 
 class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
-  int _navIndex = 0;
+  int? _navHighlight;
 
   Future<void> _startGuest(int tab) async {
     try {
@@ -6946,73 +7340,147 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
   Widget build(BuildContext context) {
     final s = widget.state;
     return Scaffold(
-      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      backgroundColor: _kCustomerLandingBg,
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 72, fit: BoxFit.contain)),
-              const SizedBox(height: 12),
-              Text(
-                'Choose how you would like to continue.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: Colors.grey.shade900),
-              ),
-              const SizedBox(height: 16),
-              Expanded(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Expanded(
-                      child: _GuestLandingTile(
-                        icon: Icons.restaurant_menu_outlined,
-                        title: 'Order Now',
-                        subtitle: 'Restaurant menu & delivery',
-                        onTap: () => _startGuest(0),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _GuestLandingTile(
-                        icon: Icons.event_available_outlined,
-                        title: 'Inquire Catering',
-                        subtitle: 'Events & catering quotes',
-                        onTap: () => _startGuest(1),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
+        child: _CustomerGuestLandingBody(
+          onOrderNow: () => _startGuest(0),
+          onInquireCatering: () => _startGuest(1),
         ),
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _navIndex,
-        onDestinationSelected: (i) async {
-          setState(() => _navIndex = i);
+      bottomNavigationBar: _GuestBottomNavBar(
+        selectedIndex: _navHighlight,
+        onSelected: (i) async {
           if (i == 0) {
+            setState(() => _navHighlight = 0);
             await _startGuest(0);
           } else if (i == 1) {
+            setState(() => _navHighlight = 1);
             await _startGuest(1);
           } else if (i == 2) {
+            setState(() => _navHighlight = 2);
             await Navigator.of(context).push<void>(
               MaterialPageRoute<void>(builder: (_) => GuestTrackOrdersScreen(state: widget.state)),
             );
-            if (mounted) setState(() => _navIndex = 0);
+            if (mounted) setState(() => _navHighlight = null);
           } else {
             await showCustomerAuthDialog(context, s);
-            if (mounted) setState(() => _navIndex = 0);
+            if (mounted) setState(() => _navHighlight = null);
           }
         },
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.restaurant_menu_outlined), label: 'Order Now'),
-          NavigationDestination(icon: Icon(Icons.event_available_outlined), label: 'Inquire'),
-          NavigationDestination(icon: Icon(Icons.local_shipping_outlined), label: 'Track'),
-          NavigationDestination(icon: Icon(Icons.login), label: 'Log In'),
+      ),
+    );
+  }
+}
+
+class _CustomerGuestLandingBody extends StatelessWidget {
+  const _CustomerGuestLandingBody({
+    required this.onOrderNow,
+    required this.onInquireCatering,
+  });
+  final VoidCallback onOrderNow;
+  final VoidCallback onInquireCatering;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Center(
+            child: Image.asset(
+              AppBrandAssets.logoDashboard,
+              height: _customerLandingLogoHeight(context),
+              fit: BoxFit.contain,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Choose how you would like to continue.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: Colors.grey.shade200),
+          ),
+          const SizedBox(height: 16),
+          IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: _GuestLandingTile(
+                    icon: Icons.restaurant_menu_outlined,
+                    iconColor: const Color(0xFFE65100),
+                    title: 'Order Now',
+                    subtitle: 'Restaurant menu & delivery',
+                    onTap: onOrderNow,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _GuestLandingTile(
+                    icon: Icons.event_available_outlined,
+                    iconColor: const Color(0xFF1565C0),
+                    title: 'Inquire Catering',
+                    subtitle: 'Events & catering quotes',
+                    onTap: onInquireCatering,
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
+      ),
+    );
+  }
+}
+
+class _GuestBottomNavBar extends StatelessWidget {
+  const _GuestBottomNavBar({required this.selectedIndex, required this.onSelected});
+  final int? selectedIndex;
+  final ValueChanged<int> onSelected;
+
+  static const _items = <({IconData icon, String label})>[
+    (icon: Icons.restaurant_menu_outlined, label: 'Order Now'),
+    (icon: Icons.event_available_outlined, label: 'Inquire'),
+    (icon: Icons.local_shipping_outlined, label: 'Track'),
+    (icon: Icons.login, label: 'Log In'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surface,
+      elevation: 3,
+      child: SafeArea(
+        top: false,
+        child: SizedBox(
+          height: 64,
+          child: Row(
+            children: List.generate(_items.length, (i) {
+              final item = _items[i];
+              final selected = selectedIndex == i;
+              final color = selected ? AppColors.brand : Colors.grey.shade600;
+              return Expanded(
+                child: InkWell(
+                  onTap: () => onSelected(i),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(item.icon, color: color, size: 22),
+                      const SizedBox(height: 4),
+                      Text(
+                        item.label,
+                        style: TextStyle(fontSize: 11, fontWeight: selected ? FontWeight.w800 : FontWeight.w500, color: color),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
       ),
     );
   }
@@ -7021,31 +7489,37 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
 class _GuestLandingTile extends StatelessWidget {
   const _GuestLandingTile({
     required this.icon,
+    required this.iconColor,
     required this.title,
     required this.subtitle,
     required this.onTap,
   });
   final IconData icon;
+  final Color iconColor;
   final String title;
   final String subtitle;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(12),
       elevation: 2,
       child: InkWell(
+        borderRadius: BorderRadius.circular(12),
         onTap: onTap,
         child: Padding(
-          padding: const EdgeInsets.all(14),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 36, color: AppColors.brand),
-              const Spacer(),
-              Text(title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
-              const SizedBox(height: 6),
-              Text(subtitle, style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade700)),
+              Icon(icon, size: 32, color: iconColor),
+              const SizedBox(height: 10),
+              Text(title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: Colors.black87)),
+              const SizedBox(height: 4),
+              Text(subtitle, style: TextStyle(fontSize: 11.5, height: 1.25, color: Colors.grey.shade700)),
             ],
           ),
         ),
@@ -7064,12 +7538,22 @@ class GuestCustomerShell extends StatefulWidget {
 
 class _GuestCustomerShellState extends State<GuestCustomerShell> {
   late int _tab;
+  late bool _onLanding;
 
   @override
   void initState() {
     super.initState();
+    _onLanding = widget.state.guestShellOpenLanding;
     _tab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
+    widget.state.guestShellOpenLanding = false;
     widget.state.guestShellInitialTabIndex = 0;
+  }
+
+  void _openTab(int i) {
+    setState(() {
+      _onLanding = false;
+      _tab = i;
+    });
   }
 
   Widget _page(int i) {
@@ -7103,46 +7587,51 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: _onLanding ? _kCustomerLandingBg : null,
       body: Column(
         children: [
-          Material(
-            color: const Color(0xFFFFF8E1),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      'Guest mode — create an account to earn loyalty rewards.',
-                      style: TextStyle(fontSize: 12.5, height: 1.35, color: Colors.grey.shade900),
+          if (!_onLanding)
+            Material(
+              color: const Color(0xFFFFF8E1),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Guest mode — create an account to earn loyalty rewards.',
+                        style: TextStyle(fontSize: 12.5, height: 1.35, color: Colors.grey.shade900),
+                      ),
                     ),
-                  ),
-                  TextButton(
-                    onPressed: widget.state.requestAuthSignup,
-                    child: const Text('Sign up'),
-                  ),
-                ],
+                    TextButton(
+                      onPressed: widget.state.requestAuthSignup,
+                      child: const Text('Sign up'),
+                    ),
+                  ],
+                ),
               ),
             ),
+          Expanded(
+            child: _onLanding
+                ? SafeArea(
+                    child: _CustomerGuestLandingBody(
+                      onOrderNow: () => _openTab(0),
+                      onInquireCatering: () => _openTab(1),
+                    ),
+                  )
+                : _page(_tab),
           ),
-          Expanded(child: _page(_tab)),
         ],
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (i) {
+      bottomNavigationBar: _GuestBottomNavBar(
+        selectedIndex: _onLanding ? null : _tab,
+        onSelected: (i) {
           if (i == 3) {
             showCustomerAuthDialog(context, widget.state);
             return;
           }
-          setState(() => _tab = i);
+          _openTab(i);
         },
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.restaurant_menu_outlined), label: 'Order Now'),
-          NavigationDestination(icon: Icon(Icons.event_available_outlined), label: 'Inquire'),
-          NavigationDestination(icon: Icon(Icons.local_shipping_outlined), label: 'Track'),
-          NavigationDestination(icon: Icon(Icons.login), label: 'Log In'),
-        ],
       ),
     );
   }
@@ -7181,7 +7670,7 @@ class CustomerDashboardScreen extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain)),
+                Center(child: Image.asset(AppBrandAssets.logoDashboard, height: _customerLandingLogoHeight(context), fit: BoxFit.contain)),
                 if (who.isNotEmpty) ...[
                   const SizedBox(height: 10),
                   Text(
@@ -7401,7 +7890,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain),
+                    Image.asset(AppBrandAssets.logoDashboard, height: _staffLogoHeight(context), fit: BoxFit.contain),
                     const SizedBox(width: 12),
                     Image.asset(AppBrandAssets.logoCuratering, height: 48, fit: BoxFit.contain),
                   ],
@@ -7574,30 +8063,48 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
     return Material(
       color: Colors.white,
       borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: () => showMenuDishDetailDialog(
-          context,
-          dishName: item.name,
-          description: item.description,
-          allergens: item.allergens,
-          imageBase64: item.imageBase64,
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: AppColors.border),
         ),
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: AppColors.border),
-          ),
-          child: Column(
-            children: [
-              Expanded(
-                child: Container(
-                  margin: const EdgeInsets.all(10),
-                  color: AppColors.canvas,
-                  child: _MenuThumb(item: item),
-                ),
+        child: Column(
+          children: [
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Container(
+                    margin: const EdgeInsets.all(10),
+                    color: AppColors.canvas,
+                    child: _MenuThumb(item: item),
+                  ),
+                  Positioned(
+                    top: 4,
+                    right: 4,
+                    child: Material(
+                      color: Colors.white.withValues(alpha: 0.92),
+                      shape: const CircleBorder(),
+                      child: IconButton(
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                        icon: const Icon(Icons.info_outline, size: 20),
+                        tooltip: 'Dish details',
+                        onPressed: () => showMenuDishDetailDialog(
+                          context,
+                          dishName: item.name,
+                          description: item.description,
+                          ingredients: item.ingredients,
+                          allergens: item.allergens,
+                          imageBase64: item.imageBase64,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
-              Text(item.name.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            Text(item.name.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
               if (_dishCardDescription(item).isNotEmpty)
                 Text(
                   _dishCardDescription(item).toUpperCase(),
@@ -7615,7 +8122,6 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
             ],
           ),
         ),
-      ),
     );
   }
 
@@ -7639,68 +8145,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 8),
                     itemCount: widget.state.tray.length,
-                    itemBuilder: (context, i) {
-                      final e = widget.state.tray[i];
-                      return Card(
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
-                              const SizedBox(height: 4),
-                              Text(
-                                cartLineDetailSubtitle(e),
-                                style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade800),
-                              ),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  IconButton(
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                    icon: const Icon(Icons.remove_circle_outline, size: 22),
-                                    onPressed: () => widget.state.changeQty(e, -1),
-                                  ),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                                    child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                  ),
-                                  IconButton(
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                    icon: const Icon(Icons.add_circle_outline, size: 22),
-                                    onPressed: () => widget.state.changeQty(e, 1),
-                                  ),
-                                ],
-                              ),
-                              if (e.dip.trim().isNotEmpty)
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.end,
-                                  children: [
-                                    IconButton(
-                                      padding: EdgeInsets.zero,
-                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                                      icon: const Icon(Icons.remove_circle_outline, size: 20),
-                                      onPressed: e.dipQty > 0 ? () => widget.state.changeDipQty(e, -1) : null,
-                                    ),
-                                    Padding(
-                                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                                      child: Text('${e.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
-                                    ),
-                                    IconButton(
-                                      padding: EdgeInsets.zero,
-                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                                      icon: const Icon(Icons.add_circle_outline, size: 20),
-                                      onPressed: () => widget.state.changeDipQty(e, 1),
-                                    ),
-                                  ],
-                                ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
+                    itemBuilder: (context, i) => _buildTrayLineCard(widget.state, widget.state.tray[i]),
                   ),
           ),
           Padding(
@@ -9138,88 +9583,7 @@ class TrayScreen extends StatelessWidget {
                           physics: const AlwaysScrollableScrollPhysics(),
                           padding: const EdgeInsets.all(12),
                           itemCount: state.tray.length,
-                          itemBuilder: (context, index) {
-                            final item = state.tray[index];
-                            return Card(
-                              child: Padding(
-                                padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                                  children: [
-                                    Row(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        SizedBox(
-                                          width: 56,
-                                          height: 56,
-                                          child: ClipRRect(
-                                            borderRadius: BorderRadius.circular(8),
-                                            child: _MenuThumb(item: item.menu, compact: true),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 10),
-                                        Expanded(
-                                          child: Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            children: [
-                                              Text(item.menu.name, style: const TextStyle(fontWeight: FontWeight.w700)),
-                                              const SizedBox(height: 4),
-                                              Text(
-                                                cartLineDetailSubtitle(item),
-                                                style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Row(
-                                      children: [
-                                        const Text('Main qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
-                                        const Spacer(),
-                                        IconButton(
-                                          onPressed: () {
-                                            state.changeQty(item, 1);
-                                          },
-                                          icon: const Icon(Icons.add_circle, color: AppColors.success),
-                                        ),
-                                        Text('${item.qty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
-                                        IconButton(
-                                          onPressed: () {
-                                            final q = item.qty;
-                                            state.changeQty(item, -1);
-                                            if (q <= 1) {
-                                              appSnack(context, 'Removed ${item.menu.name} from tray');
-                                            }
-                                          },
-                                          icon: const Icon(Icons.remove_circle, color: AppColors.accent),
-                                        ),
-                                      ],
-                                    ),
-                                    if (item.dip.trim().isNotEmpty) ...[
-                                      const SizedBox(height: 4),
-                                      Row(
-                                        children: [
-                                          const Text('Add-on qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
-                                          const Spacer(),
-                                          IconButton(
-                                            onPressed: item.dipQty > 0 ? () => state.changeDipQty(item, -1) : null,
-                                            icon: const Icon(Icons.remove_circle_outline),
-                                          ),
-                                          Text('${item.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                          IconButton(
-                                            onPressed: () => state.changeDipQty(item, 1),
-                                            icon: const Icon(Icons.add_circle_outline),
-                                          ),
-                                        ],
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                            );
-                          },
+                          itemBuilder: (context, index) => _buildTrayLineCard(state, state.tray[index]),
                         ),
                 ),
               ),
@@ -9793,12 +10157,9 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   child: Column(
                     children: s.tray
                         .map(
-                          (e) => ListTile(
-                            dense: true,
-                            isThreeLine: e.dip.trim().isNotEmpty,
-                            title: Text(e.menu.name),
-                            subtitle: Text(cartLineDetailSubtitle(e)),
-                            trailing: Text('₱${cartLineSubtotal(e).toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                          (e) => Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: _buildTrayLineCard(s, e, onChanged: () => setState(() {})),
                           ),
                         )
                         .toList(),
@@ -9946,6 +10307,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
   bool showTray = true;
   bool showNotes = true;
   bool showDelivery = true;
+  final paymentReferenceController = TextEditingController();
   XFile? uploadedFile;
   Uint8List? _localProofBytes;
   /// Keeps first GCash proof visible after customer uploads balance proof (server field can lag on refresh).
@@ -9954,6 +10316,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
   @override
   void initState() {
     super.initState();
+    final ref = widget.order?.paymentReferenceInitial?.trim();
+    if (ref != null && ref.isNotEmpty) paymentReferenceController.text = ref;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await widget.state.loadOrders(force: true);
       if (!mounted) return;
@@ -9964,6 +10328,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
       }
       setState(() {});
     });
+  }
+
+  @override
+  void dispose() {
+    paymentReferenceController.dispose();
+    super.dispose();
   }
 
   OrderData? _syncedOrder(AppState s) {
@@ -9990,6 +10360,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
               dipQty: e.dipQty,
               qty: e.qty,
               price: e.menu.price,
+              lineNote: e.lineNote,
             ),
           )
           .toList(),
@@ -10037,7 +10408,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
         return;
       }
       final newOrder = result.order!;
-      final err = await s.uploadPaymentProof(newOrder.id, file, paymentProofBase64: proofB64);
+      final err = await s.uploadPaymentProof(
+        newOrder.id,
+        file,
+        paymentProofBase64: proofB64,
+        paymentReferenceInitial: paymentReferenceController.text.trim(),
+      );
       if (!mounted) return;
       if (err != null) {
         appSnack(context, err);
@@ -10062,7 +10438,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
       }
     }
     final oid = (_placedOrder ?? widget.order)!.id;
-    final err = await s.uploadPaymentProof(oid, file, paymentProofBase64: proofB64);
+    final err = await s.uploadPaymentProof(
+      oid,
+      file,
+      paymentProofBase64: proofB64,
+      paymentReferenceInitial: paymentReferenceController.text.trim(),
+    );
     if (!mounted) return;
     if (err != null) {
       appSnack(context, err);
@@ -10287,6 +10668,17 @@ class _PaymentScreenState extends State<PaymentScreen> {
                               fit: BoxFit.contain,
                             ),
                           ),
+                          if (!insufficient) ...[
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: paymentReferenceController,
+                              decoration: const InputDecoration(
+                                labelText: 'GCash reference number',
+                                hintText: 'Enter transaction reference',
+                              ),
+                              textCapitalization: TextCapitalization.characters,
+                            ),
+                          ],
                           const SizedBox(height: 12),
                           LayoutBuilder(
                             builder: (context, c) {
@@ -10416,12 +10808,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
                         children: [
                           if (isDraft)
                             ...s.tray.map(
-                              (e) => ListTile(
-                                dense: true,
-                                isThreeLine: e.dip.trim().isNotEmpty,
-                                title: Text(e.menu.name),
-                                subtitle: Text(cartLineDetailSubtitle(e)),
-                                trailing: Text('₱${cartLineSubtotal(e).toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                              (e) => Padding(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: _buildTrayLineCard(s, e, onChanged: () => setState(() {})),
                               ),
                             )
                           else if (orderForUi.lines.isEmpty)
@@ -13871,6 +14260,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                               context,
                                               dishName: dish.name,
                                               description: dish.description,
+                                              ingredients: dish.ingredients,
                                               allergens: dish.allergens,
                                               imageBase64: dish.imageBase64,
                                             );
@@ -13894,31 +14284,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                         ),
                                       ),
                                       ),
-                                      title: InkWell(
-                                        onTap: () {
-                                          if (dish != null) {
-                                            showMenuDishDetailDialog(
-                                              context,
-                                              dishName: dish.name,
-                                              description: dish.description,
-                                              allergens: dish.allergens,
-                                              imageBase64: dish.imageBase64,
-                                            );
-                                          } else {
-                                            showMenuDishDetailDialog(
-                                              context,
-                                              dishName: dishName,
-                                              description: '',
-                                              allergens: const [],
-                                            );
-                                          }
-                                        },
-                                        child: Text(dishName, style: const TextStyle(fontSize: 13, decoration: TextDecoration.underline)),
-                                      ),
+                                      title: Text(dishName, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
                                       subtitle: Text(
                                         dish != null && dish.allergens.isNotEmpty
                                             ? 'Allergens: ${dish.allergens.join(', ')}'
-                                            : 'Tap the image or dish name for details',
+                                            : 'Tap the image for description and allergens',
                                         style: const TextStyle(fontSize: 11),
                                         maxLines: 3,
                                         overflow: TextOverflow.ellipsis,
@@ -16899,53 +17269,51 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                               child: Row(
                                 children: [
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: SizedBox(
-                                      width: 40,
-                                      height: 40,
-                                      child: dishItem != null ? _MenuThumb(item: dishItem, compact: true) : const Icon(Icons.fastfood, size: 22),
+                                  GestureDetector(
+                                    onTap: dishItem != null
+                                        ? () => showMenuDishDetailDialog(
+                                              context,
+                                              dishName: dishItem.name,
+                                              description: dishItem.description,
+                                              ingredients: dishItem.ingredients,
+                                              allergens: dishItem.allergens,
+                                              imageBase64: dishItem.imageBase64,
+                                            )
+                                        : () => showMenuDishDetailDialog(
+                                              context,
+                                              dishName: dishName,
+                                              description: '',
+                                              allergens: const [],
+                                            ),
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(6),
+                                      child: SizedBox(
+                                        width: 40,
+                                        height: 40,
+                                        child: dishItem != null ? _MenuThumb(item: dishItem, compact: true) : const Icon(Icons.fastfood, size: 22),
+                                      ),
                                     ),
                                   ),
                                   const SizedBox(width: 10),
                                   Expanded(
-                                    child: InkWell(
-                                      onTap: dishItem != null
-                                          ? () => showMenuDishDetailDialog(
-                                                context,
-                                                dishName: dishItem.name,
-                                                description: dishItem.description,
-                                                allergens: dishItem.allergens,
-                                                imageBase64: dishItem.imageBase64,
-                                              )
-                                          : () => showMenuDishDetailDialog(
-                                                context,
-                                                dishName: dishName,
-                                                description: '',
-                                                allergens: const [],
-                                              ),
-                                      child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        children: [
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          dishName,
+                                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                                        ),
+                                        if (dishItem != null && dishItem.allergens.isNotEmpty)
                                           Text(
-                                            dishName,
-                                            style: TextStyle(
-                                              fontSize: 13,
-                                              fontWeight: dishItem != null && dishItem.allergens.isNotEmpty
-                                                  ? FontWeight.w600
-                                                  : FontWeight.normal,
-                                              decoration: dishItem != null && dishItem.allergens.isNotEmpty
-                                                  ? TextDecoration.underline
-                                                  : null,
-                                            ),
+                                            'Allergens: ${dishItem.allergens.join(', ')}',
+                                            style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                                          )
+                                        else if (dishItem != null)
+                                          Text(
+                                            'Tap image for description and allergens',
+                                            style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
                                           ),
-                                          if (dishItem != null && dishItem.allergens.isNotEmpty)
-                                            Text(
-                                              'Allergens: ${dishItem.allergens.join(', ')}',
-                                              style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
-                                            ),
-                                        ],
-                                      ),
+                                      ],
                                     ),
                                   ),
                                   Icon(
@@ -19402,30 +19770,35 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ),
             if (post && _compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true) > 0.01) ...[
               const SizedBox(height: 12),
-              Container(
+              Builder(
+                builder: (ctx) {
+                  final addlPaymentConfirmed =
+                      d.postAnalysis['additional_costs_payment_confirmed'] == true;
+                  final sectionColor = addlPaymentConfirmed ? Colors.green : Colors.red;
+                  return Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
-                  color: Colors.red.shade50,
+                  color: sectionColor.shade50,
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.red.shade700, width: 1.5),
+                  border: Border.all(color: sectionColor.shade700, width: 1.5),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Text(
                       'Additional Costs Payment',
-                      style: TextStyle(fontWeight: FontWeight.w800, color: Colors.red.shade900),
+                      style: TextStyle(fontWeight: FontWeight.w800, color: sectionColor.shade900),
                     ),
                     const SizedBox(height: 6),
                     Text(
                       'One combined payment for all additional costs entered in For Down Payment, On Going, and For Full Payment.',
-                      style: TextStyle(fontSize: 12, height: 1.35, color: Colors.red.shade900),
+                      style: TextStyle(fontSize: 12, height: 1.35, color: sectionColor.shade900),
                     ),
                     const SizedBox(height: 8),
                     Text(
                       'Amount due: PHP ${_compiledPostDraftAdditionalCostsTotal(includeWorkingPostStage: true).toStringAsFixed(2)}',
-                      style: TextStyle(fontWeight: FontWeight.w700, color: Colors.red.shade900),
+                      style: TextStyle(fontWeight: FontWeight.w700, color: sectionColor.shade900),
                     ),
                     const SizedBox(height: 8),
                     TextField(
@@ -19492,9 +19865,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     ],
                     const SizedBox(height: 8),
                     FilledButton(
-                      style: FilledButton.styleFrom(backgroundColor: Colors.red.shade800),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: addlPaymentConfirmed ? Colors.green.shade800 : Colors.red.shade800,
+                      ),
                       onPressed: !widget.state.isManager ||
-                              (d.postAnalysis['additional_costs_payment_confirmed'] == true) ||
+                              addlPaymentConfirmed ||
                               _managerAdditionalCostsProofBytes == null
                           ? null
                           : () async {
@@ -19531,35 +19906,40 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 ),
                               );
                               if (ok != true || !mounted) return;
-                              final err = await widget.state.managerPatchCateringPostAnalysis(
-                                id: d.id,
-                                orderKind: d.orderKind,
-                                patch: {
-                                  'additional_costs_payment_confirmed': true,
-                                  'manager_additional_costs_proof_b64':
-                                      base64Encode(_managerAdditionalCostsProofBytes!),
-                                  'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
-                                },
-                              );
-                              if (!mounted) return;
-                              if (err != null) {
-                                appSnack(context, err);
-                                return;
+                              _showManagerBlockingProgress('Confirming additional costs payment…');
+                              try {
+                                final err = await widget.state.managerPatchCateringPostAnalysis(
+                                  id: d.id,
+                                  orderKind: d.orderKind,
+                                  patch: {
+                                    'additional_costs_payment_confirmed': true,
+                                    'manager_additional_costs_proof_b64':
+                                        base64Encode(_managerAdditionalCostsProofBytes!),
+                                    'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
+                                  },
+                                );
+                                if (!mounted) return;
+                                if (err != null) {
+                                  appSnack(context, err);
+                                  return;
+                                }
+                                final full = await widget.state.loadManagerCateringItem(
+                                  id: d.id,
+                                  orderKind: d.orderKind,
+                                );
+                                if (!mounted) return;
+                                if (full != null) setState(() => _loadedDetailRow = full);
+                                appSnack(context, 'Additional costs payment confirmed');
+                              } finally {
+                                if (mounted) _hideManagerBlockingProgress();
                               }
-                              final full = await widget.state.loadManagerCateringItem(
-                                id: d.id,
-                                orderKind: d.orderKind,
-                              );
-                              if (!mounted) return;
-                              if (full != null) setState(() => _loadedDetailRow = full);
-                              appSnack(context, 'Additional costs payment confirmed');
                             },
-                      child: Text(
-                        d.postAnalysis['additional_costs_payment_confirmed'] == true ? 'PAID' : 'Confirm payment',
-                      ),
+                      child: Text(addlPaymentConfirmed ? 'PAID' : 'Confirm payment'),
                     ),
                   ],
                 ),
+              );
+                },
               ),
             ],
           ],
@@ -19604,8 +19984,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final isDownPaymentSubstage = widget.stage == kStageForDownPayment;
     final isPost = widget.stage == kStageForFullPayment;
     final isCompleted = widget.stage == 'completed';
+    final isCancelled = widget.stage == 'cancelled';
     final isOnlineInquiry = widget.stage == 'online_inquiries';
     final isDraftStage = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+    final showLaborTravelAsText = !isDraftStage &&
+        (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted || isCancelled);
+    final showSeatingSection = orderSupportsSeatingLayout(row.orderKind) && canShowSeatingLayout(row.status);
+    final seatingEventDateTime = _eventDateTimeJoinedFromRowScheduleSlots(row.scheduleSlots);
+    final seatingVenueAddress = row.address.trim();
     final managerDraftCanAdvanceToNext =
         !isDraftStage ||
             (_managerDraftAdvanceGateSig.isNotEmpty &&
@@ -20365,7 +20751,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               allowTaskEditor: true,
               checklistStatusOnly: true,
             ),
-            if (row.orderKind == 'event' && canShowSeatingLayout(row.status))
+            if (showSeatingSection)
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(12),
@@ -20381,6 +20767,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         exportOnly: true,
                         eventTitle: row.eventTitle,
                         transactionNo: row.transactionNo,
+                        eventDateTime: seatingEventDateTime,
+                        venueAddress: seatingVenueAddress,
                         helperText: 'View seating layout output. Download as image or PDF.',
                         buttonLabel: 'View seating layout',
                         onOpenEditor: () async {
@@ -20442,6 +20830,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         _snapshotAdditionalCostsForCurrentStage(clearWorking: true, refreshTimestamp: true);
         _showManagerBlockingProgress('Moving to On Going…');
         try {
+          _applyDraftLaborTravelFromRow(d);
+          final flatAdditional = _flattenAdditionalCostsFromGroups();
+          final laborNow = _laborCostComputed();
+          final travelNow = _travelCostComputed();
+          final totalNow = _grandTotalComputed();
           final err = await widget.state.managerAdvanceCateringStage(
             id: d.id,
             orderKind: d.orderKind,
@@ -20449,7 +20842,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             postAnalysis: {
               'processing_phase': 'ongoing',
               'additional_costs_groups': _additionalCostsGroupsForPostAnalysis(),
+              if (d.postAnalysis['manager_down_payment_confirmed'] == true)
+                'manager_down_payment_confirmed': true,
             },
+            checklist: checklistRows.map((e) => Map<String, dynamic>.from(e)).toList(),
+            additionalCosts: flatAdditional,
+            laborCost: laborNow,
+            travelCost: travelNow,
+            totalCost: totalNow,
           );
           if (!mounted) return;
           if (err != null) {
@@ -20914,7 +21314,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 ),
                               );
                               if (ok != true || !mounted) return;
-                              await saveCurrentStage();
+                              _showManagerBlockingProgress('Saving down payment…');
+                              try {
+                                await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+                              } finally {
+                                if (mounted) _hideManagerBlockingProgress();
+                              }
                               if (!mounted) return;
                               final err = await widget.state.managerPatchCateringPostAnalysis(
                                 id: d.id,
@@ -21268,6 +21673,27 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
+          if (showLaborTravelAsText)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Labor & travel', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    _laborTravelPlainTextSection(row),
+                  ],
+                ),
+              ),
+            ),
+          if (!isCompleted)
+            _additionalCostsCard(
+              draft: isDraftStage,
+              processing: isProcessing && !isPost,
+              post: isPost,
+              row: row,
+            ),
           if (!isDraftStage && (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted))
             Card(
               child: Padding(
@@ -21401,10 +21827,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     Text('Payment method: ${row.paymentMethod}'),
                     if (row.formalityLevel.trim().isNotEmpty)
                       Text('Formality: ${row.formalityLevel}'),
-                    if (isCompleted) ...[
-                      const SizedBox(height: 8),
-                      _laborTravelPlainTextSection(row),
-                    ],
                     if (row.scheduleSlots.isNotEmpty) ...[
                       const SizedBox(height: 6),
                       if (isProcessing || isPost || isCompleted) ...[
@@ -21857,31 +22279,29 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                                   child: Row(
                                     children: [
-                                      SizedBox(
-                                        width: 40,
-                                        height: 40,
+                                      GestureDetector(
+                                        onTap: () => showMenuDishDetailDialog(
+                                          context,
+                                          dishName: dish.name,
+                                          description: dish.description,
+                                          ingredients: dish.ingredients,
+                                          allergens: dish.allergens,
+                                          imageBase64: dish.imageBase64,
+                                        ),
                                         child: ClipRRect(
                                           borderRadius: BorderRadius.circular(8),
-                                          child: _MenuThumb(item: dish, compact: true),
+                                          child: SizedBox(
+                                            width: 40,
+                                            height: 40,
+                                            child: _MenuThumb(item: dish, compact: true),
+                                          ),
                                         ),
                                       ),
                                       const SizedBox(width: 10),
                                       Expanded(
-                                        child: InkWell(
-                                          onTap: () => showMenuDishDetailDialog(
-                                            context,
-                                            dishName: dish.name,
-                                            description: dish.description,
-                                            allergens: dish.allergens,
-                                            imageBase64: dish.imageBase64,
-                                          ),
-                                          child: Text(
-                                            dish.name,
-                                            style: const TextStyle(
-                                              decoration: TextDecoration.underline,
-                                              fontWeight: FontWeight.w600,
-                                            ),
-                                          ),
+                                        child: Text(
+                                          dish.name,
+                                          style: const TextStyle(fontWeight: FontWeight.w600),
                                         ),
                                       ),
                                       IconButton(
@@ -22023,7 +22443,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (row.orderKind == 'event' && canShowSeatingLayout(row.status))
+          if (showSeatingSection)
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -22039,6 +22459,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       exportOnly: widget.supervisorMode || !canEditSeatingLayout(row.status),
                       eventTitle: row.eventTitle,
                       transactionNo: row.transactionNo,
+                      eventDateTime: seatingEventDateTime,
+                      venueAddress: seatingVenueAddress,
                       helperText: widget.supervisorMode
                           ? 'View seating layout output. Download as image or PDF.'
                           : canEditSeatingLayout(row.status)
@@ -22080,18 +22502,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (!isCompleted) ...[
+          if (!isCompleted && isDraftStage)
             _laborCostCard(
-              allowLaborEdits: isDraftStage && canEditStage,
-              showTravelReadOnly: !isDraftStage,
+              allowLaborEdits: canEditStage,
+              showTravelReadOnly: false,
             ),
-            _additionalCostsCard(
-              draft: isDraftStage,
-              processing: isProcessing && !isPost,
-              post: isPost,
-              row: row,
-            ),
-          ],
           if (isDraftStage) ...[
             Card(
               child: Padding(
@@ -22452,9 +22867,35 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Expanded(
-            child: ClipRRect(
-              borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
-              child: _MenuThumb(item: item),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                ClipRRect(
+                  borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
+                  child: _MenuThumb(item: item),
+                ),
+                Positioned(
+                  top: 4,
+                  right: 4,
+                  child: Material(
+                    color: Colors.white.withValues(alpha: 0.92),
+                    shape: const CircleBorder(),
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                      icon: const Icon(Icons.info_outline, size: 18),
+                      onPressed: () => showMenuDishDetailDialog(
+                        context,
+                        dishName: item.name,
+                        description: item.description,
+                        ingredients: item.ingredients,
+                        allergens: item.allergens,
+                        imageBase64: item.imageBase64,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
           Padding(
@@ -22462,20 +22903,11 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                InkWell(
-                  onTap: () => showMenuDishDetailDialog(
-                    context,
-                    dishName: item.name,
-                    description: item.description,
-                    allergens: item.allergens,
-                    imageBase64: item.imageBase64,
-                  ),
-                  child: Text(
-                    item.name,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12, decoration: TextDecoration.underline),
-                  ),
+                Text(
+                  item.name,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12),
                 ),
                 Row(
                   children: [
@@ -22516,68 +22948,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 8),
                     itemCount: widget.state.tray.length,
-                    itemBuilder: (context, i) {
-                      final e = widget.state.tray[i];
-                      return Card(
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Text(e.menu.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
-                              const SizedBox(height: 4),
-                              Text(
-                                cartLineDetailSubtitle(e),
-                                style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade800),
-                              ),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  IconButton(
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                    icon: const Icon(Icons.remove_circle_outline, size: 22),
-                                    onPressed: () => widget.state.changeQty(e, -1),
-                                  ),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                                    child: Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                  ),
-                                  IconButton(
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                    icon: const Icon(Icons.add_circle_outline, size: 22),
-                                    onPressed: () => widget.state.changeQty(e, 1),
-                                  ),
-                                ],
-                              ),
-                              if (e.dip.trim().isNotEmpty)
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.end,
-                                  children: [
-                                    IconButton(
-                                      padding: EdgeInsets.zero,
-                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                                      icon: const Icon(Icons.remove_circle_outline, size: 20),
-                                      onPressed: e.dipQty > 0 ? () => widget.state.changeDipQty(e, -1) : null,
-                                    ),
-                                    Padding(
-                                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                                      child: Text('${e.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
-                                    ),
-                                    IconButton(
-                                      padding: EdgeInsets.zero,
-                                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                                      icon: const Icon(Icons.add_circle_outline, size: 20),
-                                      onPressed: () => widget.state.changeDipQty(e, 1),
-                                    ),
-                                  ],
-                                ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
+                    itemBuilder: (context, i) => _buildTrayLineCard(widget.state, widget.state.tray[i]),
                   ),
           ),
           Padding(
@@ -22765,82 +23136,7 @@ class PosYourTrayScreen extends StatelessWidget {
                 : ListView.builder(
                     padding: const EdgeInsets.all(12),
                     itemCount: state.tray.length,
-                    itemBuilder: (context, i) {
-                      final e = state.tray[i];
-                      return Card(
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  SizedBox(
-                                    width: 56,
-                                    height: 56,
-                                    child: ClipRRect(
-                                      borderRadius: BorderRadius.circular(8),
-                                      child: _MenuThumb(item: e.menu),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(e.menu.name, style: const TextStyle(fontWeight: FontWeight.w700)),
-                                        const SizedBox(height: 4),
-                                        Text(
-                                          cartLineDetailSubtitle(e),
-                                          style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                  Text(
-                                    '₱${cartLineSubtotal(e).toStringAsFixed(2)}',
-                                    style: const TextStyle(fontWeight: FontWeight.w800),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              Row(
-                                children: [
-                                  const Text('Main qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
-                                  const Spacer(),
-                                  IconButton(
-                                    onPressed: () => state.changeQty(e, 1),
-                                    icon: const Icon(Icons.add_circle, color: AppColors.success),
-                                  ),
-                                  Text('${e.qty}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
-                                  IconButton(
-                                    onPressed: () => state.changeQty(e, -1),
-                                    icon: const Icon(Icons.remove_circle, color: AppColors.accent),
-                                  ),
-                                ],
-                              ),
-                              if (e.dip.trim().isNotEmpty)
-                                Row(
-                                  children: [
-                                    const Text('Add-on qty', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
-                                    const Spacer(),
-                                    IconButton(
-                                      onPressed: e.dipQty > 0 ? () => state.changeDipQty(e, -1) : null,
-                                      icon: const Icon(Icons.remove_circle_outline),
-                                    ),
-                                    Text('${e.dipQty}', style: const TextStyle(fontWeight: FontWeight.w800)),
-                                    IconButton(
-                                      onPressed: () => state.changeDipQty(e, 1),
-                                      icon: const Icon(Icons.add_circle_outline),
-                                    ),
-                                  ],
-                                ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
+                          itemBuilder: (context, i) => _buildTrayLineCard(state, state.tray[i]),
                   ),
           ),
           Padding(
@@ -22902,6 +23198,7 @@ class PosYourTrayScreen extends StatelessWidget {
 class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
   String paymentMethod = 'CASH';
   final amountReceived = TextEditingController();
+  final gcashReference = TextEditingController();
   final note = TextEditingController();
   final customerLabel = TextEditingController();
   Uint8List? gcashProofBytes;
@@ -22940,6 +23237,7 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
   @override
   void dispose() {
     amountReceived.dispose();
+    gcashReference.dispose();
     note.dispose();
     customerLabel.dispose();
     super.dispose();
@@ -22996,6 +23294,12 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                   Text('Change: ₱${change.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w700)),
                 if (isGcash) ...[
                   const SizedBox(height: 12),
+                  TextField(
+                    controller: gcashReference,
+                    decoration: const InputDecoration(labelText: 'GCash reference number'),
+                    textCapitalization: TextCapitalization.characters,
+                  ),
+                  const SizedBox(height: 12),
                   Row(
                     children: [
                       Expanded(
@@ -23048,21 +23352,7 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                 ...widget.state.tray.map(
                   (e) => Padding(
                     padding: const EdgeInsets.only(bottom: 8),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            '${e.menu.name}\n${cartLineDetailSubtitle(e)}',
-                            style: const TextStyle(height: 1.25),
-                          ),
-                        ),
-                        Text(
-                          '₱${cartLineSubtotal(e).toStringAsFixed(2)}',
-                          style: const TextStyle(fontWeight: FontWeight.w800),
-                        ),
-                      ],
-                    ),
+                    child: _buildTrayLineCard(widget.state, e, onChanged: () => setState(() {})),
                   ),
                 ),
               ],
@@ -23122,6 +23412,7 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                 note: note.text.trim(),
                 posCustomerLabel: customerLabel.text.trim(),
                 paymentProofBase64: gcashProofBytes != null ? base64Encode(gcashProofBytes!) : '',
+                paymentReference: isGcash ? gcashReference.text.trim() : '',
               );
               if (context.mounted) Navigator.of(context).pop();
               if (!context.mounted) return;
@@ -23185,6 +23476,8 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
               Text('Status: ${statusReadable(o.status)}'),
               Text('Placed: ${formatDateTimeLocal(o.createdAt)}'),
               Text('Payment: ${o.paymentMode.trim().isEmpty ? '—' : o.paymentMode}'),
+              if (o.paymentReferenceInitial != null && o.paymentReferenceInitial!.trim().isNotEmpty)
+                Text('Reference: ${o.paymentReferenceInitial}'),
               if (o.cashierAmountReceived != null)
                 Text('Amount received: ₱${o.cashierAmountReceived!.toStringAsFixed(2)}'),
               if (o.cashierChange != null && o.cashierChange != 0)

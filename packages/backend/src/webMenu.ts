@@ -1,3 +1,5 @@
+import type pg from "pg";
+
 /**
  * Reads dish / set-menu data from your existing web-app tables.
  *
@@ -121,6 +123,68 @@ export function resolveMenuSql(): string | null {
     ${where ? `WHERE ${where}` : ""}
     ORDER BY ${escapeIdent(idCol)}
   `.trim();
+}
+
+const DEFAULT_MENU_ALLERGENS_LEGACY =
+  "COALESCE(NULLIF(TRIM(md.allergens), ''), '[]') AS allergens";
+
+async function columnExists(pool: pg.Pool, table: string, column: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+     LIMIT 1`,
+    [table, column],
+  );
+  return rows.length > 0;
+}
+
+/** Resolve allergen label column on menu_dishes_allergens (name vs legacy allergen_name). */
+export async function menuAllergenLabelSql(pool: pg.Pool): Promise<string> {
+  const hasName = await columnExists(pool, "menu_dishes_allergens", "name");
+  const hasLegacy = await columnExists(pool, "menu_dishes_allergens", "allergen_name");
+  if (hasName && hasLegacy) return "COALESCE(ma.name, ma.allergen_name)";
+  if (hasName) return "ma.name";
+  if (hasLegacy) return "ma.allergen_name";
+  return "''";
+}
+
+/** SELECT expression for menu_dishes.allergens (TEXT JSON vs BIGINT[] of allergen_id). */
+export async function menuAllergensSelectExpr(pool: pg.Pool, dishAlias = "md"): Promise<string> {
+  const { rows } = await pool.query(
+    `SELECT data_type FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'menu_dishes' AND column_name = 'allergens'
+     LIMIT 1`,
+  );
+  if (rows.length === 0) return `'[]'::text`;
+  const dataType = String((rows[0] as { data_type: string }).data_type ?? "").toLowerCase();
+  if (dataType === "array") {
+    const label = await menuAllergenLabelSql(pool);
+    return `COALESCE(
+      (
+        SELECT COALESCE(json_agg(TRIM(${label}::text) ORDER BY ord)::text, '[]')
+        FROM unnest(COALESCE(${dishAlias}.allergens, ARRAY[]::bigint[])) WITH ORDINALITY AS u(allergen_id, ord)
+        LEFT JOIN public.menu_dishes_allergens ma ON ma.allergen_id = u.allergen_id
+        WHERE COALESCE(TRIM(${label}::text), '') <> ''
+      ),
+      '[]'
+    )`;
+  }
+  return `COALESCE(NULLIF(TRIM(${dishAlias}.allergens::text), ''), '[]')`;
+}
+
+let cachedMenuSqlWithAllergens: string | null = null;
+
+/** Default public menu SQL with allergens expression matched to the live DB schema. */
+export async function resolveMenuSqlForPool(pool: pg.Pool): Promise<string | null> {
+  const base = resolveMenuSql();
+  if (!base) return null;
+  if (!base.includes(DEFAULT_MENU_ALLERGENS_LEGACY.split(" AS ")[0]!)) {
+    return base;
+  }
+  if (cachedMenuSqlWithAllergens) return cachedMenuSqlWithAllergens;
+  const allergenExpr = await menuAllergensSelectExpr(pool);
+  cachedMenuSqlWithAllergens = base.replace(DEFAULT_MENU_ALLERGENS_LEGACY, `${allergenExpr} AS allergens`);
+  return cachedMenuSqlWithAllergens;
 }
 
 export function resolveSetMenusSql(): string | null {

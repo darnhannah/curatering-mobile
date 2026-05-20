@@ -16,25 +16,20 @@ bool isCateringPlusEventOrderType(String orderType, {String eventTitle = ''}) {
   return eventTitle.trim().isNotEmpty;
 }
 
-/// Show seating section on manager catering+event orders in these pipeline stages.
-bool canShowSeatingLayout(String status) {
-  final s = status.trim().toLowerCase();
-  return s == 'online_inquiries' ||
-      s == 'new_event' ||
-      s == 'for_down_payment' ||
-      s == 'for_ongoing' ||
-      s == 'for_full_payment';
+/// Catering-only and catering + event styling orders both support seating layout.
+bool orderSupportsSeatingLayout(String orderKind) {
+  final k = orderKind.trim().toLowerCase();
+  return k == 'catering' || k == 'event';
 }
 
-/// Edit seating in draft / active pipeline stages (not completed or cancelled).
+/// Show seating section on manager orders (catering or catering + event styling) in On Going only.
+bool canShowSeatingLayout(String status) {
+  return status.trim().toLowerCase() == 'for_ongoing';
+}
+
+/// Edit seating layout only while the order is in On Going.
 bool canEditSeatingLayout(String status) {
-  final s = status.trim().toLowerCase();
-  return s == 'online_inquiries' ||
-      s == 'new_event' ||
-      s == 'for_down_payment' ||
-      s == 'for_ongoing' ||
-      s == 'for_full_payment' ||
-      s == 'for_processing';
+  return status.trim().toLowerCase() == 'for_ongoing';
 }
 
 String eventDesignSourceLabel(Map<String, dynamic> themeDesign) {

@@ -140,11 +140,6 @@ function isCateringPlusEvent(row: Record<string, unknown>, table: string): boole
 }
 
 async function ensureAiGenerationsTable(pool: pg.Pool): Promise<void> {
-  const exists = await pool.query(
-    `SELECT 1 FROM information_schema.tables
-     WHERE table_schema = 'public' AND table_name = 'ai_generations' LIMIT 1`,
-  );
-  if (exists.rows.length > 0) return;
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ai_generations (
       id BIGSERIAL PRIMARY KEY,
@@ -155,6 +150,16 @@ async function ensureAiGenerationsTable(pool: pg.Pool): Promise<void> {
       job_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+  await pool.query(`ALTER TABLE ai_generations ADD COLUMN IF NOT EXISTS user_email TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE ai_generations ADD COLUMN IF NOT EXISTS image_url TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE ai_generations ADD COLUMN IF NOT EXISTS prompt TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE ai_generations ADD COLUMN IF NOT EXISTS design_meta JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  );
+  await pool.query(`ALTER TABLE ai_generations ADD COLUMN IF NOT EXISTS job_id TEXT`);
+  await pool.query(
+    `ALTER TABLE ai_generations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+  );
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ai_generations_user_email ON ai_generations (LOWER(user_email))`);
 }
 

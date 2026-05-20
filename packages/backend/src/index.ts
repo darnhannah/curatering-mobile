@@ -63,7 +63,7 @@ import {
   sendGuestOrderProofConfirmation,
 } from "./guestNotify.js";
 import { ensureIdCounterRow, nextCusIdFromCounter, nextTrIdFromCounter } from "./idCounters.js";
-import { resolveMenuSql, resolveSetMenusSql } from "./webMenu.js";
+import { menuAllergenLabelSql, resolveMenuSqlForPool, resolveSetMenusSql } from "./webMenu.js";
 
 if (isMailConfigured()) {
   if (mailUsesResend()) {
@@ -132,8 +132,11 @@ async function ensureCateringPipelineStatusChecks(p: ReturnType<typeof getPool>)
       ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
       CHECK (status = ANY (${CATERING_PIPELINE_STATUSES_SQL}))
     `);
-  } catch {
-    // ignore — constraint may already match
+  } catch (e) {
+    console.warn(
+      "[schema] event_orders_status_check:",
+      e instanceof Error ? e.message : e,
+    );
   }
   try {
     await p.query(`ALTER TABLE catering_orders DROP CONSTRAINT IF EXISTS catering_orders_status_check`);
@@ -141,8 +144,11 @@ async function ensureCateringPipelineStatusChecks(p: ReturnType<typeof getPool>)
       ALTER TABLE catering_orders ADD CONSTRAINT catering_orders_status_check
       CHECK (status = ANY (${CATERING_PIPELINE_STATUSES_SQL}))
     `);
-  } catch {
-    // ignore
+  } catch (e) {
+    console.warn(
+      "[schema] catering_orders_status_check:",
+      e instanceof Error ? e.message : e,
+    );
   }
 }
 
@@ -939,6 +945,7 @@ type ParsedRestaurantLine = {
   dip_qty: number;
   qty: number;
   price: number;
+  notes: string;
 };
 
 function parseRestaurantOrderLine(i: unknown): ParsedRestaurantLine | null {
@@ -953,7 +960,8 @@ function parseRestaurantOrderLine(i: unknown): ParsedRestaurantLine | null {
   if (!Number.isFinite(dip_qty) || dip_qty < 0) dip_qty = 0;
   if (!dip) dip_qty = 1;
   if (!item_name || qty <= 0 || price < 0) return null;
-  return { item_name, dip, dip_qty, qty, price };
+  const notes = String(r.notes ?? r.line_note ?? "").trim();
+  return { item_name, dip, dip_qty, qty, price, notes };
 }
 
 function restaurantLineSubtotal(line: ParsedRestaurantLine): number {
@@ -1210,16 +1218,11 @@ app.post("/api/items", async (_req, res) => {
 app.get("/api/mobile/allergens", async (_req, res) => {
   try {
     const pool = getPool();
-    const hasName = await pool.query(
-      `SELECT 1 FROM information_schema.columns
-       WHERE table_schema = 'public' AND table_name = 'menu_dishes_allergens' AND column_name = 'name'
-       LIMIT 1`,
-    );
-    const nameCol = hasName.rows.length > 0 ? "name" : "allergen_name";
+    const label = await menuAllergenLabelSql(pool);
     const { rows } = await pool.query(
-      `SELECT TRIM(${nameCol}::text) AS name
-       FROM menu_dishes_allergens
-       WHERE COALESCE(TRIM(${nameCol}::text), '') <> ''
+      `SELECT TRIM(${label}::text) AS name
+       FROM menu_dishes_allergens ma
+       WHERE COALESCE(TRIM(${label}::text), '') <> ''
        ORDER BY 1`,
     );
     res.json(rows);
@@ -1230,7 +1233,8 @@ app.get("/api/mobile/allergens", async (_req, res) => {
 });
 
 app.get("/api/mobile/menu", async (_req, res) => {
-  const sql = resolveMenuSql();
+  const pool = getPool();
+  const sql = await resolveMenuSqlForPool(pool);
   if (!sql) {
     res.status(503).json({
       error:
@@ -1239,7 +1243,7 @@ app.get("/api/mobile/menu", async (_req, res) => {
     return;
   }
   try {
-    const { rows } = await getPool().query(sql);
+    const { rows } = await pool.query(sql);
     res.json(
       rows.map((r) => ({
         id: String((r as Record<string, unknown>).id ?? ""),
@@ -2247,6 +2251,9 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
   const customerLabel = String(req.body?.pos_customer_label ?? "").trim();
   const amountReceivedRaw = req.body?.amount_received;
   const paymentProof = String(req.body?.payment_proof ?? "").trim();
+  const paymentReference = String(
+    req.body?.payment_reference_initial ?? req.body?.payment_reference ?? "",
+  ).trim();
   const items: unknown[] = Array.isArray(req.body?.items) ? (req.body.items as unknown[]) : [];
   if (!cashierEmail || !cashierPassword) {
     res.status(400).json({ error: "cashier_email and cashier_password are required" });
@@ -2288,11 +2295,11 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
       `INSERT INTO restaurant_orders
         (order_id, note, payment_method, payment_uploaded, payment_proof,
          full_name, pos_customer_label, total_cost, amount_paid, change_given,
-         delivery_address, contact_number, payment_mode,
+         delivery_address, contact_number, payment_mode, payment_reference_initial,
          order_source, order_status, tray_items, submitted_order_dt_stamp, last_updated_order_status_dt_stamp)
        VALUES
-        ('TEMP', $1, $2, $3, $4, $5, $6, $7, $8, $9, '', '', 'GCASH ONLY',
-         'POS_MOBILE', 'IN_PREPARATION', '[]'::jsonb, NOW(), NOW())
+        ('TEMP', $1, $2, $3, $4, $5, $6, $7, $8, $9, '', '', NULL, $10,
+         'POS_MOBILE', NULL, '[]'::jsonb, NOW(), NOW())
        RETURNING mobile_id AS id`,
       [
         note.trim() || posNote,
@@ -2304,6 +2311,7 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
         total,
         !Number.isNaN(amountReceived) ? amountReceived : null,
         changeDue,
+        paymentMethod === "GCASH" ? paymentReference || null : null,
       ],
     );
     const orderId = Number(rows[0].id);
@@ -2355,6 +2363,7 @@ async function attachOrderItems(rows: Array<Record<string, unknown>>): Promise<A
         dip_qty: Math.max(0, Math.floor(Number(it.dip_qty ?? 1)) || 0),
         qty: Number(it.qty ?? 0),
         price: Number(it.price ?? 0),
+        notes: String(it.notes ?? it.line_note ?? "").trim(),
       }));
     }
     return {
@@ -3030,6 +3039,9 @@ app.post("/api/mobile/orders", async (req, res) => {
 app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
   const id = Number(req.params.id);
   const paymentProof = String(req.body?.payment_proof ?? "");
+  const paymentReference = String(
+    req.body?.payment_reference_initial ?? req.body?.payment_reference ?? "",
+  ).trim();
   if (!id || !paymentProof) {
     res.status(400).json({ error: "id and payment_proof are required" });
     return;
@@ -3099,9 +3111,10 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
         `UPDATE restaurant_orders
          SET payment_uploaded_initial = TRUE,
              payment_proof_initial = $2,
+             payment_reference_initial = COALESCE(NULLIF($3::text, ''), payment_reference_initial),
              last_updated_order_status_dt_stamp = NOW()
          WHERE mobile_id = $1`,
-        [id, paymentProof],
+        [id, paymentProof, paymentReference || null],
       );
       const totalNum = Number(row.total) || 0;
       const emailTo = String(row.user_email ?? "").trim().toLowerCase();
@@ -4650,6 +4663,7 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
   const menu = Array.isArray(req.body?.menu) ? req.body.menu : null;
   const actualEventImages = Array.isArray(req.body?.actual_event_images) ? req.body.actual_event_images : null;
   try {
+    await ensureNewEventSchemaOnce();
     const table = orderKind === "catering" ? "catering_orders" : "event_orders";
     const txSelect = orderKind === "catering" ? CATERING_TRANSACTION_ID : EVENT_TRANSACTION_ID;
     const postAnalysisSelect = orderKind === "event" ? EVENT_POST_ANALYSIS_JSON : CATERING_POST_ANALYSIS_JSON;
@@ -4848,7 +4862,16 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
     res.json({ ok: true, id: rows[0].id, status: nextStatus });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "database error" });
+    const code = err && typeof err === "object" && "code" in err ? String((err as { code: string }).code) : "";
+    if (code === "23514") {
+      res.status(500).json({
+        error:
+          "Could not update order stage — database status constraint is outdated. Redeploy the backend (restart) so pipeline statuses including for_ongoing are applied, then try again.",
+      });
+      return;
+    }
+    const msg = err instanceof Error ? err.message : "database error";
+    res.status(500).json({ error: msg || "database error" });
   }
 });
 
@@ -5838,6 +5861,7 @@ registerEventDesignSeatingRoutes(app, {
 
 async function main() {
   await initDb();
+  await ensureNewEventSchemaOnce();
   await backfillLoyaltyForConfirmedMobileOrders();
   await recomputeHistoricalLoyaltyPoints();
   await seedCashierAccount();

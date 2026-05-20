@@ -9,6 +9,45 @@ import '../utils/allergen_ui.dart';
 import '../utils/order_type_utils.dart';
 import '../utils/theme_design_venue_refs.dart';
 
+Future<void> showSeatingLayoutFullscreen(
+  BuildContext context, {
+  required SeatingPlanData plan,
+  List<String> venueReferencePhotosBase64 = const [],
+}) {
+  return showDialog<void>(
+    context: context,
+    barrierColor: Colors.black87,
+    builder: (ctx) => Dialog(
+      insetPadding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 4, 0),
+            child: Row(
+              children: [
+                const Expanded(
+                  child: Text('Seating layout', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                ),
+                IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(ctx)),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              child: SeatingPlanInteractive(
+                plan: plan,
+                editable: false,
+                venueReferencePhotosBase64: venueReferencePhotosBase64,
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 /// Theme design preview + actions aligned with customer My Inquiries / Inquire Catering.
 Widget buildManagerThemeDesignBlock({
   required Map<String, dynamic> themeDesign,
@@ -67,6 +106,8 @@ Widget buildManagerSeatingLayoutBlock({
   bool exportOnly = false,
   String eventTitle = '',
   String transactionNo = '',
+  String eventDateTime = '',
+  String venueAddress = '',
   Map<String, dynamic> themeDesign = const {},
 }) {
   final plan = SeatingPlanData.fromJson(seatingPlanJson);
@@ -78,6 +119,8 @@ Widget buildManagerSeatingLayoutBlock({
         plan: plan,
         eventTitle: eventTitle,
         transactionNo: transactionNo,
+        eventDateTime: eventDateTime,
+        venueAddress: venueAddress,
       );
 
   Future<void> downloadImage() => saveSeatingLayoutImageToGallery(context: context, plan: plan);
@@ -125,11 +168,39 @@ Widget buildManagerSeatingLayoutBlock({
       if (hasPlan) ...[
         SizedBox(
           height: 220,
-          child: SeatingPlanInteractive(
-            plan: plan,
-            editable: false,
-            venueReferencePhotosBase64: venueRefs,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.grey.shade300),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Material(
+              color: Colors.grey.shade50,
+              child: InkWell(
+                onTap: () => showSeatingLayoutFullscreen(context, plan: plan, venueReferencePhotosBase64: venueRefs),
+                child: FittedBox(
+                  fit: BoxFit.contain,
+                  alignment: Alignment.center,
+                  child: SizedBox(
+                    width: 520,
+                    height: 320,
+                    child: SeatingPlanInteractive(
+                      plan: plan,
+                      editable: false,
+                      venueReferencePhotosBase64: venueRefs,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            ),
           ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Tap the layout to view full screen.',
+          style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
         ),
         const SizedBox(height: 8),
       ] else

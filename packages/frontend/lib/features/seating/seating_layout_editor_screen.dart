@@ -141,12 +141,6 @@ class _SeatingLayoutEditorScreenState extends State<SeatingLayoutEditorScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Seating layout saved.')),
       );
-      await previewSeatingLayoutPdf(
-        context: context,
-        plan: _plan,
-        eventTitle: widget.eventTitle,
-        transactionNo: widget.transactionNo,
-      );
       if (!mounted) return;
       Navigator.pop(context, _plan);
     } catch (e) {
