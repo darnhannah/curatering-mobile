@@ -61,21 +61,13 @@ ThemeData buildAppLightTheme() {
   return ThemeData(
     useMaterial3: true,
     brightness: Brightness.light,
-    scaffoldBackgroundColor: Colors.white,
+    scaffoldBackgroundColor: AppColors.canvas,
     colorScheme: ColorScheme.fromSeed(seedColor: AppColors.brand, brightness: Brightness.light),
     cardTheme: CardThemeData(
       color: Colors.white,
       elevation: 2,
       shadowColor: Colors.black26,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-    ),
-    dialogTheme: const DialogThemeData(
-      backgroundColor: Colors.white,
-      surfaceTintColor: Colors.white,
-    ),
-    bottomSheetTheme: const BottomSheetThemeData(
-      backgroundColor: Colors.white,
-      surfaceTintColor: Colors.white,
     ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
@@ -1376,49 +1368,6 @@ Widget cashierPaymentReferenceCard(String label, String reference) {
   );
 }
 
-Widget? cashierPaymentProofSuffixIcon(
-  BuildContext context,
-  OrderData o, {
-  bool balance = false,
-}) {
-  final hasImage = balance ? orderHasBalancePaymentProofImage(o) : orderHasInitialPaymentProofImage(o);
-  if (!hasImage) return null;
-  final b64 = balance ? o.supplementalPaymentProofBase64 : o.paymentProofBase64;
-  if (b64 == null || b64.trim().isEmpty) return null;
-  return IconButton(
-    icon: const Icon(Icons.image_outlined),
-    tooltip: balance ? 'View balance payment proof' : 'View proof of payment',
-    onPressed: () {
-      try {
-        final bytes = base64Decode(b64.trim());
-        showProofFullScreen(
-          context,
-          Uint8List.fromList(bytes),
-          title: balance ? 'Balance payment proof' : 'Proof of payment',
-        );
-      } catch (_) {
-        appSnack(context, 'Could not display image');
-      }
-    },
-  );
-}
-
-List<Widget> cashierPaymentReferenceOnlyWidgets(OrderData o, {bool includeBalance = true}) {
-  final widgets = <Widget>[];
-  final initRef = orderPaymentReferenceInitial(o);
-  if (!orderHasInitialPaymentProofImage(o) && initRef != null) {
-    widgets.add(cashierPaymentReferenceCard('PAYMENT REFERENCE (full payment)', initRef));
-  }
-  if (includeBalance) {
-    final balRef = orderPaymentReferenceBalance(o);
-    if (!orderHasBalancePaymentProofImage(o) && balRef != null) {
-      if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 8));
-      widgets.add(cashierPaymentReferenceCard('PAYMENT REFERENCE (balance)', balRef));
-    }
-  }
-  return widgets;
-}
-
 List<Widget> cashierPaymentProofAndReferenceSection(
   BuildContext context,
   OrderData o, {
@@ -1686,14 +1635,6 @@ String inquiryStatusReadable(String status) {
       return 'On Going';
     case 'for_full_payment':
       return 'For Full Payment';
-    case 'for_processing':
-      return 'For Processing';
-    case 'for_post_analysis':
-      return 'For Post Analysis';
-    case 'completed':
-      return 'Completed';
-    case 'cancelled':
-      return 'Cancelled';
     default:
       return s
           .replaceAll('_', ' ')
@@ -1702,108 +1643,6 @@ String inquiryStatusReadable(String status) {
           .map((w) => '${w[0].toUpperCase()}${w.substring(1).toLowerCase()}')
           .join(' ');
   }
-}
-
-List<Widget> inquiryDetailLineWidgets(InquiryRecord r) {
-  final isFullEvent = isInquiryCateringWithEventStyling(r.inquiryType);
-  Widget line(String text) => Padding(
-        padding: const EdgeInsets.only(bottom: 8),
-        child: Text(text, style: const TextStyle(height: 1.35)),
-      );
-
-  final lines = <Widget>[
-    line('Transaction no.: ${r.displayTransactionRef}'),
-    line('Type: ${r.inquiryType}'),
-    line('Status: ${inquiryStatusReadable(r.status)}'),
-  ];
-  if (r.isCompletedBooking && r.loyaltyPointsEarned > 0) {
-    lines.add(line('Catering loyalty: +${r.loyaltyPointsEarned} pts'));
-  }
-  if (r.eventType.trim().isNotEmpty) lines.add(line('Event type: ${r.eventType}'));
-  if (r.formalityLevel.trim().isNotEmpty) lines.add(line('Formality: ${r.formalityLevel}'));
-  final guestAllergens = r.themeDesign['guest_allergens'];
-  if (guestAllergens is List && guestAllergens.isNotEmpty) {
-    lines.add(line('Guest allergens to avoid: ${guestAllergens.map((e) => '$e').join(', ')}'));
-  }
-  if (isFullEvent) {
-    if (r.eventTitle.trim().isNotEmpty) lines.add(line('Event title: ${r.eventTitle}'));
-    if (r.eventCity.trim().isNotEmpty) lines.add(line('City: ${r.eventCity}'));
-    if (r.eventSetting.trim().isNotEmpty) lines.add(line('Setting: ${r.eventSetting}'));
-    if (r.themeSuggestionNote.trim().isNotEmpty) lines.add(line('Theme / styling: ${r.themeSuggestionNote}'));
-  }
-  lines.add(line('Guests: ${r.guestCount}'));
-  lines.add(line('Contact: ${r.contactPerson} / ${r.contactNumber}'));
-  lines.add(line('Email: ${r.inquiryEmail}'));
-  if (r.dateOfEvent.trim().isNotEmpty) {
-    final formatted = formatScheduleSlotLine(r.dateOfEvent).trim();
-    if (formatted.isNotEmpty) {
-      lines.add(line('Date/Time of Event:'));
-      for (final ln in formatted.split('\n')) {
-        final t = ln.trim();
-        if (t.isNotEmpty) lines.add(line(t));
-      }
-    }
-  }
-  if (r.serviceIncluded.trim().isNotEmpty) {
-    lines.add(line('Service: ${r.serviceIncluded == 'yes' ? 'With service' : 'Without service'}'));
-  }
-  lines.add(line('Food tasting requested: ${r.foodTastingRequested ? 'Yes' : 'No'}'));
-  if (r.note.trim().isNotEmpty) lines.add(line('Note: ${r.note}'));
-  lines.add(line('Curate own menu: ${r.curateOwnMenu ? 'Yes' : 'No'}'));
-  if (r.selectedSetMenu.trim().isNotEmpty && r.selectedSetMenu != 'All Dishes') {
-    lines.add(line('Set menu: ${r.selectedSetMenu}'));
-  }
-  if (r.selectedDishes.isNotEmpty) lines.add(line('Dishes: ${r.selectedDishes.join(', ')}'));
-  if (r.menuSuggestionNote.trim().isNotEmpty &&
-      !r.menuSuggestionNote.toLowerCase().contains('suggest me a menu instead')) {
-    lines.add(line('Menu note: ${r.menuSuggestionNote}'));
-  }
-  if (r.estimatedTotal > 0) {
-    final st = r.status.trim().toLowerCase();
-    final useFinal = st == kStageForDownPayment ||
-        st == kStageForOngoing ||
-        st == kStageForFullPayment ||
-        st == 'completed';
-    lines.add(
-      line('${useFinal ? 'Final cost' : 'Estimated cost'}: ₱${r.estimatedTotal.toStringAsFixed(2)}'),
-    );
-  }
-  if (r.downPaymentAmount > 0) lines.add(line('Down payment paid: ₱${r.downPaymentAmount.toStringAsFixed(2)}'));
-  if (r.fullPaymentAmount > 0) lines.add(line('Full payment recorded: ₱${r.fullPaymentAmount.toStringAsFixed(2)}'));
-  lines.add(line('Submitted: ${formatDateTimeLocal(r.createdAt)}'));
-  return lines;
-}
-
-Future<void> showInquiryDetailDialog(
-  BuildContext context,
-  InquiryRecord r, {
-  bool allowFollowUp = false,
-  Future<void> Function()? onFollowUp,
-}) async {
-  await showDialog<void>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: Colors.white,
-      title: Text(r.displayTransactionRef),
-      content: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: inquiryDetailLineWidgets(r),
-        ),
-      ),
-      actions: [
-        if (allowFollowUp && onFollowUp != null)
-          TextButton(
-            onPressed: () async {
-              Navigator.of(ctx).pop();
-              await onFollowUp();
-            },
-            child: const Text('Follow up'),
-          ),
-        TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close')),
-      ],
-    ),
-  );
 }
 
 String cateringManagerListStatusLabelFor(String status, String processingSubstageLabel) {
@@ -3438,16 +3277,9 @@ class AppState extends ChangeNotifier {
   }
 
   /// Local-only session for ordering without an account (see [isGuestSession]).
-  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly.
-  void setGuestShellTab(int tab) {
-    guestShellOpenLanding = false;
-    guestShellInitialTabIndex = tab.clamp(0, 3);
-    notifyListeners();
-  }
-
-  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly; omit for menu tab.
+  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly; omit to show landing first.
   Future<void> enterGuestCheckoutSession({int? initialShellTabIndex}) async {
-    guestShellOpenLanding = false;
+    guestShellOpenLanding = initialShellTabIndex == null;
     guestShellInitialTabIndex = (initialShellTabIndex ?? 0).clamp(0, 3);
     final salt = DateTime.now().millisecondsSinceEpoch;
     final r = math.Random().nextInt(1 << 30);
@@ -3897,8 +3729,8 @@ class AppState extends ChangeNotifier {
     _persistCustomerTraySnapshot().catchError((_) {});
   }
 
-  /// Customer menu + cashier POS: dish detail, optional add-ons, then add to tray. Returns true if added.
-  Future<bool> promptAndAddRestaurantDish(BuildContext context, MenuItemData item) async {
+  /// Customer menu + cashier POS: dish detail, optional add-ons, then add to tray.
+  Future<void> promptAndAddRestaurantDish(BuildContext context, MenuItemData item) async {
     var selectedDip = '';
     var addonQty = 1;
     final lineNoteCtl = TextEditingController();
@@ -3934,7 +3766,6 @@ class AppState extends ChangeNotifier {
         return StatefulBuilder(
           builder: (ctx, setSt) {
             return AlertDialog(
-              backgroundColor: Colors.white,
               title: Text(item.name, maxLines: 3, style: const TextStyle(fontSize: 16)),
               content: SizedBox(
                 width: math.min(MediaQuery.sizeOf(ctx).width * 0.92, 520),
@@ -4019,14 +3850,8 @@ class AppState extends ChangeNotifier {
                 ),
               ),
               actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(false),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () => Navigator.of(ctx).pop(true),
-                  child: const Text('Add to tray'),
-                ),
+                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add to tray')),
               ],
             );
           },
@@ -4035,11 +3860,10 @@ class AppState extends ChangeNotifier {
     );
     final note = lineNoteCtl.text.trim();
     lineNoteCtl.dispose();
-    if (ok != true) return false;
+    if (ok != true) return;
     final dip = selectedDip == 'None' || selectedDip.isEmpty ? '' : selectedDip;
     final dq = dip.isEmpty ? 1 : addonQty;
     addToTray(item, dip: dip, dipQty: dq, lineNote: note);
-    return true;
   }
 
   void clearTray() {
@@ -6227,7 +6051,6 @@ class AppScaffold extends StatelessWidget {
             .any((o) => state.orderNosWithUnreadAttention.contains(o.orderNo));
     final showAttentionDot = isCustomer ? pendingAttentionExists : (state.unreadNotificationsCount > 0 || pendingAttentionExists);
     return Scaffold(
-      backgroundColor: isCustomer ? Colors.white : Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         foregroundColor: headerFg,
         iconTheme: IconThemeData(color: headerFg),
@@ -6774,7 +6597,6 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.white,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -7120,11 +6942,9 @@ Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppStat
   try {
     od = state.orders.firstWhere((e) => e.id == o.id);
   } catch (_) {}
-  final trackUrl = od.deliveryTrackingUrl.trim();
   await showDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
-      backgroundColor: Colors.white,
       title: Text(uiOrderNo(od.orderNo)),
       content: SingleChildScrollView(
         child: Column(
@@ -7145,24 +6965,6 @@ Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppStat
               'Requested delivery time',
               od.deliveryTime.isEmpty || od.deliveryTime == 'NOW' ? 'As soon as possible' : od.deliveryTime,
             ),
-            if (orderShowsDeliveryTrackingLink(od) && trackUrl.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: InkWell(
-                  onTap: () async {
-                    final uri = Uri.tryParse(trackUrl.startsWith('http') ? trackUrl : 'https://$trackUrl');
-                    if (uri != null) await launchUrl(uri, mode: LaunchMode.externalApplication);
-                  },
-                  child: Text(
-                    'Track delivery: $trackUrl',
-                    style: TextStyle(
-                      color: Colors.blue.shade800,
-                      fontWeight: FontWeight.w700,
-                      decoration: TextDecoration.underline,
-                    ),
-                  ),
-                ),
-              ),
             _orderDetailLineWidget('Payment method', od.paymentMode.isEmpty ? 'GCASH ONLY' : od.paymentMode),
             if (od.note.trim().isNotEmpty) _orderDetailLineWidget('Your note', od.note.trim()),
             const SizedBox(height: 16),
@@ -7208,11 +7010,13 @@ bool _guestTrackCanCancel(OrderData o) {
 }
 
 bool _guestTrackCanFollowUpInquiry(InquiryRecord r) {
-  return r.status.trim().toLowerCase() == 'online_inquiries';
+  final s = r.status.trim().toLowerCase();
+  return s == 'online_inquiries' || s == 'for_down_payment';
 }
 
 bool _guestTrackCanCancelInquiry(InquiryRecord r) {
-  return r.status.trim().toLowerCase() == 'online_inquiries';
+  final s = r.status.trim().toLowerCase();
+  return s == 'online_inquiries' || s == 'new_event' || s == 'for_down_payment';
 }
 
 Future<void> _guestTrackFollowUpInquiry(BuildContext context, AppState state, InquiryRecord r) async {
@@ -7388,28 +7192,10 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
     final q = _searchController.text.trim().toLowerCase();
     return _orders.where((o) {
       final st = o.status.toUpperCase();
-      final fs = o.fulfillmentStage.toUpperCase();
-      switch (_orderStatusFilter) {
-        case 'pending':
-          if (!(st.contains('WAITING FOR PAYMENT') || st.contains('WAITING FOR ORDER'))) return false;
-          break;
-        case 'balance':
-          if (!(st.contains('INSUFFICIENT') || st.contains('BALANCE'))) return false;
-          break;
-        case 'preparing':
-          if (fs != 'IN_PREPARATION') return false;
-          break;
-        case 'for_delivery':
-          if (fs != 'OUT_FOR_DELIVERY' && !st.contains('FOR DELIVERY') && !st.contains('OUT FOR DELIVERY')) {
-            return false;
-          }
-          break;
-        case 'delivered':
-          if (fs != 'DELIVERED' && !orderLooksCompleted(o)) return false;
-          break;
-        case 'cancelled':
-          if (!customerOrderCancelled(o)) return false;
-          break;
+      if (_orderStatusFilter == 'pending') {
+        if (!(st.contains('WAITING FOR PAYMENT') || st.contains('WAITING FOR ORDER'))) return false;
+      } else if (_orderStatusFilter == 'balance') {
+        if (!(st.contains('INSUFFICIENT') || st.contains('BALANCE'))) return false;
       }
       if (q.isEmpty) return true;
       return uiOrderNo(o.orderNo).toLowerCase().contains(q) ||
@@ -7421,8 +7207,12 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
   List<InquiryRecord> get _filteredInquiries {
     final q = _searchController.text.trim().toLowerCase();
     return _inquiries.where((r) {
-      final st = normalizeCateringPipelineStatus(r.status);
-      if (_inquiryStatusFilter != 'all' && st != _inquiryStatusFilter) return false;
+      final st = r.status.trim().toLowerCase();
+      if (_inquiryStatusFilter == 'online') {
+        if (st != 'online_inquiries') return false;
+      } else if (_inquiryStatusFilter == 'processing') {
+        if (st != 'for_down_payment' && st != 'for_ongoing' && st != 'for_full_payment') return false;
+      }
       if (q.isEmpty) return true;
       return r.displayTransactionRef.toLowerCase().contains(q) ||
           r.eventTitle.toLowerCase().contains(q) ||
@@ -7450,69 +7240,57 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
   }
 
   Widget _trackSearchAndFilters() {
-    final orderItems = const [
-      DropdownMenuItem(value: 'all', child: Text('All orders')),
-      DropdownMenuItem(value: 'pending', child: Text('Pending review / payment')),
-      DropdownMenuItem(value: 'balance', child: Text('Balance due')),
-      DropdownMenuItem(value: 'preparing', child: Text('In preparation')),
-      DropdownMenuItem(value: 'for_delivery', child: Text('Out for delivery')),
-      DropdownMenuItem(value: 'delivered', child: Text('Delivered')),
-      DropdownMenuItem(value: 'cancelled', child: Text('Cancelled')),
-    ];
-    final inquiryItems = const [
-      DropdownMenuItem(value: 'all', child: Text('All inquiries')),
-      DropdownMenuItem(value: 'new_event', child: Text('New event')),
-      DropdownMenuItem(value: 'online_inquiries', child: Text('Online inquiries')),
-      DropdownMenuItem(value: 'for_down_payment', child: Text('For down payment')),
-      DropdownMenuItem(value: 'for_ongoing', child: Text('On going')),
-      DropdownMenuItem(value: 'for_full_payment', child: Text('For full payment')),
-      DropdownMenuItem(value: 'for_processing', child: Text('For processing')),
-      DropdownMenuItem(value: 'for_post_analysis', child: Text('For post analysis')),
-      DropdownMenuItem(value: 'completed', child: Text('Completed')),
-      DropdownMenuItem(value: 'cancelled', child: Text('Cancelled')),
-    ];
     return Material(
       color: Colors.white,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: Column(
           children: [
-            Expanded(
-              child: TextField(
-                controller: _searchController,
-                decoration: const InputDecoration(
-                  hintText: 'Search order or inquiry…',
-                  prefixIcon: Icon(Icons.search),
-                  isDense: true,
-                  border: OutlineInputBorder(),
-                ),
-                onChanged: (_) => setState(() {}),
+            TextField(
+              controller: _searchController,
+              decoration: const InputDecoration(
+                hintText: 'Search order or inquiry…',
+                prefixIcon: Icon(Icons.search),
+                isDense: true,
+                border: OutlineInputBorder(),
               ),
+              onChanged: (_) => setState(() {}),
             ),
-            const SizedBox(width: 8),
-            SizedBox(
-              width: 196,
-              child: DropdownButtonFormField<String>(
-                value: _tab.index == 0 ? _orderStatusFilter : _inquiryStatusFilter,
-                isExpanded: true,
-                decoration: InputDecoration(
-                  labelText: _tab.index == 0 ? 'Filter' : 'Filter',
-                  isDense: true,
-                  border: const OutlineInputBorder(),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: _tab.index == 0 ? _orderStatusFilter : _inquiryStatusFilter,
+                    decoration: InputDecoration(
+                      labelText: _tab.index == 0 ? 'Order filter' : 'Inquiry filter',
+                      isDense: true,
+                      border: const OutlineInputBorder(),
+                    ),
+                    items: _tab.index == 0
+                        ? const [
+                            DropdownMenuItem(value: 'all', child: Text('All orders')),
+                            DropdownMenuItem(value: 'pending', child: Text('Pending review / payment')),
+                            DropdownMenuItem(value: 'balance', child: Text('Balance due')),
+                          ]
+                        : const [
+                            DropdownMenuItem(value: 'all', child: Text('All inquiries')),
+                            DropdownMenuItem(value: 'online', child: Text('Online inquiries')),
+                            DropdownMenuItem(value: 'processing', child: Text('In processing')),
+                          ],
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() {
+                        if (_tab.index == 0) {
+                          _orderStatusFilter = v;
+                        } else {
+                          _inquiryStatusFilter = v;
+                        }
+                      });
+                    },
+                  ),
                 ),
-                items: _tab.index == 0 ? orderItems : inquiryItems,
-                onChanged: (v) {
-                  if (v == null) return;
-                  setState(() {
-                    if (_tab.index == 0) {
-                      _orderStatusFilter = v;
-                    } else {
-                      _inquiryStatusFilter = v;
-                    }
-                  });
-                },
-              ),
+              ],
             ),
           ],
         ),
@@ -7537,42 +7315,15 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
       itemCount: rows.length,
       itemBuilder: (context, i) {
         final o = rows[i];
-        final trackUrl = o.deliveryTrackingUrl.trim();
-        final showTrack = orderShowsDeliveryTrackingLink(o) && trackUrl.isNotEmpty;
         return Card(
           color: Colors.white,
           child: ListTile(
             title: Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w800)),
-            subtitle: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}'
-                  '${orderCustomerPaymentSummaryText(o).isEmpty ? '' : '\n${orderCustomerPaymentSummaryText(o)}'}',
-                ),
-                if (showTrack)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: InkWell(
-                      onTap: () async {
-                        final uri = Uri.tryParse(trackUrl.startsWith('http') ? trackUrl : 'https://$trackUrl');
-                        if (uri != null) {
-                          await launchUrl(uri, mode: LaunchMode.externalApplication);
-                        }
-                      },
-                      child: Text(
-                        'Track delivery',
-                        style: TextStyle(
-                          color: Colors.blue.shade800,
-                          fontWeight: FontWeight.w700,
-                          decoration: TextDecoration.underline,
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
+            subtitle: Text(
+              '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}'
+              '${orderCustomerPaymentSummaryText(o).isEmpty ? '' : '\n${orderCustomerPaymentSummaryText(o)}'}',
             ),
-            isThreeLine: !showTrack,
+            isThreeLine: true,
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -7647,12 +7398,6 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
                     ),
                   ),
               ],
-            ),
-            onTap: () => showInquiryDetailDialog(
-              context,
-              r,
-              allowFollowUp: _guestTrackCanFollowUpInquiry(r),
-              onFollowUp: () => _guestTrackFollowUpInquiry(context, widget.state, r),
             ),
           ),
         );
@@ -8137,11 +7882,8 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
   int? _navHighlight;
 
   Future<void> _startGuest(int tab) async {
-    widget.state.setGuestShellTab(tab);
     try {
       await widget.state.enterGuestCheckoutSession(initialShellTabIndex: tab);
-      if (!mounted) return;
-      widget.state.setGuestShellTab(tab);
     } catch (e) {
       if (!mounted) return;
       appSnack(context, describeApiNetworkError(e, normalizeApiBase(widget.state.apiBase)));
@@ -8152,7 +7894,7 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
   Widget build(BuildContext context) {
     final s = widget.state;
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: _kCustomerLandingBg,
       body: SafeArea(
         child: _CustomerGuestLandingBody(
           onOrderNow: () => _startGuest(0),
@@ -8210,7 +7952,7 @@ class _CustomerGuestLandingBody extends StatelessWidget {
           Text(
             'Choose how you would like to continue.',
             textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: Colors.grey.shade800),
+            style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: Colors.grey.shade200),
           ),
           const SizedBox(height: 16),
           IntrinsicHeight(
@@ -8350,17 +8092,24 @@ class GuestCustomerShell extends StatefulWidget {
 
 class _GuestCustomerShellState extends State<GuestCustomerShell> {
   late int _tab;
+  late bool _onLanding;
 
   @override
   void initState() {
     super.initState();
-    _tab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
+    final initialTab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
+    _tab = initialTab;
+    _onLanding = widget.state.guestShellOpenLanding;
+    if (initialTab == 0 || initialTab == 1) _onLanding = false;
     widget.state.guestShellOpenLanding = false;
+    widget.state.guestShellInitialTabIndex = 0;
   }
 
   void _openTab(int i) {
-    widget.state.setGuestShellTab(i);
-    setState(() => _tab = i);
+    setState(() {
+      _onLanding = false;
+      _tab = i;
+    });
   }
 
   Widget _page(int i) {
@@ -8372,7 +8121,7 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
       case 2:
         return GuestTrackOrdersScreen(
           state: widget.state,
-          onBack: () => _openTab(0),
+          onBack: () => setState(() => _onLanding = true),
         );
       default:
         return Center(
@@ -8396,54 +8145,53 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: widget.state,
-      builder: (context, _) {
-        final syncedTab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
-        if (_tab != syncedTab) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) setState(() => _tab = syncedTab);
-          });
-        }
-        return Scaffold(
-          backgroundColor: Colors.white,
-          body: Column(
-            children: [
-              Material(
-                color: const Color(0xFFFFF8E1),
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          'Guest mode — create an account to earn loyalty rewards.',
-                          style: TextStyle(fontSize: 12.5, height: 1.35, color: Colors.grey.shade900),
-                        ),
+    return Scaffold(
+      backgroundColor: _onLanding ? _kCustomerLandingBg : null,
+      body: Column(
+        children: [
+          if (!_onLanding)
+            Material(
+              color: const Color(0xFFFFF8E1),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Guest mode — create an account to earn loyalty rewards.',
+                        style: TextStyle(fontSize: 12.5, height: 1.35, color: Colors.grey.shade900),
                       ),
-                      TextButton(
-                        onPressed: widget.state.requestAuthSignup,
-                        child: const Text('Sign up'),
-                      ),
-                    ],
-                  ),
+                    ),
+                    TextButton(
+                      onPressed: widget.state.requestAuthSignup,
+                      child: const Text('Sign up'),
+                    ),
+                  ],
                 ),
               ),
-              Expanded(child: _page(_tab)),
-            ],
+            ),
+          Expanded(
+            child: _onLanding
+                ? SafeArea(
+                    child: _CustomerGuestLandingBody(
+                      onOrderNow: () => _openTab(0),
+                      onInquireCatering: () => _openTab(1),
+                    ),
+                  )
+                : _page(_tab),
           ),
-          bottomNavigationBar: _GuestBottomNavBar(
-            selectedIndex: _tab,
-            onSelected: (i) {
-              if (i == 3) {
-                showCustomerAuthDialog(context, widget.state);
-                return;
-              }
-              _openTab(i);
-            },
-          ),
-        );
-      },
+        ],
+      ),
+      bottomNavigationBar: _GuestBottomNavBar(
+        selectedIndex: _onLanding ? null : _tab,
+        onSelected: (i) {
+          if (i == 3) {
+            showCustomerAuthDialog(context, widget.state);
+            return;
+          }
+          _openTab(i);
+        },
+      ),
     );
   }
 }
@@ -8667,7 +8415,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
       animation: state,
       builder: (context, _) {
         return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -8866,8 +8614,8 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   }
 
   Future<void> _addToTray(BuildContext context, MenuItemData item) async {
-    final added = await widget.state.promptAndAddRestaurantDish(context, item);
-    if (added && context.mounted) appSnack(context, 'Added ${item.name} to tray');
+    await widget.state.promptAndAddRestaurantDish(context, item);
+    if (context.mounted) appSnack(context, 'Added ${item.name} to tray');
   }
 
   Widget _dishCard(BuildContext context, MenuItemData item) {
@@ -9010,7 +8758,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
         if (land && mq.size.shortestSide >= 600) {
           cw = cw.clamp(2, 3);
         }
-        var aspect = cw >= 4 ? 0.78 : 0.72;
+        var aspect = cw >= 4 ? 0.82 : 0.74;
         if (land && mq.size.shortestSide >= 600) {
           aspect = 0.62;
         }
@@ -9177,25 +8925,20 @@ class _MenuThumbState extends State<_MenuThumb> {
     final iconSize = widget.compact ? 22.0 : 60.0;
     final bytes = _bytes;
     if (bytes != null && bytes.isNotEmpty) {
-      final img = Image.memory(
-        bytes,
-        key: ValueKey('menu-thumb-${widget.item.id}'),
-        fit: BoxFit.cover,
-        width: widget.compact ? 56 : double.infinity,
-        height: widget.compact ? 56 : double.infinity,
-        gaplessPlayback: true,
-        filterQuality: FilterQuality.medium,
-        cacheWidth: widget.compact ? 112 : 320,
-        cacheHeight: widget.compact ? 112 : 320,
-        errorBuilder: (_, __, ___) => Icon(Icons.fastfood, size: iconSize),
-      );
       return RepaintBoundary(
-        child: widget.compact ? img : SizedBox.expand(child: img),
+        child: Image.memory(
+          bytes,
+          key: ValueKey('menu-thumb-${widget.item.id}'),
+          fit: BoxFit.cover,
+          gaplessPlayback: true,
+          filterQuality: FilterQuality.medium,
+          cacheWidth: widget.compact ? 112 : null,
+          cacheHeight: widget.compact ? 112 : null,
+          errorBuilder: (_, __, ___) => Icon(Icons.fastfood, size: iconSize),
+        ),
       );
     }
-    return widget.compact
-        ? Icon(Icons.fastfood, size: iconSize)
-        : Center(child: Icon(Icons.fastfood, size: iconSize));
+    return Icon(Icons.fastfood, size: iconSize);
   }
 }
 
@@ -16395,7 +16138,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           return Stack(
             children: [
               Scaffold(
-                backgroundColor: Colors.white,
+                backgroundColor: Theme.of(context).scaffoldBackgroundColor,
                 appBar: AppBar(
                   backgroundColor: const Color(0xFF242424),
                   foregroundColor: const Color(0xFFFFC024),
@@ -16423,7 +16166,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           return Stack(
             children: [
               Scaffold(
-                backgroundColor: Colors.white,
+                backgroundColor: Theme.of(context).scaffoldBackgroundColor,
                 appBar: AppBar(
                   backgroundColor: Colors.black87,
                   foregroundColor: Colors.white,
@@ -16925,7 +16668,6 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
       animation: widget.state,
       builder: (context, _) {
         return Scaffold(
-          backgroundColor: Colors.white,
           appBar: AppBar(
             backgroundColor: const Color(0xFF242424),
             foregroundColor: const Color(0xFFFFC024),
@@ -17806,7 +17548,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     }
 
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -20967,7 +20709,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   Widget build(BuildContext context) {
     if (!_detailReady) {
       return Scaffold(
-        backgroundColor: Colors.white,
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
         appBar: AppBar(
           backgroundColor: const Color(0xFF242424),
           foregroundColor: const Color(0xFFFFC024),
@@ -21739,7 +21481,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     if (widget.supervisorMode) {
       return Scaffold(
-        backgroundColor: Colors.white,
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
         appBar: AppBar(
           backgroundColor: const Color(0xFF242424),
           foregroundColor: const Color(0xFFFFC024),
@@ -22142,7 +21884,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           ),
         ),
         child: Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -23768,7 +23510,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
       animation: widget.state,
       builder: (context, _) {
         return Scaffold(
-          backgroundColor: Colors.white,
+          backgroundColor: Theme.of(context).scaffoldBackgroundColor,
           appBar: AppBar(
             backgroundColor: Colors.black87,
             foregroundColor: Colors.white,
@@ -25694,22 +25436,23 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           TextField(
                             controller: supplementalAmount,
                             keyboardType: TextInputType.number,
-                            decoration: InputDecoration(
+                            decoration: const InputDecoration(
                               labelText: 'ADDITIONAL AMOUNT RECEIVED (balance)',
                               helperText: 'Adjust if needed, then mark insufficient or overpayment.',
-                              suffixIcon: cashierPaymentProofSuffixIcon(context, o, balance: true),
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
-                          ...cashierPaymentReferenceOnlyWidgets(o),
+                          const SizedBox(height: 10),
+                          ...cashierPaymentProofAndReferenceSection(context, o),
                         ] else ...[
+                          ...cashierPaymentProofAndReferenceSection(context, o, includeBalance: false),
+                          const SizedBox(height: 10),
                           TextField(
                             controller: amountReceived,
                             keyboardType: TextInputType.number,
                             readOnly: waitingCustomerBalance,
                             decoration: InputDecoration(
                               labelText: 'AMOUNT RECEIVED',
-                              suffixIcon: cashierPaymentProofSuffixIcon(context, o),
                               helperText: waitingCustomerBalance
                                   ? 'Waiting for customer balance proof or reference in the app.'
                                   : (insufficientStatus
@@ -25718,7 +25461,6 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
-                          ...cashierPaymentReferenceOnlyWidgets(o, includeBalance: false),
                         ],
                         LockedField(
                           label: pendingBalReview ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',
@@ -25984,22 +25726,23 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           TextField(
                             controller: supplementalAmount,
                             keyboardType: TextInputType.number,
-                            decoration: InputDecoration(
+                            decoration: const InputDecoration(
                               labelText: 'ADDITIONAL AMOUNT RECEIVED (balance)',
                               helperText: 'Adjust if needed, then mark insufficient or overpayment.',
-                              suffixIcon: cashierPaymentProofSuffixIcon(context, o, balance: true),
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
-                          ...cashierPaymentReferenceOnlyWidgets(o),
+                          const SizedBox(height: 10),
+                          ...cashierPaymentProofAndReferenceSection(context, o),
                         ] else ...[
+                          ...cashierPaymentProofAndReferenceSection(context, o, includeBalance: false),
+                          const SizedBox(height: 10),
                           TextField(
                             controller: amountReceived,
                             keyboardType: TextInputType.number,
                             readOnly: waitingCustomerBalance,
                             decoration: InputDecoration(
                               labelText: 'AMOUNT RECEIVED',
-                              suffixIcon: cashierPaymentProofSuffixIcon(context, o),
                               helperText: waitingCustomerBalance
                                   ? 'Waiting for customer balance proof or reference in the app.'
                                   : (insufficientStatus
@@ -26008,7 +25751,6 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             ),
                             onChanged: (_) => setState(() {}),
                           ),
-                          ...cashierPaymentReferenceOnlyWidgets(o, includeBalance: false),
                         ],
                         LockedField(
                           label: pendingBalReview ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',

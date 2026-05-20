@@ -535,7 +535,39 @@ export async function initDb(): Promise<void> {
     );
   `);
 
-  await ensureCateringPipelineStatusChecks(p);
+  // Customer / manager cancellation requires `cancelled` on event inquiries too (older DBs may omit it from CHECK).
+  try {
+    await p.query(`ALTER TABLE event_orders DROP CONSTRAINT IF EXISTS event_orders_status_check`);
+  } catch {
+    // ignore
+  }
+  const pipelineStatuses = `ARRAY[
+        'new_event'::text, 'online_inquiries'::text,
+        'for_down_payment'::text, 'for_ongoing'::text, 'for_full_payment'::text,
+        'for_processing'::text, 'for_post_analysis'::text,
+        'completed'::text, 'cancelled'::text
+      ]`;
+  try {
+    await p.query(`
+      ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
+      CHECK (status = ANY (${pipelineStatuses}))
+    `);
+  } catch {
+    // Constraint may already be correct or renamed in some deployments.
+  }
+  try {
+    await p.query(`ALTER TABLE catering_orders DROP CONSTRAINT IF EXISTS catering_orders_status_check`);
+  } catch {
+    // ignore
+  }
+  try {
+    await p.query(`
+      ALTER TABLE catering_orders ADD CONSTRAINT catering_orders_status_check
+      CHECK (status = ANY (${pipelineStatuses}))
+    `);
+  } catch {
+    // ignore
+  }
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS customer_order_feedback (
@@ -554,33 +586,5 @@ export async function initDb(): Promise<void> {
   );
 
   await runSchemaNormalize(p);
-  await ensureCateringPipelineStatusChecks(p);
   restaurantOrdersCustomerIdKindCache = await detectRestaurantOrdersCustomerIdKind(p);
-}
-
-const CATERING_PIPELINE_STATUSES_SQL = `ARRAY[
-  'new_event'::text, 'online_inquiries'::text,
-  'for_down_payment'::text, 'for_ongoing'::text, 'for_full_payment'::text,
-  'for_processing'::text, 'for_post_analysis'::text,
-  'completed'::text, 'cancelled'::text
-]`;
-
-/** (Re)apply pipeline status CHECK on event_orders + catering_orders — required for for_ongoing / for_down_payment tabs. */
-export async function ensureCateringPipelineStatusChecks(p: pg.Pool): Promise<void> {
-  for (const table of ["event_orders", "catering_orders"] as const) {
-    const constraint = `${table}_status_check`;
-    try {
-      await p.query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${constraint}`);
-      await p.query(`
-        ALTER TABLE ${table} ADD CONSTRAINT ${constraint}
-        CHECK (status = ANY (${CATERING_PIPELINE_STATUSES_SQL}))
-      `);
-      console.log(`[schema] ${constraint} updated (includes for_ongoing, for_down_payment)`);
-    } catch (e) {
-      console.error(
-        `[schema] ${constraint} could not be applied — manager stage moves may use legacy for_processing until fixed:`,
-        e instanceof Error ? e.message : e,
-      );
-    }
-  }
 }

@@ -1,4 +1,4 @@
-import "./envBootstrap.js";
+﻿import "./envBootstrap.js";
 import crypto from "node:crypto";
 import bcrypt from "bcrypt";
 import cors from "cors";
@@ -13,12 +13,11 @@ import {
 } from "./mail.js";
 import {
   formatDbStartupError,
-  ensureCateringPipelineStatusChecks,
   getPool,
   getRestaurantOrdersCustomerIdKind,
   initDb,
 } from "./db.js";
-import { normalizeSeatingPlan, registerEventDesignSeatingRoutes } from "./eventDesignSeating.js";
+import { normalizeSeatingPlan } from "./seatingPlanNormalize.js";
 import {
   CATERING_POST_ANALYSIS_JSON,
   CATERING_TRANSACTION_ID,
@@ -69,14 +68,14 @@ import { menuAllergenLabelSql, resolveMenuSqlForPool, resolveSetMenusSql } from 
 if (isMailConfigured()) {
   if (mailUsesResend()) {
     console.info(
-      "[mail] Resend API (HTTPS) enabled — OTP and notification emails bypass outbound SMTP (recommended on Railway Hobby / blocked SMTP).",
+      "[mail] Resend API (HTTPS) enabled â€” OTP and notification emails bypass outbound SMTP (recommended on Railway Hobby / blocked SMTP).",
     );
   } else {
     console.info("[mail] SMTP credentials loaded; OTP and notification emails are enabled.");
   }
 } else {
   console.warn(
-    "[mail] Mail not configured. On Railway Free/Hobby, outbound SMTP (465/587) is often blocked — use RESEND_API_KEY + RESEND_FROM (see .env.example), or upgrade for SMTP. Otherwise set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD.",
+    "[mail] Mail not configured. On Railway Free/Hobby, outbound SMTP (465/587) is often blocked â€” use RESEND_API_KEY + RESEND_FROM (see .env.example), or upgrade for SMTP. Otherwise set TRANSPORTER_EMAIL + TRANSPORTER_PASSWORD.",
   );
 }
 
@@ -119,26 +118,38 @@ app.use((req, _res, next) => {
   next();
 });
 
-/** Older DBs only allowed for_processing / for_post_analysis; map canonical tab statuses when CHECK is stale. */
-function cateringStatusLegacyWriteFallback(
-  nextStatus: string,
-  post: Record<string, unknown> | null,
-): { status: string; post: Record<string, unknown> } | null {
-  const base = post ? { ...post } : {};
-  switch (nextStatus.trim().toLowerCase()) {
-    case "for_ongoing":
-      return { status: "for_processing", post: { ...base, processing_phase: "ongoing" } };
-    case "for_down_payment":
-      return { status: "for_processing", post: { ...base, processing_phase: "down_payment" } };
-    case "for_full_payment":
-      return { status: "for_post_analysis", post: base };
-    default:
-      return null;
-  }
-}
+const CATERING_PIPELINE_STATUSES_SQL = `ARRAY[
+  'new_event'::text, 'online_inquiries'::text,
+  'for_down_payment'::text, 'for_ongoing'::text, 'for_full_payment'::text,
+  'for_processing'::text, 'for_post_analysis'::text,
+  'completed'::text, 'cancelled'::text
+]`;
 
-function isPgCheckViolation(err: unknown): boolean {
-  return err != null && typeof err === "object" && "code" in err && String((err as { code: string }).code) === "23514";
+async function ensureCateringPipelineStatusChecks(p: ReturnType<typeof getPool>): Promise<void> {
+  try {
+    await p.query(`ALTER TABLE event_orders DROP CONSTRAINT IF EXISTS event_orders_status_check`);
+    await p.query(`
+      ALTER TABLE event_orders ADD CONSTRAINT event_orders_status_check
+      CHECK (status = ANY (${CATERING_PIPELINE_STATUSES_SQL}))
+    `);
+  } catch (e) {
+    console.warn(
+      "[schema] event_orders_status_check:",
+      e instanceof Error ? e.message : e,
+    );
+  }
+  try {
+    await p.query(`ALTER TABLE catering_orders DROP CONSTRAINT IF EXISTS catering_orders_status_check`);
+    await p.query(`
+      ALTER TABLE catering_orders ADD CONSTRAINT catering_orders_status_check
+      CHECK (status = ANY (${CATERING_PIPELINE_STATUSES_SQL}))
+    `);
+  } catch (e) {
+    console.warn(
+      "[schema] catering_orders_status_check:",
+      e instanceof Error ? e.message : e,
+    );
+  }
 }
 
 function ensureNewEventSchemaOnce(): Promise<void> {
@@ -1127,7 +1138,7 @@ async function applyLoyaltyRewardsBestEffort(
     if (!customerId) return;
 
     const deliveryNotes =
-      kind === "catering_event" ? `Catering event loyalty · ${email}` : `Mobile app loyalty · ${email}`;
+      kind === "catering_event" ? `Catering event loyalty Â· ${email}` : `Mobile app loyalty Â· ${email}`;
 
     await getPool().query(
       `INSERT INTO restaurant_orders (
@@ -1229,7 +1240,7 @@ app.get("/api/mobile/menu", async (_req, res) => {
   if (!sql) {
     res.status(503).json({
       error:
-        "Menu query disabled or not configured. Remove DISABLE_DEFAULT_PUBLIC_MENU or set WEB_MENU_SQL / WEB_MENU_TABLE — see .env.example.",
+        "Menu query disabled or not configured. Remove DISABLE_DEFAULT_PUBLIC_MENU or set WEB_MENU_SQL / WEB_MENU_TABLE â€” see .env.example.",
     });
     return;
   }
@@ -1255,7 +1266,7 @@ app.get("/api/mobile/menu", async (_req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({
-      error: "menu query failed — check WEB_MENU_SQL / WEB_MENU_* env matches your existing tables",
+      error: "menu query failed â€” check WEB_MENU_SQL / WEB_MENU_* env matches your existing tables",
     });
   }
 });
@@ -1278,7 +1289,7 @@ app.get("/api/mobile/set-menus", async (_req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({
-      error: "set menu query failed — check WEB_SET_MENUS_SQL / WEB_SET_MENU_* env",
+      error: "set menu query failed â€” check WEB_SET_MENUS_SQL / WEB_SET_MENU_* env",
     });
   }
 });
@@ -1292,7 +1303,7 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
   if (!isMailConfigured() && !mobileDevOtpLogging) {
     res.status(503).json({
       error:
-        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
+        "SMTP not configured â€” set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     });
     return;
   }
@@ -1305,7 +1316,7 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
     );
     const row0 = existing.rows[0] as { id: string; is_verified: boolean } | undefined;
     if (row0?.is_verified) {
-      res.status(409).json({ error: "account already exists — log in instead" });
+      res.status(409).json({ error: "account already exists â€” log in instead" });
       return;
     }
     if (row0 && !row0.is_verified) {
@@ -1374,7 +1385,7 @@ app.post("/api/mobile/auth/signup/complete", async (req, res) => {
     const taken = await getPool().query("SELECT is_verified FROM customer_accounts WHERE email = $1", [email]);
     const takenRow = taken.rows[0] as { is_verified: boolean } | undefined;
     if (takenRow?.is_verified) {
-      res.status(409).json({ error: "account already exists — log in instead" });
+      res.status(409).json({ error: "account already exists â€” log in instead" });
       return;
     }
     const hash = await bcrypt.hash(password, 10);
@@ -1493,7 +1504,7 @@ app.post("/api/mobile/auth/request-password-reset", async (req, res) => {
   if (!isMailConfigured() && !mobileDevOtpLogging) {
     res.status(503).json({
       error:
-        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
+        "SMTP not configured â€” set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     });
     return;
   }
@@ -1892,13 +1903,13 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
         const combined = first + supplementalAmtIn;
         if (combined + 1e-9 < total) {
           res.status(400).json({
-            error: `Recorded payments are still below the order total (need at least ₱${(total - first).toFixed(2)} more).`,
+            error: `Recorded payments are still below the order total (need at least â‚±${(total - first).toFixed(2)} more).`,
           });
           return;
         }
         newStatus = "ORDER CONFIRMED";
         mailSubject = `Order ${ord.order_no} confirmed`;
-        mailBody = `Good news — your order ${ord.order_no} has been confirmed.\nTotal: ₱${total.toFixed(2)}\nThank you for choosing Macrina's Kitchen and Catering.`;
+        mailBody = `Good news â€” your order ${ord.order_no} has been confirmed.\nTotal: â‚±${total.toFixed(2)}\nThank you for choosing Macrina's Kitchen and Catering.`;
         changeAmt = Math.round((combined - total) * 100) / 100;
 
         await getPool().query(
@@ -1913,7 +1924,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
 
         await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
           orderNo: ord.order_no,
-          inAppMessage: `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
+          inAppMessage: `[${ord.order_no}] Order confirmed. Total: â‚±${total.toFixed(2)}`,
         });
         if (!isGuestUserEmail(String(ord.user_email ?? ""))) {
           await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
@@ -1931,7 +1942,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
 
       newStatus = "ORDER CONFIRMED";
       mailSubject = `Order ${ord.order_no} confirmed`;
-      mailBody = `Good news — your order ${ord.order_no} has been confirmed.\nTotal: ₱${total.toFixed(2)}\nThank you for choosing Macrina's Kitchen and Catering.`;
+      mailBody = `Good news â€” your order ${ord.order_no} has been confirmed.\nTotal: â‚±${total.toFixed(2)}\nThank you for choosing Macrina's Kitchen and Catering.`;
       if (!Number.isNaN(amountReceived) && amountReceived >= 0) {
         cashReceived = amountReceived;
         changeAmt = Math.round((amountReceived - total) * 100) / 100;
@@ -1970,7 +1981,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
         mailSubject = `Action needed: balance payment for ${ord.order_no}`;
         mailBody =
           `Our team reviewed your balance payment for order ${ord.order_no}.\n\n` +
-          `The additional amount received (₱${supplementalAmtIn.toFixed(2)}) is still below the remaining balance of ₱${remaining.toFixed(2)}.\n\n` +
+          `The additional amount received (â‚±${supplementalAmtIn.toFixed(2)}) is still below the remaining balance of â‚±${remaining.toFixed(2)}.\n\n` +
           `Please pay the remaining balance and upload a new payment proof in the app under your order.`;
         await getPool().query(
           `UPDATE restaurant_orders
@@ -1984,7 +1995,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
         );
         await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
           orderNo: ord.order_no,
-          inAppMessage: `[${ord.order_no}] Payment update: please pay the remaining balance (total ₱${total.toFixed(2)}).`,
+          inAppMessage: `[${ord.order_no}] Payment update: please pay the remaining balance (total â‚±${total.toFixed(2)}).`,
         });
         res.json({ ok: true, status: newStatus });
         return;
@@ -1994,7 +2005,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       mailSubject = `Action needed: payment for ${ord.order_no}`;
       mailBody =
         `Our team reviewed your payment for order ${ord.order_no}.\n\n` +
-        `The amount received was not enough to cover your order total of ₱${total.toFixed(2)}.\n\n` +
+        `The amount received was not enough to cover your order total of â‚±${total.toFixed(2)}.\n\n` +
         `Please pay the remaining balance through the payment channel we use for your order.\n\n` +
         `Upload your additional payment proof in the app under your order.`;
       if (!Number.isNaN(amountReceived) && amountReceived >= 0) {
@@ -2030,12 +2041,12 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
           });
           return;
         }
-        newStatus = "ORDER CONFIRMED — OVERPAYMENT (EXCESS REFUND ON DELIVERY)";
+        newStatus = "ORDER CONFIRMED â€” OVERPAYMENT (EXCESS REFUND ON DELIVERY)";
         changeAmt = Math.round((combined - total) * 100) / 100;
-        mailSubject = `Order ${ord.order_no} confirmed — overpayment notice`;
+        mailSubject = `Order ${ord.order_no} confirmed â€” overpayment notice`;
         mailBody =
           `Your order ${ord.order_no} has been confirmed.\n\n` +
-          `We detected an overpayment relative to your order total of ₱${total.toFixed(2)}. ` +
+          `We detected an overpayment relative to your order total of â‚±${total.toFixed(2)}. ` +
           `The excess amount will be returned to you when your order is delivered (or per our coordinator's instructions).\n\n` +
           `Thank you for choosing Macrina's Kitchen and Catering.`;
         await getPool().query(
@@ -2049,7 +2060,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
         );
         await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
           orderNo: ord.order_no,
-          inAppMessage: `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`,
+          inAppMessage: `[${ord.order_no}] Order confirmed. Total: â‚±${total.toFixed(2)}`,
         });
         if (!isGuestUserEmail(String(ord.user_email ?? ""))) {
           await applyLoyaltyRewardsBestEffort(String(ord.user_email), ord.order_no, total, "restaurant_mobile");
@@ -2058,11 +2069,11 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
         return;
       }
 
-      newStatus = "ORDER CONFIRMED — OVERPAYMENT (EXCESS REFUND ON DELIVERY)";
-      mailSubject = `Order ${ord.order_no} confirmed — overpayment notice`;
+      newStatus = "ORDER CONFIRMED â€” OVERPAYMENT (EXCESS REFUND ON DELIVERY)";
+      mailSubject = `Order ${ord.order_no} confirmed â€” overpayment notice`;
       mailBody =
         `Your order ${ord.order_no} has been confirmed.\n\n` +
-        `We detected an overpayment relative to your order total of ₱${total.toFixed(2)}. ` +
+        `We detected an overpayment relative to your order total of â‚±${total.toFixed(2)}. ` +
         `The excess amount will be returned to you when your order is delivered (or per our coordinator's instructions).\n\n` +
         `Thank you for choosing Macrina's Kitchen and Catering.`;
       if (!Number.isNaN(amountReceived) && amountReceived >= 0) {
@@ -2082,9 +2093,9 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
 
     let inApp = `[${ord.order_no}] Status: ${newStatus}`;
     if (action === "confirm" || (action === "overpayment" && newStatus.toUpperCase().includes("CONFIRMED"))) {
-      inApp = `[${ord.order_no}] Order confirmed. Total: ₱${total.toFixed(2)}`;
+      inApp = `[${ord.order_no}] Order confirmed. Total: â‚±${total.toFixed(2)}`;
     } else if (action === "insufficient") {
-      inApp = `[${ord.order_no}] Payment update: please pay the remaining balance (total ₱${total.toFixed(2)}).`;
+      inApp = `[${ord.order_no}] Payment update: please pay the remaining balance (total â‚±${total.toFixed(2)}).`;
     }
     await notifyRestaurantOrderCustomer(guestReachFromRow(ord), mailSubject, mailBody, {
       orderNo: ord.order_no,
@@ -2148,7 +2159,7 @@ app.post("/api/mobile/pos/online-orders/:id/remind-balance", async (req, res) =>
     const subject = `Reminder: remaining balance for ${ord.order_no}`;
     const body =
       `This is a follow-up reminder for order ${ord.order_no}.\n\n` +
-      `Your total order amount is ₱${total.toFixed(2)} and we are still waiting for the remaining balance.\n` +
+      `Your total order amount is â‚±${total.toFixed(2)} and we are still waiting for the remaining balance.\n` +
       `Please upload your additional payment proof in the app so we can continue processing your order.\n\n` +
       `Thank you.`;
     await notifyRestaurantOrderCustomer(guestReachFromRow(ord), subject, body, {
@@ -2281,7 +2292,7 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
   try {
     await client.query("BEGIN");
     const posNote =
-      [note.trim(), customerLabel ? `Customer: ${customerLabel}` : ""].filter((x) => x.length > 0).join(" · ") || "";
+      [note.trim(), customerLabel ? `Customer: ${customerLabel}` : ""].filter((x) => x.length > 0).join(" Â· ") || "";
     const walkInName = customerLabel || "Walk-in";
     const { rows } = await client.query(
       `INSERT INTO restaurant_orders
@@ -2447,7 +2458,7 @@ async function finalizeRestaurantOrderAfterInsert(
   return orderNo;
 }
 
-/** Recent POS / online orders for cashier history screen — completed only (delivered online or claimed walk-in). */
+/** Recent POS / online orders for cashier history screen â€” completed only (delivered online or claimed walk-in). */
 app.post("/api/mobile/pos/order-history", async (req, res) => {
   const cashierEmail = String(req.body?.cashier_email ?? "").trim().toLowerCase();
   const cashierPassword = String(req.body?.cashier_password ?? "");
@@ -2799,7 +2810,7 @@ app.post("/api/mobile/guest-orders/request-track-otp", async (req, res) => {
   if (!isMailConfigured() && !mobileDevOtpLogging) {
     res.status(503).json({
       error:
-        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
+        "SMTP not configured â€” set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     });
     return;
   }
@@ -3098,11 +3109,11 @@ app.post("/api/mobile/orders", async (req, res) => {
     if (!isGuest) {
       void sendMailSafe(
         userEmail,
-        `${orderNo} — order placed`,
+        `${orderNo} â€” order placed`,
         `Thank you for ordering with Macrina's Kitchen and Catering.\n\n` +
           `Your restaurant order ${orderNo} has been placed and is awaiting payment confirmation from our team.\n` +
           `You will be notified by email as soon as your payment has been confirmed.\n\n` +
-          `Total: ₱${total.toFixed(2)}\n\n` +
+          `Total: â‚±${total.toFixed(2)}\n\n` +
           `Please complete payment (GCash) and upload your proof in the app if you have not already.`,
       );
     }
@@ -3182,7 +3193,7 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
       if (notify) {
         void sendMailSafe(
           notify,
-          `Balance payment proof — ${row.order_no}`,
+          `Balance payment proof â€” ${row.order_no}`,
           `A customer uploaded supplemental payment proof for order ${row.order_no}. Open Online Orders in the cashier app to review and enter the amount received.`,
         );
       }
@@ -3219,8 +3230,8 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
         } else if (emailTo) {
           void sendMailSafe(
             emailTo,
-            `Order ${row.order_no} — checkout complete`,
-            `Your order ${row.order_no} payment proof was received.\nTotal: ₱${totalNum.toFixed(2)}\nNote: ${row.note || "(none)"}\n\nOur team will review your payment shortly.`,
+            `Order ${row.order_no} â€” checkout complete`,
+            `Your order ${row.order_no} payment proof was received.\nTotal: â‚±${totalNum.toFixed(2)}\nNote: ${row.note || "(none)"}\n\nOur team will review your payment shortly.`,
           );
         }
       }
@@ -3406,498 +3417,6 @@ app.post("/api/mobile/catering/schedule-conflicts", async (req, res) => {
   }
 });
 
-app.post("/api/public/events/theme-design/theme-search", async (req, res) => {
-  try {
-    const query = String(req.body?.prompt ?? "").trim();
-    const eventTitle = String(req.body?.eventTitle ?? "").trim();
-    const eventType = String(req.body?.eventType ?? "").trim();
-    const formalityLevel = String(req.body?.formalityLevel ?? "").trim();
-    const pageNum = Math.max(1, Number(req.body?.page ?? 1));
-    const perPage = Math.max(1, Math.min(24, Number(req.body?.perPage ?? 12)));
-    const pexelsQuery = buildPexelsQuery({
-      eventTitle,
-      eventType,
-      formalityLevel,
-      prompt: query,
-      forceNoPeople: true,
-    });
-    const pex = await fetchPexelsImages({ query: pexelsQuery, perPage: 30, page: pageNum });
-    const source = pex.images.length > 0 ? pex.images : sanitizeThemeSuggestions(fallbackThemeSuggestions);
-    const start = 0;
-    const total = source.length;
-    const images = source.slice(start, start + perPage);
-    res.json({
-      ok: true,
-      query,
-      usedFallback: pex.images.length === 0,
-      error: pex.images.length === 0 ? pex.error || undefined : undefined,
-      images,
-      page: pageNum,
-      perPage,
-      total,
-      hasMore: images.length < total,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "theme search failed" });
-  }
-});
-
-app.post("/api/public/events/theme-design/yolo-sam-infer", async (req, res) => {
-  try {
-    const cleanedImageBase64 = sanitizeBase64Image(req.body?.imageBase64);
-    const fast = await callAiService(
-      "/v1/infer/yolo-sam",
-      {
-        image_base64: cleanedImageBase64,
-        confidence_threshold: Number.isFinite(Number(req.body?.confidenceThreshold))
-          ? Number(req.body?.confidenceThreshold)
-          : 0.25,
-        max_detections: Number.isFinite(Number(req.body?.maxDetections)) ? Number(req.body?.maxDetections) : 30,
-        mask_format: ["polygon", "rle", "alpha_png"].includes(String(req.body?.maskFormat))
-          ? String(req.body?.maskFormat)
-          : "polygon",
-      },
-      AI_SERVICE_TIMEOUT_SEGMENT_MS,
-    );
-    const objects = Array.isArray(fast.objects) ? fast.objects : [];
-    res.json({
-      ok: true,
-      imageWidth: Number(fast.image_width ?? fast.imageWidth ?? 0),
-      imageHeight: Number(fast.image_height ?? fast.imageHeight ?? 0),
-      detections: Array.isArray(fast.detections) ? fast.detections : [],
-      objects,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to run YOLO+SAM inference" });
-  }
-});
-
-app.post("/api/public/events/theme-design/swap-colors", async (req, res) => {
-  try {
-    const cleanedImageBase64 = sanitizeBase64Image(req.body?.imageBase64);
-    const masks = Array.isArray(req.body?.masks) ? req.body.masks : [];
-    const edits = Array.isArray(req.body?.edits) ? req.body.edits : [];
-    const normalizedMasks = masks
-      .filter((m: unknown) => m && typeof m === "object")
-      .map((m: unknown) => {
-        const o = m as Record<string, unknown>;
-        return {
-          object_id: String(o.objectId ?? o.object_id ?? ""),
-          polygon_points: Array.isArray(o.polygonPoints) ? o.polygonPoints : Array.isArray(o.polygon_points) ? o.polygon_points : undefined,
-          mask_rle: o.maskRle ?? o.mask_rle ?? undefined,
-          mask_base64: o.maskBase64 ?? o.mask_base64 ?? undefined,
-        };
-      })
-      .filter((m: { object_id: string }) => Boolean(m.object_id));
-    const normalizedEdits = edits
-      .filter((e: unknown) => e && typeof e === "object")
-      .map((e: unknown) => {
-        const o = e as Record<string, unknown>;
-        return {
-          object_id: String(o.objectId ?? o.object_id ?? ""),
-          target_hex: ensureHexColor(o.targetHex ?? o.target_hex ?? req.body?.currentTintColorHex),
-          intensity: Number(o.intensity ?? 1),
-        };
-      })
-      .filter((e: { object_id: string }) => Boolean(e.object_id));
-    const fast = await callAiService(
-      "/v1/edit/recolor",
-      {
-        image_base64: cleanedImageBase64,
-        masks: normalizedMasks,
-        edits: normalizedEdits,
-      },
-      AI_SERVICE_TIMEOUT_RECOLOR_MS,
-    );
-    res.json({
-      ok: true,
-      imageBase64: String(fast.image_base64 ?? fast.imageBase64 ?? ""),
-      applied: Array.isArray(fast.applied) ? fast.applied : [],
-      skipped: Array.isArray(fast.skipped) ? fast.skipped : [],
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to recolor theme objects" });
-  }
-});
-
-app.post("/api/public/events/theme-design/extract-objects", async (req, res) => {
-  try {
-    const imagesBase64 = Array.isArray(req.body?.imagesBase64) ? req.body.imagesBase64 : [];
-    const results: Array<Record<string, unknown>> = [];
-    for (let i = 0; i < imagesBase64.length; i++) {
-      try {
-        const cleaned = sanitizeBase64Image(imagesBase64[i]);
-        const fast = await callAiService(
-          "/v1/infer/yolo-sam-extract",
-          {
-            image_base64: cleaned,
-            confidence_threshold: Number.isFinite(Number(req.body?.confidenceThreshold))
-              ? Number(req.body?.confidenceThreshold)
-              : 0.35,
-            max_detections: Number.isFinite(Number(req.body?.maxDetections)) ? Number(req.body?.maxDetections) : 20,
-            mask_format: "alpha_png",
-          },
-          AI_SERVICE_TIMEOUT_SEGMENT_MS,
-        );
-        const objects = Array.isArray(fast.objects)
-          ? fast.objects.map((obj: unknown, idx: number) => {
-              const o = obj as Record<string, unknown>;
-              return {
-                id: String(o.id ?? o.object_id ?? `obj_${i}_${idx}`),
-                label: String(o.label ?? "Object"),
-                score: Number(o.score ?? 0),
-                sourceImageIndex: i,
-                boundingBox: {
-                  left: Number((o.box as Record<string, unknown> | undefined)?.x ?? (o.box as Record<string, unknown> | undefined)?.left ?? 0),
-                  top: Number((o.box as Record<string, unknown> | undefined)?.y ?? (o.box as Record<string, unknown> | undefined)?.top ?? 0),
-                  width: Number((o.box as Record<string, unknown> | undefined)?.width ?? 0),
-                  height: Number((o.box as Record<string, unknown> | undefined)?.height ?? 0),
-                },
-                polygonPoints: normalizePolygonPoints(o.polygon_points ?? o.polygonPoints ?? []),
-                maskBase64: String(o.mask_base64 ?? o.maskBase64 ?? ""),
-                objectImageBase64: String(o.object_image_base64 ?? o.objectImageBase64 ?? ""),
-              };
-            })
-          : [];
-        results.push({
-          imageIndex: i,
-          imageWidth: Number(fast.image_width ?? fast.imageWidth ?? 0),
-          imageHeight: Number(fast.image_height ?? fast.imageHeight ?? 0),
-          objects,
-        });
-      } catch {
-        results.push({ imageIndex: i, imageWidth: 0, imageHeight: 0, objects: [] });
-      }
-    }
-    res.json({ ok: true, images: results });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to extract theme objects" });
-  }
-});
-
-app.post("/api/public/events/theme-design/analyze-base", async (req, res) => {
-  try {
-    const cleaned = sanitizeBase64Image(req.body?.baseImageBase64);
-    let objects: Array<Record<string, unknown>> = [];
-    try {
-      const fast = await callAiService(
-        "/v1/infer/yolo-sam",
-        {
-          image_base64: cleaned,
-          confidence_threshold: 0.25,
-          max_detections: 20,
-          mask_format: "polygon",
-        },
-        AI_SERVICE_TIMEOUT_SEGMENT_MS,
-      );
-      objects = Array.isArray(fast.objects) ? (fast.objects as Array<Record<string, unknown>>) : [];
-    } catch {
-      objects = [];
-    }
-    const occupied = objects.map((obj) => {
-      const box = (obj.box ?? {}) as Record<string, unknown>;
-      return {
-        left: Number(box.x ?? box.left ?? 0),
-        top: Number(box.y ?? box.top ?? 0),
-        width: Number(box.width ?? 0),
-        height: Number(box.height ?? 0),
-        label: String(obj.label ?? "Object"),
-      };
-    });
-    const freeSpaces: Array<Record<string, number>> = [];
-    const grid = 3;
-    for (let row = 0; row < grid; row++) {
-      for (let col = 0; col < grid; col++) {
-        const left = col / grid;
-        const top = row / grid;
-        const width = 1 / grid;
-        const height = 1 / grid;
-        const overlaps = occupied.some((box) => {
-          const xOverlap = Math.max(0, Math.min(left + width, box.left + box.width) - Math.max(left, box.left));
-          const yOverlap = Math.max(0, Math.min(top + height, box.top + box.height) - Math.max(top, box.top));
-          return xOverlap * yOverlap > 0.02;
-        });
-        if (!overlaps) freeSpaces.push({ left, top, width, height });
-      }
-    }
-    res.json({
-      ok: true,
-      freeSpaces,
-      recommendations: occupied.some((o) => /table|desk|counter|buffet/i.test(String(o.label)))
-        ? ["flowers", "fruit platter", "plates", "napkins"]
-        : ["flowers", "lights", "decorative elements", "table setup"],
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to analyze base image" });
-  }
-});
-
-app.post("/api/public/events/theme-design/auto-place", async (req, res) => {
-  try {
-    const freeSpaces = Array.isArray(req.body?.freeSpaces) ? req.body.freeSpaces : [];
-    const objects = Array.isArray(req.body?.objects) ? req.body.objects : [];
-    const placements = objects.map((obj: unknown, idx: number) => {
-      const slot = (freeSpaces[idx % Math.max(1, freeSpaces.length)] as Record<string, unknown> | undefined) ?? {
-        left: 0.1 + ((idx % 3) * 0.25),
-        top: 0.2 + ((idx % 2) * 0.25),
-        width: 0.25,
-        height: 0.25,
-      };
-      const o = obj as Record<string, unknown>;
-      return {
-        objectId: String(o.id ?? `obj_${idx}`),
-        x: Number(slot.left ?? 0),
-        y: Number(slot.top ?? 0),
-        width: Number(slot.width ?? 0.25),
-        height: Number(slot.height ?? 0.25),
-        rotation: 0,
-        zIndex: idx,
-        confidence: 0.72,
-        reason: "Placed in low-occupancy region",
-      };
-    });
-    res.json({ ok: true, placements });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to auto-place objects" });
-  }
-});
-
-app.post("/api/public/events/theme-design/render-composite", async (req, res) => {
-  try {
-    const cleanedBase = sanitizeBase64Image(req.body?.baseImageBase64);
-    const objectsRaw = Array.isArray(req.body?.objects) ? req.body.objects : [];
-    const objects = objectsRaw
-      .filter((obj: unknown) => obj && typeof obj === "object")
-      .map((obj: unknown, idx: number) => {
-        const o = obj as Record<string, unknown>;
-        return {
-          object_image_base64: String(o.objectImageBase64 ?? o.object_image_base64 ?? ""),
-          x: Number(o.x ?? 0),
-          y: Number(o.y ?? 0),
-          width: Number(o.width ?? 120),
-          height: Number(o.height ?? 120),
-          rotation: Number(o.rotation ?? 0),
-          z_index: Number(o.zIndex ?? o.z_index ?? idx),
-          target_hex: o.targetHex ? ensureHexColor(o.targetHex) : null,
-          intensity: Number(o.intensity ?? 1),
-        };
-      })
-      .filter((o: { object_image_base64: string }) => Boolean(o.object_image_base64));
-    const fast = await callAiService(
-      "/v1/edit/compose",
-      { base_image_base64: cleanedBase, objects },
-      AI_SERVICE_TIMEOUT_COMPOSE_MS,
-    );
-    res.json({ ok: true, imageBase64: String(fast.image_base64 ?? fast.imageBase64 ?? "") });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "Failed to render composite" });
-  }
-});
-
-app.post("/api/public/events/theme-design/add-by-prompt", async (req, res) => {
-  try {
-    const cleanedBase = sanitizeBase64Image(req.body?.baseImageBase64);
-    const prompt = String(req.body?.prompt ?? "").trim();
-    if (!prompt) {
-      res.status(400).json({ error: "prompt is required" });
-      return;
-    }
-    const sourceQuery = buildPexelsQuery({
-      eventTitle: req.body?.eventTitle,
-      eventType: req.body?.eventType,
-      formalityLevel: req.body?.formalityLevel,
-      prompt,
-      baseImageUrl: req.body?.baseImageUrl,
-      forceNoPeople: true,
-    });
-    const pex = await fetchPexelsImages({ query: sourceQuery, perPage: 30, page: 1 });
-    const sourceImages = (pex.images.length > 0 ? pex.images : sanitizeThemeSuggestions(fallbackThemeSuggestions)).slice(0, 10);
-    const imageDownloads = await Promise.all(
-      sourceImages.map(async (row) => {
-        const url = String(row.imageUrl ?? "").trim();
-        if (!url) return "";
-        try {
-          const dl = await fetch(url, { method: "GET" });
-          if (!dl.ok) return "";
-          const buf = Buffer.from(await dl.arrayBuffer());
-          return buf.toString("base64");
-        } catch {
-          return "";
-        }
-      }),
-    );
-    const imagesBase64 = imageDownloads.filter((b) => b);
-    if (imagesBase64.length === 0) {
-      res.json({
-        ok: true,
-        usedFallback: true,
-        error: pex.error || "No prompt images found.",
-        imageBase64: cleanedBase,
-        placements: [],
-      });
-      return;
-    }
-
-    let occupied: Array<{ left: number; top: number; width: number; height: number; label: string }> = [];
-    try {
-      const baseInfo = await callAiService(
-        "/v1/infer/yolo-sam",
-        {
-          image_base64: cleanedBase,
-          confidence_threshold: 0.35,
-          max_detections: 20,
-          mask_format: "polygon",
-        },
-        AI_SERVICE_TIMEOUT_ADD_BY_PROMPT_MS,
-      );
-      occupied = (Array.isArray(baseInfo.objects) ? baseInfo.objects : []).map((obj: unknown) => {
-        const o = obj as Record<string, unknown>;
-        const box = (o.box ?? {}) as Record<string, unknown>;
-        return {
-          left: Number(box.x ?? box.left ?? 0),
-          top: Number(box.y ?? box.top ?? 0),
-          width: Number(box.width ?? 0),
-          height: Number(box.height ?? 0),
-          label: String(o.label ?? "Object"),
-        };
-      });
-    } catch {
-      occupied = [];
-    }
-
-    const freeSpaces: Array<{ left: number; top: number; width: number; height: number }> = [];
-    const grid = 3;
-    for (let row = 0; row < grid; row++) {
-      for (let col = 0; col < grid; col++) {
-        const left = col / grid;
-        const top = row / grid;
-        const width = 1 / grid;
-        const height = 1 / grid;
-        const overlaps = occupied.some((box) => {
-          const xOverlap = Math.max(0, Math.min(left + width, box.left + box.width) - Math.max(left, box.left));
-          const yOverlap = Math.max(0, Math.min(top + height, box.top + box.height) - Math.max(top, box.top));
-          return xOverlap * yOverlap > 0.02;
-        });
-        if (!overlaps) freeSpaces.push({ left, top, width, height });
-      }
-    }
-
-    const extractedGroups: Array<{ id: string; label: string; objectImageBase64: string }> = [];
-    for (let i = 0; i < imagesBase64.length; i++) {
-      try {
-        const fast = await callAiService(
-          "/v1/infer/yolo-sam-extract",
-          {
-            image_base64: imagesBase64[i],
-            confidence_threshold: 0.35,
-            max_detections: 20,
-            mask_format: "alpha_png",
-          },
-          AI_SERVICE_TIMEOUT_ADD_BY_PROMPT_MS,
-        );
-        const objects = Array.isArray(fast.objects)
-          ? fast.objects.map((obj: unknown, idx: number) => {
-              const o = obj as Record<string, unknown>;
-              return {
-                id: String(o.id ?? o.object_id ?? `obj_${i}_${idx}`),
-                label: String(o.label ?? "Object"),
-                objectImageBase64: String(o.object_image_base64 ?? o.objectImageBase64 ?? ""),
-              };
-            })
-          : [];
-        extractedGroups.push(...objects.filter((o) => o.objectImageBase64));
-      } catch {
-        // Skip failed source and continue.
-      }
-    }
-
-    let usedSourceImageFallback = false;
-    if (extractedGroups.length === 0) {
-      usedSourceImageFallback = true;
-      for (let i = 0; i < Math.min(imagesBase64.length, 6); i++) {
-        extractedGroups.push({
-          id: `fallback_source_${i}`,
-          label: "Source image",
-          objectImageBase64: String(imagesBase64[i] ?? ""),
-        });
-      }
-    }
-    if (extractedGroups.length === 0) {
-      res.status(422).json({ error: "No objects extracted from prompt sources" });
-      return;
-    }
-
-    const placements = extractedGroups.map((obj, idx) => {
-      const slot = freeSpaces[idx % Math.max(1, freeSpaces.length)] ?? {
-        left: 0.1 + ((idx % 3) * 0.25),
-        top: 0.2 + ((idx % 2) * 0.25),
-        width: 0.25,
-        height: 0.25,
-      };
-      return {
-        objectImageBase64: obj.objectImageBase64,
-        x: Number(slot.left ?? 0),
-        y: Number(slot.top ?? 0),
-        width: Number(slot.width ?? 0.25),
-        height: Number(slot.height ?? 0.25),
-        rotation: 0,
-        zIndex: idx,
-        intensity: 1.0,
-        targetHex: null,
-      };
-    });
-
-    const composeResp = await callAiService(
-      "/v1/edit/compose",
-      {
-        base_image_base64: cleanedBase,
-        objects: placements.map((o) => ({
-          object_image_base64: o.objectImageBase64,
-          x: o.x,
-          y: o.y,
-          width: o.width,
-          height: o.height,
-          rotation: o.rotation,
-          z_index: o.zIndex,
-          intensity: o.intensity,
-          target_hex: o.targetHex,
-        })),
-      },
-      AI_SERVICE_TIMEOUT_COMPOSE_MS,
-    );
-
-    res.json({
-      ok: true,
-      imageBase64: String(composeResp.image_base64 ?? composeResp.imageBase64 ?? ""),
-      placements,
-      images: sourceImages,
-      usedSourceImageFallback,
-    });
-  } catch (err) {
-    console.error(err);
-    let safeBase = "";
-    try {
-      safeBase = sanitizeBase64Image(req.body?.baseImageBase64);
-    } catch {
-      safeBase = "";
-    }
-    res.json({
-      ok: true,
-      usedFallback: true,
-      error: err instanceof Error ? err.message : "Failed to add objects by prompt",
-      imageBase64: safeBase,
-      placements: [],
-      images: fallbackThemeSuggestions.slice(0, 6),
-    });
-  }
-});
 
 app.get("/api/mobile/inquiries", async (req, res) => {
   const userEmail = String(req.query.user_email ?? "").trim().toLowerCase();
@@ -4244,7 +3763,7 @@ app.post("/api/mobile/inquiries", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({
-      error: err instanceof Error ? err.message : "could not save inquiry — check database migrations",
+      error: err instanceof Error ? err.message : "could not save inquiry â€” check database migrations",
     });
   }
 });
@@ -4307,7 +3826,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                     WHEN schedule_slots IS NULL THEN ''
                     WHEN jsonb_typeof(schedule_slots::jsonb) <> 'array' OR COALESCE(jsonb_array_length(schedule_slots::jsonb), 0) < 1 THEN ''
                     ELSE TRIM(BOTH FROM CONCAT_WS(
-                      ' · ',
+                      ' Â· ',
                       NULLIF(TRIM(schedule_slots::jsonb->0->>'date'), ''),
                       NULLIF(TRIM(schedule_slots::jsonb->0->>'label'), ''),
                       CASE
@@ -4315,7 +3834,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                           TRIM(schedule_slots::jsonb->0->>'from') ||
                           CASE
                             WHEN NULLIF(TRIM(schedule_slots::jsonb->0->>'to'), '') IS NOT NULL THEN
-                              '–' || TRIM(schedule_slots::jsonb->0->>'to')
+                              'â€“' || TRIM(schedule_slots::jsonb->0->>'to')
                             ELSE ''
                           END
                         ELSE NULL
@@ -4361,7 +3880,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                     WHEN schedule_slots IS NULL THEN ''
                     WHEN jsonb_typeof(schedule_slots::jsonb) <> 'array' OR COALESCE(jsonb_array_length(schedule_slots::jsonb), 0) < 1 THEN ''
                     ELSE TRIM(BOTH FROM CONCAT_WS(
-                      ' · ',
+                      ' Â· ',
                       NULLIF(TRIM(schedule_slots::jsonb->0->>'date'), ''),
                       NULLIF(TRIM(schedule_slots::jsonb->0->>'label'), ''),
                       CASE
@@ -4369,7 +3888,7 @@ app.post("/api/mobile/pos/catering/list", async (req, res) => {
                           TRIM(schedule_slots::jsonb->0->>'from') ||
                           CASE
                             WHEN NULLIF(TRIM(schedule_slots::jsonb->0->>'to'), '') IS NOT NULL THEN
-                              '–' || TRIM(schedule_slots::jsonb->0->>'to')
+                              'â€“' || TRIM(schedule_slots::jsonb->0->>'to')
                             ELSE ''
                           END
                         ELSE NULL
@@ -4810,7 +4329,7 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
       ? (postAnalysis as Record<string, unknown>)
       : null;
     const mergedPost: Record<string, unknown> | null = incomingPost != null ? { ...existingPost, ...incomingPost } : null;
-    let postToSave: Record<string, unknown> | null =
+    const postToSave =
       nextStatus === "for_processing"
         ? (() => {
             const base = mergedPost ?? { ...existingPost };
@@ -4823,36 +4342,25 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
             return base;
           })()
         : mergedPost;
-    if (nextStatus === "for_ongoing") {
-      const base = postToSave ?? { ...existingPost };
-      base.processing_phase = "ongoing";
-      postToSave = base;
-    } else if (nextStatus === "for_down_payment") {
-      const base = postToSave ?? { ...existingPost };
-      if (!base.processing_phase) base.processing_phase = "down_payment";
-      postToSave = base;
-    }
+    const bumpStageEnteredAt = before.status !== nextStatus;
+    const checklistPayload = packChecklistWithPost(checklistToSave, postToSave, before.checklist);
     const addlCol = additionalCostsDbColumnForStatus(String(before.status ?? ""));
-
-    const runStageUpdate = async (statusToWrite: string, postForPack: Record<string, unknown> | null) => {
-      const bumpStageEnteredAt =
-        String(before.status ?? "").trim().toLowerCase() !== statusToWrite.trim().toLowerCase();
-      const checklistPayload = packChecklistWithPost(checklistToSave, postForPack, before.checklist);
-      const stageBaseParams = [
-        id,
-        statusToWrite,
-        staffEmail,
-        Number.isFinite(downPaymentAmount) ? downPaymentAmount : null,
-        Number.isFinite(fullPaymentAmount) ? fullPaymentAmount : null,
-        checklistPayload ? JSON.stringify(checklistPayload) : null,
-        additionalCosts ? JSON.stringify(additionalCosts) : null,
-        Number.isFinite(laborCost) ? laborCost : null,
-        Number.isFinite(travelCost) ? travelCost : null,
-        Number.isFinite(totalCost) ? totalCost : null,
-      ];
-      if (orderKind === "event") {
-        return getPool().query(
-          `UPDATE event_orders
+    const stageBaseParams = [
+      id,
+      nextStatus,
+      staffEmail,
+      Number.isFinite(downPaymentAmount) ? downPaymentAmount : null,
+      Number.isFinite(fullPaymentAmount) ? fullPaymentAmount : null,
+      checklistPayload ? JSON.stringify(checklistPayload) : null,
+      additionalCosts ? JSON.stringify(additionalCosts) : null,
+      Number.isFinite(laborCost) ? laborCost : null,
+      Number.isFinite(travelCost) ? travelCost : null,
+      Number.isFinite(totalCost) ? totalCost : null,
+    ];
+    const { rows } =
+      orderKind === "event"
+        ? await getPool().query(
+            `UPDATE event_orders
        SET status = $2,
            updated_by = $3,
            updated_at = NOW(),
@@ -4876,17 +4384,16 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
            stage_entered_at = CASE WHEN $14::boolean THEN NOW() ELSE stage_entered_at END
        WHERE id::text = $1
        RETURNING id::text, email_address, ${txSelect} AS transaction_no, total_cost`,
-          [
-            ...stageBaseParams,
-            Number.isFinite(themeDesignCost) ? themeDesignCost : null,
-            themeDesign ? JSON.stringify(themeDesign) : null,
-            menu ? JSON.stringify(menu) : null,
-            bumpStageEnteredAt,
-          ],
-        );
-      }
-      return getPool().query(
-        `UPDATE catering_orders
+            [
+              ...stageBaseParams,
+              Number.isFinite(themeDesignCost) ? themeDesignCost : null,
+              themeDesign ? JSON.stringify(themeDesign) : null,
+              menu ? JSON.stringify(menu) : null,
+              bumpStageEnteredAt,
+            ],
+          )
+        : await getPool().query(
+            `UPDATE catering_orders
        SET status = $2,
            updated_by = $3,
            updated_at = NOW(),
@@ -4903,29 +4410,10 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
            stage_entered_at = CASE WHEN $12::boolean THEN NOW() ELSE stage_entered_at END
        WHERE id::text = $1
        RETURNING id::text, email_address, ${txSelect} AS transaction_no, total_cost`,
-        [...stageBaseParams, menu ? JSON.stringify(menu) : null, bumpStageEnteredAt],
-      );
-    };
-
-    let writeStatus = nextStatus;
-    let writePost = postToSave;
-    let rows: { rows: Array<Record<string, unknown>> };
-    try {
-      rows = await runStageUpdate(writeStatus, writePost);
-    } catch (err) {
-      if (!isPgCheckViolation(err)) throw err;
-      const legacy = cateringStatusLegacyWriteFallback(nextStatus, writePost);
-      if (!legacy) throw err;
-      console.warn(
-        `[catering/stage] CHECK rejected status=${nextStatus} for ${orderKind}/${id}; writing legacy status=${legacy.status}`,
-      );
-      writeStatus = legacy.status;
-      writePost = legacy.post;
-      rows = await runStageUpdate(writeStatus, writePost);
-    }
+            [...stageBaseParams, menu ? JSON.stringify(menu) : null, bumpStageEnteredAt],
+          );
     void costBreakdown;
-    const row0 = rows.rows[0] as Record<string, unknown> | undefined;
-    if (!row0) {
+    if (!rows[0]) {
       res.status(404).json({ error: "event order not found" });
       return;
     }
@@ -4937,37 +4425,37 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
         [id, JSON.stringify(actualEventImages)],
       );
     }
-    const orderRef = String(row0.transaction_no ?? id);
-    const orderTotal = toNum(row0.total_cost ?? before.total_cost, 0);
+    const orderRef = String(rows[0].transaction_no ?? id);
+    const orderTotal = toNum(rows[0].total_cost ?? before.total_cost, 0);
     const dueMsg =
       nextStatus === "for_processing"
         ? `Your inquiry ${orderRef} is now FOR PROCESSING. Please pay the down payment to continue.`
         : nextStatus === "for_post_analysis"
-          ? `Down payment confirmed for ${orderRef}. Remaining balance is now due. Current total: ₱${orderTotal.toFixed(2)}.`
+          ? `Down payment confirmed for ${orderRef}. Remaining balance is now due. Current total: â‚±${orderTotal.toFixed(2)}.`
           : nextStatus === "completed"
-            ? `Order ${orderRef} is completed. Final total: ₱${orderTotal.toFixed(2)}.`
+            ? `Order ${orderRef} is completed. Final total: â‚±${orderTotal.toFixed(2)}.`
             : "";
     if (dueMsg) {
       // In-app notifications are keyed by the customer's login email, not internal customer_id.
-      const notifyEmail = String(row0.email_address ?? before.email_address ?? "")
+      const notifyEmail = String(rows[0].email_address ?? before.email_address ?? "")
         .trim()
         .toLowerCase();
       if (notifyEmail) {
         await getPool().query(`INSERT INTO notifications (user_id, message) VALUES ($1, $2)`, [notifyEmail, dueMsg]);
       }
       void sendMailSafe(
-        String(row0.email_address ?? before.email_address),
+        String(rows[0].email_address ?? before.email_address),
         `Order update ${orderRef}`,
         dueMsg,
       );
     }
     // Award catering loyalty when the order reaches For Full Payment (for_post_analysis), not on completed.
     if (nextStatus === "for_post_analysis") {
-      const loyaltyEmail = String(row0.email_address ?? before.email_address ?? "").trim().toLowerCase();
+      const loyaltyEmail = String(rows[0].email_address ?? before.email_address ?? "").trim().toLowerCase();
       const loyaltyPoints = loyaltyPointsFor("catering_event", orderTotal);
       await applyLoyaltyRewardsBestEffort(
         loyaltyEmail,
-        String(row0.transaction_no ?? before.transaction_no ?? id),
+        String(rows[0].transaction_no ?? before.transaction_no ?? id),
         orderTotal,
         "catering_event",
       );
@@ -4976,13 +4464,14 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
         [id, loyaltyPoints],
       );
     }
-    res.json({ ok: true, id: row0.id, status: nextStatus, db_status: writeStatus });
+    res.json({ ok: true, id: rows[0].id, status: nextStatus });
   } catch (err) {
     console.error(err);
-    if (isPgCheckViolation(err)) {
+    const code = err && typeof err === "object" && "code" in err ? String((err as { code: string }).code) : "";
+    if (code === "23514") {
       res.status(500).json({
         error:
-          "Could not update order stage — database status constraint is outdated. Restart the backend once (applies schema fix), or contact support if this persists.",
+          "Could not update order stage â€” database status constraint is outdated. Redeploy the backend (restart) so pipeline statuses including for_ongoing are applied, then try again.",
       });
       return;
     }
@@ -5333,7 +4822,7 @@ app.post("/api/mobile/pos/catering/:id/switch-order-kind", async (req, res) => {
     await client.query("ROLLBACK").catch(() => {});
     console.error(err);
     res.status(500).json({
-      error: err instanceof Error ? err.message : "could not switch order kind — check database columns",
+      error: err instanceof Error ? err.message : "could not switch order kind â€” check database columns",
     });
   } finally {
     client.release();
@@ -5362,7 +4851,7 @@ app.post("/api/mobile/pos/catering/send-order-summary-email", async (req, res) =
   if (!isMailConfigured()) {
     res.status(503).json({
       error:
-        "SMTP not configured — set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
+        "SMTP not configured â€” set TRANSPORTER_EMAIL and TRANSPORTER_PASSWORD (or GMAIL_USER + GMAIL_APP_PASSWORD)",
     });
     return;
   }
@@ -5968,15 +5457,6 @@ async function seedCustomerSeedRow(): Promise<void> {
   }
 }
 
-registerEventDesignSeatingRoutes(app, {
-  getPool,
-  verifyPosStaff: (email, password, roles) =>
-    verifyPosStaff(
-      email,
-      password,
-      (roles ?? ["manager", "supervisor", "cashier"]) as PosStaffRole[],
-    ),
-});
 
 async function main() {
   await initDb();
