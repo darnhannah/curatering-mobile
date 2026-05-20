@@ -807,7 +807,6 @@ const double kDeliveryMaxDistanceKm = 5.0;
 const int kRestaurantOpenHour = 8;
 const int kRestaurantCloseHour = 19;
 const String kRestaurantHoursHint = "Macrina's Kitchen is only open from 8:00 am to 7:00 pm";
-const String kCateringEventHoursHint = 'Event times must be between 8:00 am and 7:00 pm.';
 
 bool isWithinRestaurantHours(TimeOfDay t) {
   final mins = t.hour * 60 + t.minute;
@@ -13890,10 +13889,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
       initialTime: w.from ?? const TimeOfDay(hour: 12, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
-    if (!isWithinRestaurantHours(t)) {
-      appSnack(ctx, kCateringEventHoursHint);
-      return;
-    }
     setState(() => _eventWindows[index].from = t);
     _scheduleConflictRefresh();
   }
@@ -13906,10 +13901,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
       initialTime: w.to ?? const TimeOfDay(hour: 14, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
-    if (!isWithinRestaurantHours(t)) {
-      appSnack(ctx, kCateringEventHoursHint);
-      return;
-    }
     setState(() => _eventWindows[index].to = t);
     _scheduleConflictRefresh();
   }
@@ -14379,8 +14370,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       ),
                       const SizedBox(height: 8),
                       Text('Event schedule (from / to)', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
-                      const SizedBox(height: 4),
-                      Text(kCateringEventHoursHint, style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
                       const SizedBox(height: 6),
                       ...List.generate(_eventWindows.length, (index) {
                         final w = _eventWindows[index];
@@ -17014,10 +17003,6 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       initialTime: w.from ?? const TimeOfDay(hour: 12, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
-    if (!isWithinRestaurantHours(t)) {
-      appSnack(ctx, kCateringEventHoursHint);
-      return;
-    }
     setState(() => _eventWindows[index].from = t);
   }
 
@@ -17029,10 +17014,6 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       initialTime: w.to ?? const TimeOfDay(hour: 14, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
-    if (!isWithinRestaurantHours(t)) {
-      appSnack(ctx, kCateringEventHoursHint);
-      return;
-    }
     setState(() => _eventWindows[index].to = t);
   }
 
