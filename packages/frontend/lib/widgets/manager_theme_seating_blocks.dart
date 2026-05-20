@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 
 import '../features/seating/seating_layout_export.dart';
@@ -5,6 +7,7 @@ import '../features/seating/seating_plan.dart';
 import '../features/seating/seating_plan_canvas.dart';
 import '../utils/allergen_ui.dart';
 import '../utils/order_type_utils.dart';
+import '../utils/theme_design_venue_refs.dart';
 
 /// Theme design preview + actions aligned with customer My Inquiries / Inquire Catering.
 Widget buildManagerThemeDesignBlock({
@@ -64,9 +67,11 @@ Widget buildManagerSeatingLayoutBlock({
   bool exportOnly = false,
   String eventTitle = '',
   String transactionNo = '',
+  Map<String, dynamic> themeDesign = const {},
 }) {
   final plan = SeatingPlanData.fromJson(seatingPlanJson);
   final hasPlan = !plan.isEffectivelyEmpty;
+  final venueRefs = venueReferencePhotosFromThemeDesign(themeDesign);
 
   Future<void> previewPdf() => previewSeatingLayoutPdf(
         context: context,
@@ -85,12 +90,45 @@ Widget buildManagerSeatingLayoutBlock({
         style: TextStyle(color: Colors.grey.shade700, fontSize: 13, height: 1.35),
       ),
       const SizedBox(height: 10),
+      if (venueRefs.isNotEmpty) ...[
+        Text(
+          'Venue reference photos (from event theme design)',
+          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.grey.shade800),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          exportOnly
+              ? 'These photos were uploaded with the customer inquiry. Open the editor to set one as the floor background.'
+              : 'In the seating editor, tap a photo below the tools to use it as the floor background.',
+          style: TextStyle(fontSize: 12, color: Colors.grey.shade600, height: 1.3),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          height: 72,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: venueRefs.length,
+            separatorBuilder: (_, __) => const SizedBox(width: 8),
+            itemBuilder: (context, i) => ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Image.memory(
+                base64Decode(venueRefs[i]),
+                width: 72,
+                height: 72,
+                fit: BoxFit.cover,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+      ],
       if (hasPlan) ...[
         SizedBox(
           height: 220,
           child: SeatingPlanInteractive(
             plan: plan,
             editable: false,
+            venueReferencePhotosBase64: venueRefs,
           ),
         ),
         const SizedBox(height: 8),

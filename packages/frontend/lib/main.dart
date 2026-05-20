@@ -19,8 +19,10 @@ import 'package:printing/printing.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'customer_local_notifications.dart';
+import 'features/event_design/event_design_admin_screen.dart';
 import 'features/event_design/event_theme_design_screen.dart';
 import 'features/seating/seating_layout_editor_screen.dart';
+import 'utils/image_pick_limits.dart';
 import 'features/seating/seating_plan.dart';
 import 'utils/allergen_ui.dart';
 import 'utils/order_type_utils.dart';
@@ -388,11 +390,13 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
             child: child ?? const SizedBox.shrink(),
           ),
           home: appState.userEmail == null
-              ? AuthScreen(
-                  key: ValueKey(appState.authSessionKey),
-                  state: appState,
-                  cashierMode: widget.forcePosLogin || kPosLoginBuild || appState.reopenAuthAsStaff,
-                )
+              ? (widget.forcePosLogin || kPosLoginBuild || appState.reopenAuthAsStaff
+                  ? AuthScreen(
+                      key: ValueKey(appState.authSessionKey),
+                      state: appState,
+                      cashierMode: widget.forcePosLogin || kPosLoginBuild || appState.reopenAuthAsStaff,
+                    )
+                  : CustomerPreAuthShell(state: appState))
               : _PostLoginWelcomeScope(
                   state: appState,
                   child: appState.isCashier
@@ -401,7 +405,9 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                           ? SupervisorOngoingShellScreen(state: appState)
                           : appState.isManager
                               ? ManagerDashboardScreen(state: appState)
-                              : CustomerDashboardScreen(state: appState),
+                              : (appState.userRole == 'customer' && appState.isGuestSession
+                                  ? GuestCustomerShell(state: appState)
+                                  : CustomerDashboardScreen(state: appState)),
                 ),
         );
       },
@@ -759,6 +765,22 @@ void appSnack(BuildContext context, String message) {
 const int kMinCateringOnlyPax = 10;
 const int kMinCateringEventPax = 50;
 const double kPesosPerPax = 500;
+/// Inquiry landing: 49 or below → catering-only form; 50+ → catering with event styling.
+const int kInquiryLandingEventStylingMinPax = 50;
+const String kInquiryTypeCatering = 'CATERING';
+const String kInquiryTypeCateringWithEventStyling = 'CATERING WITH EVENT STYLING';
+const String kLegacyInquiryTypeCateringAndEvent = 'CATERING AND EVENT';
+
+bool isInquiryCateringWithEventStyling(String inquiryType) {
+  final u = inquiryType.trim().toUpperCase();
+  return u == kInquiryTypeCateringWithEventStyling || u == kLegacyInquiryTypeCateringAndEvent;
+}
+
+String inquiryTypeDisplayLabel(String inquiryType) {
+  if (isInquiryCateringWithEventStyling(inquiryType)) return 'Catering with Event Styling';
+  if (inquiryType.trim().toUpperCase() == kInquiryTypeCatering) return 'Catering';
+  return inquiryType;
+}
 
 /// Layout variant for manager catering order summary PDFs.
 enum _ManagerOrderSummaryPdfVariant {
@@ -774,6 +796,25 @@ enum _ManagerOrderSummaryPdfVariant {
 const double kRestaurantLat = 14.513436;
 const double kRestaurantLng = 121.059198;
 const double kDeliveryMaxDistanceKm = 5.0;
+/// Restaurant delivery / pickup hours (schedule selection on checkout).
+const int kRestaurantOpenHour = 8;
+const int kRestaurantCloseHour = 22;
+const String kRestaurantHoursHint = "Macrina's Kitchen is only open from 8:00 am to 10:00 pm";
+
+bool isWithinRestaurantHours(TimeOfDay t) {
+  final mins = t.hour * 60 + t.minute;
+  return mins >= kRestaurantOpenHour * 60 && mins <= kRestaurantCloseHour * 60;
+}
+
+TimeOfDay clampToRestaurantHours(TimeOfDay t) {
+  if (t.hour < kRestaurantOpenHour) return const TimeOfDay(hour: 8, minute: 0);
+  if (t.hour > kRestaurantCloseHour || (t.hour == kRestaurantCloseHour && t.minute > 0)) {
+    return const TimeOfDay(hour: 22, minute: 0);
+  }
+  return t;
+}
+
+bool isRestaurantOpenNow() => isWithinRestaurantHours(TimeOfDay.now());
 const List<String> kCateringAllowedRegions = [
   'ncr',
   'national capital region',
@@ -888,6 +929,7 @@ class MenuItemData {
     required this.id,
     required this.name,
     required this.description,
+    this.listingSubtitle = '',
     required this.price,
     required this.dips,
     this.ingredients = const [],
@@ -899,7 +941,10 @@ class MenuItemData {
 
   final String id;
   final String name;
+  /// Short copy from `menu_dishes.description` (shown in add-to-tray / dish detail).
   final String description;
+  /// Meal type / category line for list cards (API `listing_subtitle`).
+  final String listingSubtitle;
   final double price;
   final List<String> dips;
   final List<String> ingredients;
@@ -1131,7 +1176,10 @@ List<OrderLineItem> orderLinesFromApiMap(Map<String, dynamic> map) {
     }
   }
 
-  addFrom(map['items']);
+  addFrom(map['tray_items']);
+  if (out.isEmpty) {
+    addFrom(map['items']);
+  }
   if (out.isEmpty) {
     addFrom(map['order_lines_snapshot']);
   }
@@ -1331,9 +1379,15 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
   final supStr = supRaw != null ? '$supRaw'.trim() : '';
   final refInit = '${map['payment_reference_initial'] ?? ''}'.trim();
   final refBal = '${map['payment_reference_balance'] ?? ''}'.trim();
-  final guestEm = '${map['guest_contact_email'] ?? ''}'.trim();
-  final fullName = '${map['full_name'] ?? ''}'.trim();
-  final contactNum = '${map['contact_number'] ?? ''}'.trim();
+  final fullName = '${map['full_name'] ?? map['delivery_name'] ?? ''}'.trim();
+  final contactNum = '${map['contact_number'] ?? map['delivery_contact'] ?? ''}'.trim();
+  final walkInNote = '${map['walk_in_note'] ?? ''}'.trim();
+  final deliveryNote = '${map['delivery_notes'] ?? map['note'] ?? ''}'.trim();
+  final orderSource = '${map['order_source'] ?? 'MOBILE_APP'}';
+  final isWalkIn = orderSource.toUpperCase() == 'POS' ||
+      orderSource.toUpperCase() == 'POS_MOBILE' ||
+      orderSource.toUpperCase() == 'POS_WEB';
+  final note = isWalkIn ? (walkInNote.isNotEmpty ? walkInNote : deliveryNote) : deliveryNote;
   return OrderData(
     id: jsonToInt(map['id']),
     orderNo: orderNoFromApiMap(map),
@@ -1346,13 +1400,13 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
         proofStr.isNotEmpty && looksLikeBase64ImageProof(proofStr) ? proofStr : null,
     lines: lines,
     userEmail: map['user_email'] != null && '${map['user_email']}'.trim().isNotEmpty ? '${map['user_email']}' : null,
-    note: '${map['note'] ?? ''}',
-    paymentMode: '${map['payment_mode'] ?? ''}',
-    deliveryName: '${map['delivery_name'] ?? ''}',
-    deliveryContact: '${map['delivery_contact'] ?? ''}',
+    note: note,
+    paymentMode: '${map['payment_mode'] ?? map['payment_method'] ?? ''}',
+    deliveryName: fullName.isNotEmpty ? fullName : '${map['delivery_name'] ?? ''}',
+    deliveryContact: contactNum.isNotEmpty ? contactNum : '${map['delivery_contact'] ?? ''}',
     deliveryAddress: '${map['delivery_address'] ?? ''}',
     deliveryTime: '${map['delivery_time'] ?? ''}',
-    orderSource: '${map['order_source'] ?? 'MOBILE_APP'}',
+    orderSource: orderSource,
     posCustomerLabel: '${map['pos_customer_label'] ?? ''}',
     cashierAmountReceived: map['cashier_amount_received'] != null ? jsonToDouble(map['cashier_amount_received']) : null,
     cashierChange: map['cashier_change'] != null ? jsonToDouble(map['cashier_change']) : null,
@@ -1372,7 +1426,7 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
     loyaltyPointsEarned: jsonToInt(map['loyalty_points_earned']),
     paymentReferenceInitial: refInit.isEmpty ? null : refInit,
     paymentReferenceBalance: refBal.isEmpty ? null : refBal,
-    guestContactEmail: guestEm.isEmpty ? null : guestEm,
+    guestContactEmail: null,
     orderFullName: fullName.isEmpty ? null : fullName,
     orderContactNumber: contactNum.isEmpty ? null : contactNum,
   );
@@ -1978,7 +2032,7 @@ class InquiryRecord {
   final String orderKind;
 
   bool get isCateringPlusEvent =>
-      inquiryType.trim().toUpperCase() == 'CATERING AND EVENT' ||
+      isInquiryCateringWithEventStyling(inquiryType) ||
       orderKind == 'event' ||
       isCateringPlusEventOrderType(orderKind, eventTitle: eventTitle);
 
@@ -2349,6 +2403,8 @@ class AppState extends ChangeNotifier {
   bool openAuthInSignupMode = false;
   /// Guest tapped Sign Up — after account creation, require a fresh login (no auto session).
   bool signupFromGuestPrompt = false;
+  /// First bottom-nav tab on [GuestCustomerShell] after [enterGuestCheckoutSession] (0–3).
+  int guestShellInitialTabIndex = 0;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
   final Set<String> _readAttentionOrderNos = <String>{};
@@ -3011,7 +3067,11 @@ class AppState extends ChangeNotifier {
           .patch(
             _uri('/api/mobile/orders/$orderId/cancel-customer'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'user_email': userEmail}),
+            body: jsonEncode({
+              'user_email': userEmail,
+              if (isGuestSession && profile.contactEmail.trim().isNotEmpty)
+                'contact_email': profile.contactEmail.trim().toLowerCase(),
+            }),
           )
           .timeout(_apiTimeout);
       if (res.statusCode != 200) {
@@ -3152,7 +3212,8 @@ class AppState extends ChangeNotifier {
   }
 
   /// Local-only session for ordering without an account (see [isGuestSession]).
-  Future<void> enterGuestCheckoutSession() async {
+  Future<void> enterGuestCheckoutSession({int initialShellTabIndex = 0}) async {
+    guestShellInitialTabIndex = initialShellTabIndex.clamp(0, 3);
     final salt = DateTime.now().millisecondsSinceEpoch;
     final r = math.Random().nextInt(1 << 30);
     userEmail = 'guest_${salt}_$r@guest.curatering.internal'.toLowerCase();
@@ -3356,6 +3417,7 @@ class AppState extends ChangeNotifier {
               id: '${map['id']}',
               name: '${map['name']}',
               description: '${map['description']}',
+              listingSubtitle: '${map['listing_subtitle'] ?? ''}',
               price: jsonToDouble(map['price']),
               dips: dipValues,
               ingredients: ingValues,
@@ -3596,25 +3658,69 @@ class AppState extends ChangeNotifier {
     _persistCustomerTraySnapshot().catchError((_) {});
   }
 
-  /// Customer menu + cashier POS: optional add-on / quantity before adding a line to the tray.
+  /// Customer menu + cashier POS: dish detail, optional add-ons, then add to tray.
   Future<void> promptAndAddRestaurantDish(BuildContext context, MenuItemData item) async {
     var selectedDip = '';
     var addonQty = 1;
-    if (item.dips.isNotEmpty) {
-      final dipChoices = ['None', ...item.dips];
-      selectedDip = 'None';
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (ctx) {
-          return StatefulBuilder(
-            builder: (ctx, setSt) {
-              return AlertDialog(
-                title: Text('Add ${item.name}', maxLines: 2),
-                content: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
+    final dipChoices = item.dips.isNotEmpty ? <String>['None', ...item.dips] : <String>['None'];
+    selectedDip = 'None';
+    final desc = item.description.trim();
+    final allergenLines = item.allergens.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    final rawImg = item.imageBase64?.trim();
+    Widget? headerImage;
+    if (rawImg != null && rawImg.isNotEmpty) {
+      try {
+        final bytes = Uint8List.fromList(base64Decode(rawImg));
+        headerImage = ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: Image.memory(
+            bytes,
+            height: 160,
+            width: double.infinity,
+            fit: BoxFit.cover,
+            cacheWidth: 480,
+            errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+          ),
+        );
+      } catch (_) {
+        headerImage = null;
+      }
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSt) {
+            return AlertDialog(
+              title: Text('Add to tray · ${item.name}', maxLines: 3),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (headerImage != null) ...[
+                      headerImage,
+                      const SizedBox(height: 12),
+                    ],
+                    if (desc.isNotEmpty) ...[
+                      const Text('Description', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      Text(desc, style: TextStyle(height: 1.35, color: Colors.grey.shade800)),
+                      const SizedBox(height: 12),
+                    ],
+                    const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 6),
+                    if (allergenLines.isEmpty)
+                      Text('No allergens listed for this dish.', style: TextStyle(fontSize: 13, color: Colors.grey.shade700))
+                    else
+                      ...allergenLines.map(
+                        (a) => Padding(
+                          padding: const EdgeInsets.only(bottom: 2),
+                          child: Text('• $a', style: const TextStyle(height: 1.3)),
+                        ),
+                      ),
+                    if (item.dips.isNotEmpty) ...[
+                      const SizedBox(height: 14),
                       DropdownButtonFormField<String>(
                         value: selectedDip,
                         isExpanded: true,
@@ -3651,19 +3757,19 @@ class AppState extends ChangeNotifier {
                         ),
                       ],
                     ],
-                  ),
+                  ],
                 ),
-                actions: [
-                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-                  FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add to tray')),
-                ],
-              );
-            },
-          );
-        },
-      );
-      if (ok != true) return;
-    }
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add to tray')),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (ok != true) return;
     final dip = selectedDip == 'None' || selectedDip.isEmpty ? '' : selectedDip;
     final dq = dip.isEmpty ? 1 : addonQty;
     addToTray(item, dip: dip, dipQty: dq);
@@ -3901,7 +4007,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> loadOrders({bool force = false}) async {
     if (userEmail == null || _loadOrdersInFlight) return;
-    if (!force && _ordersLoadedAt != null && DateTime.now().difference(_ordersLoadedAt!) < const Duration(seconds: 2)) {
+    if (!force && _ordersLoadedAt != null && DateTime.now().difference(_ordersLoadedAt!) < const Duration(seconds: 8)) {
       return;
     }
     _loadOrdersInFlight = true;
@@ -3939,6 +4045,98 @@ class AppState extends ChangeNotifier {
       }
     } finally {
       _loadOrdersInFlight = false;
+    }
+  }
+
+  /// Fetches one order with full fields (e.g. payment proof images) and merges into [orders].
+  Future<OrderData?> loadRestaurantOrderDetail(int orderId) async {
+    if (userEmail == null) return null;
+    try {
+      final query = <String, String>{'user_email': userEmail!};
+      if (isGuestSession) {
+        final guestContact = profile.contactEmail.trim().toLowerCase();
+        if (guestContact.isNotEmpty) query['contact_email'] = guestContact;
+      }
+      final res = await http.get(_uri('/api/mobile/orders/$orderId', query));
+      if (res.statusCode != 200) return null;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return null;
+      final map = body;
+      final lines = orderLinesFromApiMap(map);
+      final o = orderDataFromApiMap(map, lines);
+      final idx = orders.indexWhere((x) => x.id == orderId);
+      if (idx >= 0) {
+        orders[idx] = o;
+        notifyListeners();
+      }
+      return o;
+    } catch (e) {
+      debugPrint('loadRestaurantOrderDetail failed: $e');
+      return null;
+    }
+  }
+
+  Future<String?> requestGuestTrackOtp(String email) async {
+    final em = email.trim().toLowerCase();
+    if (!em.contains('@')) return 'Enter a valid email address';
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/guest-orders/request-track-otp'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'email': em}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not send verification code'}';
+        } catch (_) {
+          return 'Could not send verification code (${res.statusCode})';
+        }
+      }
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
+    }
+  }
+
+  Future<({String? error, List<OrderData> orders})> fetchGuestOrdersWithTrackOtp(
+    String email,
+    String otp,
+  ) async {
+    final em = email.trim().toLowerCase();
+    final code = otp.trim();
+    if (!em.contains('@')) return (error: 'Enter a valid email address', orders: <OrderData>[]);
+    if (code.isEmpty) return (error: 'Enter the verification code from your email', orders: <OrderData>[]);
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/guest-orders/list'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'email': em, 'otp': code}),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        String msg = 'Could not load orders (${res.statusCode})';
+        try {
+          final err = jsonDecode(res.body);
+          if (err is Map && err['error'] != null) msg = '${err['error']}';
+        } catch (_) {}
+        return (error: msg, orders: <OrderData>[]);
+      }
+      final body = jsonDecode(res.body);
+      if (body is! List) return (error: 'Unexpected server response', orders: <OrderData>[]);
+      final parsed = <OrderData>[];
+      for (final e in body) {
+        try {
+          final map = e as Map<String, dynamic>;
+          parsed.add(orderDataFromApiMap(map, orderLinesFromApiMap(map)));
+        } catch (_) {}
+      }
+      return (error: null, orders: parsed);
+    } catch (e) {
+      return (error: describeApiNetworkError(e, normalizeApiBase(apiBase)), orders: <OrderData>[]);
     }
   }
 
@@ -5226,12 +5424,11 @@ class _AuthScreenState extends State<AuthScreen> {
                                     try {
                                       await widget.state.enterGuestCheckoutSession();
                                       if (!mounted) return;
-                                      // Ensure the user lands on the dashboard even if the root widget rebuild lags.
                                       WidgetsBinding.instance.addPostFrameCallback((_) {
                                         if (!mounted) return;
-                                        Navigator.of(context).pushReplacement(
-                                          MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: widget.state)),
-                                        );
+                                        if (Navigator.of(context).canPop()) {
+                                          Navigator.of(context).pop();
+                                        }
                                       });
                                     } catch (e) {
                                       if (mounted) {
@@ -5636,7 +5833,8 @@ class AppScaffold extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isCustomer = state.userRole == 'customer';
-    final keepHamburger = isCustomer && title != 'CHECKOUT' && title != 'PAYMENT';
+    final guestNoDrawer = isCustomer && state.isGuestSession;
+    final keepHamburger = isCustomer && title != 'CHECKOUT' && title != 'PAYMENT' && !state.isGuestSession;
     final headerBg = isCustomer ? const Color(0xFF242424) : AppColors.brand;
     final headerFg = isCustomer ? const Color(0xFFFFC024) : Theme.of(context).colorScheme.onPrimary;
     final qty = state.tray.fold<int>(0, (s, e) => s + e.qty);
@@ -5650,44 +5848,15 @@ class AppScaffold extends StatelessWidget {
       appBar: AppBar(
         foregroundColor: headerFg,
         iconTheme: IconThemeData(color: headerFg),
-        leading: (forceDrawerLeading || keepHamburger) && state.userEmail != null
-            ? Builder(
-                builder: (context) {
-                  return Stack(
-                    clipBehavior: Clip.none,
-                    alignment: Alignment.center,
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.menu),
-                        onPressed: () => Scaffold.of(context).openDrawer(),
-                      ),
-                      if (showAttentionDot)
-                        Positioned(
-                          right: 6,
-                          top: 6,
-                          child: Container(
-                            width: 10,
-                            height: 10,
-                            decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                          ),
-                        ),
-                    ],
-                  );
-                },
-              )
-            : Navigator.of(context).canPop()
+        leading: guestNoDrawer
+            ? (Navigator.of(context).canPop()
                 ? IconButton(
-                    icon: const Icon(Icons.arrow_back),
-                    onPressed: () async {
-                      if (onBackPressed != null) {
-                        onBackPressed!();
-                        return;
-                      }
-                      final nav = Navigator.of(context);
-                      await nav.maybePop();
-                    },
+                    icon: Icon(Icons.arrow_back, color: headerFg),
+                    onPressed: () => Navigator.maybePop(context),
                   )
-                : Builder(
+                : null)
+            : ((forceDrawerLeading || keepHamburger) && state.userEmail != null)
+                ? Builder(
                     builder: (context) {
                       return Stack(
                         clipBehavior: Clip.none,
@@ -5710,7 +5879,43 @@ class AppScaffold extends StatelessWidget {
                         ],
                       );
                     },
-                  ),
+                  )
+                : Navigator.of(context).canPop()
+                    ? IconButton(
+                        icon: const Icon(Icons.arrow_back),
+                        onPressed: () async {
+                          if (onBackPressed != null) {
+                            onBackPressed!();
+                            return;
+                          }
+                          final nav = Navigator.of(context);
+                          await nav.maybePop();
+                        },
+                      )
+                    : Builder(
+                        builder: (context) {
+                          return Stack(
+                            clipBehavior: Clip.none,
+                            alignment: Alignment.center,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.menu),
+                                onPressed: () => Scaffold.of(context).openDrawer(),
+                              ),
+                              if (showAttentionDot)
+                                Positioned(
+                                  right: 6,
+                                  top: 6,
+                                  child: Container(
+                                    width: 10,
+                                    height: 10,
+                                    decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                                  ),
+                                ),
+                            ],
+                          );
+                        },
+                      ),
         backgroundColor: headerBg,
         title: Text(
           title,
@@ -5733,7 +5938,7 @@ class AppScaffold extends StatelessWidget {
           ...?actions,
         ],
       ),
-      drawer: AppDrawer(state: state),
+      drawer: guestNoDrawer ? null : AppDrawer(state: state),
       body: _adaptiveScaffoldBody(context, body),
     );
   }
@@ -5781,12 +5986,18 @@ class AppDrawer extends StatelessWidget {
             ),
           ),
           ListTile(
+            leading: const Icon(Icons.dashboard_outlined),
             title: const Text('Dashboard'),
             onTap: () => open(context, CustomerDashboardScreen(state: state)),
           ),
-          if (!state.isGuestSession) ...[
-            ListTile(title: const Text('My Profile'), onTap: () => open(context, MyProfileScreen(state: state))),
+          if (state.userEmail != null && !state.isGuestSession) ...[
             ListTile(
+              leading: const Icon(Icons.person_outline),
+              title: const Text('My Profile'),
+              onTap: () => open(context, MyProfileScreen(state: state)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.receipt_long_outlined),
               title: const Text('My Orders'),
               trailing: showAttentionDot
                   ? Container(
@@ -5799,12 +6010,32 @@ class AppDrawer extends StatelessWidget {
                 open(context, MyOrdersScreen(state: state));
               },
             ),
-            ListTile(title: const Text('My Catering Inquiries'), onTap: () => open(context, MyInquiriesScreen(state: state))),
+            ListTile(
+              leading: const Icon(Icons.question_answer_outlined),
+              title: const Text('My Catering Inquiries'),
+              onTap: () => open(context, MyInquiriesScreen(state: state)),
+            ),
           ],
-          ListTile(title: const Text('Your Tray'), onTap: () => open(context, TrayScreen(state: state))),
-          ListTile(title: const Text('Order Now'), onTap: () => open(context, RestaurantMenuScreen(state: state))),
-          ListTile(title: const Text('Inquire Catering'), onTap: () => open(context, InquiryScreen(state: state))),
-          ListTile(title: const Text('Settings'), onTap: () => open(context, SettingsScreen(state: state))),
+          ListTile(
+            leading: const Icon(Icons.shopping_cart_outlined),
+            title: const Text('Your Tray'),
+            onTap: () => open(context, TrayScreen(state: state)),
+          ),
+          ListTile(
+            leading: const Icon(Icons.restaurant_menu_outlined),
+            title: const Text('Order Now'),
+            onTap: () => open(context, RestaurantMenuScreen(state: state)),
+          ),
+          ListTile(
+            leading: const Icon(Icons.event_available_outlined),
+            title: const Text('Inquire Catering'),
+            onTap: () => open(context, InquiryScreen(state: state)),
+          ),
+          ListTile(
+            leading: const Icon(Icons.settings_outlined),
+            title: const Text('Settings'),
+            onTap: () => open(context, SettingsScreen(state: state)),
+          ),
           if (state.isGuestSession) ...[
             const Divider(height: 28),
             ListTile(
@@ -5813,12 +6044,6 @@ class AppDrawer extends StatelessWidget {
               onTap: () {
                 Navigator.pop(context);
                 state.returnGuestToCustomerLogin();
-                Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
-                  MaterialPageRoute<void>(
-                    builder: (_) => AuthScreen(state: state, cashierMode: false),
-                  ),
-                  (_) => false,
-                );
               },
             ),
           ],
@@ -6158,9 +6383,9 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
   void initState() {
     super.initState();
     widget.state.setManagerActiveStage(kStageForOngoing);
-    widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
-    widget.state.loadAllergenCatalog(force: true);
-    widget.state.loadMenu(force: true);
+    widget.state.loadManagerCateringByStage(kStageForOngoing);
+    widget.state.loadAllergenCatalog();
+    widget.state.loadMenu();
   }
 
   @override
@@ -6256,28 +6481,692 @@ class ManagerRoleDrawer extends StatelessWidget {
   }
 }
 
+/// Guest order tracking: verify contact email with OTP, then show restaurant orders for that email.
+class GuestTrackOrdersScreen extends StatefulWidget {
+  const GuestTrackOrdersScreen({super.key, required this.state});
+  final AppState state;
+
+  @override
+  State<GuestTrackOrdersScreen> createState() => _GuestTrackOrdersScreenState();
+}
+
+class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
+  final emailController = TextEditingController();
+  final otpController = TextEditingController();
+  bool _otpSent = false;
+  bool _verified = false;
+  bool _busy = false;
+  String? _error;
+  List<OrderData> _orders = [];
+
+  @override
+  void initState() {
+    super.initState();
+    final saved = widget.state.profile.contactEmail.trim();
+    if (saved.isNotEmpty) emailController.text = saved;
+    if (widget.state.isGuestSession && saved.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadSessionOrders());
+    }
+  }
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    otpController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadSessionOrders() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    await widget.state.loadOrders(force: true);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _verified = true;
+      _orders = List<OrderData>.from(widget.state.orders);
+    });
+  }
+
+  Future<void> _sendOtp() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final err = await widget.state.requestGuestTrackOtp(emailController.text);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (err != null) {
+        _error = err;
+      } else {
+        _otpSent = true;
+        _verified = false;
+        _orders = [];
+      }
+    });
+  }
+
+  Future<void> _verifyAndLoad() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final result = await widget.state.fetchGuestOrdersWithTrackOtp(emailController.text, otpController.text);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _error = result.error;
+      if (result.error == null) {
+        _verified = true;
+        _orders = result.orders;
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final inShell = widget.state.isGuestSession;
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF242424),
+        foregroundColor: const Color(0xFFFFC024),
+        title: const Text('TRACK MY ORDER', style: TextStyle(fontWeight: FontWeight.w800)),
+        centerTitle: true,
+        automaticallyImplyLeading: !inShell,
+      ),
+      body: _verified
+          ? RefreshIndicator(
+              onRefresh: () async {
+                if (widget.state.isGuestSession && widget.state.profile.contactEmail.trim().isNotEmpty) {
+                  await _loadSessionOrders();
+                } else {
+                  await _verifyAndLoad();
+                }
+              },
+              child: _orders.isEmpty
+                  ? ListView(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.all(24),
+                      children: [
+                        Text(
+                          'No restaurant orders found for this email yet.',
+                          style: TextStyle(color: Colors.grey.shade700),
+                        ),
+                      ],
+                    )
+                  : ListView.builder(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.all(12),
+                      itemCount: _orders.length,
+                      itemBuilder: (context, i) {
+                        final o = _orders[i];
+                        return Card(
+                          child: ListTile(
+                            title: Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w800)),
+                            subtitle: Text(
+                              '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}',
+                            ),
+                            isThreeLine: true,
+                            onTap: () async {
+                              await widget.state.loadRestaurantOrderDetail(o.id);
+                              if (!context.mounted) return;
+                              OrderData od = o;
+                              try {
+                                od = widget.state.orders.firstWhere((e) => e.id == o.id);
+                              } catch (_) {}
+                              appSnack(context, '${uiOrderNo(od.orderNo)}: ${statusReadableForOrder(od)}');
+                            },
+                          ),
+                        );
+                      },
+                    ),
+            )
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    'Enter the email you used when placing your order. We will send a one-time code to verify it is you.',
+                    style: TextStyle(height: 1.4, color: Colors.grey.shade800),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: emailController,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: const InputDecoration(
+                      labelText: 'Email address',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  if (_otpSent) ...[
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: otpController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Verification code',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ],
+                  if (_error != null) ...[
+                    const SizedBox(height: 12),
+                    Text(_error!, style: TextStyle(color: Colors.red.shade800)),
+                  ],
+                  const SizedBox(height: 16),
+                  if (!_otpSent)
+                    FilledButton(
+                      onPressed: _busy ? null : _sendOtp,
+                      child: Text(_busy ? 'Sending…' : 'Send verification code'),
+                    )
+                  else ...[
+                    FilledButton(
+                      onPressed: _busy ? null : _verifyAndLoad,
+                      child: Text(_busy ? 'Verifying…' : 'View my orders'),
+                    ),
+                    TextButton(
+                      onPressed: _busy
+                          ? null
+                          : () => setState(() {
+                                _otpSent = false;
+                                otpController.clear();
+                              }),
+                      child: const Text('Use a different email'),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+    );
+  }
+}
+
+Future<void> showCustomerAuthDialog(
+  BuildContext context,
+  AppState state, {
+  bool offerGuestContinue = false,
+  int guestContinueTabIndex = 0,
+}) async {
+  await showDialog<void>(
+    context: context,
+    builder: (dCtx) {
+      return Dialog(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: _CustomerLoginDialogBody(
+            state: state,
+            offerGuestContinue: offerGuestContinue,
+            guestContinueTabIndex: guestContinueTabIndex,
+          ),
+        ),
+      );
+    },
+  );
+}
+
+class _CustomerLoginDialogBody extends StatefulWidget {
+  const _CustomerLoginDialogBody({
+    required this.state,
+    this.offerGuestContinue = false,
+    this.guestContinueTabIndex = 0,
+  });
+  final AppState state;
+  final bool offerGuestContinue;
+  final int guestContinueTabIndex;
+
+  @override
+  State<_CustomerLoginDialogBody> createState() => _CustomerLoginDialogBodyState();
+}
+
+class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  String? busy;
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _toast(String msg) async {
+    final ctx = context;
+    if (!ctx.mounted) return;
+    ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = widget.state;
+    return Padding(
+      padding: const EdgeInsets.all(18),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Log in', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900, color: Colors.grey.shade900)),
+            const SizedBox(height: 14),
+            _LabeledInput(label: 'EMAIL ADDRESS', controller: emailController),
+            const SizedBox(height: 10),
+            _LabeledInput(label: 'PASSWORD', controller: passwordController, obscure: true),
+            const SizedBox(height: 18),
+            FilledButton(
+              onPressed: busy != null
+                  ? null
+                  : () async {
+                      setState(() => busy = 'Logging in…');
+                      try {
+                        final err = await state.login(emailController.text, passwordController.text);
+                        if (!context.mounted) return;
+                        if (err != null) {
+                          await _toast(err);
+                          return;
+                        }
+                        Navigator.of(context).pop();
+                      } finally {
+                        if (mounted) setState(() => busy = null);
+                      }
+                    },
+              child: Text(busy ?? 'LOG IN'),
+            ),
+            TextButton(
+              onPressed: busy != null
+                  ? null
+                  : () {
+                      state.openAuthInSignupMode = true;
+                      Navigator.of(context).pop();
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          fullscreenDialog: true,
+                          builder: (_) => AuthScreen(state: state, cashierMode: false),
+                        ),
+                      );
+                    },
+              child: const Text('Create an account'),
+            ),
+            if (widget.offerGuestContinue) ...[
+              const SizedBox(height: 8),
+              Text(
+                'OR',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.grey.shade700),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton(
+                onPressed: busy != null
+                    ? null
+                    : () async {
+                        setState(() => busy = 'Starting guest checkout…');
+                        try {
+                          await widget.state.enterGuestCheckoutSession(
+                            initialShellTabIndex: widget.guestContinueTabIndex,
+                          );
+                          if (!context.mounted) return;
+                          Navigator.of(context).pop();
+                        } catch (e) {
+                          if (context.mounted) {
+                            await _toast(describeApiNetworkError(e, normalizeApiBase(widget.state.apiBase)));
+                          }
+                        } finally {
+                          if (mounted) setState(() => busy = null);
+                        }
+                      },
+                child: const Text('CONTINUE AS GUEST'),
+              ),
+            ],
+            TextButton(onPressed: busy != null ? null : () => Navigator.of(context).pop(), child: const Text('Cancel')),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+void showCateringPackageDialog(BuildContext context) {
+  showDialog<void>(
+    context: context,
+    builder: (ctx) {
+      return DefaultTabController(
+        length: 2,
+        child: AlertDialog(
+          title: const Text('Catering packages'),
+          content: SizedBox(
+            width: math.min(MediaQuery.sizeOf(ctx).width * 0.92, 480),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const TabBar(
+                  tabs: [
+                    Tab(text: 'Within Taguig'),
+                    Tab(text: 'Outside Taguig'),
+                  ],
+                ),
+                SizedBox(
+                  height: 360,
+                  child: TabBarView(
+                    children: [
+                      SingleChildScrollView(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const Text('Catering', style: TextStyle(fontWeight: FontWeight.w800)),
+                            const SizedBox(height: 6),
+                            const Text('1) Php 500 per pax'),
+                            const Text('2) Setup: staff and buffet service'),
+                            const SizedBox(height: 6),
+                            Text(
+                              'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
+                              style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey),
+                            ),
+                            const SizedBox(height: 16),
+                            const Text('Catering with Event Styling', style: TextStyle(fontWeight: FontWeight.w800)),
+                            const SizedBox(height: 6),
+                            const Text('1) Php 500 per pax'),
+                            const Text('2) Minimal Design: tables and chairs with linen and centerpiece'),
+                            const Text('3) Setup: staff and buffet service'),
+                            const SizedBox(height: 6),
+                            Text(
+                              'For extensive event styling and other requests, please include in your notes upon inquiry submission.',
+                              style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey),
+                            ),
+                          ],
+                        ),
+                      ),
+                      SingleChildScrollView(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const Text('Catering', style: TextStyle(fontWeight: FontWeight.w800)),
+                            const SizedBox(height: 6),
+                            const Text('1) Php 500 per pax'),
+                            const Text('2) Setup: staff and buffet service'),
+                            const SizedBox(height: 6),
+                            Text(
+                              'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
+                              style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey),
+                            ),
+                            const SizedBox(height: 16),
+                            const Text('Catering with Event Styling', style: TextStyle(fontWeight: FontWeight.w800)),
+                            const SizedBox(height: 6),
+                            const Text('1) Php 500 per pax'),
+                            const Text('2) Setup: staff and buffet service'),
+                            const SizedBox(height: 6),
+                            Text(
+                              'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
+                              style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+          ],
+        ),
+      );
+    },
+  );
+}
+
+class CustomerPreAuthShell extends StatefulWidget {
+  const CustomerPreAuthShell({super.key, required this.state});
+  final AppState state;
+
+  @override
+  State<CustomerPreAuthShell> createState() => _CustomerPreAuthShellState();
+}
+
+class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
+  int _navIndex = 0;
+
+  Future<void> _startGuest(int tab) async {
+    try {
+      await widget.state.enterGuestCheckoutSession(initialShellTabIndex: tab);
+    } catch (e) {
+      if (!mounted) return;
+      appSnack(context, describeApiNetworkError(e, normalizeApiBase(widget.state.apiBase)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.state;
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 72, fit: BoxFit.contain)),
+              const SizedBox(height: 12),
+              Text(
+                'Choose how you would like to continue.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: Colors.grey.shade900),
+              ),
+              const SizedBox(height: 16),
+              Expanded(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(
+                      child: _GuestLandingTile(
+                        icon: Icons.restaurant_menu_outlined,
+                        title: 'Order Now',
+                        subtitle: 'Restaurant menu & delivery',
+                        onTap: () => _startGuest(0),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _GuestLandingTile(
+                        icon: Icons.event_available_outlined,
+                        title: 'Inquire Catering',
+                        subtitle: 'Events & catering quotes',
+                        onTap: () => _startGuest(1),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _navIndex,
+        onDestinationSelected: (i) async {
+          setState(() => _navIndex = i);
+          if (i == 0) {
+            await _startGuest(0);
+          } else if (i == 1) {
+            await _startGuest(1);
+          } else if (i == 2) {
+            await Navigator.of(context).push<void>(
+              MaterialPageRoute<void>(builder: (_) => GuestTrackOrdersScreen(state: widget.state)),
+            );
+            if (mounted) setState(() => _navIndex = 0);
+          } else {
+            await showCustomerAuthDialog(context, s);
+            if (mounted) setState(() => _navIndex = 0);
+          }
+        },
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.restaurant_menu_outlined), label: 'Order Now'),
+          NavigationDestination(icon: Icon(Icons.event_available_outlined), label: 'Inquire'),
+          NavigationDestination(icon: Icon(Icons.local_shipping_outlined), label: 'Track'),
+          NavigationDestination(icon: Icon(Icons.login), label: 'Log In'),
+        ],
+      ),
+    );
+  }
+}
+
+class _GuestLandingTile extends StatelessWidget {
+  const _GuestLandingTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 2,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(icon, size: 36, color: AppColors.brand),
+              const Spacer(),
+              Text(title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+              const SizedBox(height: 6),
+              Text(subtitle, style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade700)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class GuestCustomerShell extends StatefulWidget {
+  const GuestCustomerShell({super.key, required this.state});
+  final AppState state;
+
+  @override
+  State<GuestCustomerShell> createState() => _GuestCustomerShellState();
+}
+
+class _GuestCustomerShellState extends State<GuestCustomerShell> {
+  late int _tab;
+
+  @override
+  void initState() {
+    super.initState();
+    _tab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
+    widget.state.guestShellInitialTabIndex = 0;
+  }
+
+  Widget _page(int i) {
+    switch (i) {
+      case 0:
+        return RestaurantMenuScreen(state: widget.state);
+      case 1:
+        return InquiryScreen(state: widget.state);
+      case 2:
+        return GuestTrackOrdersScreen(state: widget.state);
+      default:
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('Sign in with your email and password, or create an account.'),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: () => showCustomerAuthDialog(context, widget.state),
+                  child: const Text('Log In / Sign Up'),
+                ),
+              ],
+            ),
+          ),
+        );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Column(
+        children: [
+          Material(
+            color: const Color(0xFFFFF8E1),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Guest mode — create an account to earn loyalty rewards.',
+                      style: TextStyle(fontSize: 12.5, height: 1.35, color: Colors.grey.shade900),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: widget.state.requestAuthSignup,
+                    child: const Text('Sign up'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Expanded(child: _page(_tab)),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) {
+          if (i == 3) {
+            showCustomerAuthDialog(context, widget.state);
+            return;
+          }
+          setState(() => _tab = i);
+        },
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.restaurant_menu_outlined), label: 'Order Now'),
+          NavigationDestination(icon: Icon(Icons.event_available_outlined), label: 'Inquire'),
+          NavigationDestination(icon: Icon(Icons.local_shipping_outlined), label: 'Track'),
+          NavigationDestination(icon: Icon(Icons.login), label: 'Log In'),
+        ],
+      ),
+    );
+  }
+}
+
 class CustomerDashboardScreen extends StatelessWidget {
   const CustomerDashboardScreen({super.key, required this.state});
   final AppState state;
 
   @override
   Widget build(BuildContext context) {
-    final isGuest = state.isGuestSession;
-    final who = isGuest
-        ? 'Guest'
-        : (state.profile.fullName.trim().isNotEmpty
-            ? state.profile.fullName.trim()
-            : (state.userEmail ?? '').trim());
-    final items = <({String title, IconData icon, Widget? screen, VoidCallback? onTap})>[
-      (title: 'Order Now', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state), onTap: null),
-      (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state), onTap: null),
-      if (!isGuest) (title: 'My Orders', icon: Icons.receipt_long_outlined, screen: MyOrdersScreen(state: state), onTap: null),
-      (title: 'Inquire Catering', icon: Icons.event_available_outlined, screen: InquiryScreen(state: state), onTap: null),
-      if (!isGuest)
-        (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state), onTap: null),
-      if (!isGuest) (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state), onTap: null),
+    final who = state.profile.fullName.trim().isNotEmpty
+        ? state.profile.fullName.trim()
+        : (state.userEmail ?? '').trim();
+    final primaryPair = <({String title, IconData icon, Widget screen})>[
+      (title: 'Order Now', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state)),
+      (title: 'Inquire Catering', icon: Icons.event_available_outlined, screen: InquiryScreen(state: state)),
     ];
-    final gridItems = items;
+    final otherItems = <({String title, IconData icon, Widget? screen, VoidCallback? onTap})>[
+      (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state), onTap: null),
+      (title: 'My Orders', icon: Icons.receipt_long_outlined, screen: MyOrdersScreen(state: state), onTap: null),
+      (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state), onTap: null),
+      (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state), onTap: null),
+    ];
     return AppScaffold(
       state: state,
       title: 'DASHBOARD',
@@ -6290,9 +7179,9 @@ class CustomerDashboardScreen extends StatelessWidget {
             decoration: const BoxDecoration(color: Color(0xFF242424)),
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
             child: Column(
-          crossAxisAlignment: CrossAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-            Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain)),
+                Center(child: Image.asset(AppBrandAssets.logoDashboard, height: 76, fit: BoxFit.contain)),
                 if (who.isNotEmpty) ...[
                   const SizedBox(height: 10),
                   Text(
@@ -6304,30 +7193,6 @@ class CustomerDashboardScreen extends StatelessWidget {
               ],
             ),
           ),
-          if (isGuest)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text(
-                    'Create an account to earn loyalty rewards on restaurant orders and completed catering events.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 14,
-                      height: 1.4,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.grey.shade800,
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  FilledButton(
-                    onPressed: state.requestAuthSignup,
-                    child: const Text('SIGN UP'),
-                  ),
-                ],
-              ),
-            ),
           Expanded(
             child: RefreshIndicator(
               onRefresh: () async {
@@ -6336,8 +7201,8 @@ class CustomerDashboardScreen extends StatelessWidget {
                   state.loadSetMenus(force: true),
                   state.loadOrders(force: true),
                   state.loadInquiries(force: true),
+                  state.loadProfile(force: true),
                 ];
-                if (!state.isGuestSession) wait.add(state.loadProfile(force: true));
                 await Future.wait(wait);
                 await state.loadNotifications(force: true);
               },
@@ -6346,55 +7211,115 @@ class CustomerDashboardScreen extends StatelessWidget {
                   final w = constraints.maxWidth;
                   final crossAxisCount = w >= 800 ? 3 : 2;
                   final childAspectRatio = w >= 800 ? 1.15 : 1.35;
-                  return GridView.builder(
+                  return ListView(
                     physics: const AlwaysScrollableScrollPhysics(),
-                    padding: const EdgeInsets.all(12),
-                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: crossAxisCount,
-                      crossAxisSpacing: 10,
-                      mainAxisSpacing: 10,
-                      childAspectRatio: childAspectRatio,
-                    ),
-                    itemCount: gridItems.length,
-                    itemBuilder: (context, index) {
-                      final item = gridItems[index];
-                      return Card(
-                        color: Colors.white,
-                        elevation: 2,
-                        shadowColor: Colors.black26,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(12),
-                          onTap: () {
-                            if (item.onTap != null) {
-                              item.onTap!();
-                              return;
-                            }
-                            final screen = item.screen;
-                            if (screen == null) return;
-                            Navigator.of(context).push(
-                              MaterialPageRoute<void>(builder: (_) => screen),
-                            );
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.all(14),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Icon(item.icon, color: AppColors.brand, size: 30),
-                                const Spacer(),
-                                Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
-                              ],
-                            ),
-                          ),
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
+                    children: [
+                      IntrinsicHeight(
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            for (var i = 0; i < primaryPair.length; i++) ...[
+                              if (i > 0) const SizedBox(width: 10),
+                              Expanded(
+                                child: _CustomerDashTileCard(
+                                  title: primaryPair[i].title,
+                                  icon: primaryPair[i].icon,
+                                  onTap: () => Navigator.of(context).push(
+                                    MaterialPageRoute<void>(builder: (_) => primaryPair[i].screen),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
-                      );
-                    },
+                      ),
+                      const SizedBox(height: 14),
+                      const Divider(height: 1),
+                      const SizedBox(height: 12),
+                      GridView.builder(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: crossAxisCount,
+                          crossAxisSpacing: 10,
+                          mainAxisSpacing: 10,
+                          childAspectRatio: childAspectRatio,
+                        ),
+                        itemCount: otherItems.length,
+                        itemBuilder: (context, index) {
+                          final item = otherItems[index];
+                          return Card(
+                            color: Colors.white,
+                            elevation: 2,
+                            shadowColor: Colors.black26,
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(12),
+                              onTap: () {
+                                if (item.onTap != null) {
+                                  item.onTap!();
+                                  return;
+                                }
+                                final screen = item.screen;
+                                if (screen == null) return;
+                                Navigator.of(context).push(
+                                  MaterialPageRoute<void>(builder: (_) => screen),
+                                );
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.all(14),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Icon(item.icon, color: AppColors.brand, size: 30),
+                                    const Spacer(),
+                                    Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
                   );
                 },
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Compact tile used on the registered-customer dashboard primary row.
+class _CustomerDashTileCard extends StatelessWidget {
+  const _CustomerDashTileCard({required this.title, required this.icon, required this.onTap});
+  final String title;
+  final IconData icon;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      color: Colors.white,
+      elevation: 2,
+      shadowColor: Colors.black26,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(icon, color: AppColors.brand, size: 30),
+              const Spacer(),
+              Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -6613,15 +7538,23 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await Future.wait([
-        widget.state.loadMenu(force: true),
-        widget.state.loadSetMenus(force: true),
+        widget.state.loadMenu(),
+        widget.state.loadSetMenus(),
       ]);
       if (mounted) setState(() {});
+      unawaited(
+        Future.wait([
+          widget.state.loadMenu(force: true),
+          widget.state.loadSetMenus(force: true),
+        ]).then((_) {
+          if (mounted) setState(() {});
+        }),
+      );
     });
   }
 
   String _dishCardDescription(MenuItemData item) {
-    final raw = item.description.trim();
+    final raw = item.listingSubtitle.trim().isNotEmpty ? item.listingSubtitle.trim() : item.description.trim();
     if (raw.isEmpty) return '';
     final noRestaurant = raw.replaceAll(RegExp(r'\brestaurant\b', caseSensitive: false), '').replaceAll('• •', '•');
     return noRestaurant
@@ -6643,7 +7576,13 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
       borderRadius: BorderRadius.circular(14),
       child: InkWell(
         borderRadius: BorderRadius.circular(14),
-        onTap: () => showDishAllergensDialog(context, dishName: item.name, allergens: item.allergens),
+        onTap: () => showMenuDishDetailDialog(
+          context,
+          dishName: item.name,
+          description: item.description,
+          allergens: item.allergens,
+          imageBase64: item.imageBase64,
+        ),
         child: Container(
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(14),
@@ -6786,7 +7725,17 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                         style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                         onPressed: widget.state.tray.isEmpty
                             ? null
-                            : () {
+                            : () async {
+                                if (widget.state.userEmail == null) {
+                                  await showCustomerAuthDialog(
+                                    context,
+                                    widget.state,
+                                    offerGuestContinue: true,
+                                    guestContinueTabIndex: 0,
+                                  );
+                                  return;
+                                }
+                                if (!context.mounted) return;
                                 Navigator.of(context).push<void>(
                                   MaterialPageRoute<void>(
                                     builder: (_) => CheckoutScreen(state: widget.state),
@@ -6816,7 +7765,10 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
           final okSection = _sectionFilter == 'ALL' ||
               m.restaurantMenuBucket.toLowerCase() == _sectionFilter.toLowerCase();
           final q = _search.trim().toLowerCase();
-          final okSearch = q.isEmpty || m.name.toLowerCase().contains(q) || m.description.toLowerCase().contains(q);
+          final okSearch = q.isEmpty ||
+              m.name.toLowerCase().contains(q) ||
+              m.description.toLowerCase().contains(q) ||
+              m.listingSubtitle.toLowerCase().contains(q);
           return okSection && okSearch;
         }).toList();
         final mq = MediaQuery.of(context);
@@ -6956,7 +7908,12 @@ class _MenuThumb extends StatelessWidget {
     if (raw != null && raw.isNotEmpty) {
       try {
         final bytes = base64Decode(raw);
-        return Image.memory(Uint8List.fromList(bytes), fit: BoxFit.cover);
+        return Image.memory(
+          Uint8List.fromList(bytes),
+          fit: BoxFit.cover,
+          cacheWidth: compact ? 88 : 360,
+          cacheHeight: compact ? 88 : 360,
+        );
       } catch (_) {}
     }
     return Icon(Icons.fastfood, size: iconSize);
@@ -8271,7 +9228,17 @@ class TrayScreen extends StatelessWidget {
                 actionLabel: 'CHECKOUT',
                 onAction: state.tray.isEmpty
                     ? null
-                    : () {
+                    : () async {
+                        if (state.userEmail == null) {
+                          await showCustomerAuthDialog(
+                            context,
+                            state,
+                            offerGuestContinue: true,
+                            guestContinueTabIndex: 0,
+                          );
+                          return;
+                        }
+                        if (!context.mounted) return;
                         Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => CheckoutScreen(state: state)));
                       },
               ),
@@ -8344,7 +9311,12 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     }
     _deliveryAddresses.clear();
     _selectedDeliveryAddress = null;
-    _selectedDeliveryTime = widget.state.checkoutDeliveryTime.trim().isEmpty ? 'NOW' : widget.state.checkoutDeliveryTime.trim();
+    final savedTime = widget.state.checkoutDeliveryTime.trim();
+    _selectedDeliveryTime = savedTime.isEmpty ? 'NOW' : savedTime;
+    if (!isRestaurantOpenNow() && _selectedDeliveryTime == 'NOW') {
+      _selectedDeliveryTime = '';
+      widget.state.updateCheckoutDraftDeliveryTime('');
+    }
     unawaited(_loadInRangeDeliveryAddresses());
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await widget.state.loadMenu(force: true);
@@ -8530,6 +9502,35 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     }
   }
 
+  bool _deliveryTimeAllowed(String value) {
+    final v = value.trim();
+    if (v.isEmpty) {
+      appSnack(context, 'Choose a delivery time (ASAP or schedule).');
+      return false;
+    }
+    if (v == 'NOW') {
+      if (!isRestaurantOpenNow()) {
+        appSnack(
+          context,
+          'ASAP is only available from 8:00 am to 10:00 pm. Please set a schedule.',
+        );
+        return false;
+      }
+      return true;
+    }
+    try {
+      final dt = DateFormat('yyyy-MM-dd HH:mm').parseStrict(v);
+      if (!isWithinRestaurantHours(TimeOfDay(hour: dt.hour, minute: dt.minute))) {
+        appSnack(context, 'Delivery time must be between 8:00 am and 10:00 pm.');
+        return false;
+      }
+      return true;
+    } catch (_) {
+      appSnack(context, 'Invalid delivery time.');
+      return false;
+    }
+  }
+
   Future<void> _pickScheduledDelivery() async {
     final now = DateTime.now();
     final d = await showDatePicker(
@@ -8539,8 +9540,16 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
       lastDate: now.add(const Duration(days: 60)),
     );
     if (d == null || !mounted) return;
-    final t = await showTimePicker(context: context, initialTime: TimeOfDay.now());
+    final t = await showTimePicker(
+      context: context,
+      initialTime: clampToRestaurantHours(TimeOfDay.now()),
+      helpText: 'Select time (8:00 am – 10:00 pm)',
+    );
     if (t == null || !mounted) return;
+    if (!isWithinRestaurantHours(t)) {
+      appSnack(context, 'Choose a delivery time between 8:00 am and 10:00 pm.');
+      return;
+    }
     final dt = DateTime(d.year, d.month, d.day, t.hour, t.minute);
     final label = DateFormat('yyyy-MM-dd HH:mm').format(dt);
     setState(() => _selectedDeliveryTime = label);
@@ -8562,6 +9571,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
+    final asapAvailable = isRestaurantOpenNow();
+    final deliveryTimeLabel = _selectedDeliveryTime.trim().isEmpty
+        ? '—'
+        : (_selectedDeliveryTime == 'NOW' ? 'ASAP' : _selectedDeliveryTime);
     return AppScaffold(
       state: s,
       title: 'CHECKOUT',
@@ -8731,17 +9744,19 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                           },
                         ),
                       ],
-                      LockedField(label: 'TIME OF DELIVERY', value: _selectedDeliveryTime),
+                      LockedField(label: 'TIME OF DELIVERY', value: deliveryTimeLabel),
                       const SizedBox(height: 8),
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
                         children: [
                           OutlinedButton.icon(
-                            onPressed: () {
-                              setState(() => _selectedDeliveryTime = 'NOW');
-                              widget.state.updateCheckoutDraftDeliveryTime('NOW');
-                            },
+                            onPressed: asapAvailable
+                                ? () {
+                                    setState(() => _selectedDeliveryTime = 'NOW');
+                                    widget.state.updateCheckoutDraftDeliveryTime('NOW');
+                                  }
+                                : null,
                             icon: const Icon(Icons.flash_on_outlined, size: 18),
                             label: const Text('ASAP'),
                           ),
@@ -8752,6 +9767,18 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                           ),
                         ],
                       ),
+                      const SizedBox(height: 6),
+                      Text(
+                        kRestaurantHoursHint,
+                        style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3),
+                      ),
+                      if (!asapAvailable) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          'ASAP is unavailable right now — use Set schedule for a time between 8:00 am and 10:00 pm.',
+                          style: TextStyle(fontSize: 12, color: Colors.orange.shade800, height: 1.3),
+                        ),
+                      ],
                       const LockedField(label: 'MODE OF PAYMENT', value: 'GCASH ONLY'),
                     ],
                   ),
@@ -8839,6 +9866,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   appSnack(context, 'Choose a delivery time (ASAP or schedule).');
                   return;
                 }
+                if (!_deliveryTimeAllowed(_selectedDeliveryTime)) return;
                 if (_guestDeliveryDistanceKm == null || _guestDeliveryOutOfRange) {
                   appSnack(context, 'Pin or select a delivery address within ${kDeliveryMaxDistanceKm.toStringAsFixed(0)} km of the restaurant.');
                   return;
@@ -8852,6 +9880,11 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   appSnack(context, 'Complete your name and contact number in My Profile first.');
                   return;
                 }
+                if (_selectedDeliveryTime.trim().isEmpty) {
+                  appSnack(context, 'Choose a delivery time (ASAP or schedule).');
+                  return;
+                }
+                if (!_deliveryTimeAllowed(_selectedDeliveryTime)) return;
                 s.profile.deliveryAddress = _selectedDeliveryAddress!.trim();
               }
               s.updateCheckoutDraftDeliveryTime(_selectedDeliveryTime);
@@ -9958,7 +10991,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
     });
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await _loadRestaurantFeedbackPrefs();
-      await widget.state.loadOrders(force: true);
+      await widget.state.loadOrders();
       if (mounted) setState(() {});
     });
   }
@@ -10208,23 +11241,30 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                         ],
                       ),
                     ),
-                    onTap: () {
+                    onTap: () async {
                       widget.state.markOrderAttentionRead(o.orderNo);
+                      await widget.state.loadRestaurantOrderDetail(o.id);
+                      if (!context.mounted) return;
                       showDialog<void>(
                         context: context,
-                        builder: (ctx) => AlertDialog(
-                          title: Text(uiOrderNo(o.orderNo)),
+                        builder: (ctx) {
+                          OrderData od = o;
+                          try {
+                            od = widget.state.orders.firstWhere((e) => e.id == o.id);
+                          } catch (_) {}
+                          return AlertDialog(
+                          title: Text(uiOrderNo(od.orderNo)),
                           content: SingleChildScrollView(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                _detailLine('Order no.', uiOrderNo(o.orderNo)),
-                                _detailLine('Status', statusReadableForOrder(o)),
-                                _detailLine('Fulfillment stage', fulfillmentStageReadable(o.fulfillmentStage)),
+                                _detailLine('Order no.', uiOrderNo(od.orderNo)),
+                                _detailLine('Status', statusReadableForOrder(od)),
+                                _detailLine('Fulfillment stage', fulfillmentStageReadable(od.fulfillmentStage)),
                                 Builder(
                                   builder: (ctx) {
-                                    final fb = _restaurantFeedbackByOrderNo[o.orderNo];
+                                    final fb = _restaurantFeedbackByOrderNo[od.orderNo];
                                     if (fb == null) return const SizedBox.shrink();
                                     final rawStars = fb['stars'];
                                     final stars = rawStars is int ? rawStars : int.tryParse('$rawStars') ?? 0;
@@ -10241,68 +11281,68 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                     );
                                   },
                                 ),
-                                if (o.loyaltyPointsEarned > 0)
-                                  _detailLine('Loyalty points from this order', '+${o.loyaltyPointsEarned} pts'),
-                                _detailLine('Placed', formatDateTimeLocal(o.createdAt)),
-                                _detailLine('Account email', o.userEmail ?? '—'),
+                                if (od.loyaltyPointsEarned > 0)
+                                  _detailLine('Loyalty points from this order', '+${od.loyaltyPointsEarned} pts'),
+                                _detailLine('Placed', formatDateTimeLocal(od.createdAt)),
+                                _detailLine('Account email', od.userEmail ?? '—'),
                                 const Divider(height: 24),
                                 const Text('Delivery & contact', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
                                 const SizedBox(height: 8),
-                                _detailLine('Recipient name', o.deliveryName),
-                                _detailLine('Contact number', o.deliveryContact),
-                                _detailLine('Delivery address', o.deliveryAddress),
+                                _detailLine('Recipient name', od.deliveryName),
+                                _detailLine('Contact number', od.deliveryContact),
+                                _detailLine('Delivery address', od.deliveryAddress),
                                 _detailLine(
                                   'Requested delivery time',
-                                  o.deliveryTime.isEmpty || o.deliveryTime == 'NOW' ? 'As soon as possible' : o.deliveryTime,
+                                  od.deliveryTime.isEmpty || od.deliveryTime == 'NOW' ? 'As soon as possible' : od.deliveryTime,
                                 ),
-                                _detailLine('Payment method', o.paymentMode.isEmpty ? 'GCASH ONLY' : o.paymentMode),
-                                if (orderShowsDeliveryTrackingLink(o)) _detailTrackingUrl('Delivery tracking', o.deliveryTrackingUrl.trim()),
-                                if (o.note.trim().isNotEmpty) _detailLine('Your note', o.note.trim()),
-                                if (o.status.toUpperCase().contains('INSUFFICIENT')) ...[
+                                _detailLine('Payment method', od.paymentMode.isEmpty ? 'GCASH ONLY' : od.paymentMode),
+                                if (orderShowsDeliveryTrackingLink(od)) _detailTrackingUrl('Delivery tracking', od.deliveryTrackingUrl.trim()),
+                                if (od.note.trim().isNotEmpty) _detailLine('Your note', od.note.trim()),
+                                if (od.status.toUpperCase().contains('INSUFFICIENT')) ...[
                                   const Divider(height: 24),
                                   const Text('Balance payment', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
                                   const SizedBox(height: 8),
-                                  if (o.cashierAmountReceived != null)
-                                    _detailLine('Amount recorded by kitchen (paid so far)', '₱${o.cashierAmountReceived!.toStringAsFixed(2)}'),
+                                  if (od.cashierAmountReceived != null)
+                                    _detailLine('Amount recorded by kitchen (paid so far)', '₱${od.cashierAmountReceived!.toStringAsFixed(2)}'),
                                   _detailLine(
                                     'Still needed for confirmation',
-                                    '₱${(o.total - (o.cashierAmountReceived ?? 0)).clamp(0, double.infinity).toStringAsFixed(2)}',
+                                    '₱${(od.total - (od.cashierAmountReceived ?? 0)).clamp(0, double.infinity).toStringAsFixed(2)}',
                                   ),
                                   _detailLine(
                                     'Balance proof uploaded',
-                                    (orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o))
+                                    (orderPaymentReferenceBalance(od) != null || orderHasBalancePaymentProofImage(od))
                                         ? 'Yes'
                                         : 'Not yet — open Balance payment',
                                   ),
                                 ],
                                 const SizedBox(height: 8),
                                 Text(
-                                  'Payment on file: ${orderHasPaymentOnFile(o) ? 'Yes' : 'No'}',
+                                  'Payment on file: ${orderHasPaymentOnFile(od) ? 'Yes' : 'No'}',
                                   style: const TextStyle(height: 1.35),
                                 ),
-                                if (orderPaymentReferenceInitial(o) != null)
-                                  _detailLine('Payment reference', orderPaymentReferenceInitial(o)!),
-                                if (orderPaymentReferenceBalance(o) != null)
-                                  _detailLine('Balance payment reference', orderPaymentReferenceBalance(o)!),
-                                if (orderHasInitialPaymentProofImage(o)) ...[
+                                if (orderPaymentReferenceInitial(od) != null)
+                                  _detailLine('Payment reference', orderPaymentReferenceInitial(od)!),
+                                if (orderPaymentReferenceBalance(od) != null)
+                                  _detailLine('Balance payment reference', orderPaymentReferenceBalance(od)!),
+                                if (orderHasInitialPaymentProofImage(od)) ...[
                                   const SizedBox(height: 12),
                                   const Text('Payment proof', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
                                   const SizedBox(height: 8),
-                                  ..._buildProofPreview(o.paymentProofBase64!),
+                                  ..._buildProofPreview(od.paymentProofBase64!),
                                 ],
-                                if (orderHasBalancePaymentProofImage(o)) ...[
+                                if (orderHasBalancePaymentProofImage(od)) ...[
                                   const SizedBox(height: 12),
                                   const Text('Additional payment proof', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
                                   const SizedBox(height: 8),
-                                  ..._buildProofPreview(o.supplementalPaymentProofBase64!),
+                                  ..._buildProofPreview(od.supplementalPaymentProofBase64!),
                                 ],
                                 const SizedBox(height: 16),
                                 const Text('Dishes ordered', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
                                 const SizedBox(height: 8),
-                                if (o.lines.isEmpty)
+                                if (od.lines.isEmpty)
                                   const Text('No line items from server — pull down to refresh.')
                                 else
-                                  ...o.lines.map(
+                                  ...od.lines.map(
                                     (l) => Padding(
                                       padding: const EdgeInsets.only(bottom: 8),
                                       child: Text(
@@ -10312,18 +11352,18 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                     ),
                                   ),
                                 const SizedBox(height: 16),
-                                Text('Total: ₱${o.total.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                Text('Total: ₱${od.total.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
                               ],
                             ),
                           ),
                           actions: [
-                            if (!customerOrderCancelled(o) && o.status.toUpperCase().contains('INSUFFICIENT'))
+                            if (!customerOrderCancelled(od) && od.status.toUpperCase().contains('INSUFFICIENT'))
                               TextButton(
                                 onPressed: () {
                                   Navigator.of(ctx).pop();
                                   Navigator.of(context).push(
                                     MaterialPageRoute<void>(
-                                      builder: (_) => PaymentScreen(state: widget.state, order: o, note: o.note),
+                                      builder: (_) => PaymentScreen(state: widget.state, order: od, note: od.note),
                                     ),
                                   );
                                 },
@@ -10331,7 +11371,8 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                               ),
                             TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close')),
                           ],
-                        ),
+                        );
+                        },
                       );
                     },
                         ),
@@ -11529,7 +12570,9 @@ class InquiryScreen extends StatefulWidget {
 }
 
 class _InquiryScreenState extends State<InquiryScreen> {
-  String inquiryType = 'CATERING';
+  bool _showLanding = true;
+  final _landingPaxController = TextEditingController();
+  String inquiryType = kInquiryTypeCatering;
   bool curateOwn = false;
   bool _menuChoicePicked = false;
   bool _attemptedSubmit = false;
@@ -11615,6 +12658,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     _scheduleConflictDebounce?.cancel();
     _venueDebounce?.cancel();
     eventCity.removeListener(_onVenueChanged);
+    _landingPaxController.dispose();
     guestCount.dispose();
     paxBuffer.dispose();
     eventTitle.dispose();
@@ -11633,7 +12677,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
 
   void _resetInquiryForm() {
     setState(() {
-      inquiryType = 'CATERING';
+      inquiryType = kInquiryTypeCatering;
+      _showLanding = true;
       curateOwn = false;
       _menuChoicePicked = false;
       _attemptedSubmit = false;
@@ -11657,6 +12702,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
       _publicScheduleConflictCount = 0;
     });
     themeNotesController.clear();
+    _landingPaxController.clear();
     guestCount.clear();
     paxBuffer.clear();
     eventTitle.clear();
@@ -11672,7 +12718,25 @@ class _InquiryScreenState extends State<InquiryScreen> {
   }
 
   int _minPaxForCurrentInquiry() =>
-      inquiryType == 'CATERING AND EVENT' ? kMinCateringEventPax : kMinCateringOnlyPax;
+      isInquiryCateringWithEventStyling(inquiryType) ? kMinCateringEventPax : kMinCateringOnlyPax;
+
+  int? get _landingPaxParsed {
+    final raw = _landingPaxController.text.trim();
+    if (raw.isEmpty) return null;
+    return int.tryParse(raw);
+  }
+
+  void _proceedFromLanding() {
+    final pax = _landingPaxParsed;
+    if (pax == null || pax < 1) {
+      appSnack(context, 'Enter how many guests you will have.');
+      return;
+    }
+    guestCount.text = '$pax';
+    inquiryType =
+        pax >= kInquiryLandingEventStylingMinPax ? kInquiryTypeCateringWithEventStyling : kInquiryTypeCatering;
+    setState(() => _showLanding = false);
+  }
 
   /// For estimate: empty guests → 0; otherwise clamp to the minimum for this inquiry type.
   int _billableGuestCountForPricing() {
@@ -11892,12 +12956,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
   }
 
   Future<void> _pickThemeReferenceImage() async {
-    final x = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 85);
-    if (x == null) return;
-    final bytes = await x.readAsBytes();
-    if (!mounted) return;
+    final added = await pickImagesBase64(context: context, allowMultiple: true);
+    if (!mounted || added.isEmpty) return;
     setState(() {
-      _themeReferenceImagesB64.add(base64Encode(bytes));
+      for (final b in added) {
+        if (!_themeReferenceImagesB64.contains(b)) _themeReferenceImagesB64.add(b);
+      }
     });
   }
 
@@ -11971,16 +13035,16 @@ class _InquiryScreenState extends State<InquiryScreen> {
     if (curateOwn && selectedDishes.length < _minSelectedDishesRequired) {
       return 'Select at least $_minSelectedDishesRequired dish(es) for the menu.';
     }
-    if (inquiryType == 'CATERING AND EVENT' && _themeDesignChoice.isEmpty) {
+    if (isInquiryCateringWithEventStyling(inquiryType) && _themeDesignChoice.isEmpty) {
       return 'Choose an event theme design option.';
     }
-    if (inquiryType == 'CATERING AND EVENT' &&
+    if (isInquiryCateringWithEventStyling(inquiryType) &&
         _themeDesignChoice == 'create_own' &&
         (_aiThemeDesignPayload == null ||
             '${_aiThemeDesignPayload!['generatedImageUrl'] ?? ''}'.trim().isEmpty)) {
       return 'Create your theme design before submitting.';
     }
-    if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty) return 'Enter event title.';
+    if (isInquiryCateringWithEventStyling(inquiryType) && eventTitle.text.trim().isEmpty) return 'Enter event title.';
     if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
       return 'Describe the event type for “Other”.';
     }
@@ -12022,9 +13086,62 @@ class _InquiryScreenState extends State<InquiryScreen> {
     );
   }
 
+  Widget _buildInquiryLanding(BuildContext context) {
+    final state = widget.state;
+    final pax = _landingPaxParsed;
+    return AppScaffold(
+      state: state,
+      title: 'INQUIRE CATERING SERVICE',
+      showTrayShortcut: false,
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            OutlinedButton.icon(
+              onPressed: () => showCateringPackageDialog(context),
+              icon: const Icon(Icons.menu_book_outlined),
+              label: const Text('View Package'),
+            ),
+            const SizedBox(height: 28),
+            Text(
+              'How many guests will you have?',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _landingPaxController,
+              keyboardType: TextInputType.number,
+              maxLength: 4,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(4),
+              ],
+              decoration: const InputDecoration(
+                hintText: 'Number of guests',
+                counterText: '',
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            if (pax != null && pax > 0) ...[
+              const SizedBox(height: 10),
+              Text(
+                'Total cost for $pax with standard package is Php ${pax * kPesosPerPax}. Additional charges apply if you have additional requests not included in the package.',
+                style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey.shade800),
+              ),
+            ],
+            const Spacer(),
+            FilledButton(onPressed: _proceedFromLanding, child: const Text('NEXT')),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = widget.state;
+    if (_showLanding) return _buildInquiryLanding(context);
     final cateringMenu = state.menu.where((m) => m.isCateringDish).toList();
     final setMenuNames = ['All Dishes', ...state.setMenus.map((m) => m.name)];
     final effectiveSetMenu = setMenuNames.contains(selectedSetMenu) ? selectedSetMenu : 'All Dishes';
@@ -12056,21 +13173,18 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 physics: const AlwaysScrollableScrollPhysics(),
                 padding: const EdgeInsets.all(12),
                 children: [
-                DropdownButtonFormField<String>(
-                  value: inquiryType,
-                  items: const [
-                    DropdownMenuItem(value: 'CATERING', child: Text('CATERING')),
-                    DropdownMenuItem(value: 'CATERING AND EVENT', child: Text('CATERING AND EVENT')),
-                  ],
-                  onChanged: (v) => setState(() => inquiryType = v ?? 'CATERING'),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Package type', style: TextStyle(fontWeight: FontWeight.w700)),
+                  subtitle: Text(inquiryTypeDisplayLabel(inquiryType)),
                 ),
-                if (inquiryType == 'CATERING') ...[
+                if (!isInquiryCateringWithEventStyling(inquiryType)) ...[
                   const SizedBox(height: 10),
                   _buildEventTypePicker(),
                 ],
                 const SizedBox(height: 10),
                 Text(
-                  'Catering only: minimum $kMinCateringOnlyPax guests. Catering & event: minimum $kMinCateringEventPax guests. Estimated cost is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
+                  'Catering: minimum $kMinCateringOnlyPax guests. Catering with Event Styling: minimum $kMinCateringEventPax guests. Estimated cost is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
                   style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 10),
@@ -12086,11 +13200,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         controller: eventTitle,
                         decoration: _requiredDecoration(
                           label: 'Event title',
-                          invalid: inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isEmpty,
+                          invalid: isInquiryCateringWithEventStyling(inquiryType) && eventTitle.text.trim().isEmpty,
                         ),
                       ),
                       const SizedBox(height: 8),
-                      if (inquiryType == 'CATERING AND EVENT') ...[
+                      if (isInquiryCateringWithEventStyling(inquiryType)) ...[
                         _buildEventTypePicker(),
                         const SizedBox(height: 8),
                       ],
@@ -12351,7 +13465,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                     ],
                   ),
                 ),
-                if (inquiryType == 'CATERING AND EVENT') ...[
+                if (isInquiryCateringWithEventStyling(inquiryType)) ...[
                   const SizedBox(height: 10),
                   ToggleSection(
                     title: 'EVENT THEME DESIGN',
@@ -12400,6 +13514,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           ),
                         if (_themeDesignChoice == 'suggest') ...[
                           const SizedBox(height: 12),
+                          Text(
+                            'You may upload multiple reference images (max ${kMaxImageAttachmentBytes ~/ (1024 * 1024)} MB each).',
+                            style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3),
+                          ),
+                          const SizedBox(height: 8),
                           TextField(
                             controller: themeNotesController,
                             maxLines: 4,
@@ -12414,7 +13533,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                               OutlinedButton.icon(
                                 onPressed: _pickThemeReferenceImage,
                                 icon: const Icon(Icons.upload_file),
-                                label: const Text('Upload reference image'),
+                                label: const Text('Upload reference images'),
                               ),
                               const SizedBox(width: 8),
                               Text('${_themeReferenceImagesB64.length} image(s)'),
@@ -12745,7 +13864,26 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                       contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                                       tileColor: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
                                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                      secondary: ClipRRect(
+                                      secondary: GestureDetector(
+                                        onTap: () {
+                                          if (dish != null) {
+                                            showMenuDishDetailDialog(
+                                              context,
+                                              dishName: dish.name,
+                                              description: dish.description,
+                                              allergens: dish.allergens,
+                                              imageBase64: dish.imageBase64,
+                                            );
+                                          } else {
+                                            showMenuDishDetailDialog(
+                                              context,
+                                              dishName: dishName,
+                                              description: '',
+                                              allergens: const [],
+                                            );
+                                          }
+                                        },
+                                        child: ClipRRect(
                                         borderRadius: BorderRadius.circular(6),
                                         child: SizedBox(
                                           width: 40,
@@ -12755,18 +13893,32 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                               : const Icon(Icons.fastfood, size: 22),
                                         ),
                                       ),
+                                      ),
                                       title: InkWell(
-                                        onTap: () => showDishAllergensDialog(
-                                          context,
-                                          dishName: dishName,
-                                          allergens: dish?.allergens ?? const [],
-                                        ),
+                                        onTap: () {
+                                          if (dish != null) {
+                                            showMenuDishDetailDialog(
+                                              context,
+                                              dishName: dish.name,
+                                              description: dish.description,
+                                              allergens: dish.allergens,
+                                              imageBase64: dish.imageBase64,
+                                            );
+                                          } else {
+                                            showMenuDishDetailDialog(
+                                              context,
+                                              dishName: dishName,
+                                              description: '',
+                                              allergens: const [],
+                                            );
+                                          }
+                                        },
                                         child: Text(dishName, style: const TextStyle(fontSize: 13, decoration: TextDecoration.underline)),
                                       ),
                                       subtitle: Text(
                                         dish != null && dish.allergens.isNotEmpty
                                             ? 'Allergens: ${dish.allergens.join(', ')}'
-                                            : 'Tap dish name for allergen details',
+                                            : 'Tap the image or dish name for details',
                                         style: const TextStyle(fontSize: 11),
                                         maxLines: 3,
                                         overflow: TextOverflow.ellipsis,
@@ -12811,6 +13963,15 @@ class _InquiryScreenState extends State<InquiryScreen> {
             actionLabel: 'SUBMIT',
             onSecondary: () => Navigator.of(context).pop(),
             onAction: () async {
+              if (widget.state.userEmail == null) {
+                await showCustomerAuthDialog(
+                  context,
+                  widget.state,
+                  offerGuestContinue: true,
+                  guestContinueTabIndex: 1,
+                );
+                return;
+              }
               setState(() => _attemptedSubmit = true);
               final v = _validateInquiry();
               if (v != null) {
@@ -12828,8 +13989,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text('Type: $inquiryType'),
-                        if (inquiryType == 'CATERING AND EVENT' && eventTitle.text.trim().isNotEmpty) ...[
+                        Text('Type: ${inquiryTypeDisplayLabel(inquiryType)}'),
+                        if (isInquiryCateringWithEventStyling(inquiryType) && eventTitle.text.trim().isNotEmpty) ...[
                           const SizedBox(height: 6),
                           Text('Event: ${eventTitle.text.trim()}'),
                         ],
@@ -12885,7 +14046,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
               err = await state.submitInquiry({
                 'inquiry_type': inquiryType,
                 'event_title': eventTitle.text.trim(),
-                'event_type': (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
+                'event_type': (inquiryType == 'CATERING' || isInquiryCateringWithEventStyling(inquiryType)) ? _resolvedEventType() : '',
                 'customer': contactPerson.text.trim(),
                 'contact_person': contactPerson.text.trim(),
                 'contact_number': contactNumber.text.trim(),
@@ -12895,7 +14056,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'curate_own_menu': curateOwn,
                 'selected_set_menu': selectedSetMenu,
                 'selected_dishes': selectedDishes.toList(),
-                'include_event_theme': inquiryType == 'CATERING AND EVENT',
+                'include_event_theme': isInquiryCateringWithEventStyling(inquiryType),
                 'guest_count': guestsSaved,
                 'pax_buffer': paxBufferSaved,
                 'estimated_total': est,
@@ -12905,7 +14066,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 ],
                 'menu_suggestion_note': curateOwn ? '' : menuSuggestionNote,
                 'theme_suggestion_note': themeNotesController.text.trim(),
-                if (inquiryType == 'CATERING AND EVENT')
+                if (isInquiryCateringWithEventStyling(inquiryType))
                   'theme_design': _themeDesignChoice == 'create_own'
                       ? Map<String, dynamic>.from(_aiThemeDesignPayload ?? {})
                       : {
@@ -13063,7 +14224,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
   }
 
   List<Widget> _inquiryDetailLines(InquiryRecord r) {
-    final isFullEvent = r.inquiryType == 'CATERING AND EVENT';
+    final isFullEvent = isInquiryCateringWithEventStyling(r.inquiryType);
     Widget line(String text) => Padding(
           padding: const EdgeInsets.only(bottom: 8),
           child: Text(text, style: const TextStyle(height: 1.35)),
@@ -13366,7 +14527,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
         }
         switch (_filter) {
           case 'event_only':
-            return i.inquiryType == 'CATERING AND EVENT';
+            return isInquiryCateringWithEventStyling(i.inquiryType);
           case 'catering_only':
             return i.inquiryType == 'CATERING';
           default:
@@ -13774,6 +14935,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     'Rates are applied automatically when orders complete.',
                   ),
                 ),
+              if (widget.state.isManagerOrSupervisor &&
+                  (widget.state.userEmail ?? '').trim().isNotEmpty &&
+                  widget.state.loginPassword.isNotEmpty)
+                ListTile(
+                  leading: const Icon(Icons.palette_outlined),
+                  title: const Text('Event theme design options'),
+                  subtitle: const Text('Edit style, mood, color, and decor choices shown to customers.'),
+                  onTap: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => EventDesignAdminScreen(
+                          apiBase: widget.state.apiBase,
+                          staffEmail: widget.state.userEmail!.trim(),
+                          staffPassword: widget.state.loginPassword,
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ListTile(
                 leading: Icon(
                   widget.state.themeMode == ThemeMode.dark ? Icons.dark_mode_outlined : Icons.light_mode_outlined,
@@ -13807,7 +14987,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 subtitle: const Text('Describe your issue so we can help'),
                 onTap: _openHelp,
               ),
-              if (!widget.state.isGuestSession)
+              if (widget.state.userEmail != null && !widget.state.isGuestSession)
                 ListTile(
                   leading: const Icon(Icons.logout),
                   title: const Text('Log out'),
@@ -14672,7 +15852,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   }
 
   int _minPaxForCurrentInquiry() =>
-      inquiryType == 'CATERING AND EVENT' ? kMinCateringEventPax : kMinCateringOnlyPax;
+      isInquiryCateringWithEventStyling(inquiryType) ? kMinCateringEventPax : kMinCateringOnlyPax;
 
   int _billableGuestCountForPricing() {
     final raw = guestCount.text.trim();
@@ -14759,7 +15939,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       ((_billableGuestCountForPricing() + _paxBufferForPricing()) * kPesosPerPax) +
       _laborCostComputed() +
       _travelCostComputed() +
-      (inquiryType == 'CATERING AND EVENT' ? _themeCostComputed() : 0) +
+      (isInquiryCateringWithEventStyling(inquiryType) ? _themeCostComputed() : 0) +
       _sumCostRows(additionalCosts);
 
   String _resolvedEventType() {
@@ -14935,10 +16115,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     }
     if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
     if (eventTitle.text.trim().isEmpty) return 'Enter event title.';
-    if (inquiryType == 'CATERING AND EVENT' &&
+    if (isInquiryCateringWithEventStyling(inquiryType) &&
         themeSuggestionNote.trim().isEmpty &&
         themeCostController.text.trim().isEmpty) {
-      return 'Enter theme design notes or theme design cost for Catering + Event.';
+      return 'Enter theme design notes or theme design cost for Catering with Event Styling.';
     }
     if (travelCostController.text.trim().isEmpty) return 'Enter travel cost.';
     final maleN = int.tryParse(laborMaleController.text.trim()) ?? 0;
@@ -15074,14 +16254,14 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         'labor_manual_costs': laborManualCosts,
         'formality_level': formalityLevel,
         if (_selectedGuestAllergens.isNotEmpty) 'guest_allergens': _selectedGuestAllergens.toList(),
-        if (inquiryType == 'CATERING AND EVENT') 'theme_suggestion_note': themeSuggestionNote,
+        if (isInquiryCateringWithEventStyling(inquiryType)) 'theme_suggestion_note': themeSuggestionNote,
       };
       final costBreakdown = <Map<String, dynamic>>[
         {'label': 'Base food cost', 'amount': _billableGuestCountForPricing() * kPesosPerPax},
         {'label': 'Pax buffer', 'amount': _paxBufferForPricing() * kPesosPerPax},
         {'label': 'Labor cost', 'amount': _laborCostComputed()},
         {'label': 'Travel cost', 'amount': _travelCostComputed()},
-        if (inquiryType == 'CATERING AND EVENT')
+        if (isInquiryCateringWithEventStyling(inquiryType))
           {'label': 'Theme design cost', 'amount': _themeCostComputed()},
         {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
       ];
@@ -15128,7 +16308,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
           final createErr = await widget.state.managerCreateNewEvent(
             orderKind: orderKind,
             eventTitle: eventTitle.text.trim(),
-            eventType: (inquiryType == 'CATERING' || inquiryType == 'CATERING AND EVENT') ? _resolvedEventType() : '',
+            eventType: (inquiryType == 'CATERING' || isInquiryCateringWithEventStyling(inquiryType)) ? _resolvedEventType() : '',
             customerName: customerName.text.trim(),
             contactPerson: contactPerson.text.trim(),
             contactNumber: contactNumber.text.trim(),
@@ -15190,7 +16370,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final total = _estimatedCost();
       final downPaymentDue = total * 0.5;
       final settingLabel = eventSetting == 'closed' ? 'Closed space' : 'Open space';
-      final cateringType = inquiryType == 'CATERING' ? 'Catering' : 'Catering and Event';
+      final cateringType = inquiryTypeDisplayLabel(inquiryType);
 
       pw.Widget labelValueRow(String k, String v) => pw.Padding(
             padding: const pw.EdgeInsets.only(bottom: 5),
@@ -15249,7 +16429,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               'PAX buffer and cost',
               '$paxBufferValue x PHP ${kPesosPerPax.toStringAsFixed(0)} | PHP ${(paxBufferValue * kPesosPerPax).toStringAsFixed(2)}',
             ),
-            if (inquiryType == 'CATERING AND EVENT')
+            if (isInquiryCateringWithEventStyling(inquiryType))
               labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
             if (additionalCostTotal > 0.01) ...[
               labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCosts)),
@@ -15290,7 +16470,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         padding: const EdgeInsets.fromLTRB(12, 12, 12, 220),
         children: [
         Text(
-          'Catering only: minimum $kMinCateringOnlyPax guests. Catering + Event: minimum $kMinCateringEventPax guests. Estimated cost uses ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
+          'Catering: minimum $kMinCateringOnlyPax guests. Catering with Event Styling: minimum $kMinCateringEventPax guests. Estimated cost uses ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
           style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
         ),
         const SizedBox(height: 10),
@@ -15307,7 +16487,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 decoration: const InputDecoration(labelText: 'Inquiry type'),
                 items: const [
                   DropdownMenuItem(value: 'CATERING', child: Text('CATERING')),
-                  DropdownMenuItem(value: 'CATERING AND EVENT', child: Text('CATERING AND EVENT')),
+                  DropdownMenuItem(value: 'CATERING WITH EVENT STYLING', child: Text('CATERING WITH EVENT STYLING')),
                 ],
                 onChanged: (v) => setState(() => inquiryType = v ?? 'CATERING'),
               ),
@@ -15731,12 +16911,19 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                                   Expanded(
                                     child: InkWell(
                                       onTap: dishItem != null
-                                          ? () => showDishAllergensDialog(
+                                          ? () => showMenuDishDetailDialog(
+                                                context,
+                                                dishName: dishItem.name,
+                                                description: dishItem.description,
+                                                allergens: dishItem.allergens,
+                                                imageBase64: dishItem.imageBase64,
+                                              )
+                                          : () => showMenuDishDetailDialog(
                                                 context,
                                                 dishName: dishName,
-                                                allergens: dishItem.allergens,
-                                              )
-                                          : null,
+                                                description: '',
+                                                allergens: const [],
+                                              ),
                                       child: Column(
                                         crossAxisAlignment: CrossAxisAlignment.start,
                                         children: [
@@ -15779,7 +16966,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             ],
           ),
         ),
-        if (inquiryType == 'CATERING AND EVENT') ...[
+        if (isInquiryCateringWithEventStyling(inquiryType)) ...[
           const SizedBox(height: 10),
           ToggleSection(
             title: 'Event Theme Design',
@@ -15832,6 +17019,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             child: buildManagerSeatingLayoutBlock(
               context: context,
               seatingPlanJson: _newEventSeatingPlan?.toJson() ?? const {},
+              themeDesign: _newEventThemeDesign ?? const {},
               helperText: 'Plan tables and chairs for this event (optional). Saved with the new event.',
               buttonLabel: _newEventSeatingPlan == null || _newEventSeatingPlan!.isEffectivelyEmpty
                   ? 'Edit seating layout'
@@ -15853,6 +17041,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                       orderKind: 'event',
                       draftOnly: true,
                       initialPlan: _newEventSeatingPlan,
+                      themeDesign: _newEventThemeDesign ?? const {},
                     ),
                   ),
                 );
@@ -16169,7 +17358,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                 itemBuilder: (ctx) => const [
                   PopupMenuItem(value: 'all', child: Text('All types')),
                   PopupMenuItem(value: 'catering', child: Text('Catering only')),
-                  PopupMenuItem(value: 'event', child: Text('Catering + Event')),
+                  PopupMenuItem(value: 'event', child: Text('Catering with Event Styling')),
                 ],
                 child: const Icon(Icons.filter_list),
               ),
@@ -17233,7 +18422,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final balanceStillDue = (totalComputed - downPaidLine).clamp(0.0, double.infinity);
     final balancePaidLine = d.fullPaymentAmount > 0 ? d.fullPaymentAmount : balanceStillDue;
     final menuLines = _menuDishNamesFromRowMenu();
-    final cateringType = d.orderKind == 'catering' ? 'Catering' : 'Catering and Event';
+    final cateringType = d.orderKind == 'catering' ? 'Catering' : 'Catering with Event Styling';
 
     String pdfTitle() {
       switch (variant) {
@@ -19188,6 +20377,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       buildManagerSeatingLayoutBlock(
                         context: context,
                         seatingPlanJson: row.seatingPlan,
+                        themeDesign: row.themeDesign,
                         exportOnly: true,
                         eventTitle: row.eventTitle,
                         transactionNo: row.transactionNo,
@@ -19209,6 +20399,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 readOnly: true,
                                 eventTitle: row.eventTitle,
                                 transactionNo: row.transactionNo,
+                                themeDesign: row.themeDesign,
                               ),
                             ),
                           );
@@ -20185,7 +21376,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   const SizedBox(height: 8),
                   if (!isDraftStage) ...[
                     Text(
-                      'Order type: ${row.orderType == 'catering_event' || row.orderKind == 'event' ? 'Catering + Event' : 'Catering Only'}',
+                      'Order type: ${row.orderType == 'catering_event' || row.orderKind == 'event' ? 'Catering with Event Styling' : 'Catering Only'}',
                     ),
                     if (row.transactionNo.trim().isNotEmpty)
                       Padding(
@@ -20238,14 +21429,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     ],
                   ] else ...[
                     DropdownButtonFormField<String>(
-                      value: _draftOrderKind == 'catering' ? 'CATERING' : 'CATERING AND EVENT',
+                      value: _draftOrderKind == 'catering' ? 'CATERING' : 'CATERING WITH EVENT STYLING',
                       decoration: const InputDecoration(
                         labelText: 'Inquiry type',
                         helperText: 'Changing type moves this record between catering-only and full event tables when you save.',
                       ),
                       items: const [
                         DropdownMenuItem(value: 'CATERING', child: Text('CATERING')),
-                        DropdownMenuItem(value: 'CATERING AND EVENT', child: Text('CATERING AND EVENT')),
+                        DropdownMenuItem(value: 'CATERING WITH EVENT STYLING', child: Text('CATERING WITH EVENT STYLING')),
                       ],
                       onChanged: canEditStage
                           ? (v) => setState(() {
@@ -20677,10 +21868,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                       const SizedBox(width: 10),
                                       Expanded(
                                         child: InkWell(
-                                          onTap: () => showDishAllergensDialog(
+                                          onTap: () => showMenuDishDetailDialog(
                                             context,
                                             dishName: dish.name,
+                                            description: dish.description,
                                             allergens: dish.allergens,
+                                            imageBase64: dish.imageBase64,
                                           ),
                                           child: Text(
                                             dish.name,
@@ -20734,6 +21927,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           id: lookup?.id ?? dishName,
                           name: dishName,
                           description: lookup?.description ?? '',
+                          listingSubtitle: lookup?.listingSubtitle ?? '',
                           price: lookup?.price ?? 0,
                           dips: const [],
                           category: lookup?.category ?? '',
@@ -20841,6 +22035,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     buildManagerSeatingLayoutBlock(
                       context: context,
                       seatingPlanJson: row.seatingPlan,
+                      themeDesign: row.themeDesign,
                       exportOnly: widget.supervisorMode || !canEditSeatingLayout(row.status),
                       eventTitle: row.eventTitle,
                       transactionNo: row.transactionNo,
@@ -20869,6 +22064,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               readOnly: widget.supervisorMode || !canEditSeatingLayout(row.status),
                               eventTitle: row.eventTitle,
                               transactionNo: row.transactionNo,
+                              themeDesign: row.themeDesign,
                             ),
                           ),
                         );
@@ -21267,10 +22463,12 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 InkWell(
-                  onTap: () => showDishAllergensDialog(
+                  onTap: () => showMenuDishDetailDialog(
                     context,
                     dishName: item.name,
+                    description: item.description,
                     allergens: item.allergens,
+                    imageBase64: item.imageBase64,
                   ),
                   child: Text(
                     item.name,
@@ -21279,13 +22477,6 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                     style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12, decoration: TextDecoration.underline),
                   ),
                 ),
-                if (item.dips.isNotEmpty)
-                  Text(
-                    item.dips.join(', ').toUpperCase(),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 9, color: Colors.grey.shade700),
-                  ),
                 Row(
                   children: [
                     Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
@@ -21971,7 +23162,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
     _walkTab.addListener(() {
       if (mounted) setState(() {});
     });
-    widget.state.loadCashierWalkInQueues(force: true);
+    widget.state.loadCashierWalkInQueues();
   }
 
   @override

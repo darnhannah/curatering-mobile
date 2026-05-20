@@ -2,8 +2,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
-
+import '../../utils/image_pick_limits.dart';
 import 'seating_plan.dart';
 import 'venue_floor_shapes.dart';
 
@@ -41,12 +40,15 @@ class SeatingPlanInteractive extends StatefulWidget {
   final SeatingPlanData plan;
   final bool editable;
   final ValueChanged<SeatingPlanData>? onChanged;
+  /// Venue reference photos from event theme design (base64) — selectable as floor background.
+  final List<String> venueReferencePhotosBase64;
 
   const SeatingPlanInteractive({
     super.key,
     required this.plan,
     this.editable = false,
     this.onChanged,
+    this.venueReferencePhotosBase64 = const [],
   });
 
   @override
@@ -132,12 +134,18 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
   }
 
   Future<void> _pickFloorImage() async {
-    final x = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 85);
-    if (!mounted) return;
-    if (x == null) return;
-    final bytes = await x.readAsBytes();
-    if (bytes.isEmpty) return;
-    final b64 = base64Encode(bytes);
+    final added = await pickImagesBase64(context: context, allowMultiple: false);
+    if (!mounted || added.isEmpty) return;
+    _emit(
+      widget.plan.copyWith(
+        floorImageBase64: added.first,
+        clearFloorImageUrl: true,
+        clearVenueFloorShape: true,
+      ),
+    );
+  }
+
+  void _useVenueReferenceAsFloor(String b64) {
     _emit(
       widget.plan.copyWith(
         floorImageBase64: b64,
@@ -540,6 +548,56 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (widget.editable && widget.venueReferencePhotosBase64.isNotEmpty) ...[
+          Text(
+            'Venue reference from event theme design',
+            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: Colors.grey.shade800),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Tap a photo to use it as the seating floor background.',
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 88,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: widget.venueReferencePhotosBase64.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemBuilder: (context, i) {
+                final b64 = widget.venueReferencePhotosBase64[i];
+                final selected = p.floorImageBase64 == b64;
+                return GestureDetector(
+                  onTap: () => _useVenueReferenceAsFloor(b64),
+                  child: Stack(
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.memory(
+                          base64Decode(b64),
+                          width: 88,
+                          height: 88,
+                          fit: BoxFit.cover,
+                        ),
+                      ),
+                      if (selected)
+                        Positioned.fill(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Theme.of(context).colorScheme.primary, width: 3),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
         if (widget.editable) ...[
           Wrap(
             spacing: 8,

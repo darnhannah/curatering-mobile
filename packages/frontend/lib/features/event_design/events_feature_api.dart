@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'api_config.dart';
+import 'event_design_categories.dart';
 import '../seating/seating_plan.dart';
 
 class EventsFeatureApi {
@@ -13,6 +14,36 @@ class EventsFeatureApi {
   Uri _uri(String path, [Map<String, String>? query]) {
     final base = featureApiBase(apiBase);
     return Uri.parse('$base$path').replace(queryParameters: query);
+  }
+
+  Future<EventDesignCategories> getEventDesignCategories() async {
+    final res = await http.get(_uri('/api/mobile/event-design/categories'));
+    if (res.statusCode != 200) return EventDesignCategories.defaults;
+    try {
+      final body = jsonDecode(res.body);
+      return EventDesignCategories.fromJson(body);
+    } catch (_) {
+      return EventDesignCategories.defaults;
+    }
+  }
+
+  Future<void> saveEventDesignCategories({
+    required EventDesignCategories categories,
+    required String staffEmail,
+    required String staffPassword,
+  }) async {
+    final res = await http.put(
+      _uri('/api/mobile/event-design/categories'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'cashier_email': staffEmail,
+        'cashier_password': staffPassword,
+        'categories': categories.toJson(),
+      }),
+    );
+    if (res.statusCode != 200) {
+      throw Exception(_errorFromBody(res.body) ?? 'Could not save event design categories');
+    }
   }
 
   Future<List<Map<String, dynamic>>> listAiGenerations(

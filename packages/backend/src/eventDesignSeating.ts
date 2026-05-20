@@ -485,4 +485,102 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
       res.status(500).json({ error: "database error" });
     }
   });
+
+  const DEFAULT_EVENT_DESIGN_CATEGORIES = {
+    styles: ["Elegant", "Rustic", "Modern", "Garden", "Minimalist", "Vintage", "Bohemian"],
+    moods: ["Romantic", "Bright", "Dramatic", "Cozy", "Luxurious", "Fun"],
+    palettes: [
+      "White & Gold",
+      "Pastel Pink",
+      "Earthy Green",
+      "Navy & Silver",
+      "Peach & Cream",
+      "Black & White",
+    ],
+    decor: [
+      "Floral Centerpieces",
+      "Fairy Lights",
+      "Stage Backdrop",
+      "Balloon Setup",
+      "Drapery & Curtains",
+      "Table Runners",
+      "Photo Booth",
+      "Chandeliers",
+    ],
+  };
+
+  async function ensureEventDesignCategoriesTable(p: pg.Pool): Promise<void> {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS event_design_category_options (
+        id TEXT PRIMARY KEY DEFAULT 'default',
+        categories JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    const { rows } = await p.query(
+      `SELECT categories FROM event_design_category_options WHERE id = 'default' LIMIT 1`,
+    );
+    if (rows.length === 0) {
+      await p.query(
+        `INSERT INTO event_design_category_options (id, categories) VALUES ('default', $1::jsonb)`,
+        [JSON.stringify(DEFAULT_EVENT_DESIGN_CATEGORIES)],
+      );
+    }
+  }
+
+  function normalizeCategoryList(raw: unknown, fallback: string[]): string[] {
+    if (!Array.isArray(raw)) return [...fallback];
+    const out = raw.map((e) => String(e ?? "").trim()).filter((s) => s.length > 0 && s.length <= 80);
+    return out.length > 0 ? out.slice(0, 64) : [...fallback];
+  }
+
+  function parseCategoriesPayload(raw: unknown): Record<string, string[]> {
+    const src = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+    return {
+      styles: normalizeCategoryList(src.styles, DEFAULT_EVENT_DESIGN_CATEGORIES.styles),
+      moods: normalizeCategoryList(src.moods, DEFAULT_EVENT_DESIGN_CATEGORIES.moods),
+      palettes: normalizeCategoryList(src.palettes, DEFAULT_EVENT_DESIGN_CATEGORIES.palettes),
+      decor: normalizeCategoryList(src.decor, DEFAULT_EVENT_DESIGN_CATEGORIES.decor),
+    };
+  }
+
+  app.get("/api/mobile/event-design/categories", async (_req, res) => {
+    try {
+      const p = pool();
+      await ensureEventDesignCategoriesTable(p);
+      const { rows } = await p.query(
+        `SELECT categories FROM event_design_category_options WHERE id = 'default' LIMIT 1`,
+      );
+      const raw = rows[0]?.categories ?? DEFAULT_EVENT_DESIGN_CATEGORIES;
+      res.json(parseCategoriesPayload(raw));
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "database error" });
+    }
+  });
+
+  app.put("/api/mobile/event-design/categories", async (req, res) => {
+    const staffEmail = String(req.body?.cashier_email ?? req.body?.staff_email ?? "").trim().toLowerCase();
+    const staffPassword = String(req.body?.cashier_password ?? req.body?.staff_password ?? "");
+    const auth = await deps.verifyPosStaff(staffEmail, staffPassword, ["manager", "supervisor"]);
+    if (!auth.ok) {
+      res.status(403).json({ error: "manager or supervisor credentials required" });
+      return;
+    }
+    const categories = parseCategoriesPayload(req.body?.categories ?? req.body);
+    try {
+      const p = pool();
+      await ensureEventDesignCategoriesTable(p);
+      await p.query(
+        `INSERT INTO event_design_category_options (id, categories, updated_at)
+         VALUES ('default', $1::jsonb, NOW())
+         ON CONFLICT (id) DO UPDATE SET categories = EXCLUDED.categories, updated_at = NOW()`,
+        [JSON.stringify(categories)],
+      );
+      res.json({ ok: true, categories });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "database error" });
+    }
+  });
 }

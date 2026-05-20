@@ -228,7 +228,6 @@ export async function initDb(): Promise<void> {
   if (customerIdKindBefore === "absent") {
     await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id TEXT`);
   }
-  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS guest_contact_email TEXT`);
   const restaurantOrdersCustomerIdKind = await detectRestaurantOrdersCustomerIdKind(p);
   restaurantOrdersCustomerIdKindCache = restaurantOrdersCustomerIdKind;
   // Keep web PK `id` (UUID) separate from business `order_id` (ORD-*). repairRestaurantOrdersIdentity() in schemaNormalize fixes mistaken renames.
@@ -371,7 +370,7 @@ export async function initDb(): Promise<void> {
     UPDATE restaurant_orders
     SET order_status = 'IN_PREPARATION'
     WHERE COALESCE(order_status, '') = 'PENDING_CASHIER'
-      AND order_source = 'POS'
+      AND upper(COALESCE(order_source, '')) IN ('POS', 'POS_MOBILE', 'POS_WEB')
   `);
   await p.query(`
     UPDATE restaurant_orders
@@ -400,17 +399,12 @@ export async function initDb(): Promise<void> {
     // Some environments may define role constraints differently; keep startup resilient.
   }
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
-  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS cost_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS labor_cost NUMERIC NOT NULL DEFAULT 0`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS travel_cost NUMERIC NOT NULL DEFAULT 0`);
-  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS full_payment_due_at TIMESTAMPTZ`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
-  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS cost_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS labor_cost NUMERIC NOT NULL DEFAULT 0`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS travel_cost NUMERIC NOT NULL DEFAULT 0`);
-  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);
-  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS full_payment_due_at TIMESTAMPTZ`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ`);
   await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
@@ -486,6 +480,21 @@ export async function initDb(): Promise<void> {
       COMMENT ON COLUMN public.menu_dishes.allergens IS
         'Array of menu_dishes_allergens.allergen_id. Resolve display text via menu_dishes_allergens.allergen_name.'
     `);
+    await p.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'menu_dishes'
+            AND column_name = 'description'
+        ) THEN
+          ALTER TABLE public.menu_dishes
+            ADD COLUMN description TEXT NOT NULL DEFAULT '';
+        END IF;
+      END $$;
+    `);
   } catch {
     // menu_dishes may be absent in minimal dev DBs.
   }
@@ -514,6 +523,14 @@ export async function initDb(): Promise<void> {
       user_email TEXT PRIMARY KEY,
       tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS guest_order_track_otp (
+      email TEXT PRIMARY KEY,
+      otp_code TEXT NOT NULL,
+      otp_expires_at TIMESTAMPTZ NOT NULL
     );
   `);
 

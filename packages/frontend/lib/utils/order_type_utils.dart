@@ -4,8 +4,8 @@
 String orderTypeDisplayLabel(String orderType, {String eventTitle = ''}) {
   final t = orderType.trim().toLowerCase();
   if (t == 'catering') return 'Catering only';
-  if (t == 'catering_event' || t == 'event') return 'Catering + Event';
-  if (eventTitle.trim().isNotEmpty) return 'Catering + Event';
+  if (t == 'catering_event' || t == 'event') return 'Catering with Event Styling';
+  if (eventTitle.trim().isNotEmpty) return 'Catering with Event Styling';
   return 'Catering only';
 }
 

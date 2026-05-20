@@ -8,7 +8,8 @@
  *   public.menu_dishes + public.set_menus (see DEFAULT_PUBLIC_* below).
  *
  * Expected column aliases from menu query:
- *   id (text uuid ok), name, description, price, dips (JSON text array), dish_type (optional)
+ *   id (text uuid ok), name, description (dish copy), listing_subtitle (optional type/category line),
+ *   price, dips (JSON text array), dish_type (optional)
  *
  * Set menus query expected columns:
  *   name, description, dishes (JSON text array of dish names)
@@ -19,11 +20,12 @@ export const DEFAULT_PUBLIC_MENU_SQL = `
   SELECT
     md.id::text AS id,
     md.name::text AS name,
+    COALESCE(NULLIF(TRIM(md.description), ''), '')::text AS description,
     CASE
       WHEN LOWER(TRIM(COALESCE(md.meal_type, md.type, ''))) = 'restaurant'
         THEN NULLIF(TRIM(md.category), '')
       ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), NULLIF(TRIM(md.category), '')))
-    END AS description,
+    END AS listing_subtitle,
     COALESCE(NULLIF(TRIM(md.price), '')::numeric, 0) AS price,
     COALESCE(md.sauces::text, '[]') AS dips,
     COALESCE(md.ingredients::text, '[]') AS ingredients,
@@ -108,6 +110,7 @@ export function resolveMenuSql(): string | null {
       ${escapeIdent(idCol)}::text AS id,
       ${escapeIdent(nameCol)}::text AS name,
       COALESCE(${escapeIdent(descCol)}::text, '') AS description,
+      ''::text AS listing_subtitle,
       ${escapeIdent(priceCol)}::numeric AS price,
       ${dipsExpr} AS dips,
       ${ingredientsExpr} AS ingredients,

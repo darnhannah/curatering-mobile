@@ -3,10 +3,10 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import 'event_design_constants.dart';
+import '../../utils/image_pick_limits.dart';
+import 'event_design_categories.dart';
 import 'events_feature_api.dart';
 import 'runpod_service.dart';
 
@@ -33,7 +33,6 @@ class EventThemeDesignScreen extends StatefulWidget {
   final String userEmail;
   final String? orderId;
   final String orderKind;
-  /// Draft inquiry session key (before order is saved).
   final String? designSessionId;
   final String initialEventType;
   final Map<String, dynamic>? initialThemeDesign;
@@ -59,12 +58,17 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
   final _paletteOther = TextEditingController();
   final _decorOther = TextEditingController();
   final _notes = TextEditingController();
-  String? _venueB64;
+  final List<String> _venuePhotosB64 = [];
   String? _generatedUrl;
   final List<String> _previousUrls = [];
   bool _generating = false;
   bool _saving = false;
   List<Map<String, dynamic>> _history = [];
+  EventDesignCategories _categories = EventDesignCategories.defaults;
+  final PageController _pageController = PageController();
+  int _pageIndex = 0;
+
+  static const _pageTitles = ['Style & mood', 'Colors & decor', 'Venue photos', 'Generate & save'];
 
   @override
   void initState() {
@@ -85,17 +89,38 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       _decor.add('$d');
     }
     _notes.text = '${td['customInstructions'] ?? td['note'] ?? ''}';
-    _venueB64 = '${td['venuePhotoBase64'] ?? ''}'.trim().isEmpty ? null : '${td['venuePhotoBase64']}';
+    final singleVenue = '${td['venuePhotoBase64'] ?? ''}'.trim();
+    if (singleVenue.isNotEmpty) _venuePhotosB64.add(singleVenue);
+    for (final v in (td['venuePhotos'] is List ? td['venuePhotos'] as List : const [])) {
+      final s = '$v'.trim();
+      if (s.isNotEmpty && !_venuePhotosB64.contains(s)) _venuePhotosB64.add(s);
+    }
+    for (final v in (td['reference_images'] is List ? td['reference_images'] as List : const [])) {
+      final s = '$v'.trim();
+      if (s.isNotEmpty && !_venuePhotosB64.contains(s)) _venuePhotosB64.add(s);
+    }
     _generatedUrl = '${td['generatedImageUrl'] ?? ''}'.trim().isEmpty ? null : '${td['generatedImageUrl']}';
     for (final u in (td['previousGeneratedImageUrls'] is List ? td['previousGeneratedImageUrls'] as List : const [])) {
       final s = '$u'.trim();
       if (s.isNotEmpty && s != _generatedUrl) _previousUrls.add(s);
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) => _loadHistory());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadHistory();
+      _loadCategories();
+    });
+  }
+
+  Future<void> _loadCategories() async {
+    try {
+      final api = EventsFeatureApi(apiBase: widget.apiBase);
+      final c = await api.getEventDesignCategories();
+      if (mounted) setState(() => _categories = c);
+    } catch (_) {}
   }
 
   @override
   void dispose() {
+    _pageController.dispose();
     _styleOther.dispose();
     _moodOther.dispose();
     _paletteOther.dispose();
@@ -150,35 +175,31 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
     return out;
   }
 
-  /// Resize venue reference to max 768px width PNG base64 (handoff `inquire_page.dart`).
-  Future<String?> _encodeVenueForRunpod() async {
-    if (_venueB64 == null || _venueB64!.isEmpty) return null;
+  String? get _primaryVenueB64 => _venuePhotosB64.isEmpty ? null : _venuePhotosB64.first;
+
+  Future<String?> _encodeVenueForRunpod(String b64) async {
+    if (b64.isEmpty) return null;
     try {
-      final raw = base64Decode(_venueB64!);
+      final raw = base64Decode(b64);
       final codec = await ui.instantiateImageCodec(raw, targetWidth: 768);
       final frame = await codec.getNextFrame();
       final png = await frame.image.toByteData(format: ui.ImageByteFormat.png);
       frame.image.dispose();
-      if (png == null) return _venueB64;
+      if (png == null) return b64;
       return base64Encode(png.buffer.asUint8List());
     } catch (_) {
-      return _venueB64;
+      return b64;
     }
   }
 
-  Future<void> _pickVenue({bool replace = false}) async {
-    final x = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 88, maxWidth: 1600);
-    if (x == null) return;
-    final bytes = await x.readAsBytes();
-    if (bytes.length > 5 * 1024 * 1024) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Photo must be 5 MB or smaller.')),
-        );
+  Future<void> _pickVenuePhotos() async {
+    final added = await pickImagesBase64(context: context, allowMultiple: true, maxWidth: 1600);
+    if (!mounted || added.isEmpty) return;
+    setState(() {
+      for (final b in added) {
+        if (!_venuePhotosB64.contains(b)) _venuePhotosB64.add(b);
       }
-      return;
-    }
-    setState(() => _venueB64 = base64Encode(bytes));
+    });
   }
 
   String _detail(String? chip, TextEditingController other) {
@@ -261,9 +282,10 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       _decorOther.text.trim().isNotEmpty;
 
   Future<void> _generate() async {
-    if (_venueB64 == null || _venueB64!.isEmpty) {
+    final primary = _primaryVenueB64;
+    if (primary == null || primary.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Upload a venue reference photo first.')),
+        const SnackBar(content: Text('Upload at least one venue reference photo first.')),
       );
       return;
     }
@@ -275,7 +297,7 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
     }
     setState(() => _generating = true);
     try {
-      final venue = await _encodeVenueForRunpod();
+      final venue = await _encodeVenueForRunpod(primary);
       final url = await RunPodService.generateImageWithPolling(
         _composePrompt(),
         user_id: widget.userEmail,
@@ -337,7 +359,9 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       'colorPalette': _palettes.toList(),
       'decorElements': _decor.toList(),
       'customInstructions': _notes.text.trim(),
-      if (_venueB64 != null) 'venuePhotoBase64': _venueB64,
+      if (_venuePhotosB64.isNotEmpty) 'venuePhotoBase64': _venuePhotosB64.first,
+      if (_venuePhotosB64.isNotEmpty) 'venuePhotos': List<String>.from(_venuePhotosB64),
+      if (_venuePhotosB64.isNotEmpty) 'reference_images': List<String>.from(_venuePhotosB64),
       if (_generatedUrl != null) 'generatedImageUrl': _generatedUrl,
       'previousGeneratedImageUrls': prev.toList(),
       'wantsCustomDesign': true,
@@ -419,8 +443,8 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
     required List<String> options,
     required Set<String> selected,
     required void Function(String) onToggle,
+    bool singleSelect = false,
     TextEditingController? otherCtrl,
-    String otherLabel = 'Other',
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -434,14 +458,9 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
             for (final o in options)
               FilterChip(
                 label: Text(o),
-                selected: selected.contains(o),
+                selected: singleSelect ? selected.contains(o) : selected.contains(o),
                 onSelected: (_) => setState(() => onToggle(o)),
               ),
-            FilterChip(
-              label: Text(otherLabel),
-              selected: otherCtrl != null && otherCtrl.text.trim().isNotEmpty,
-              onSelected: (_) => setState(() {}),
-            ),
           ],
         ),
         if (otherCtrl != null) ...[
@@ -514,6 +533,57 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
     );
   }
 
+  void _goNext() {
+    if (_pageIndex < _pageTitles.length - 1) {
+      _pageController.nextPage(duration: const Duration(milliseconds: 280), curve: Curves.easeOut);
+    }
+  }
+
+  void _goBack() {
+    if (_pageIndex > 0) {
+      _pageController.previousPage(duration: const Duration(milliseconds: 280), curve: Curves.easeOut);
+    }
+  }
+
+  Widget _pageIndicator() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: List.generate(_pageTitles.length, (i) {
+          final active = i == _pageIndex;
+          return Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 2),
+              child: Column(
+                children: [
+                  Container(
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: active ? const Color(0xFFE8B923) : Colors.grey.shade300,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _pageTitles[i],
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+                      color: active ? Colors.black87 : Colors.grey.shade600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -547,189 +617,271 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                   ],
                 ),
               )
-            : ListView(
-                padding: const EdgeInsets.all(16),
+            : Column(
                 children: [
-                  InputDecorator(
-                    decoration: const InputDecoration(
-                      labelText: 'Event type',
-                      border: OutlineInputBorder(),
-                      filled: true,
-                    ),
-                    child: Row(
+                  _pageIndicator(),
+                  Expanded(
+                    child: PageView(
+                      controller: _pageController,
+                      onPageChanged: (i) => setState(() => _pageIndex = i),
                       children: [
-                        Expanded(
-                          child: Text(
-                            _eventType,
-                            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                          ),
+                        ListView(
+                          padding: const EdgeInsets.all(16),
+                          children: [
+                            _lockedEventTypeField(),
+                            _chipSection(
+                              title: 'Style',
+                              options: _categories.styles,
+                              selected: _style != null ? {_style!} : {},
+                              singleSelect: true,
+                              onToggle: (v) => setState(() => _style = _style == v ? null : v),
+                              otherCtrl: _styleOther,
+                            ),
+                            _chipSection(
+                              title: 'Mood / lighting',
+                              options: _categories.moods,
+                              selected: _mood != null ? {_mood!} : {},
+                              singleSelect: true,
+                              onToggle: (v) => setState(() => _mood = _mood == v ? null : v),
+                              otherCtrl: _moodOther,
+                            ),
+                          ],
                         ),
-                        Icon(Icons.lock_outline, size: 18, color: Colors.grey.shade600),
+                        ListView(
+                          padding: const EdgeInsets.all(16),
+                          children: [
+                            _chipSection(
+                              title: 'Color palette',
+                              options: _categories.palettes,
+                              selected: _palettes,
+                              onToggle: (v) => setState(() {
+                                if (_palettes.contains(v)) {
+                                  _palettes.remove(v);
+                                } else {
+                                  _palettes.add(v);
+                                }
+                              }),
+                              otherCtrl: _paletteOther,
+                            ),
+                            _chipSection(
+                              title: 'Decor elements',
+                              options: _categories.decor,
+                              selected: _decor,
+                              onToggle: (v) => setState(() {
+                                if (_decor.contains(v)) {
+                                  _decor.remove(v);
+                                } else {
+                                  _decor.add(v);
+                                }
+                              }),
+                              otherCtrl: _decorOther,
+                            ),
+                            TextField(
+                              controller: _notes,
+                              maxLines: 3,
+                              decoration: const InputDecoration(
+                                labelText: 'Notes',
+                                hintText: 'e.g. simple wedding setup with garden theme',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ],
+                        ),
+                        ListView(
+                          padding: const EdgeInsets.all(16),
+                          children: [
+                            Text('Venue reference photos', style: Theme.of(context).textTheme.titleSmall),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Upload one or more photos of your venue (max ${kMaxImageAttachmentBytes ~/ (1024 * 1024)} MB each). '
+                              'The first photo is used for AI generation; all photos are available for seating layout.',
+                              style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                            ),
+                            const SizedBox(height: 10),
+                            OutlinedButton.icon(
+                              onPressed: _pickVenuePhotos,
+                              icon: const Icon(Icons.photo_library_outlined),
+                              label: const Text('Add venue photos'),
+                            ),
+                            if (_venuePhotosB64.isNotEmpty) ...[
+                              const SizedBox(height: 10),
+                              SizedBox(
+                                height: 100,
+                                child: ListView.separated(
+                                  scrollDirection: Axis.horizontal,
+                                  itemCount: _venuePhotosB64.length,
+                                  separatorBuilder: (_, __) => const SizedBox(width: 8),
+                                  itemBuilder: (context, i) => Stack(
+                                    children: [
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: Image.memory(
+                                          base64Decode(_venuePhotosB64[i]),
+                                          width: 100,
+                                          height: 100,
+                                          fit: BoxFit.cover,
+                                        ),
+                                      ),
+                                      if (i == 0)
+                                        Positioned(
+                                          left: 4,
+                                          bottom: 4,
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            color: Colors.black54,
+                                            child: const Text('Primary', style: TextStyle(color: Colors.white, fontSize: 10)),
+                                          ),
+                                        ),
+                                      Positioned(
+                                        right: 0,
+                                        top: 0,
+                                        child: InkWell(
+                                          onTap: () => setState(() => _venuePhotosB64.removeAt(i)),
+                                          child: Container(
+                                            color: Colors.black54,
+                                            padding: const EdgeInsets.all(2),
+                                            child: const Icon(Icons.close, size: 14, color: Colors.white),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        ListView(
+                          padding: const EdgeInsets.all(16),
+                          children: [
+                            if (_generatedUrl != null) ...[
+                              Text('Selected design', style: Theme.of(context).textTheme.titleMedium),
+                              const SizedBox(height: 8),
+                              GestureDetector(
+                                onTap: () => showDialog<void>(
+                                  context: context,
+                                  builder: (ctx) => Dialog(
+                                    child: InteractiveViewer(
+                                      child: Image.network(_generatedUrl!, fit: BoxFit.contain),
+                                    ),
+                                  ),
+                                ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: Image.network(_generatedUrl!, height: 220, width: double.infinity, fit: BoxFit.cover),
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  TextButton.icon(
+                                    onPressed: () => _downloadUrl(_generatedUrl!),
+                                    icon: const Icon(Icons.download_outlined),
+                                    label: const Text('Open / download'),
+                                  ),
+                                  TextButton.icon(
+                                    onPressed: () {
+                                      Clipboard.setData(ClipboardData(text: _generatedUrl!));
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(content: Text('Image URL copied')),
+                                      );
+                                    },
+                                    icon: const Icon(Icons.link),
+                                    label: const Text('Copy link'),
+                                  ),
+                                ],
+                              ),
+                            ] else
+                              Container(
+                                height: 160,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  color: Colors.grey.shade200,
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: const Text('Your design preview will appear here after you generate.'),
+                              ),
+                            _previousDesignsGallery(),
+                            const SizedBox(height: 12),
+                            FilledButton.icon(
+                              onPressed: _generating ? null : _generate,
+                              icon: const Icon(Icons.auto_awesome),
+                              label: const Text('GENERATE EVENT DESIGN'),
+                              style: FilledButton.styleFrom(
+                                minimumSize: const Size.fromHeight(48),
+                                backgroundColor: const Color(0xFFE8B923),
+                                foregroundColor: Colors.black87,
+                              ),
+                            ),
+                          ],
+                        ),
                       ],
                     ),
                   ),
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text(
-                      'From your inquiry form — change it there if needed.',
-                      style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  _chipSection(
-                    title: 'Style',
-                    options: kEventDesignStyles,
-                    selected: _style != null ? {_style!} : {},
-                    onToggle: (v) => setState(() => _style = _style == v ? null : v),
-                    otherCtrl: _styleOther,
-                  ),
-                  _chipSection(
-                    title: 'Mood / lighting',
-                    options: kEventDesignMoods,
-                    selected: _mood != null ? {_mood!} : {},
-                    onToggle: (v) => setState(() => _mood = _mood == v ? null : v),
-                    otherCtrl: _moodOther,
-                  ),
-                  _chipSection(
-                    title: 'Color palette',
-                    options: kEventDesignPalettes,
-                    selected: _palettes,
-                    onToggle: (v) => setState(() {
-                      if (_palettes.contains(v)) {
-                        _palettes.remove(v);
-                      } else {
-                        _palettes.add(v);
-                      }
-                    }),
-                    otherCtrl: _paletteOther,
-                  ),
-                  _chipSection(
-                    title: 'Decor elements',
-                    options: kEventDesignDecor,
-                    selected: _decor,
-                    onToggle: (v) => setState(() {
-                      if (_decor.contains(v)) {
-                        _decor.remove(v);
-                      } else {
-                        _decor.add(v);
-                      }
-                    }),
-                    otherCtrl: _decorOther,
-                  ),
-                  TextField(
-                    controller: _notes,
-                    maxLines: 3,
-                    decoration: const InputDecoration(
-                      labelText: 'Notes',
-                      hintText: 'e.g. simple wedding setup with garden theme',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text('Venue photo', style: Theme.of(context).textTheme.titleSmall),
-                  const SizedBox(height: 8),
-                  if (_venueB64 != null)
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: Image.memory(base64Decode(_venueB64!), height: 140, width: double.infinity, fit: BoxFit.cover),
-                    ),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 8,
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: () => _pickVenue(replace: _venueB64 != null),
-                        icon: const Icon(Icons.photo_camera_outlined),
-                        label: Text(_venueB64 == null ? 'Upload venue photo' : 'Change venue reference photo'),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  if (_generatedUrl != null) ...[
-                    Text('Selected design', style: Theme.of(context).textTheme.titleMedium),
-                    const SizedBox(height: 8),
-                    GestureDetector(
-                      onTap: () => showDialog<void>(
-                        context: context,
-                        builder: (ctx) => Dialog(
-                          child: InteractiveViewer(
-                            child: Image.network(_generatedUrl!, fit: BoxFit.contain),
-                          ),
-                        ),
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.network(_generatedUrl!, height: 220, width: double.infinity, fit: BoxFit.cover),
+                  SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                      child: Row(
+                        children: [
+                          if (_pageIndex > 0)
+                            TextButton(onPressed: _goBack, child: const Text('Back'))
+                          else
+                            TextButton(
+                              onPressed: () async {
+                                if (await _confirmCancel()) {
+                                  if (context.mounted) Navigator.pop(context);
+                                }
+                              },
+                              child: const Text('Cancel'),
+                            ),
+                          const Spacer(),
+                          if (_pageIndex < _pageTitles.length - 1)
+                            FilledButton(onPressed: _goNext, child: const Text('Next'))
+                          else
+                            FilledButton(
+                              onPressed: _saving ? null : _save,
+                              child: Text(widget.persistToOrder ? 'Save' : 'Use this design'),
+                            ),
+                        ],
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        TextButton.icon(
-                          onPressed: () => _downloadUrl(_generatedUrl!),
-                          icon: const Icon(Icons.download_outlined),
-                          label: const Text('Open / download'),
-                        ),
-                        TextButton.icon(
-                          onPressed: () {
-                            Clipboard.setData(ClipboardData(text: _generatedUrl!));
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('Image URL copied')),
-                            );
-                          },
-                          icon: const Icon(Icons.link),
-                          label: const Text('Copy link'),
-                        ),
-                      ],
-                    ),
-                  ] else
-                    Container(
-                      height: 160,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade200,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Text('Your design preview will appear here after you generate.'),
-                    ),
-                  _previousDesignsGallery(),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Each run sends all selections and notes together. Image models can vary slightly between runs — pick the best result from the gallery above.',
-                    style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade800),
-                  ),
-                  const SizedBox(height: 16),
-                  FilledButton.icon(
-                    onPressed: _generating ? null : _generate,
-                    icon: const Icon(Icons.auto_awesome),
-                    label: const Text('GENERATE EVENT DESIGN'),
-                    style: FilledButton.styleFrom(
-                      minimumSize: const Size.fromHeight(48),
-                      backgroundColor: const Color(0xFFE8B923),
-                      foregroundColor: Colors.black87,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      TextButton(
-                        onPressed: () async {
-                          if (await _confirmCancel()) {
-                            if (context.mounted) Navigator.pop(context);
-                          }
-                        },
-                        child: const Text('Cancel'),
-                      ),
-                      const Spacer(),
-                      FilledButton(
-                        onPressed: _saving ? null : _save,
-                        child: Text(widget.persistToOrder ? 'Save' : 'Use this design'),
-                      ),
-                    ],
                   ),
                 ],
               ),
       ),
+    );
+  }
+
+  Widget _lockedEventTypeField() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InputDecorator(
+          decoration: const InputDecoration(
+            labelText: 'Event type',
+            border: OutlineInputBorder(),
+            filled: true,
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  _eventType,
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                ),
+              ),
+              Icon(Icons.lock_outline, size: 18, color: Colors.grey.shade600),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(top: 6, bottom: 12),
+          child: Text(
+            'From your inquiry form — change it there if needed.',
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+          ),
+        ),
+      ],
     );
   }
 }

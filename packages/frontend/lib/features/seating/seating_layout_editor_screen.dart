@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../utils/theme_design_venue_refs.dart';
 import '../event_design/events_feature_api.dart';
 import 'seating_layout_export.dart';
 import 'seating_plan.dart';
@@ -20,6 +21,7 @@ class SeatingLayoutEditorScreen extends StatefulWidget {
     this.draftOnly = false,
     this.eventTitle = '',
     this.transactionNo = '',
+    this.themeDesign = const {},
   });
 
   final String apiBase;
@@ -34,6 +36,7 @@ class SeatingLayoutEditorScreen extends StatefulWidget {
   final bool draftOnly;
   final String eventTitle;
   final String transactionNo;
+  final Map<String, dynamic> themeDesign;
 
   @override
   State<SeatingLayoutEditorScreen> createState() => _SeatingLayoutEditorScreenState();
@@ -223,6 +226,8 @@ class _SeatingLayoutEditorScreenState extends State<SeatingLayoutEditorScreen> {
                             plan: _plan,
                             editable: !widget.readOnly,
                             onChanged: widget.readOnly ? null : (next) => setState(() => _plan = next),
+                            venueReferencePhotosBase64:
+                                venueReferencePhotosFromThemeDesign(widget.themeDesign),
                           ),
                         ),
                       ),
