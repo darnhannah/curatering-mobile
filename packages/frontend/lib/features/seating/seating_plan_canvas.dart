@@ -577,10 +577,6 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _stepHeader(
-          'Step 3: Arrange to your desire!',
-          subtitle: 'Nudge, label, and adjust the selected table or chair.',
-        ),
         if (tid != null && selTable != null) ...[
           Card(
             margin: EdgeInsets.zero,
@@ -689,120 +685,32 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _stepTile({
+    required String title,
+    String subtitle = '',
+    required List<Widget> children,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey.shade300),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _stepHeader(title, subtitle: subtitle),
+          ...children,
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCanvas() {
     final p = widget.plan;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        if (widget.editable) ...[
-          _stepHeader(
-            'Step 1: Add floor background',
-            subtitle: 'Use a venue reference photo, upload a floor image, or pick a venue shape.',
-          ),
-        ],
-        if (widget.editable && widget.venueReferencePhotosBase64.isNotEmpty) ...[
-          Text(
-            'Venue reference photos',
-            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: Colors.grey.shade800),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Tap a photo to use it as the seating floor background.',
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            height: 88,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: widget.venueReferencePhotosBase64.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 8),
-              itemBuilder: (context, i) {
-                final b64 = widget.venueReferencePhotosBase64[i];
-                final selected = p.floorImageBase64 == b64;
-                return GestureDetector(
-                  onTap: () => _useVenueReferenceAsFloor(b64),
-                  child: Stack(
-                    children: [
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.memory(
-                          base64Decode(b64),
-                          width: 88,
-                          height: 88,
-                          fit: BoxFit.cover,
-                        ),
-                      ),
-                      if (selected)
-                        Positioned.fill(
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Theme.of(context).colorScheme.primary, width: 3),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                );
-              },
-            ),
-          ),
-          const SizedBox(height: 12),
-        ],
-        if (widget.editable) ...[
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              OutlinedButton.icon(
-                onPressed: _pickVenueFloorShape,
-                icon: const Icon(Icons.category_outlined, size: 18),
-                label: const Text('Venue shape'),
-              ),
-              OutlinedButton.icon(
-                onPressed: _pickFloorImage,
-                icon: const Icon(Icons.image, size: 18),
-                label: const Text('Floor image'),
-              ),
-              TextButton.icon(
-                onPressed: p.floorImageBase64 == null &&
-                        p.floorImageUrl == null &&
-                        (p.venueFloorShape == null || p.venueFloorShape!.isEmpty)
-                    ? null
-                    : _clearFloor,
-                icon: const Icon(Icons.hide_image_outlined, size: 18),
-                label: const Text('Clear floor'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          _stepHeader('Step 2: Add tables and chairs'),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              FilledButton.tonalIcon(
-                onPressed: () => _addTable('rect'),
-                icon: const Icon(Icons.table_restaurant, size: 18),
-                label: const Text('Add rectangle table'),
-              ),
-              FilledButton.tonalIcon(
-                onPressed: () => _addTable('round'),
-                icon: const Icon(Icons.circle_outlined, size: 18),
-                label: const Text('Add round table'),
-              ),
-              FilledButton.tonalIcon(
-                onPressed: _addChair,
-                icon: const Icon(Icons.event_seat, size: 18),
-                label: const Text('Add chair'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-        ],
-        AspectRatio(
+    return AspectRatio(
           aspectRatio: 16 / 10,
           child: LayoutBuilder(
             builder: (context, c) {
@@ -974,9 +882,178 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
               );
             },
           ),
-        ),
-        _buildSelectionPanelBelowCanvas(),
+        );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = widget.plan;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (widget.editable) ...[
+          _stepTile(
+            title: 'Step 1: Add floor background',
+            subtitle: 'Use a venue reference photo, upload a floor image, or pick a venue shape.',
+            children: [
+              if (widget.venueReferencePhotosBase64.isNotEmpty) ...[
+                Text(
+                  'Venue reference photos',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: Colors.grey.shade800),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Tap a photo to use it as the seating floor background.',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                ),
+                const SizedBox(height: 8),
+                _VenueReferencePhotoStrip(
+                  photos: widget.venueReferencePhotosBase64,
+                  selectedB64: p.floorImageBase64,
+                  onSelect: _useVenueReferenceAsFloor,
+                ),
+                const SizedBox(height: 12),
+              ],
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _pickVenueFloorShape,
+                    icon: const Icon(Icons.category_outlined, size: 18),
+                    label: const Text('Venue shape'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _pickFloorImage,
+                    icon: const Icon(Icons.image, size: 18),
+                    label: const Text('Floor image'),
+                  ),
+                  TextButton.icon(
+                    onPressed: p.floorImageBase64 == null &&
+                            p.floorImageUrl == null &&
+                            (p.venueFloorShape == null || p.venueFloorShape!.isEmpty)
+                        ? null
+                        : _clearFloor,
+                    icon: const Icon(Icons.hide_image_outlined, size: 18),
+                    label: const Text('Clear floor'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          _stepTile(
+            title: 'Step 2: Add tables and chairs',
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: () => _addTable('rect'),
+                    icon: const Icon(Icons.table_restaurant, size: 18),
+                    label: const Text('Add rectangle table'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: () => _addTable('round'),
+                    icon: const Icon(Icons.circle_outlined, size: 18),
+                    label: const Text('Add round table'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _addChair,
+                    icon: const Icon(Icons.event_seat, size: 18),
+                    label: const Text('Add chair'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          _stepTile(
+            title: 'Step 3: Arrange to your desire!',
+            subtitle: 'Drag tables and chairs, then nudge and label your selection.',
+            children: [
+              _buildCanvas(),
+              const SizedBox(height: 8),
+              _buildSelectionPanelBelowCanvas(),
+            ],
+          ),
+        ] else
+          _buildCanvas(),
       ],
+    );
+  }
+}
+
+/// Cached venue reference thumbnails — avoids re-decode flicker when the plan changes.
+class _VenueReferencePhotoStrip extends StatefulWidget {
+  const _VenueReferencePhotoStrip({
+    required this.photos,
+    required this.selectedB64,
+    required this.onSelect,
+  });
+
+  final List<String> photos;
+  final String? selectedB64;
+  final ValueChanged<String> onSelect;
+
+  @override
+  State<_VenueReferencePhotoStrip> createState() => _VenueReferencePhotoStripState();
+}
+
+class _VenueReferencePhotoStripState extends State<_VenueReferencePhotoStrip> {
+  final Map<String, Uint8List> _cache = {};
+
+  Uint8List? _bytesFor(String b64) {
+    return _cache.putIfAbsent(b64, () {
+      try {
+        return Uint8List.fromList(base64Decode(b64));
+      } catch (_) {
+        return Uint8List(0);
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 88,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: widget.photos.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (context, i) {
+          final b64 = widget.photos[i];
+          final bytes = _bytesFor(b64);
+          if (bytes == null || bytes.isEmpty) return const SizedBox.shrink();
+          final selected = widget.selectedB64 == b64;
+          return GestureDetector(
+            onTap: () => widget.onSelect(b64),
+            child: Stack(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.memory(
+                    bytes,
+                    width: 88,
+                    height: 88,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                    filterQuality: FilterQuality.medium,
+                  ),
+                ),
+                if (selected)
+                  Positioned.fill(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Theme.of(context).colorScheme.primary, width: 3),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          );
+        },
+      ),
     );
   }
 }

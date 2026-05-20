@@ -1308,6 +1308,36 @@ bool orderHasBalancePaymentProofImage(OrderData o) => looksLikeBase64ImageProof(
 bool orderHasPaymentOnFile(OrderData o) =>
     o.paymentUploaded || orderPaymentReferenceInitial(o) != null || orderHasInitialPaymentProofImage(o);
 
+String normalizeGcashReferenceDigits(String raw) => raw.replaceAll(RegExp(r'\D'), '');
+
+bool isValidGcashReferenceDigits(String raw) => normalizeGcashReferenceDigits(raw).length == 13;
+
+/// Payment lines for order list tiles (amount paid, reference/proof, balance due).
+String orderCustomerPaymentSummaryText(OrderData o) {
+  final lines = <String>[];
+  final paid = o.cashierAmountReceived ?? 0;
+  if (paid > 0) {
+    lines.add('Amount paid: ₱${paid.toStringAsFixed(2)}');
+  } else if (orderHasPaymentOnFile(o)) {
+    lines.add('Payment submitted (awaiting confirmation)');
+  }
+  final ref = orderPaymentReferenceInitial(o);
+  if (ref != null) lines.add('GCash ref: $ref');
+  if (orderHasInitialPaymentProofImage(o)) lines.add('Payment proof on file');
+  final balRef = orderPaymentReferenceBalance(o);
+  if (balRef != null) lines.add('Balance GCash ref: $balRef');
+  if (orderHasBalancePaymentProofImage(o)) lines.add('Balance payment proof on file');
+  final st = o.status.toUpperCase();
+  final remainder = (o.total - paid).clamp(0.0, double.infinity);
+  if (remainder > 0.01 &&
+      (st.contains('INSUFFICIENT') ||
+          st.contains('BALANCE') ||
+          st.contains('WAITING FOR PAYMENT'))) {
+    lines.add('Balance due: ₱${remainder.toStringAsFixed(2)}');
+  }
+  return lines.join('\n');
+}
+
 bool orderHasBalancePaymentOnFile(OrderData o) =>
     orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o);
 
@@ -2141,6 +2171,7 @@ class CateringEventRecord {
     this.costBreakdown = const [],
     this.laborCost = 0,
     this.travelCost = 0,
+    this.themeDesignCost = 0,
     this.additionalCosts = const [],
     this.downPaymentAmount = 0,
     this.downPaymentStatus = '',
@@ -2184,6 +2215,7 @@ class CateringEventRecord {
   final List<dynamic> costBreakdown;
   final double laborCost;
   final double travelCost;
+  final double themeDesignCost;
   final List<dynamic> additionalCosts;
   final double downPaymentAmount;
   final String downPaymentStatus;
@@ -2272,6 +2304,7 @@ class CateringEventRecord {
       costBreakdown: (m['cost_breakdown'] is List) ? (m['cost_breakdown'] as List<dynamic>) : const [],
       laborCost: jsonToDouble(m['labor_cost']),
       travelCost: jsonToDouble(m['travel_cost']),
+      themeDesignCost: jsonToDouble(m['theme_design_cost']),
       additionalCosts: (m['additional_costs'] is List) ? (m['additional_costs'] as List<dynamic>) : const [],
       downPaymentAmount: jsonToDouble(m['down_payment_amount']),
       downPaymentStatus: '${m['down_payment_status'] ?? ''}',
@@ -3700,13 +3733,14 @@ class AppState extends ChangeNotifier {
       try {
         final bytes = Uint8List.fromList(base64Decode(rawImg));
         headerImage = ClipRRect(
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(8),
           child: Image.memory(
             bytes,
-            height: 160,
-            width: double.infinity,
+            width: 96,
+            height: 96,
             fit: BoxFit.cover,
-            cacheWidth: 480,
+            cacheWidth: 192,
+            gaplessPlayback: true,
             errorBuilder: (_, __, ___) => const SizedBox.shrink(),
           ),
         );
@@ -3720,38 +3754,36 @@ class AppState extends ChangeNotifier {
         return StatefulBuilder(
           builder: (ctx, setSt) {
             return AlertDialog(
-              title: Text('Add to tray · ${item.name}', maxLines: 3),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    if (headerImage != null) ...[
-                      headerImage,
-                      const SizedBox(height: 12),
-                    ],
-                    if (desc.isNotEmpty) ...[
-                      const Text('Description', style: TextStyle(fontWeight: FontWeight.w800)),
-                      const SizedBox(height: 6),
-                      Text(desc, style: TextStyle(height: 1.35, color: Colors.grey.shade800)),
-                      const SizedBox(height: 12),
-                    ],
-                    if (ingLines.isNotEmpty) ...[
-                      const Text('Ingredients', style: TextStyle(fontWeight: FontWeight.w800)),
-                      const SizedBox(height: 6),
-                      Text(ingLines.join(', '), style: TextStyle(height: 1.35, color: Colors.grey.shade800)),
-                      const SizedBox(height: 12),
-                    ],
-                    const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 6),
-                    if (allergenLines.isEmpty)
-                      Text('No allergens listed for this dish.', style: TextStyle(fontSize: 13, color: Colors.grey.shade700))
-                    else
-                      ...allergenLines.map(
-                        (a) => Padding(
-                          padding: const EdgeInsets.only(bottom: 2),
-                          child: Text('• $a', style: const TextStyle(height: 1.3)),
-                        ),
+              title: Text(item.name, maxLines: 3, style: const TextStyle(fontSize: 16)),
+              content: SizedBox(
+                width: math.min(MediaQuery.sizeOf(ctx).width * 0.92, 520),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (headerImage != null) ...[
+                            headerImage!,
+                            const SizedBox(width: 12),
+                          ],
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (desc.isNotEmpty) dishDetailSection('Description', desc),
+                                if (ingLines.isNotEmpty)
+                                  dishDetailSection('Ingredients', ingLines.join(', ')),
+                                Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          SizedBox(width: 108, child: dishDetailAllergenColumn(allergenLines)),
+                        ],
                       ),
                     if (item.dips.isNotEmpty) ...[
                       const SizedBox(height: 14),
@@ -3792,15 +3824,17 @@ class AppState extends ChangeNotifier {
                       ],
                     ],
                     const SizedBox(height: 12),
-                    TextField(
-                      controller: lineNoteCtl,
-                      maxLines: 2,
-                      decoration: const InputDecoration(
-                        labelText: 'Notes (optional)',
-                        hintText: 'Special requests for this dish',
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: lineNoteCtl,
+                        maxLines: 2,
+                        decoration: const InputDecoration(
+                          labelText: 'Notes (optional)',
+                          hintText: 'Special requests for this dish',
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
               actions: [
@@ -4009,25 +4043,38 @@ class AppState extends ChangeNotifier {
   }
 
   Future<String?> uploadPaymentProof(
-    int orderId,
-    XFile file, {
+    int orderId, {
+    XFile? file,
     String? paymentProofBase64,
     String? paymentReferenceInitial,
   }) async {
     try {
-      var encoded = paymentProofBase64 ?? base64Encode(await file.readAsBytes());
-      final comma = encoded.indexOf(',');
-      if (encoded.toLowerCase().startsWith('data:') && comma >= 0) {
-        encoded = encoded.substring(comma + 1).trim();
+      var encoded = paymentProofBase64?.trim() ?? '';
+      if (encoded.isEmpty && file != null) {
+        encoded = base64Encode(await file.readAsBytes());
       }
-      encoded = encoded.replaceAll(RegExp(r'\s+'), '');
+      if (encoded.isNotEmpty) {
+        final comma = encoded.indexOf(',');
+        if (encoded.toLowerCase().startsWith('data:') && comma >= 0) {
+          encoded = encoded.substring(comma + 1).trim();
+        }
+        encoded = encoded.replaceAll(RegExp(r'\s+'), '');
+      }
+      final refDigits = paymentReferenceInitial != null
+          ? normalizeGcashReferenceDigits(paymentReferenceInitial)
+          : '';
+      if (encoded.isEmpty && refDigits.isEmpty) {
+        return 'Enter a 13-digit GCash reference or upload proof of payment';
+      }
+      if (refDigits.isNotEmpty && refDigits.length != 13) {
+        return 'GCash reference must be exactly 13 digits';
+      }
       final res = await http.patch(
         _uri('/api/mobile/orders/$orderId/payment'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
-          'payment_proof': encoded,
-          if (paymentReferenceInitial != null && paymentReferenceInitial.trim().isNotEmpty)
-            'payment_reference_initial': paymentReferenceInitial.trim(),
+          if (encoded.isNotEmpty) 'payment_proof': encoded,
+          if (refDigits.isNotEmpty) 'payment_reference_initial': refDigits,
         }),
       );
       if (res.statusCode != 200) {
@@ -4386,6 +4433,7 @@ class AppState extends ChangeNotifier {
     double? totalCost,
     List<Map<String, dynamic>>? costBreakdown,
     Map<String, dynamic>? themeDesign,
+    double? themeDesignCost,
     List<dynamic>? menu,
   }) async {
     if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
@@ -4410,6 +4458,7 @@ class AppState extends ChangeNotifier {
               if (totalCost != null) 'total_cost': totalCost,
               if (costBreakdown != null) 'cost_breakdown': costBreakdown,
               if (themeDesign != null) 'theme_design': themeDesign,
+              if (themeDesignCost != null) 'theme_design_cost': themeDesignCost,
               if (menu != null) 'menu': menu,
             }),
           )
@@ -6441,7 +6490,7 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
   void initState() {
     super.initState();
     widget.state.setManagerActiveStage(kStageForOngoing);
-    widget.state.loadManagerCateringByStage(kStageForOngoing);
+    widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
     widget.state.loadAllergenCatalog();
     widget.state.loadMenu();
   }
@@ -6588,6 +6637,123 @@ Widget _trayLineQtyRow({
           onPressed: onInc,
         ),
       ],
+    ),
+  );
+}
+
+bool dishConflictsGuestAllergens(MenuItemData? dish, Set<String> guestAllergens) {
+  if (dish == null || guestAllergens.isEmpty) return false;
+  final guest = guestAllergens.map((e) => e.trim().toLowerCase()).where((e) => e.isNotEmpty).toSet();
+  for (final a in dish.allergens) {
+    if (guest.contains(a.trim().toLowerCase())) return true;
+  }
+  return false;
+}
+
+Widget _cateringInquiryMenuDishTile({
+  required BuildContext context,
+  required String dishName,
+  MenuItemData? dish,
+  required bool selected,
+  required VoidCallback onToggleSelect,
+  bool showSelectControl = true,
+  bool disabled = false,
+  Widget? trailing,
+}) {
+  final desc = dish?.description.trim() ?? '';
+  final allergenText =
+      dish != null && dish.allergens.isNotEmpty ? dish.allergens.join(', ') : '';
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 8),
+    child: Opacity(
+      opacity: disabled ? 0.45 : 1,
+      child: Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: showSelectControl && !disabled ? onToggleSelect : null,
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: selected ? AppColors.brand : AppColors.border, width: selected ? 2 : 1),
+            color: disabled
+                ? Colors.grey.shade100
+                : (selected ? AppColors.brand.withValues(alpha: 0.1) : Colors.white),
+          ),
+          padding: const EdgeInsets.fromLTRB(8, 10, 10, 10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (showSelectControl)
+                Checkbox(
+                  value: selected,
+                  onChanged: disabled ? null : (_) => onToggleSelect(),
+                ),
+              GestureDetector(
+                onTap: () {
+                  if (dish != null) {
+                    showMenuDishDetailDialog(
+                      context,
+                      dishName: dish.name,
+                      description: dish.description,
+                      ingredients: dish.ingredients,
+                      allergens: dish.allergens,
+                      imageBase64: dish.imageBase64,
+                    );
+                  } else {
+                    showMenuDishDetailDialog(
+                      context,
+                      dishName: dishName,
+                      description: '',
+                      allergens: const [],
+                    );
+                  }
+                },
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: SizedBox(
+                    width: 56,
+                    height: 56,
+                    child: dish != null
+                        ? _MenuThumb(item: dish, compact: true)
+                        : const Icon(Icons.fastfood, size: 28),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(dishName, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+                    if (desc.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        desc,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 12, height: 1.3, color: Colors.grey.shade800),
+                      ),
+                    ],
+                    const SizedBox(height: 4),
+                    Text(
+                      allergenText.isNotEmpty
+                          ? 'Allergens: $allergenText'
+                          : 'Tap the image for full description and allergens',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade700),
+                    ),
+                  ],
+                ),
+              ),
+              if (trailing != null) trailing,
+            ],
+          ),
+        ),
+      ),
+    ),
     ),
   );
 }
@@ -6755,8 +6921,9 @@ Future<void> _guestTrackConfirmCancel(BuildContext context, AppState state, Orde
 
 /// Guest order tracking: verify contact email with OTP, then show restaurant orders for that email.
 class GuestTrackOrdersScreen extends StatefulWidget {
-  const GuestTrackOrdersScreen({super.key, required this.state});
+  const GuestTrackOrdersScreen({super.key, required this.state, this.onBack});
   final AppState state;
+  final VoidCallback? onBack;
 
   @override
   State<GuestTrackOrdersScreen> createState() => _GuestTrackOrdersScreenState();
@@ -6840,14 +7007,23 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final inShell = widget.state.isGuestSession;
     return Scaffold(
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () {
+            if (widget.onBack != null) {
+              widget.onBack!();
+            } else if (Navigator.of(context).canPop()) {
+              Navigator.of(context).pop();
+            }
+          },
+        ),
         title: const Text('TRACK MY ORDER', style: TextStyle(fontWeight: FontWeight.w800)),
         centerTitle: true,
-        automaticallyImplyLeading: !inShell,
+        automaticallyImplyLeading: false,
       ),
       body: _verified
           ? RefreshIndicator(
@@ -6879,7 +7055,8 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
                           child: ListTile(
                             title: Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w800)),
                             subtitle: Text(
-                              '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}',
+                              '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}'
+                              '${orderCustomerPaymentSummaryText(o).isEmpty ? '' : '\n${orderCustomerPaymentSummaryText(o)}'}',
                             ),
                             isThreeLine: true,
                             trailing: Row(
@@ -6918,6 +7095,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
                   TextField(
                     controller: emailController,
                     keyboardType: TextInputType.emailAddress,
+                    readOnly: _otpSent,
                     decoration: const InputDecoration(
                       labelText: 'Email address',
                       border: OutlineInputBorder(),
@@ -7169,6 +7347,12 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
                             return;
                           }
                           Navigator.of(context).pop();
+                          if (!context.mounted) return;
+                          Navigator.of(context).pushReplacement(
+                            MaterialPageRoute<void>(
+                              builder: (_) => CustomerDashboardScreen(state: state),
+                            ),
+                          );
                         } finally {
                           if (mounted) setState(() => busy = null);
                         }
@@ -7184,7 +7368,7 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
                         otpSent = false;
                         signupOtpVerified = false;
                       }),
-              child: Text(signupMode ? 'Already have an account? Log In' : 'Sign Up'),
+              child: Text(signupMode ? 'Already have an account? Log In' : "Don't have an account? Sign Up!"),
             ),
             if (widget.offerGuestContinue) ...[
               const SizedBox(height: 8),
@@ -7563,7 +7747,10 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
       case 1:
         return InquiryScreen(state: widget.state);
       case 2:
-        return GuestTrackOrdersScreen(state: widget.state);
+        return GuestTrackOrdersScreen(
+          state: widget.state,
+          onBack: () => setState(() => _onLanding = true),
+        );
       default:
         return Center(
           child: Padding(
@@ -8076,30 +8263,8 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                 children: [
                   Container(
                     margin: const EdgeInsets.all(10),
-                    color: AppColors.canvas,
+                    color: Colors.white,
                     child: _MenuThumb(item: item),
-                  ),
-                  Positioned(
-                    top: 4,
-                    right: 4,
-                    child: Material(
-                      color: Colors.white.withValues(alpha: 0.92),
-                      shape: const CircleBorder(),
-                      child: IconButton(
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                        icon: const Icon(Icons.info_outline, size: 20),
-                        tooltip: 'Dish details',
-                        onPressed: () => showMenuDishDetailDialog(
-                          context,
-                          dishName: item.name,
-                          description: item.description,
-                          ingredients: item.ingredients,
-                          allergens: item.allergens,
-                          imageBase64: item.imageBase64,
-                        ),
-                      ),
-                    ),
                   ),
                 ],
               ),
@@ -8353,11 +8518,16 @@ class _MenuThumb extends StatelessWidget {
     if (raw != null && raw.isNotEmpty) {
       try {
         final bytes = base64Decode(raw);
-        return Image.memory(
-          Uint8List.fromList(bytes),
-          fit: BoxFit.cover,
-          cacheWidth: compact ? 88 : 360,
-          cacheHeight: compact ? 88 : 360,
+        return RepaintBoundary(
+          child: Image.memory(
+            Uint8List.fromList(bytes),
+            key: ValueKey('menu-thumb-${item.id}'),
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            cacheWidth: compact ? 88 : 360,
+            cacheHeight: compact ? 88 : 360,
+            errorBuilder: (_, __, ___) => Icon(Icons.fastfood, size: iconSize),
+          ),
         );
       } catch (_) {}
     }
@@ -10374,6 +10544,58 @@ class _PaymentScreenState extends State<PaymentScreen> {
     );
   }
 
+  Future<void> _submitGcashReferenceOnly(AppState s, {required bool insufficient}) async {
+    if (!isValidGcashReferenceDigits(paymentReferenceController.text)) {
+      appSnack(context, 'Enter a valid 13-digit GCash reference number.');
+      return;
+    }
+    setState(() => _uploadingProof = true);
+    try {
+      if (widget.draftCheckout && _placedOrder == null) {
+        final result = await s.submitOrder(clearCheckoutDraft: false);
+        if (result.error != null) {
+          appSnack(context, result.error!);
+          return;
+        }
+        final newOrder = result.order!;
+        final err = await s.uploadPaymentProof(
+          newOrder.id,
+          paymentReferenceInitial: paymentReferenceController.text.trim(),
+        );
+        if (err != null) {
+          appSnack(context, err);
+          return;
+        }
+        final syncedAfterPlace = s.orders.where((o) => o.id == newOrder.id).toList();
+        if (!mounted) return;
+        setState(() {
+          _placedOrder = syncedAfterPlace.isNotEmpty ? syncedAfterPlace.first : newOrder;
+          localProofUploaded = true;
+        });
+        return;
+      }
+      final oid = (_placedOrder ?? widget.order)?.id;
+      if (oid == null || oid == 0) {
+        appSnack(context, 'Place your order first.');
+        return;
+      }
+      final err = await s.uploadPaymentProof(
+        oid,
+        paymentReferenceInitial: paymentReferenceController.text.trim(),
+      );
+      if (!mounted) return;
+      if (err != null) {
+        appSnack(context, err);
+        return;
+      }
+      setState(() => localProofUploaded = true);
+      final synced = _syncedOrder(s);
+      if (synced != null) setState(() => _placedOrder = synced);
+    } finally {
+      if (mounted) setState(() => _uploadingProof = false);
+    }
+  }
+
   Future<void> _pickAndUploadProof({required bool insufficient, ImageSource source = ImageSource.gallery}) async {
     if (_uploadingProof) return;
     if (widget.draftCheckout && widget.state.tray.isEmpty) {
@@ -10410,7 +10632,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
       final newOrder = result.order!;
       final err = await s.uploadPaymentProof(
         newOrder.id,
-        file,
+        file: file,
         paymentProofBase64: proofB64,
         paymentReferenceInitial: paymentReferenceController.text.trim(),
       );
@@ -10440,7 +10662,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
     final oid = (_placedOrder ?? widget.order)!.id;
     final err = await s.uploadPaymentProof(
       oid,
-      file,
+      file: file,
       paymentProofBase64: proofB64,
       paymentReferenceInitial: paymentReferenceController.text.trim(),
     );
@@ -10548,10 +10770,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
         final remainder = (orderForUi.total - paidSoFar).clamp(0, double.infinity);
         final supplementalOk =
             (synced?.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false) || (insufficient && localProofUploaded);
+        final refOk = isValidGcashReferenceDigits(paymentReferenceController.text);
         final proofDone = insufficient
             ? supplementalOk
             : ((synced?.paymentUploaded ?? false) ||
                 localProofUploaded ||
+                refOk ||
                 ((synced?.paymentProofBase64?.isNotEmpty ?? false)));
         final interceptBack =
             localProofUploaded || _placedOrder != null || (!widget.draftCheckout && widget.order != null);
@@ -10672,11 +10896,15 @@ class _PaymentScreenState extends State<PaymentScreen> {
                             const SizedBox(height: 10),
                             TextField(
                               controller: paymentReferenceController,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: [
+                                FilteringTextInputFormatter.digitsOnly,
+                                LengthLimitingTextInputFormatter(13),
+                              ],
                               decoration: const InputDecoration(
                                 labelText: 'GCash reference number',
-                                hintText: 'Enter transaction reference',
+                                hintText: '13-digit transaction reference',
                               ),
-                              textCapitalization: TextCapitalization.characters,
                             ),
                           ],
                           const SizedBox(height: 12),
@@ -10870,13 +11098,20 @@ class _PaymentScreenState extends State<PaymentScreen> {
                   }
                   final insNow = ordNow.status.toUpperCase().contains('INSUFFICIENT') ||
                       ordNow.status.toUpperCase().contains('WAITING FOR BALANCE PAYMENT CONFIRMATION');
+                  final refOkNow = isValidGcashReferenceDigits(paymentReferenceController.text);
                   final ok = insNow
                       ? (((syncedNow?.supplementalPaymentProofBase64?.trim().isNotEmpty ?? false) || localProofUploaded))
                       : ((syncedNow?.paymentUploaded ?? false) ||
                           localProofUploaded ||
+                          refOkNow ||
                           ((syncedNow?.paymentProofBase64?.isNotEmpty ?? false)));
                   if (!ok) {
-                    appSnack(context, insNow ? 'Upload balance payment proof before continuing.' : 'Upload proof of payment before continuing.');
+                    appSnack(
+                      context,
+                      insNow
+                          ? 'Upload balance payment proof before continuing.'
+                          : 'Enter a 13-digit GCash reference or upload proof of payment before continuing.',
+                    );
                     return;
                   }
                   showDialog<bool>(
@@ -10896,8 +11131,15 @@ class _PaymentScreenState extends State<PaymentScreen> {
                         ),
                       ],
                     ),
-                  ).then((okSubmit) {
+                  ).then((okSubmit) async {
                     if (okSubmit != true || !context.mounted) return;
+                    if (!insNow &&
+                        refOkNow &&
+                        !localProofUploaded &&
+                        !(syncedNow?.paymentUploaded ?? false)) {
+                      await _submitGcashReferenceOnly(s, insufficient: false);
+                      if (!context.mounted) return;
+                    }
                     Navigator.of(context).pushReplacement(
                       MaterialPageRoute<void>(
                         builder: (_) => OrderStatusScreen(state: s, order: ordNow, paymentUploaded: true),
@@ -11549,6 +11791,13 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                                 '₱${o.total.toStringAsFixed(2)}',
                                 style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5),
                               ),
+                              if (orderCustomerPaymentSummaryText(o).isNotEmpty) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  orderCustomerPaymentSummaryText(o),
+                                  style: TextStyle(fontSize: 11.5, height: 1.3, color: Colors.grey.shade800),
+                                ),
+                              ],
                               if (tabIndex == 1 &&
                                   orderShowsDeliveryTrackingLink(o)) ...[
                                 const SizedBox(height: 6),
@@ -14246,63 +14495,18 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                     }
                                   }
                                   final sel = selectedDishes.contains(dishName);
-                                  return Padding(
-                                    padding: const EdgeInsets.only(bottom: 6),
-                                    child: CheckboxListTile(
-                                      dense: true,
-                                      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                      tileColor: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
-                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                      secondary: GestureDetector(
-                                        onTap: () {
-                                          if (dish != null) {
-                                            showMenuDishDetailDialog(
-                                              context,
-                                              dishName: dish.name,
-                                              description: dish.description,
-                                              ingredients: dish.ingredients,
-                                              allergens: dish.allergens,
-                                              imageBase64: dish.imageBase64,
-                                            );
-                                          } else {
-                                            showMenuDishDetailDialog(
-                                              context,
-                                              dishName: dishName,
-                                              description: '',
-                                              allergens: const [],
-                                            );
-                                          }
-                                        },
-                                        child: ClipRRect(
-                                        borderRadius: BorderRadius.circular(6),
-                                        child: SizedBox(
-                                          width: 40,
-                                          height: 40,
-                                          child: dish != null
-                                              ? _MenuThumb(item: dish, compact: true)
-                                              : const Icon(Icons.fastfood, size: 22),
-                                        ),
-                                      ),
-                                      ),
-                                      title: Text(dishName, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                                      subtitle: Text(
-                                        dish != null && dish.allergens.isNotEmpty
-                                            ? 'Allergens: ${dish.allergens.join(', ')}'
-                                            : 'Tap the image for description and allergens',
-                                        style: const TextStyle(fontSize: 11),
-                                        maxLines: 3,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                      value: sel,
-                                      onChanged: (_) => setState(() {
-                                        if (sel) {
-                                          selectedDishes.remove(dishName);
-                                        } else {
-                                          selectedDishes.add(dishName);
-                                        }
-                                      }),
-                                      controlAffinity: ListTileControlAffinity.leading,
-                                    ),
+                                  return _cateringInquiryMenuDishTile(
+                                    context: context,
+                                    dishName: dishName,
+                                    dish: dish,
+                                    selected: sel,
+                                    onToggleSelect: () => setState(() {
+                                      if (sel) {
+                                        selectedDishes.remove(dishName);
+                                      } else {
+                                        selectedDishes.add(dishName);
+                                      }
+                                    }),
                                   );
                                 }).toList(),
                               ),
@@ -17342,6 +17546,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             onToggle: () {},
             hideToggleIcon: true,
             child: buildManagerThemeDesignBlock(
+              context: context,
               themeDesign: _newEventThemeDesign ?? const {},
               openEditorLabel: _newEventThemeDesign == null ? 'Create my own theme design' : 'Edit theme design',
               onOpenEditor: () async {
@@ -18617,8 +18822,22 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   bool get _includesThemeDesignInTotals => d.orderKind == 'event';
 
-  double _themeDesignCostAmount() =>
-      _includesThemeDesignInTotals ? _sumCostRows(themeDesignCosts) : 0;
+  double _themeDesignCostAmount() {
+    if (!_includesThemeDesignInTotals) return 0;
+    if (d.themeDesignCost > 0) return d.themeDesignCost;
+    final fromCtrl = double.tryParse(themeCostAmountController.text.trim());
+    if (fromCtrl != null && fromCtrl > 0) return fromCtrl;
+    return _sumCostRows(themeDesignCosts);
+  }
+
+  void _syncThemeDesignCostFromControllers() {
+    if (!_includesThemeDesignInTotals) return;
+    final amt = double.tryParse(themeCostAmountController.text.trim()) ?? 0;
+    if (amt <= 0) return;
+    themeDesignCosts
+      ..clear()
+      ..add({'label': 'Theme design cost', 'amount': amt});
+  }
 
   double _grandTotalComputed() =>
       _baseFoodCost() +
@@ -18901,7 +19120,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     try {
       final List<Map<String, dynamic>> pdfCosts;
       if (variant == _ManagerOrderSummaryPdfVariant.beforeDownPayment) {
-        pdfCosts = [];
+        pdfCosts = _isManagerDraftDetailStage ? _allAdditionalCostsForMainOrderSummaryPdf() : [];
       } else if (postAnalysis2Only) {
         pdfCosts = _sheetAdditionalCostsForOrderSummaryPdf();
       } else {
@@ -18936,8 +19155,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ? _ManagerOrderSummaryPdfVariant.beforeDownPayment
                 : _ManagerOrderSummaryPdfVariant.afterDownPayment;
     final bytes = await _buildOrderSummaryPdfBytes(
-      additionalCostsForPdf:
-          pdfVariant == _ManagerOrderSummaryPdfVariant.beforeDownPayment ? [] : additionalCosts,
+      additionalCostsForPdf: pdfVariant == _ManagerOrderSummaryPdfVariant.beforeDownPayment
+          ? (_isManagerDraftDetailStage ? _allAdditionalCostsForMainOrderSummaryPdf() : [])
+          : additionalCosts,
       variant: pdfVariant,
     );
     final to = r.emailAddress.trim().toLowerCase();
@@ -19292,6 +19512,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (e is Map<String, dynamic>) themeDesignCosts.add(e);
       }
     }
+    final themeAmt = row.themeDesignCost > 0
+        ? row.themeDesignCost
+        : (themeDesignCosts.isNotEmpty ? _sumCostRows(themeDesignCosts) : 0);
+    if (themeAmt > 0) {
+      themeCostAmountController.text = themeAmt.toStringAsFixed(2);
+      if (themeDesignCosts.isEmpty) {
+        themeDesignCosts.add({'label': 'Theme design cost', 'amount': themeAmt});
+      }
+    }
     final rowMenu = normalizeCateringMenuList(row.menu);
     for (final m in rowMenu) {
       final n = dishNameFromCateringMenuEntry(m).trim();
@@ -19542,7 +19771,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   Widget _laborCostCard({required bool allowLaborEdits, required bool showTravelReadOnly}) {
     return Card(
-      color: Colors.orange.shade50,
+      color: Colors.white,
+      elevation: 0,
+      surfaceTintColor: Colors.white,
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
@@ -20160,6 +20391,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (_managerFullPaymentProofBytes != null) {
           postAnalysis['manager_full_payment_proof_b64'] = base64Encode(_managerFullPaymentProofBytes!);
         }
+        _syncThemeDesignCostFromControllers();
         final themeDesign = <String, dynamic>{
           ...rowBase.themeDesign,
           'cost_items': themeDesignCosts,
@@ -20206,6 +20438,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ],
               if (gc != null && gc >= 0) 'guest_count': gc,
               'pax_buffer': int.tryParse(managerPaxBufferController.text.trim()) ?? 0,
+              if (_includesThemeDesignInTotals) 'theme_design_cost': _themeDesignCostAmount(),
             },
           );
           if (!mounted) return false;
@@ -20251,6 +20484,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
           ],
           themeDesign: themeDesign,
+          themeDesignCost: _includesThemeDesignInTotals ? _themeDesignCostAmount() : null,
           menu: selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
         );
         if (!mounted) return false;
@@ -20829,6 +21063,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (!mounted) return;
         _snapshotAdditionalCostsForCurrentStage(clearWorking: true, refreshTimestamp: true);
         _showManagerBlockingProgress('Moving to On Going…');
+        var movedOk = false;
         try {
           _applyDraftLaborTravelFromRow(d);
           final flatAdditional = _flattenAdditionalCostsFromGroups();
@@ -20850,6 +21085,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             laborCost: laborNow,
             travelCost: travelNow,
             totalCost: totalNow,
+            themeDesignCost: d.orderKind == 'event' ? _themeDesignCostAmount() : null,
           );
           if (!mounted) return;
           if (err != null) {
@@ -20861,8 +21097,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           if (full != null) setState(() => _loadedDetailRow = full);
           await widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
           appSnack(context, 'Moved to On Going');
+          movedOk = true;
         } finally {
           if (mounted) _hideManagerBlockingProgress();
+        }
+        if (mounted && movedOk && Navigator.of(context).canPop()) {
+          Navigator.of(context).pop();
         }
         return;
       }
@@ -21044,6 +21284,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           totalCost: invoiceTotalSubmit,
           costBreakdown: costBreakdown,
           themeDesign: themeDesign,
+          themeDesignCost: rowSubmit.orderKind == 'event' ? _themeDesignCostAmount() : null,
           menu: selectedDishes.isEmpty ? rowSubmit.menu : selectedDishes.toList(),
         );
         if (!mounted) return;
@@ -21105,7 +21346,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           if (ok && Navigator.of(context).canPop()) Navigator.of(context).pop();
         }
       },
-      child: Scaffold(
+      child: Theme(
+        data: Theme.of(context).copyWith(
+          cardTheme: const CardThemeData(
+            color: Colors.white,
+            elevation: 0,
+            surfaceTintColor: Colors.white,
+          ),
+        ),
+        child: Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
@@ -21687,14 +21936,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (!isCompleted)
+          if (!isCompleted && !isDownPaymentSubstage)
             _additionalCostsCard(
               draft: isDraftStage,
               processing: isProcessing && !isPost,
               post: isPost,
               row: row,
             ),
-          if (!isDraftStage && (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted))
+          if (isDraftStage || (!isDraftStage && (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted)))
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -21709,7 +21958,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     Builder(
                       builder: (ctx) {
                         final showBeforeDownPayment =
-                            isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted;
+                            isDraftStage || isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted;
                         final showAfterDownPayment = isOngoingSubstage || isPost || isCompleted;
                         final showAdditionalCosts = !isCompleted && _hasAdditionalCostsSectionInput();
                         final showFullyPaid = isPost || isCompleted;
@@ -22270,58 +22519,40 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                             return dishes;
                           }()).map((dish) {
                             final sel = selectedDishes.contains(dish.name);
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 6),
-                              child: Material(
-                                color: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
-                                borderRadius: BorderRadius.circular(10),
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                  child: Row(
-                                    children: [
-                                      GestureDetector(
-                                        onTap: () => showMenuDishDetailDialog(
-                                          context,
-                                          dishName: dish.name,
-                                          description: dish.description,
-                                          ingredients: dish.ingredients,
-                                          allergens: dish.allergens,
-                                          imageBase64: dish.imageBase64,
-                                        ),
-                                        child: ClipRRect(
-                                          borderRadius: BorderRadius.circular(8),
-                                          child: SizedBox(
-                                            width: 40,
-                                            height: 40,
-                                            child: _MenuThumb(item: dish, compact: true),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 10),
-                                      Expanded(
-                                        child: Text(
-                                          dish.name,
-                                          style: const TextStyle(fontWeight: FontWeight.w600),
-                                        ),
-                                      ),
-                                      IconButton(
-                                        tooltip: sel ? 'Remove from menu' : 'Add to menu',
-                                        onPressed: !canEditStage
-                                            ? null
-                                            : () => setState(() {
-                                                  if (sel) {
-                                                    selectedDishes.remove(dish.name);
-                                                  } else {
-                                                    selectedDishes.add(dish.name);
-                                                  }
-                                                }),
-                                        icon: Icon(
-                                          sel ? Icons.check_circle : Icons.circle_outlined,
-                                          color: sel ? AppColors.success : Colors.grey.shade500,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                            final blocked = dishConflictsGuestAllergens(dish, managerGuestAllergens);
+                            return _cateringInquiryMenuDishTile(
+                              context: context,
+                              dishName: dish.name,
+                              dish: dish,
+                              selected: sel,
+                              disabled: blocked,
+                              onToggleSelect: () {
+                                if (!canEditStage || blocked) return;
+                                setState(() {
+                                  if (sel) {
+                                    selectedDishes.remove(dish.name);
+                                  } else {
+                                    selectedDishes.add(dish.name);
+                                  }
+                                });
+                              },
+                              showSelectControl: false,
+                              trailing: IconButton(
+                                tooltip: blocked
+                                    ? 'Conflicts with guest allergens'
+                                    : (sel ? 'Remove from menu' : 'Add to menu'),
+                                onPressed: !canEditStage || blocked
+                                    ? null
+                                    : () => setState(() {
+                                          if (sel) {
+                                            selectedDishes.remove(dish.name);
+                                          } else {
+                                            selectedDishes.add(dish.name);
+                                          }
+                                        }),
+                                icon: Icon(
+                                  sel ? Icons.check_circle : Icons.circle_outlined,
+                                  color: sel ? AppColors.success : Colors.grey.shade500,
                                 ),
                               ),
                             );
@@ -22383,7 +22614,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     const Text('Event Theme Design', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
                     buildManagerThemeDesignBlock(
+                      context: context,
                       themeDesign: row.themeDesign,
+                      eventTitle: row.eventTitle,
+                      transactionNo: row.transactionNo,
                       openEditorLabel: hasEventThemeDesign(row.themeDesign)
                           ? 'Edit theme design'
                           : 'Create my own theme design',
@@ -22690,6 +22924,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             )
           : null,
       ),
+    ),
     );
   }
 }
@@ -22873,27 +23108,6 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                 ClipRRect(
                   borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
                   child: _MenuThumb(item: item),
-                ),
-                Positioned(
-                  top: 4,
-                  right: 4,
-                  child: Material(
-                    color: Colors.white.withValues(alpha: 0.92),
-                    shape: const CircleBorder(),
-                    child: IconButton(
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                      icon: const Icon(Icons.info_outline, size: 18),
-                      onPressed: () => showMenuDishDetailDialog(
-                        context,
-                        dishName: item.name,
-                        description: item.description,
-                        ingredients: item.ingredients,
-                        allergens: item.allergens,
-                        imageBase64: item.imageBase64,
-                      ),
-                    ),
-                  ),
                 ),
               ],
             ),
@@ -23296,8 +23510,15 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                   const SizedBox(height: 12),
                   TextField(
                     controller: gcashReference,
-                    decoration: const InputDecoration(labelText: 'GCash reference number'),
-                    textCapitalization: TextCapitalization.characters,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(13),
+                    ],
+                    decoration: const InputDecoration(
+                      labelText: 'GCash reference number',
+                      hintText: '13 digits (optional if proof uploaded)',
+                    ),
                   ),
                   const SizedBox(height: 12),
                   Row(
@@ -23376,8 +23597,13 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                 await showStaffPosNotification('Checkout', 'Amount received is less than the total.');
                 return;
               }
-              if (isGcash && gcashProofBytes == null) {
-                await showStaffPosNotification('Checkout', 'Upload proof of payment for GCash.');
+              if (isGcash &&
+                  gcashProofBytes == null &&
+                  !isValidGcashReferenceDigits(gcashReference.text)) {
+                await showStaffPosNotification(
+                  'Checkout',
+                  'Enter a 13-digit GCash reference or upload proof of payment.',
+                );
                 return;
               }
               final ok = await showDialog<bool>(

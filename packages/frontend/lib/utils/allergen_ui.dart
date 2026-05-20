@@ -88,7 +88,7 @@ Widget managerThemeDesignImagePreview(Map<String, dynamic> themeDesign, {double 
   );
 }
 
-Widget _dishDetailSection(String title, String body) {
+Widget dishDetailSection(String title, String body) {
   if (body.trim().isEmpty) return const SizedBox.shrink();
   return Padding(
     padding: const EdgeInsets.only(bottom: 10),
@@ -103,7 +103,7 @@ Widget _dishDetailSection(String title, String body) {
   );
 }
 
-Widget _dishDetailAllergenColumn(List<String> allergens) {
+Widget dishDetailAllergenColumn(List<String> allergens) {
   return Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
@@ -175,18 +175,18 @@ Future<void> showMenuDishDetailDialog(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _dishDetailSection('Description', desc),
+                    dishDetailSection('Description', desc),
                     if (ing.isNotEmpty)
-                      _dishDetailSection(
+                      dishDetailSection(
                         'Ingredients',
                         ing.join(', '),
                       ),
-                    if (note.isNotEmpty) _dishDetailSection('Notes', note),
+                    if (note.isNotEmpty) dishDetailSection('Notes', note),
                   ],
                 ),
               ),
               const SizedBox(width: 12),
-              SizedBox(width: 108, child: _dishDetailAllergenColumn(list)),
+              SizedBox(width: 108, child: dishDetailAllergenColumn(list)),
             ],
           ),
         ),

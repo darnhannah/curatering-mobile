@@ -171,6 +171,7 @@ function ensureNewEventSchemaOnce(): Promise<void> {
     await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS labor_cost NUMERIC NOT NULL DEFAULT 0`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS travel_cost NUMERIC NOT NULL DEFAULT 0`);
     await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS travel_cost NUMERIC NOT NULL DEFAULT 0`);
+    await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS theme_design_cost NUMERIC NOT NULL DEFAULT 0`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS inquiry_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS stage_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS allergens TEXT NOT NULL DEFAULT ''`);
@@ -2277,13 +2278,14 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
   const changeDue =
     !Number.isNaN(amountReceived) && amountReceived >= 0 ? Math.round((amountReceived - total) * 100) / 100 : null;
 
-  if (paymentMethod === "GCASH" && !paymentProof) {
-    res.status(400).json({ error: "payment_proof is required for GCASH" });
+  if (paymentMethod === "GCASH" && !paymentProof && !paymentReference) {
+    res.status(400).json({ error: "GCASH requires payment proof or a reference number" });
     return;
   }
 
-  const proofUploaded = paymentMethod === "GCASH";
+  const proofUploaded = paymentMethod === "GCASH" && paymentProof.length > 0;
   const proofVal = proofUploaded ? paymentProof : null;
+  const paymentModeVal = paymentMethod === "CASH" ? "CASH" : "GCASH ONLY";
 
   const client = await getPool().connect();
   try {
@@ -2298,7 +2300,7 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
          delivery_address, contact_number, payment_mode, payment_reference_initial,
          order_source, order_status, tray_items, submitted_order_dt_stamp, last_updated_order_status_dt_stamp)
        VALUES
-        ('TEMP', $1, $2, $3, $4, $5, $6, $7, $8, $9, '', '', NULL, $10,
+        ('TEMP', $1, $2, $3, $4, $5, $6, $7, $8, $9, '', '', $10, $11,
          'POS_MOBILE', NULL, '[]'::jsonb, NOW(), NOW())
        RETURNING mobile_id AS id`,
       [
@@ -2311,6 +2313,7 @@ app.post("/api/mobile/pos/walkin-order", async (req, res) => {
         total,
         !Number.isNaN(amountReceived) ? amountReceived : null,
         changeDue,
+        paymentModeVal,
         paymentMethod === "GCASH" ? paymentReference || null : null,
       ],
     );
@@ -3038,12 +3041,12 @@ app.post("/api/mobile/orders", async (req, res) => {
 
 app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
   const id = Number(req.params.id);
-  const paymentProof = String(req.body?.payment_proof ?? "");
+  const paymentProof = String(req.body?.payment_proof ?? "").trim();
   const paymentReference = String(
     req.body?.payment_reference_initial ?? req.body?.payment_reference ?? "",
   ).trim();
-  if (!id || !paymentProof) {
-    res.status(400).json({ error: "id and payment_proof are required" });
+  if (!id || (!paymentProof && !paymentReference)) {
+    res.status(400).json({ error: "id and payment_proof or payment_reference_initial are required" });
     return;
   }
   try {
@@ -3109,12 +3112,13 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
     } else {
       await getPool().query(
         `UPDATE restaurant_orders
-         SET payment_uploaded_initial = TRUE,
-             payment_proof_initial = $2,
+         SET payment_uploaded_initial = CASE WHEN $2::text <> '' OR $3::text <> '' THEN TRUE ELSE payment_uploaded_initial END,
+             payment_proof_initial = CASE WHEN $2::text <> '' THEN $2 ELSE payment_proof_initial END,
              payment_reference_initial = COALESCE(NULLIF($3::text, ''), payment_reference_initial),
+             payment_mode = COALESCE(NULLIF(payment_mode, ''), 'GCASH ONLY'),
              last_updated_order_status_dt_stamp = NOW()
          WHERE mobile_id = $1`,
-        [id, paymentProof, paymentReference || null],
+        [id, paymentProof || null, paymentReference || null],
       );
       const totalNum = Number(row.total) || 0;
       const emailTo = String(row.user_email ?? "").trim().toLowerCase();
@@ -4377,6 +4381,7 @@ app.post("/api/mobile/pos/catering/item", async (req, res) => {
              COALESCE(theme_design->>'service_included', '') AS service_included,
              ${EVENT_TRANSACTION_ID} AS transaction_no, payment_method,
              '[]'::jsonb AS cost_breakdown, labor_cost, travel_cost,
+             COALESCE(theme_design_cost, 0) AS theme_design_cost,
              ${eventAdditionalCostsSql("status")},
              full_payment_due_at, address_lat, address_lng, allergens,
              down_payment_reference, full_payment_reference,
@@ -4660,6 +4665,7 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
   const additionalCosts = Array.isArray(req.body?.additional_costs) ? req.body.additional_costs : null;
   const costBreakdown = Array.isArray(req.body?.cost_breakdown) ? req.body.cost_breakdown : null;
   const themeDesign = req.body?.theme_design ?? null;
+  const themeDesignCost = Number(req.body?.theme_design_cost ?? NaN);
   const menu = Array.isArray(req.body?.menu) ? req.body.menu : null;
   const actualEventImages = Array.isArray(req.body?.actual_event_images) ? req.body.actual_event_images : null;
   try {
@@ -4770,18 +4776,20 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
            labor_cost = COALESCE($8, labor_cost),
            travel_cost = COALESCE($9, travel_cost),
            total_cost = COALESCE($10, total_cost),
-           theme_design = COALESCE($11::jsonb, theme_design),
+           theme_design_cost = COALESCE($11, theme_design_cost),
+           theme_design = COALESCE($12::jsonb, theme_design),
            event_setting = CASE
-             WHEN $11::jsonb IS NOT NULL AND NULLIF(TRIM($11::jsonb->>'event_setting'), '') IS NOT NULL
-               THEN TRIM($11::jsonb->>'event_setting')
+             WHEN $12::jsonb IS NOT NULL AND NULLIF(TRIM($12::jsonb->>'event_setting'), '') IS NOT NULL
+               THEN TRIM($12::jsonb->>'event_setting')
              ELSE event_setting
            END,
-           menu = COALESCE($12::jsonb, menu),
-           stage_entered_at = CASE WHEN $13::boolean THEN NOW() ELSE stage_entered_at END
+           menu = COALESCE($13::jsonb, menu),
+           stage_entered_at = CASE WHEN $14::boolean THEN NOW() ELSE stage_entered_at END
        WHERE id::text = $1
        RETURNING id::text, email_address, ${txSelect} AS transaction_no, total_cost`,
             [
               ...stageBaseParams,
+              Number.isFinite(themeDesignCost) ? themeDesignCost : null,
               themeDesign ? JSON.stringify(themeDesign) : null,
               menu ? JSON.stringify(menu) : null,
               bumpStageEnteredAt,
@@ -4945,6 +4953,7 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
   const checklist = req.body?.checklist ?? null;
   const menu = req.body?.menu ?? null;
   const themeDesign = req.body?.theme_design ?? null;
+  const themeDesignCost = Number(req.body?.theme_design_cost ?? NaN);
   const additionalCosts = req.body?.additional_costs ?? null;
   const laborCost = Number(req.body?.labor_cost ?? NaN);
   const travelCost = Number(req.body?.travel_cost ?? NaN);
@@ -5038,19 +5047,20 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           labor_cost = COALESCE($8, labor_cost),
           travel_cost = COALESCE($9, travel_cost),
           total_cost = COALESCE($10, total_cost),
-          down_payment_amount = COALESCE($11, down_payment_amount),
-          guest_count = COALESCE($12, guest_count),
-          pax_buffer = COALESCE($13, pax_buffer),
-          address = COALESCE($14, address),
-          schedule_slots = COALESCE($15::jsonb, schedule_slots),
-          event_title = COALESCE($16, event_title),
-          event_type = COALESCE($17, event_type),
-          formality_level = COALESCE($18, formality_level),
-          seating_plan = COALESCE($19::jsonb, seating_plan),
-          customer_name = COALESCE($20, customer_name),
-          contact_person = COALESCE($21, contact_person),
-          contact_number = COALESCE($22, contact_number),
-          email_address = COALESCE($23, email_address)
+          theme_design_cost = COALESCE($11, theme_design_cost),
+          down_payment_amount = COALESCE($12, down_payment_amount),
+          guest_count = COALESCE($13, guest_count),
+          pax_buffer = COALESCE($14, pax_buffer),
+          address = COALESCE($15, address),
+          schedule_slots = COALESCE($16::jsonb, schedule_slots),
+          event_title = COALESCE($17, event_title),
+          event_type = COALESCE($18, event_type),
+          formality_level = COALESCE($19, formality_level),
+          seating_plan = COALESCE($20::jsonb, seating_plan),
+          customer_name = COALESCE($21, customer_name),
+          contact_person = COALESCE($22, contact_person),
+          contact_number = COALESCE($23, contact_number),
+          email_address = COALESCE($24, email_address)
         WHERE id::text = $1 AND status IN ('new_event', 'online_inquiries')`,
         [
           id,
@@ -5063,6 +5073,7 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           Number.isFinite(laborCost) ? laborCost : null,
           Number.isFinite(travelCost) ? travelCost : null,
           Number.isFinite(totalCost) ? totalCost : null,
+          Number.isFinite(themeDesignCost) ? themeDesignCost : null,
           Number.isFinite(downPaymentAmount) ? downPaymentAmount : null,
           Number.isFinite(guestCount) ? Math.max(0, Math.floor(guestCount)) : null,
           paxBuffer,

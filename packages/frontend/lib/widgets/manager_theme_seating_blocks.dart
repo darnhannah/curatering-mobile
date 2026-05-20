@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
+import '../features/event_design/theme_design_export.dart';
 import '../features/seating/seating_layout_export.dart';
 import '../features/seating/seating_plan.dart';
 import '../features/seating/seating_plan_canvas.dart';
@@ -50,25 +51,45 @@ Future<void> showSeatingLayoutFullscreen(
 
 /// Theme design preview + actions aligned with customer My Inquiries / Inquire Catering.
 Widget buildManagerThemeDesignBlock({
+  required BuildContext context,
   required Map<String, dynamic> themeDesign,
   required VoidCallback? onOpenEditor,
   required String openEditorLabel,
+  String eventTitle = '',
+  String transactionNo = '',
   bool showCostFields = false,
   TextEditingController? noteController,
   TextEditingController? costController,
   bool readOnlyCostFields = false,
 }) {
+  final hasImage = hasEventThemeDesign(themeDesign);
   return Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
-      if (hasEventThemeDesign(themeDesign)) ...[
+      if (hasImage) ...[
         Text(
           eventDesignSourceLabel(themeDesign),
           style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
         ),
         const SizedBox(height: 8),
       ],
-      managerThemeDesignImagePreview(themeDesign),
+      Material(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: hasImage ? () => showThemeDesignFullscreen(context, themeDesign) : null,
+          child: managerThemeDesignImagePreview(themeDesign),
+        ),
+      ),
+      if (hasImage)
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            'Tap the image for full-screen preview.',
+            style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+          ),
+        ),
       const SizedBox(height: 8),
       if (onOpenEditor != null)
         FilledButton.icon(
@@ -76,6 +97,45 @@ Widget buildManagerThemeDesignBlock({
           icon: const Icon(Icons.auto_awesome),
           label: Text(openEditorLabel),
         ),
+      if (hasImage) ...[
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            OutlinedButton.icon(
+              onPressed: () => previewThemeDesignPdf(
+                context: context,
+                themeDesign: themeDesign,
+                eventTitle: eventTitle,
+                transactionNo: transactionNo,
+              ),
+              icon: const Icon(Icons.picture_as_pdf_outlined),
+              label: const Text('Preview PDF'),
+            ),
+            OutlinedButton.icon(
+              onPressed: () async {
+                try {
+                  await saveThemeDesignImageToGallery(context: context, themeDesign: themeDesign);
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Image saved to your gallery.')),
+                    );
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('$e'), backgroundColor: Colors.red.shade700),
+                    );
+                  }
+                }
+              },
+              icon: const Icon(Icons.image_outlined),
+              label: const Text('Download image'),
+            ),
+          ],
+        ),
+      ],
       if (showCostFields && noteController != null && costController != null) ...[
         const SizedBox(height: 10),
         TextField(
@@ -159,6 +219,7 @@ Widget buildManagerSeatingLayoutBlock({
                 width: 72,
                 height: 72,
                 fit: BoxFit.cover,
+                gaplessPlayback: true,
               ),
             ),
           ),

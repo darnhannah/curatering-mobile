@@ -329,6 +329,12 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       });
       await _loadHistory();
       if (mounted) {
+        await _pageController.animateToPage(
+          3,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeOut,
+        );
+        setState(() => _pageIndex = 3);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Your event design is ready!')),
         );
@@ -550,6 +556,26 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
     }
   }
 
+  Widget _stepTile({required String title, required List<Widget> children}) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey.shade300),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+          const SizedBox(height: 12),
+          ...children,
+        ],
+      ),
+    );
+  }
+
   Widget _pageIndicator() {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -633,11 +659,9 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
-                            Text(
-                              _pageTitles[0],
-                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
-                            ),
-                            const SizedBox(height: 12),
+                            _stepTile(
+                              title: _pageTitles[0],
+                              children: [
                             _lockedEventTypeField(),
                             _chipSection(
                               title: 'Style',
@@ -655,16 +679,16 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                               onToggle: (v) => setState(() => _mood = _mood == v ? null : v),
                               otherCtrl: _moodOther,
                             ),
+                              ],
+                            ),
                           ],
                         ),
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
-                            Text(
-                              _pageTitles[1],
-                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
-                            ),
-                            const SizedBox(height: 12),
+                            _stepTile(
+                              title: _pageTitles[1],
+                              children: [
                             _chipSection(
                               title: 'Color palette',
                               options: _categories.palettes,
@@ -691,25 +715,16 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                               }),
                               otherCtrl: _decorOther,
                             ),
-                            TextField(
-                              controller: _notes,
-                              maxLines: 3,
-                              decoration: const InputDecoration(
-                                labelText: 'Notes',
-                                hintText: 'e.g. simple wedding setup with garden theme',
-                                border: OutlineInputBorder(),
-                              ),
+                              ],
                             ),
                           ],
                         ),
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
-                            Text(
-                              _pageTitles[2],
-                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
-                            ),
-                            const SizedBox(height: 12),
+                            _stepTile(
+                              title: _pageTitles[2],
+                              children: [
                             Text('Venue reference photos', style: Theme.of(context).textTheme.titleSmall),
                             const SizedBox(height: 6),
                             Text(
@@ -769,14 +784,24 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                                 ),
                               ),
                             ],
+                              ],
+                            ),
                           ],
                         ),
                         ListView(
                           padding: const EdgeInsets.all(16),
                           children: [
-                            Text(
-                              _pageTitles[3],
-                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                            _stepTile(
+                              title: _pageTitles[3],
+                              children: [
+                            TextField(
+                              controller: _notes,
+                              maxLines: 3,
+                              decoration: const InputDecoration(
+                                labelText: 'Notes',
+                                hintText: 'e.g. simple wedding setup with garden theme',
+                                border: OutlineInputBorder(),
+                              ),
                             ),
                             const SizedBox(height: 12),
                             if (_generatedUrl != null) ...[
@@ -837,6 +862,8 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                                 backgroundColor: const Color(0xFFE8B923),
                                 foregroundColor: Colors.black87,
                               ),
+                            ),
+                              ],
                             ),
                           ],
                         ),
