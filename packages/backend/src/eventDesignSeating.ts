@@ -131,12 +131,9 @@ function canEditSeating(status: string): boolean {
   return SEATING_EDIT_STATUSES.has(String(status ?? "").trim().toLowerCase());
 }
 
-function isCateringPlusEvent(row: Record<string, unknown>, table: string): boolean {
-  const ot = String(row.order_type ?? "").trim().toLowerCase();
-  if (ot === "catering_event" || ot === "event") return true;
-  if (table === "event_orders") return true;
-  const title = String(row.event_title ?? "").trim();
-  return title.length > 0;
+/** Seating is available for all catering and event-styling order kinds (any event type). */
+function orderSupportsSeating(_row: Record<string, unknown>, _table: string): boolean {
+  return true;
 }
 
 async function ensureAiGenerationsTable(pool: pg.Pool): Promise<void> {
@@ -441,8 +438,8 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
         res.status(403).json({ error: "forbidden" });
         return;
       }
-      if (!isCateringPlusEvent(access.row, access.table)) {
-        res.status(400).json({ error: "seating applies to catering + event orders only" });
+      if (!orderSupportsSeating(access.row, access.table)) {
+        res.status(400).json({ error: "seating is not available for this order" });
         return;
       }
       res.json({
@@ -470,8 +467,8 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
         res.status(403).json({ error: "forbidden" });
         return;
       }
-      if (!isCateringPlusEvent(access.row, access.table)) {
-        res.status(400).json({ error: "seating applies to catering + event orders only" });
+      if (!orderSupportsSeating(access.row, access.table)) {
+        res.status(400).json({ error: "seating is not available for this order" });
         return;
       }
       const st = String(access.row.status ?? "").trim().toLowerCase();
@@ -480,8 +477,9 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
         return;
       }
       const normalized = normalizeSeatingPlan(rawPlan);
+      const table = access.table === "catering_orders" ? "catering_orders" : "event_orders";
       await pool().query(
-        `UPDATE event_orders SET seating_plan = $2::jsonb, updated_at = NOW() WHERE id::text = $1`,
+        `UPDATE ${table} SET seating_plan = $2::jsonb, updated_at = NOW() WHERE id::text = $1`,
         [orderId, JSON.stringify(normalized)],
       );
       res.json({ ok: true, seating_plan: normalized });

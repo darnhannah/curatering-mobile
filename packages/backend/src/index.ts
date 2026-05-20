@@ -159,6 +159,7 @@ function ensureNewEventSchemaOnce(): Promise<void> {
     // Runtime self-heal for environments that missed some migrations.
     await ensureCateringPipelineStatusChecks(p);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`);
+    await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
     await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
     await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
@@ -2870,7 +2871,6 @@ app.post("/api/mobile/guest-orders/list", async (req, res) => {
       res.status(403).json({ error: "invalid or expired verification code" });
       return;
     }
-    await getPool().query(`DELETE FROM guest_order_track_otp WHERE email = $1`, [email]);
     await ensureRestaurantOrderApiColumnsOnce();
     const { rows } = await getPool().query(
       `SELECT ${restaurantOrderListSelectSql()},
@@ -2883,7 +2883,95 @@ app.post("/api/mobile/guest-orders/list", async (req, res) => {
       [email],
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
-    res.json(out);
+    const { rows: inquiryRows } = await getPool().query(
+      `SELECT * FROM (
+         SELECT id::text AS id,
+              ('INQ-' || UPPER(SUBSTRING(id::text, 1, 8))) AS inquiry_no,
+              ${EVENT_TRANSACTION_ID} AS transaction_no,
+              'CATERING WITH EVENT STYLING' AS inquiry_type,
+              COALESCE(event_title, '') AS event_title,
+              COALESCE(event_type, '') AS event_type,
+              customer_name AS customer,
+              contact_person,
+              contact_number,
+              email_address AS inquiry_email,
+              CASE
+                WHEN jsonb_typeof(schedule_slots) = 'array' AND jsonb_array_length(schedule_slots) > 0
+                  THEN schedule_slots::text
+                ELSE ''
+              END AS date_of_event,
+              COALESCE((${EVENT_POST_ANALYSIS_JSON})->>'note', '') AS note,
+              FALSE AS curate_own_menu,
+              '' AS selected_set_menu,
+              menu AS selected_dishes,
+              TRUE AS include_event_theme,
+              guest_count,
+              '' AS menu_suggestion_note,
+              '' AS theme_suggestion_note,
+              COALESCE(total_cost, 0) AS estimated_total,
+              COALESCE(down_payment_amount, 0)::float8 AS down_payment_amount,
+              COALESCE(full_payment_amount, 0)::float8 AS full_payment_amount,
+              0 AS loyalty_points_earned,
+              status,
+              created_at,
+              address AS event_city,
+              ${eventSettingSql()} AS event_setting,
+              '' AS service_included,
+              COALESCE(formality_level, '') AS formality_level,
+              FALSE AS food_tasting_requested,
+              COALESCE(theme_design, '{}'::jsonb) AS theme_design,
+              COALESCE(seating_plan, '{}'::jsonb) AS seating_plan,
+              COALESCE(NULLIF(TRIM(order_type), ''), 'catering_event') AS order_type,
+              'event'::text AS order_kind
+         FROM event_orders
+         WHERE LOWER(TRIM(email_address)) = $1
+         UNION ALL
+         SELECT id::text AS id,
+              ('INQ-' || UPPER(SUBSTRING(id::text, 1, 8))) AS inquiry_no,
+              ${CATERING_TRANSACTION_ID} AS transaction_no,
+              'CATERING' AS inquiry_type,
+              '' AS event_title,
+              '' AS event_type,
+              customer_name AS customer,
+              contact_person,
+              contact_number,
+              email_address AS inquiry_email,
+              CASE
+                WHEN jsonb_typeof(schedule_slots) = 'array' AND jsonb_array_length(schedule_slots) > 0
+                  THEN schedule_slots::text
+                ELSE ''
+              END AS date_of_event,
+              COALESCE((${CATERING_POST_ANALYSIS_JSON})->>'note', '') AS note,
+              FALSE AS curate_own_menu,
+              '' AS selected_set_menu,
+              menu AS selected_dishes,
+              FALSE AS include_event_theme,
+              guest_count,
+              '' AS menu_suggestion_note,
+              '' AS theme_suggestion_note,
+              COALESCE(total_cost, 0) AS estimated_total,
+              COALESCE(down_payment_amount, 0)::float8 AS down_payment_amount,
+              COALESCE(full_payment_amount, 0)::float8 AS full_payment_amount,
+              0 AS loyalty_points_earned,
+              status,
+              created_at,
+              address AS event_city,
+              ${cateringEventSettingSql()} AS event_setting,
+              ${cateringEventSettingSql()} AS service_included,
+              COALESCE(NULLIF(TRIM(formality_level), ''), '') AS formality_level,
+              FALSE AS food_tasting_requested,
+              '{}'::jsonb AS theme_design,
+              COALESCE(seating_plan, '{}'::jsonb) AS seating_plan,
+              'catering'::text AS order_type,
+              'catering'::text AS order_kind
+         FROM catering_orders
+         WHERE LOWER(TRIM(email_address)) = $1
+       ) q
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [email],
+    );
+    res.json({ orders: out, inquiries: inquiryRows });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
@@ -4541,10 +4629,10 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
       orderKind === "catering"
         ? `INSERT INTO catering_orders
            (source, status, order_type, customer_name, contact_person, contact_number, email_address,
-            schedule_slots, address, guest_count, pax_buffer, menu, event_setting, checklist,
+            schedule_slots, address, guest_count, pax_buffer, menu, event_setting, seating_plan, checklist,
             total_cost, created_by, updated_by, customer_id, catering_id, payment_method, labor_cost, travel_cost, full_payment_due_at)
            VALUES
-           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13, $14::jsonb, $15, $16, $16, NULLIF($17, ''), $18, $19, $20, $21, $22)
+           ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13, $14::jsonb, $15::jsonb, $16::jsonb, $17, $18, $18, NULLIF($19, ''), $20, $21, $22, $23, $24)
            RETURNING id::text`
         : `INSERT INTO event_orders
            (source, status, order_type, customer_name, contact_person, contact_number, email_address,
@@ -4571,6 +4659,7 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
             String(
               req.body?.event_setting ?? (themeDesign as Record<string, unknown>)?.event_setting ?? "open",
             ).trim(),
+            seatingPlanJson,
             JSON.stringify(checklistPacked ?? { items: autoChecklist }),
             payload.total_cost,
             payload.created_by,

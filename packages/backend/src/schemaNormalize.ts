@@ -688,6 +688,9 @@ async function ensureProductionColumns(pool: pg.Pool): Promise<void> {
     await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_claimed_at TIMESTAMPTZ`);
   }
   if (await tableExists(pool, "catering_orders")) {
+    await pool.query(
+      `ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS seating_plan JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    );
     await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS event_setting TEXT NOT NULL DEFAULT ''`);
     await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS inquiry_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);
     await pool.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS stage_additional_costs JSONB NOT NULL DEFAULT '[]'::jsonb`);

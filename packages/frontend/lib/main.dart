@@ -21,6 +21,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'customer_local_notifications.dart';
 import 'features/event_design/event_design_admin_screen.dart';
 import 'features/event_design/event_theme_design_screen.dart';
+import 'features/event_design/theme_design_export.dart';
 import 'features/seating/seating_layout_editor_screen.dart';
 import 'utils/image_pick_limits.dart';
 import 'features/seating/seating_plan.dart';
@@ -62,6 +63,12 @@ ThemeData buildAppLightTheme() {
     brightness: Brightness.light,
     scaffoldBackgroundColor: AppColors.canvas,
     colorScheme: ColorScheme.fromSeed(seedColor: AppColors.brand, brightness: Brightness.light),
+    cardTheme: CardThemeData(
+      color: Colors.white,
+      elevation: 2,
+      shadowColor: Colors.black26,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: Colors.white,
@@ -798,8 +805,9 @@ const double kRestaurantLng = 121.059198;
 const double kDeliveryMaxDistanceKm = 5.0;
 /// Restaurant delivery / pickup hours (schedule selection on checkout).
 const int kRestaurantOpenHour = 8;
-const int kRestaurantCloseHour = 22;
-const String kRestaurantHoursHint = "Macrina's Kitchen is only open from 8:00 am to 10:00 pm";
+const int kRestaurantCloseHour = 19;
+const String kRestaurantHoursHint = "Macrina's Kitchen is only open from 8:00 am to 7:00 pm";
+const String kCateringEventHoursHint = 'Event times must be between 8:00 am and 7:00 pm.';
 
 bool isWithinRestaurantHours(TimeOfDay t) {
   final mins = t.hour * 60 + t.minute;
@@ -809,7 +817,7 @@ bool isWithinRestaurantHours(TimeOfDay t) {
 TimeOfDay clampToRestaurantHours(TimeOfDay t) {
   if (t.hour < kRestaurantOpenHour) return const TimeOfDay(hour: 8, minute: 0);
   if (t.hour > kRestaurantCloseHour || (t.hour == kRestaurantCloseHour && t.minute > 0)) {
-    return const TimeOfDay(hour: 22, minute: 0);
+    return const TimeOfDay(hour: 19, minute: 0);
   }
   return t;
 }
@@ -3144,8 +3152,12 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<String?> cancelInquiryAsCustomer({required String inquiryId}) async {
-    if (userEmail == null) return 'Not signed in';
+  Future<String?> cancelInquiryAsCustomer({
+    required String inquiryId,
+    String? contactEmailOverride,
+  }) async {
+    final email = (contactEmailOverride ?? userEmail)?.trim().toLowerCase();
+    if (email == null || email.isEmpty) return 'Not signed in';
     final id = inquiryId.trim();
     if (id.isEmpty) return 'Invalid inquiry';
     try {
@@ -3153,7 +3165,7 @@ class AppState extends ChangeNotifier {
           .patch(
             _uri('/api/mobile/inquiries/$id/cancel-customer'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'user_email': userEmail}),
+            body: jsonEncode({'user_email': email}),
           )
           .timeout(_apiTimeout);
       if (res.statusCode != 200) {
@@ -3296,6 +3308,7 @@ class AppState extends ChangeNotifier {
       await loadOrders(force: true);
       await loadInquiries(force: true);
       await bootstrapRealtimeSync();
+      notifyListeners();
     } catch (e, st) {
       debugPrint('enterGuestCheckoutSession failed: $e\n$st');
       rethrow;
@@ -4204,14 +4217,71 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<({String? error, List<OrderData> orders})> fetchGuestOrdersWithTrackOtp(
+  InquiryRecord? _inquiryRecordFromApiMap(Map<String, dynamic> map) {
+    try {
+      final idStr = '${map['id'] ?? ''}'.trim();
+      if (idStr.isEmpty) return null;
+      final dishes = inquirySelectedDishLabels(map['selected_dishes']);
+      return InquiryRecord(
+        id: idStr,
+        inquiryNo: '${map['inquiry_no']}',
+        inquiryType: '${map['inquiry_type']}',
+        eventTitle: '${map['event_title']}',
+        eventType: '${map['event_type']}',
+        customer: '${map['customer']}',
+        contactPerson: '${map['contact_person']}',
+        contactNumber: '${map['contact_number']}',
+        inquiryEmail: '${map['inquiry_email']}',
+        dateOfEvent: '${map['date_of_event']}',
+        note: '${map['note']}',
+        curateOwnMenu: jsonToBool(map['curate_own_menu']),
+        selectedSetMenu: '${map['selected_set_menu']}',
+        selectedDishes: dishes,
+        includeEventTheme: jsonToBool(map['include_event_theme']),
+        guestCount: jsonToInt(map['guest_count']),
+        menuSuggestionNote: '${map['menu_suggestion_note'] ?? ''}',
+        themeSuggestionNote: '${map['theme_suggestion_note'] ?? ''}',
+        estimatedTotal: jsonToDouble(map['estimated_total']),
+        status: '${map['status']}',
+        createdAt: jsonToDateTime(map['created_at'], DateTime.now()),
+        eventCity: '${map['event_city'] ?? ''}',
+        eventSetting: '${map['event_setting'] ?? ''}',
+        serviceIncluded: '${map['service_included'] ?? ''}',
+        formalityLevel: '${map['formality_level'] ?? ''}',
+        foodTastingRequested: jsonToBool(map['food_tasting_requested']),
+        loyaltyPointsEarned: jsonToInt(map['loyalty_points_earned']),
+        transactionNo: '${map['transaction_no'] ?? ''}',
+        downPaymentAmount: jsonToDouble(map['down_payment_amount']),
+        fullPaymentAmount: jsonToDouble(map['full_payment_amount']),
+        themeDesign: () {
+          final td = map['theme_design'];
+          if (td is Map) return Map<String, dynamic>.from(td);
+          return const <String, dynamic>{};
+        }(),
+        seatingPlan: () {
+          final sp = map['seating_plan'];
+          if (sp is Map) return Map<String, dynamic>.from(sp);
+          return const <String, dynamic>{};
+        }(),
+        orderKind: '${map['order_kind'] ?? 'catering'}',
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<({String? error, List<OrderData> orders, List<InquiryRecord> inquiries})> fetchGuestOrdersWithTrackOtp(
     String email,
     String otp,
   ) async {
     final em = email.trim().toLowerCase();
     final code = otp.trim();
-    if (!em.contains('@')) return (error: 'Enter a valid email address', orders: <OrderData>[]);
-    if (code.isEmpty) return (error: 'Enter the verification code from your email', orders: <OrderData>[]);
+    if (!em.contains('@')) {
+      return (error: 'Enter a valid email address', orders: <OrderData>[], inquiries: <InquiryRecord>[]);
+    }
+    if (code.isEmpty) {
+      return (error: 'Enter the verification code from your email', orders: <OrderData>[], inquiries: <InquiryRecord>[]);
+    }
     try {
       final res = await http
           .post(
@@ -4226,20 +4296,50 @@ class AppState extends ChangeNotifier {
           final err = jsonDecode(res.body);
           if (err is Map && err['error'] != null) msg = '${err['error']}';
         } catch (_) {}
-        return (error: msg, orders: <OrderData>[]);
+        return (error: msg, orders: <OrderData>[], inquiries: <InquiryRecord>[]);
       }
       final body = jsonDecode(res.body);
-      if (body is! List) return (error: 'Unexpected server response', orders: <OrderData>[]);
+      final orderMaps = <Map<String, dynamic>>[];
+      final inquiryMaps = <Map<String, dynamic>>[];
+      if (body is List) {
+        for (final e in body) {
+          if (e is Map) orderMaps.add(Map<String, dynamic>.from(e));
+        }
+      } else if (body is Map) {
+        final m = Map<String, dynamic>.from(body);
+        final rawOrders = m['orders'] ?? m['restaurant_orders'];
+        final rawInq = m['inquiries'] ?? m['catering_inquiries'];
+        if (rawOrders is List) {
+          for (final e in rawOrders) {
+            if (e is Map) orderMaps.add(Map<String, dynamic>.from(e));
+          }
+        }
+        if (rawInq is List) {
+          for (final e in rawInq) {
+            if (e is Map) inquiryMaps.add(Map<String, dynamic>.from(e));
+          }
+        }
+      } else {
+        return (error: 'Unexpected server response', orders: <OrderData>[], inquiries: <InquiryRecord>[]);
+      }
       final parsed = <OrderData>[];
-      for (final e in body) {
+      for (final map in orderMaps) {
         try {
-          final map = e as Map<String, dynamic>;
           parsed.add(orderDataFromApiMap(map, orderLinesFromApiMap(map)));
         } catch (_) {}
       }
-      return (error: null, orders: parsed);
+      final inquiries = <InquiryRecord>[];
+      for (final map in inquiryMaps) {
+        final rec = _inquiryRecordFromApiMap(map);
+        if (rec != null) inquiries.add(rec);
+      }
+      return (error: null, orders: parsed, inquiries: inquiries);
     } catch (e) {
-      return (error: describeApiNetworkError(e, normalizeApiBase(apiBase)), orders: <OrderData>[]);
+      return (
+        error: describeApiNetworkError(e, normalizeApiBase(apiBase)),
+        orders: <OrderData>[],
+        inquiries: <InquiryRecord>[],
+      );
     }
   }
 
@@ -6761,17 +6861,31 @@ Widget _cateringInquiryMenuDishTile({
 Widget _buildTrayLineCard(AppState state, CartItem item, {VoidCallback? onChanged}) {
   void refresh() => onChanged?.call();
   return Card(
+    color: Colors.white,
     child: Padding(
       padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(item.menu.name, style: const TextStyle(fontWeight: FontWeight.w700)),
-          const SizedBox(height: 4),
-          Text(
-            cartLineDetailSubtitle(item),
-            style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade800),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: SizedBox(
+              width: 56,
+              height: 56,
+              child: _MenuThumb(item: item.menu, compact: true),
+            ),
           ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(item.menu.name, style: const TextStyle(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 4),
+                Text(
+                  cartLineDetailSubtitle(item),
+                  style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade800),
+                ),
           _trayLineQtyRow(
             label: 'Main qty',
             qty: item.qty,
@@ -6798,6 +6912,9 @@ Widget _buildTrayLineCard(AppState state, CartItem item, {VoidCallback? onChange
                 refresh();
               },
             ),
+              ],
+            ),
+          ),
         ],
       ),
     ),
@@ -6893,6 +7010,48 @@ bool _guestTrackCanCancel(OrderData o) {
       u.contains('INSUFFICIENT');
 }
 
+bool _guestTrackCanFollowUpInquiry(InquiryRecord r) {
+  final s = r.status.trim().toLowerCase();
+  return s == 'online_inquiries' || s == 'for_down_payment';
+}
+
+bool _guestTrackCanCancelInquiry(InquiryRecord r) {
+  final s = r.status.trim().toLowerCase();
+  return s == 'online_inquiries' || s == 'new_event' || s == 'for_down_payment';
+}
+
+Future<void> _guestTrackFollowUpInquiry(BuildContext context, AppState state, InquiryRecord r) async {
+  final ref = r.displayTransactionRef;
+  final err = await state.submitHelpRequest(
+    area: 'Catering Inquiry Follow-up',
+    problem: 'Guest follow-up on inquiry $ref',
+    desiredOutcome: 'Please review and respond to this inquiry as soon as possible.',
+  );
+  if (context.mounted) appSnack(context, err ?? 'Follow-up sent');
+}
+
+Future<void> _guestTrackCancelInquiry(
+  BuildContext context,
+  AppState state,
+  InquiryRecord r, {
+  required String contactEmail,
+}) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Cancel inquiry?'),
+      content: Text('Cancel ${r.displayTransactionRef}?'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes, cancel')),
+      ],
+    ),
+  );
+  if (ok != true || !context.mounted) return;
+  final err = await state.cancelInquiryAsCustomer(inquiryId: r.id, contactEmailOverride: contactEmail);
+  if (context.mounted) appSnack(context, err ?? 'Inquiry cancelled');
+}
+
 Future<void> _guestTrackFollowUp(BuildContext context, AppState state, OrderData o) async {
   final err = await state.submitHelpRequest(
     area: 'Order Follow-up',
@@ -6929,18 +7088,26 @@ class GuestTrackOrdersScreen extends StatefulWidget {
   State<GuestTrackOrdersScreen> createState() => _GuestTrackOrdersScreenState();
 }
 
-class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
+class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with SingleTickerProviderStateMixin {
   final emailController = TextEditingController();
   final otpController = TextEditingController();
+  final _searchController = TextEditingController();
   bool _otpSent = false;
   bool _verified = false;
   bool _busy = false;
   String? _error;
+  String _verifiedEmail = '';
+  String _lastOtp = '';
   List<OrderData> _orders = [];
+  List<InquiryRecord> _inquiries = [];
+  String _orderStatusFilter = 'all';
+  String _inquiryStatusFilter = 'all';
+  late TabController _tab;
 
   @override
   void initState() {
     super.initState();
+    _tab = TabController(length: 2, vsync: this);
     final saved = widget.state.profile.contactEmail.trim();
     if (saved.isNotEmpty) emailController.text = saved;
     if (widget.state.isGuestSession && saved.isNotEmpty) {
@@ -6950,8 +7117,10 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
 
   @override
   void dispose() {
+    _tab.dispose();
     emailController.dispose();
     otpController.dispose();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -6960,12 +7129,24 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
       _busy = true;
       _error = null;
     });
-    await widget.state.loadOrders(force: true);
+    await Future.wait([
+      widget.state.loadOrders(force: true),
+      widget.state.loadInquiries(force: true),
+    ]);
     if (!mounted) return;
+    final em = widget.state.profile.contactEmail.trim().toLowerCase();
     setState(() {
       _busy = false;
       _verified = true;
-      _orders = List<OrderData>.from(widget.state.orders);
+      _verifiedEmail = em;
+      _orders = widget.state.orders
+          .where((o) => (o.userEmail ?? '').trim().toLowerCase() == em || em.isEmpty)
+          .toList();
+      _inquiries = em.isEmpty
+          ? <InquiryRecord>[]
+          : widget.state.inquiries
+              .where((r) => r.inquiryEmail.trim().toLowerCase() == em)
+              .toList();
     });
   }
 
@@ -7000,9 +7181,229 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
       _error = result.error;
       if (result.error == null) {
         _verified = true;
+        _verifiedEmail = emailController.text.trim().toLowerCase();
+        _lastOtp = otpController.text.trim();
         _orders = result.orders;
+        _inquiries = result.inquiries;
       }
     });
+  }
+
+  List<OrderData> get _filteredOrders {
+    final q = _searchController.text.trim().toLowerCase();
+    return _orders.where((o) {
+      final st = o.status.toUpperCase();
+      if (_orderStatusFilter == 'pending') {
+        if (!(st.contains('WAITING FOR PAYMENT') || st.contains('WAITING FOR ORDER'))) return false;
+      } else if (_orderStatusFilter == 'balance') {
+        if (!(st.contains('INSUFFICIENT') || st.contains('BALANCE'))) return false;
+      }
+      if (q.isEmpty) return true;
+      return uiOrderNo(o.orderNo).toLowerCase().contains(q) ||
+          o.status.toLowerCase().contains(q) ||
+          statusReadableForOrder(o).toLowerCase().contains(q);
+    }).toList();
+  }
+
+  List<InquiryRecord> get _filteredInquiries {
+    final q = _searchController.text.trim().toLowerCase();
+    return _inquiries.where((r) {
+      final st = r.status.trim().toLowerCase();
+      if (_inquiryStatusFilter == 'online') {
+        if (st != 'online_inquiries') return false;
+      } else if (_inquiryStatusFilter == 'processing') {
+        if (st != 'for_down_payment' && st != 'for_ongoing' && st != 'for_full_payment') return false;
+      }
+      if (q.isEmpty) return true;
+      return r.displayTransactionRef.toLowerCase().contains(q) ||
+          r.eventTitle.toLowerCase().contains(q) ||
+          r.customer.toLowerCase().contains(q) ||
+          inquiryStatusReadable(r.status).toLowerCase().contains(q);
+    }).toList();
+  }
+
+  Future<void> _refreshVerified() async {
+    if (widget.state.isGuestSession && widget.state.profile.contactEmail.trim().isNotEmpty) {
+      await _loadSessionOrders();
+      return;
+    }
+    if (_verifiedEmail.isEmpty || _lastOtp.isEmpty) return;
+    setState(() => _busy = true);
+    final result = await widget.state.fetchGuestOrdersWithTrackOtp(_verifiedEmail, _lastOtp);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (result.error == null) {
+        _orders = result.orders;
+        _inquiries = result.inquiries;
+      }
+    });
+  }
+
+  Widget _trackSearchAndFilters() {
+    return Material(
+      color: Colors.white,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+        child: Column(
+          children: [
+            TextField(
+              controller: _searchController,
+              decoration: const InputDecoration(
+                hintText: 'Search order or inquiry…',
+                prefixIcon: Icon(Icons.search),
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: _tab.index == 0 ? _orderStatusFilter : _inquiryStatusFilter,
+                    decoration: InputDecoration(
+                      labelText: _tab.index == 0 ? 'Order filter' : 'Inquiry filter',
+                      isDense: true,
+                      border: const OutlineInputBorder(),
+                    ),
+                    items: _tab.index == 0
+                        ? const [
+                            DropdownMenuItem(value: 'all', child: Text('All orders')),
+                            DropdownMenuItem(value: 'pending', child: Text('Pending review / payment')),
+                            DropdownMenuItem(value: 'balance', child: Text('Balance due')),
+                          ]
+                        : const [
+                            DropdownMenuItem(value: 'all', child: Text('All inquiries')),
+                            DropdownMenuItem(value: 'online', child: Text('Online inquiries')),
+                            DropdownMenuItem(value: 'processing', child: Text('In processing')),
+                          ],
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() {
+                        if (_tab.index == 0) {
+                          _orderStatusFilter = v;
+                        } else {
+                          _inquiryStatusFilter = v;
+                        }
+                      });
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _ordersList() {
+    final rows = _filteredOrders;
+    if (rows.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.all(24),
+        children: [
+          Text('No restaurant orders match your search.', style: TextStyle(color: Colors.grey.shade700)),
+        ],
+      );
+    }
+    return ListView.builder(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.all(12),
+      itemCount: rows.length,
+      itemBuilder: (context, i) {
+        final o = rows[i];
+        return Card(
+          color: Colors.white,
+          child: ListTile(
+            title: Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w800)),
+            subtitle: Text(
+              '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}'
+              '${orderCustomerPaymentSummaryText(o).isEmpty ? '' : '\n${orderCustomerPaymentSummaryText(o)}'}',
+            ),
+            isThreeLine: true,
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_guestTrackCanFollowUp(o))
+                  IconButton(
+                    tooltip: 'Follow up',
+                    icon: const Icon(Icons.reply_outlined, size: 20),
+                    onPressed: () => _guestTrackFollowUp(context, widget.state, o),
+                  ),
+                if (_guestTrackCanCancel(o))
+                  IconButton(
+                    tooltip: 'Cancel order',
+                    icon: Icon(Icons.cancel_outlined, size: 20, color: Colors.red.shade800),
+                    onPressed: () => _guestTrackConfirmCancel(context, widget.state, o),
+                  ),
+              ],
+            ),
+            onTap: () => showRestaurantOrderConfirmationDialog(context, widget.state, o),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _inquiriesList() {
+    final rows = _filteredInquiries;
+    if (rows.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.all(24),
+        children: [
+          Text('No catering inquiries match your search.', style: TextStyle(color: Colors.grey.shade700)),
+        ],
+      );
+    }
+    return ListView.builder(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.all(12),
+      itemCount: rows.length,
+      itemBuilder: (context, i) {
+        final r = rows[i];
+        return Card(
+          color: Colors.white,
+          child: ListTile(
+            title: Text(
+              r.eventTitle.trim().isEmpty ? r.displayTransactionRef : r.eventTitle,
+              style: const TextStyle(fontWeight: FontWeight.w800),
+            ),
+            subtitle: Text(
+              '${inquiryStatusReadable(r.status)}\n${formatDateTimeLocal(r.createdAt)}'
+              '${r.estimatedTotal > 0 ? ' · ₱${r.estimatedTotal.toStringAsFixed(2)}' : ''}',
+            ),
+            isThreeLine: true,
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_guestTrackCanFollowUpInquiry(r))
+                  IconButton(
+                    tooltip: 'Follow up',
+                    icon: const Icon(Icons.reply_outlined, size: 20),
+                    onPressed: () => _guestTrackFollowUpInquiry(context, widget.state, r),
+                  ),
+                if (_guestTrackCanCancelInquiry(r))
+                  IconButton(
+                    tooltip: 'Cancel inquiry',
+                    icon: Icon(Icons.cancel_outlined, size: 20, color: Colors.red.shade800),
+                    onPressed: () => _guestTrackCancelInquiry(
+                      context,
+                      widget.state,
+                      r,
+                      contactEmail: _verifiedEmail,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -7026,61 +7427,31 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> {
         automaticallyImplyLeading: false,
       ),
       body: _verified
-          ? RefreshIndicator(
-              onRefresh: () async {
-                if (widget.state.isGuestSession && widget.state.profile.contactEmail.trim().isNotEmpty) {
-                  await _loadSessionOrders();
-                } else {
-                  await _verifyAndLoad();
-                }
-              },
-              child: _orders.isEmpty
-                  ? ListView(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.all(24),
-                      children: [
-                        Text(
-                          'No restaurant orders found for this email yet.',
-                          style: TextStyle(color: Colors.grey.shade700),
-                        ),
-                      ],
-                    )
-                  : ListView.builder(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.all(12),
-                      itemCount: _orders.length,
-                      itemBuilder: (context, i) {
-                        final o = _orders[i];
-                        return Card(
-                          child: ListTile(
-                            title: Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w800)),
-                            subtitle: Text(
-                              '${statusReadableForOrder(o)}\n${formatDateTimeLocal(o.createdAt)} · ₱${o.total.toStringAsFixed(2)}'
-                              '${orderCustomerPaymentSummaryText(o).isEmpty ? '' : '\n${orderCustomerPaymentSummaryText(o)}'}',
-                            ),
-                            isThreeLine: true,
-                            trailing: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (_guestTrackCanFollowUp(o))
-                                  IconButton(
-                                    tooltip: 'Follow up',
-                                    icon: const Icon(Icons.reply_outlined, size: 20),
-                                    onPressed: () => _guestTrackFollowUp(context, widget.state, o),
-                                  ),
-                                if (_guestTrackCanCancel(o))
-                                  IconButton(
-                                    tooltip: 'Cancel order',
-                                    icon: Icon(Icons.cancel_outlined, size: 20, color: Colors.red.shade800),
-                                    onPressed: () => _guestTrackConfirmCancel(context, widget.state, o),
-                                  ),
-                              ],
-                            ),
-                            onTap: () => showRestaurantOrderConfirmationDialog(context, widget.state, o),
-                          ),
-                        );
-                      },
+          ? Column(
+              children: [
+                Material(
+                  color: Colors.white,
+                  child: TabBar(
+                    controller: _tab,
+                    labelColor: AppColors.brand,
+                    onTap: (_) => setState(() {}),
+                    tabs: const [
+                      Tab(text: 'Orders'),
+                      Tab(text: 'Catering Inquiries'),
+                    ],
+                  ),
+                ),
+                _trackSearchAndFilters(),
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: _refreshVerified,
+                    child: TabBarView(
+                      controller: _tab,
+                      children: [_ordersList(), _inquiriesList()],
                     ),
+                  ),
+                ),
+              ],
             )
           : SingleChildScrollView(
               padding: const EdgeInsets.all(20),
@@ -7727,8 +8098,10 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
   @override
   void initState() {
     super.initState();
+    final initialTab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
+    _tab = initialTab;
     _onLanding = widget.state.guestShellOpenLanding;
-    _tab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
+    if (initialTab == 0 || initialTab == 1) _onLanding = false;
     widget.state.guestShellOpenLanding = false;
     widget.state.guestShellInitialTabIndex = 0;
   }
@@ -8261,9 +8634,8 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  Container(
-                    margin: const EdgeInsets.all(10),
-                    color: Colors.white,
+                  ClipRRect(
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(13)),
                     child: _MenuThumb(item: item),
                   ),
                 ],
@@ -8469,9 +8841,13 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                         padding: const EdgeInsets.all(12),
                         itemCount: _sectionFilter == 'ALL' ? allAlpha.length : filtered.length,
                         gridDelegate: gridDelegate,
-                        itemBuilder: (context, index) => _sectionFilter == 'ALL'
-                            ? _dishCard(context, allAlpha[index])
-                            : _dishCard(context, filtered[index]),
+                        itemBuilder: (context, index) {
+                          final item = _sectionFilter == 'ALL' ? allAlpha[index] : filtered[index];
+                          return KeyedSubtree(
+                            key: ValueKey('menu-card-${item.id}'),
+                            child: _dishCard(context, item),
+                          );
+                        },
                       ),
               ),
             ),
@@ -8506,30 +8882,62 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   }
 }
 
-class _MenuThumb extends StatelessWidget {
+class _MenuThumb extends StatefulWidget {
   const _MenuThumb({required this.item, this.compact = false});
   final MenuItemData item;
   final bool compact;
 
   @override
+  State<_MenuThumb> createState() => _MenuThumbState();
+}
+
+class _MenuThumbState extends State<_MenuThumb> {
+  Uint8List? _bytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _decode();
+  }
+
+  @override
+  void didUpdateWidget(covariant _MenuThumb oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.item.id != widget.item.id || oldWidget.item.imageBase64 != widget.item.imageBase64) {
+      _decode();
+    }
+  }
+
+  void _decode() {
+    final raw = widget.item.imageBase64?.trim();
+    if (raw == null || raw.isEmpty) {
+      _bytes = null;
+      return;
+    }
+    try {
+      _bytes = Uint8List.fromList(base64Decode(raw));
+    } catch (_) {
+      _bytes = null;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final iconSize = compact ? 22.0 : 60.0;
-    final raw = item.imageBase64?.trim();
-    if (raw != null && raw.isNotEmpty) {
-      try {
-        final bytes = base64Decode(raw);
-        return RepaintBoundary(
-          child: Image.memory(
-            Uint8List.fromList(bytes),
-            key: ValueKey('menu-thumb-${item.id}'),
-            fit: BoxFit.cover,
-            gaplessPlayback: true,
-            cacheWidth: compact ? 88 : 360,
-            cacheHeight: compact ? 88 : 360,
-            errorBuilder: (_, __, ___) => Icon(Icons.fastfood, size: iconSize),
-          ),
-        );
-      } catch (_) {}
+    final iconSize = widget.compact ? 22.0 : 60.0;
+    final bytes = _bytes;
+    if (bytes != null && bytes.isNotEmpty) {
+      return RepaintBoundary(
+        child: Image.memory(
+          bytes,
+          key: ValueKey('menu-thumb-${widget.item.id}'),
+          fit: BoxFit.cover,
+          gaplessPlayback: true,
+          filterQuality: FilterQuality.medium,
+          cacheWidth: widget.compact ? 112 : null,
+          cacheHeight: widget.compact ? 112 : null,
+          errorBuilder: (_, __, ___) => Icon(Icons.fastfood, size: iconSize),
+        ),
+      );
     }
     return Icon(Icons.fastfood, size: iconSize);
   }
@@ -10046,7 +10454,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
       if (!isRestaurantOpenNow()) {
         appSnack(
           context,
-          'ASAP is only available from 8:00 am to 10:00 pm. Please set a schedule.',
+          'ASAP is only available from 8:00 am to 7:00 pm. Please set a schedule.',
         );
         return false;
       }
@@ -10055,7 +10463,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     try {
       final dt = DateFormat('yyyy-MM-dd HH:mm').parseStrict(v);
       if (!isWithinRestaurantHours(TimeOfDay(hour: dt.hour, minute: dt.minute))) {
-        appSnack(context, 'Delivery time must be between 8:00 am and 10:00 pm.');
+        appSnack(context, 'Delivery time must be between 8:00 am and 7:00 pm.');
         return false;
       }
       return true;
@@ -10077,11 +10485,11 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     final t = await showTimePicker(
       context: context,
       initialTime: clampToRestaurantHours(TimeOfDay.now()),
-      helpText: 'Select time (8:00 am – 10:00 pm)',
+      helpText: 'Select time (8:00 am – 7:00 pm)',
     );
     if (t == null || !mounted) return;
     if (!isWithinRestaurantHours(t)) {
-      appSnack(context, 'Choose a delivery time between 8:00 am and 10:00 pm.');
+      appSnack(context, 'Choose a delivery time between 8:00 am and 7:00 pm.');
       return;
     }
     final dt = DateTime(d.year, d.month, d.day, t.hour, t.minute);
@@ -10309,7 +10717,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                       if (!asapAvailable) ...[
                         const SizedBox(height: 4),
                         Text(
-                          'ASAP is unavailable right now — use Set schedule for a time between 8:00 am and 10:00 pm.',
+                          'ASAP is unavailable right now — use Set schedule for a time between 8:00 am and 7:00 pm.',
                           style: TextStyle(fontSize: 12, color: Colors.orange.shade800, height: 1.3),
                         ),
                       ],
@@ -10616,15 +11024,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
     setState(() => _uploadingProof = true);
     try {
     if (widget.draftCheckout && _placedOrder == null) {
-      if (!mounted) return;
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => const Center(child: CircularProgressIndicator()),
-      );
       final result = await s.submitOrder(clearCheckoutDraft: false);
       if (!mounted) return;
-      Navigator.of(context).pop();
       if (result.error != null) {
         appSnack(context, result.error!);
         return;
@@ -10783,6 +11184,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
           canPop: !interceptBack,
           onPopInvokedWithResult: (didPop, _) {
             if (didPop) return;
+            if (s.isGuestSession) return;
             Navigator.of(context).pushAndRemoveUntil(
               MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: s)),
               (_) => false,
@@ -13215,6 +13617,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
   bool _menuChoicePicked = false;
   bool _attemptedSubmit = false;
   static const int _minSelectedDishesRequired = 4;
+  static const int _maxSelectedDishesRequired = 8;
+  static const int _maxMainDishSelections = 3;
   String _themeDesignChoice = '';
   String _themeDesignSessionId = 'inquiry-${DateTime.now().microsecondsSinceEpoch}';
   Map<String, dynamic>? _aiThemeDesignPayload;
@@ -13230,6 +13634,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
   final eventTitle = TextEditingController();
   final eventTypeOther = TextEditingController();
   String eventTypeChoice = 'Birthday';
+  final customerName = TextEditingController();
+  bool _customerSameAsContact = false;
   final contactPerson = TextEditingController();
   final contactNumber = TextEditingController();
   final inquiryEmail = TextEditingController();
@@ -13275,7 +13681,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
     super.initState();
     final p = widget.state.profile;
     contactPerson.text = p.fullName;
+    customerName.text = p.fullName;
     contactNumber.text = p.contactNumber;
+    contactPerson.addListener(_syncInquiryCustomerFromContact);
     inquiryEmail.text = p.contactEmail.trim().isNotEmpty
         ? p.contactEmail.trim()
         : (widget.state.isGuestSession ? '' : (widget.state.userEmail ?? ''));
@@ -13296,11 +13704,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
     _scheduleConflictDebounce?.cancel();
     _venueDebounce?.cancel();
     eventCity.removeListener(_onVenueChanged);
+    contactPerson.removeListener(_syncInquiryCustomerFromContact);
     _landingPaxController.dispose();
     guestCount.dispose();
     paxBuffer.dispose();
     eventTitle.dispose();
     eventTypeOther.dispose();
+    customerName.dispose();
     contactPerson.dispose();
     contactNumber.dispose();
     inquiryEmail.dispose();
@@ -13345,6 +13755,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
     paxBuffer.clear();
     eventTitle.clear();
     eventTypeOther.clear();
+    customerName.clear();
+    _customerSameAsContact = false;
     contactPerson.clear();
     contactNumber.clear();
     inquiryEmail.clear();
@@ -13478,6 +13890,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
       initialTime: w.from ?? const TimeOfDay(hour: 12, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
+    if (!isWithinRestaurantHours(t)) {
+      appSnack(ctx, kCateringEventHoursHint);
+      return;
+    }
     setState(() => _eventWindows[index].from = t);
     _scheduleConflictRefresh();
   }
@@ -13490,6 +13906,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
       initialTime: w.to ?? const TimeOfDay(hour: 14, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
+    if (!isWithinRestaurantHours(t)) {
+      appSnack(ctx, kCateringEventHoursHint);
+      return;
+    }
     setState(() => _eventWindows[index].to = t);
     _scheduleConflictRefresh();
   }
@@ -13548,6 +13968,40 @@ class _InquiryScreenState extends State<InquiryScreen> {
   String _resolvedEventType() {
     if (eventTypeChoice != 'Other') return eventTypeChoice;
     return eventTypeOther.text.trim();
+  }
+
+  void _syncInquiryCustomerFromContact() {
+    if (_customerSameAsContact) customerName.text = contactPerson.text;
+  }
+
+  MenuItemData? _inquiryDishByName(String name, List<MenuItemData> menu) {
+    for (final m in menu) {
+      if (m.name.trim() == name.trim()) return m;
+    }
+    return null;
+  }
+
+  int _selectedMainDishCount(List<MenuItemData> cateringMenu) {
+    var n = 0;
+    for (final name in selectedDishes) {
+      final d = _inquiryDishByName(name, cateringMenu);
+      if (d != null && d.dishType.trim().toLowerCase() == 'main') n++;
+    }
+    return n;
+  }
+
+  bool _dishBlockedByAllergens(MenuItemData? dish) =>
+      dish != null && dishConflictsGuestAllergens(dish, _selectedGuestAllergens);
+
+  bool _canToggleDishSelection(String dishName, List<MenuItemData> cateringMenu, {required bool removing}) {
+    if (removing) return true;
+    if (selectedDishes.length >= _maxSelectedDishesRequired) return false;
+    final dish = _inquiryDishByName(dishName, cateringMenu);
+    if (_dishBlockedByAllergens(dish)) return false;
+    if (dish != null && dish.dishType.trim().toLowerCase() == 'main') {
+      if (_selectedMainDishCount(cateringMenu) >= _maxMainDishSelections) return false;
+    }
+    return true;
   }
 
   bool get _contactNumberInvalid {
@@ -13641,6 +14095,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
 
   /// Returns null if valid; otherwise an error message for the user.
   String? _validateInquiry() {
+    if (customerName.text.trim().isEmpty) return 'Enter customer name.';
     if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
     final phone = contactNumber.text.trim();
     if (phone.isEmpty) return 'Enter contact number.';
@@ -13672,6 +14127,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
     if (!_menuChoicePicked) return 'Choose a menu preference.';
     if (curateOwn && selectedDishes.length < _minSelectedDishesRequired) {
       return 'Select at least $_minSelectedDishesRequired dish(es) for the menu.';
+    }
+    if (curateOwn && selectedDishes.length > _maxSelectedDishesRequired) {
+      return 'Select at most $_maxSelectedDishesRequired dishes for the menu.';
     }
     if (isInquiryCateringWithEventStyling(inquiryType) && _themeDesignChoice.isEmpty) {
       return 'Choose an event theme design option.';
@@ -13731,46 +14189,61 @@ class _InquiryScreenState extends State<InquiryScreen> {
       state: state,
       title: 'INQUIRE CATERING SERVICE',
       showTrayShortcut: false,
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            OutlinedButton.icon(
-              onPressed: () => showCateringPackageDialog(context),
-              icon: const Icon(Icons.menu_book_outlined),
-              label: const Text('View Package'),
-            ),
-            const SizedBox(height: 28),
-            Text(
-              'How many guests will you have?',
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _landingPaxController,
-              keyboardType: TextInputType.number,
-              maxLength: 4,
-              inputFormatters: [
-                FilteringTextInputFormatter.digitsOnly,
-                LengthLimitingTextInputFormatter(4),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Text(
+                  'How many guests will you have?',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _landingPaxController,
+                  keyboardType: TextInputType.number,
+                  maxLength: 4,
+                  textAlign: TextAlign.center,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.digitsOnly,
+                    LengthLimitingTextInputFormatter(4),
+                  ],
+                  decoration: const InputDecoration(
+                    hintText: 'Number of guests',
+                    counterText: '',
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+                if (pax != null && pax > 0) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    'Total cost for $pax with standard package is Php ${pax * kPesosPerPax}. Additional charges apply if you have additional requests not included in the package.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey.shade800),
+                  ),
+                ],
+                const SizedBox(height: 20),
+                SizedBox(
+                  width: 200,
+                  child: OutlinedButton.icon(
+                    onPressed: () => showCateringPackageDialog(context),
+                    icon: const Icon(Icons.menu_book_outlined, size: 18),
+                    label: const Text('View Package'),
+                  ),
+                ),
+                const SizedBox(height: 28),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(onPressed: _proceedFromLanding, child: const Text('NEXT')),
+                ),
               ],
-              decoration: const InputDecoration(
-                hintText: 'Number of guests',
-                counterText: '',
-              ),
-              onChanged: (_) => setState(() {}),
             ),
-            if (pax != null && pax > 0) ...[
-              const SizedBox(height: 10),
-              Text(
-                'Total cost for $pax with standard package is Php ${pax * kPesosPerPax}. Additional charges apply if you have additional requests not included in the package.',
-                style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey.shade800),
-              ),
-            ],
-            const Spacer(),
-            FilledButton(onPressed: _proceedFromLanding, child: const Text('NEXT')),
-          ],
+          ),
         ),
       ),
     );
@@ -13816,10 +14289,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
                   title: const Text('Package type', style: TextStyle(fontWeight: FontWeight.w700)),
                   subtitle: Text(inquiryTypeDisplayLabel(inquiryType)),
                 ),
-                if (!isInquiryCateringWithEventStyling(inquiryType)) ...[
-                  const SizedBox(height: 10),
-                  _buildEventTypePicker(),
-                ],
                 const SizedBox(height: 10),
                 Text(
                   'Catering: minimum $kMinCateringOnlyPax guests. Catering with Event Styling: minimum $kMinCateringEventPax guests. Estimated cost is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
@@ -13842,10 +14311,31 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         ),
                       ),
                       const SizedBox(height: 8),
-                      if (isInquiryCateringWithEventStyling(inquiryType)) ...[
-                        _buildEventTypePicker(),
-                        const SizedBox(height: 8),
-                      ],
+                      _buildEventTypePicker(),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: customerName,
+                        decoration: _requiredDecoration(
+                          label: 'Customer',
+                          invalid: customerName.text.trim().isEmpty,
+                        ),
+                        onChanged: (_) => setState(() {}),
+                      ),
+                      const SizedBox(height: 2),
+                      CheckboxListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        value: _customerSameAsContact,
+                        onChanged: (v) {
+                          setState(() {
+                            _customerSameAsContact = v ?? false;
+                            if (_customerSameAsContact) customerName.text = contactPerson.text;
+                          });
+                        },
+                        title: const Text('Same as contact person'),
+                        controlAffinity: ListTileControlAffinity.leading,
+                      ),
+                      const SizedBox(height: 8),
                       Text('Formality level', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
                       const SizedBox(height: 6),
                       SegmentedButton<String>(
@@ -13889,6 +14379,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       ),
                       const SizedBox(height: 8),
                       Text('Event schedule (from / to)', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 4),
+                      Text(kCateringEventHoursHint, style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
                       const SizedBox(height: 6),
                       ...List.generate(_eventWindows.length, (index) {
                         final w = _eventWindows[index];
@@ -14304,6 +14796,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                   } else {
                                     _selectedGuestAllergens.remove(name);
                                   }
+                                  selectedDishes.removeWhere((dishName) {
+                                    final d = _inquiryDishByName(dishName, cateringMenu);
+                                    return _dishBlockedByAllergens(d);
+                                  });
                                 }),
                               ),
                           ],
@@ -14383,7 +14879,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
                               selectedSetMenu = next;
                               if (curateOwn && next != 'All Dishes') {
                                 final rows = state.setMenus.where((m) => m.name == next).toList();
-                                if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
+                                if (rows.isNotEmpty) {
+                                  for (final d in rows.first.dishes) {
+                                    if (selectedDishes.length >= _maxSelectedDishesRequired) break;
+                                    if (_canToggleDishSelection(d, cateringMenu, removing: false)) {
+                                      selectedDishes.add(d);
+                                    }
+                                  }
+                                }
                               }
                               if (!curateOwn && next != 'All Dishes') {
                                 menuSuggestionNote = 'Preferred set menu: $next';
@@ -14467,7 +14970,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         Align(
                           alignment: Alignment.centerLeft,
                           child: Text(
-                            'Required selected dishes: at least $_minSelectedDishesRequired',
+                            'Select $_minSelectedDishesRequired–$_maxSelectedDishesRequired dishes (up to $_maxMainDishSelections mains). Set menu items count toward the limit.',
                             style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
                           ),
                         ),
@@ -14487,26 +14990,40 @@ class _InquiryScreenState extends State<InquiryScreen> {
                               child: ListView(
                                 shrinkWrap: false,
                                 children: sorted.map((dishName) {
-                                  MenuItemData? dish;
-                                  for (final c in cateringMenu) {
-                                    if (c.name == dishName) {
-                                      dish = c;
-                                      break;
-                                    }
-                                  }
+                                  final dish = _inquiryDishByName(dishName, cateringMenu);
                                   final sel = selectedDishes.contains(dishName);
+                                  final blocked = _dishBlockedByAllergens(dish);
+                                  final atMax = !sel && selectedDishes.length >= _maxSelectedDishesRequired;
+                                  final atMainMax = !sel &&
+                                      dish != null &&
+                                      dish.dishType.trim().toLowerCase() == 'main' &&
+                                      _selectedMainDishCount(cateringMenu) >= _maxMainDishSelections;
                                   return _cateringInquiryMenuDishTile(
                                     context: context,
                                     dishName: dishName,
                                     dish: dish,
                                     selected: sel,
-                                    onToggleSelect: () => setState(() {
+                                    disabled: blocked || atMax || atMainMax,
+                                    onToggleSelect: () {
                                       if (sel) {
-                                        selectedDishes.remove(dishName);
-                                      } else {
-                                        selectedDishes.add(dishName);
+                                        setState(() => selectedDishes.remove(dishName));
+                                        return;
                                       }
-                                    }),
+                                      if (!_canToggleDishSelection(dishName, cateringMenu, removing: false)) {
+                                        if (atMax) {
+                                          appSnack(
+                                            context,
+                                            'You can select at most $_maxSelectedDishesRequired dishes (including set menu items).',
+                                          );
+                                        } else if (blocked) {
+                                          appSnack(context, 'This dish conflicts with your selected allergens.');
+                                        } else if (atMainMax) {
+                                          appSnack(context, 'You can select up to $_maxMainDishSelections main dishes.');
+                                        }
+                                        return;
+                                      }
+                                      setState(() => selectedDishes.add(dishName));
+                                    },
                                   );
                                 }).toList(),
                               ),
@@ -14529,14 +15046,28 @@ class _InquiryScreenState extends State<InquiryScreen> {
               ),
             ),
           ),
-          SummaryFooter(
-            lines: [
-              SummaryLine('Total Cost', '₱${estimate.toStringAsFixed(2)}', isTotal: true),
-            ],
-            secondaryLabel: 'CANCEL',
-            actionLabel: 'SUBMIT',
-            onSecondary: () => Navigator.of(context).pop(),
-            onAction: () async {
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Center(
+                child: SizedBox(
+                  width: 200,
+                  child: OutlinedButton.icon(
+                    onPressed: () => showCateringPackageDialog(context),
+                    icon: const Icon(Icons.menu_book_outlined, size: 18),
+                    label: const Text('View Package'),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SummaryFooter(
+                lines: [
+                  SummaryLine('Total Cost', '₱${estimate.toStringAsFixed(2)}', isTotal: true),
+                ],
+                secondaryLabel: 'CANCEL',
+                actionLabel: 'SUBMIT',
+                onSecondary: () => Navigator.of(context).pop(),
+                onAction: () async {
               if (widget.state.userEmail == null) {
                 await showCustomerAuthDialog(
                   context,
@@ -14621,7 +15152,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'inquiry_type': inquiryType,
                 'event_title': eventTitle.text.trim(),
                 'event_type': (inquiryType == 'CATERING' || isInquiryCateringWithEventStyling(inquiryType)) ? _resolvedEventType() : '',
-                'customer': contactPerson.text.trim(),
+                'customer': customerName.text.trim().isNotEmpty ? customerName.text.trim() : contactPerson.text.trim(),
                 'contact_person': contactPerson.text.trim(),
                 'contact_number': contactNumber.text.trim(),
                 'inquiry_email': inquiryEmail.text.trim(),
@@ -14677,6 +15208,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 );
               }
             },
+              ),
+            ],
           ),
         ],
       ),
@@ -15026,25 +15559,31 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
                 ),
                 const SizedBox(height: 8),
                 if (themeImg.isNotEmpty)
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.network(
-                      themeImg,
-                      height: 140,
-                      width: double.infinity,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                  GestureDetector(
+                    onTap: () => showThemeDesignFullscreen(ctx, r.themeDesign),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.network(
+                        themeImg,
+                        height: 140,
+                        width: double.infinity,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                      ),
                     ),
                   )
                 else if ('${r.themeDesign['venuePhotoBase64'] ?? ''}'.trim().isNotEmpty)
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.memory(
-                      base64Decode('${r.themeDesign['venuePhotoBase64']}'),
-                      height: 140,
-                      width: double.infinity,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                  GestureDetector(
+                    onTap: () => showThemeDesignFullscreen(ctx, r.themeDesign),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.memory(
+                        base64Decode('${r.themeDesign['venuePhotoBase64']}'),
+                        height: 140,
+                        width: double.infinity,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                      ),
                     ),
                   ),
               ],
@@ -16475,6 +17014,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       initialTime: w.from ?? const TimeOfDay(hour: 12, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
+    if (!isWithinRestaurantHours(t)) {
+      appSnack(ctx, kCateringEventHoursHint);
+      return;
+    }
     setState(() => _eventWindows[index].from = t);
   }
 
@@ -16486,6 +17029,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       initialTime: w.to ?? const TimeOfDay(hour: 14, minute: 0),
     );
     if (!ctx.mounted || t == null) return;
+    if (!isWithinRestaurantHours(t)) {
+      appSnack(ctx, kCateringEventHoursHint);
+      return;
+    }
     setState(() => _eventWindows[index].to = t);
   }
 
@@ -16900,9 +17447,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             menu: menuPayload,
             themeDesign: themeDesign,
             formalityLevel: formalityLevel,
-            seatingPlan: orderKind == 'event' &&
-                    _newEventSeatingPlan != null &&
-                    !_newEventSeatingPlan!.isEffectivelyEmpty
+            seatingPlan: _newEventSeatingPlan != null && !_newEventSeatingPlan!.isEffectivelyEmpty
                 ? _newEventSeatingPlan!.toJson()
                 : null,
           );
@@ -20221,6 +20766,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final showLaborTravelAsText = !isDraftStage &&
         (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted || isCancelled);
     final showSeatingSection = orderSupportsSeatingLayout(row.orderKind) && canShowSeatingLayout(row.status);
+    final canEditSeatingForRow = canEditSeatingLayout(row.status);
     final seatingEventDateTime = _eventDateTimeJoinedFromRowScheduleSlots(row.scheduleSlots);
     final seatingVenueAddress = row.address.trim();
     final managerDraftCanAdvanceToNext =
@@ -20998,13 +21544,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         context: context,
                         seatingPlanJson: row.seatingPlan,
                         themeDesign: row.themeDesign,
-                        exportOnly: true,
+                        exportOnly: !canEditSeatingForRow,
                         eventTitle: row.eventTitle,
                         transactionNo: row.transactionNo,
                         eventDateTime: seatingEventDateTime,
                         venueAddress: seatingVenueAddress,
-                        helperText: 'View seating layout output. Download as image or PDF.',
-                        buttonLabel: 'View seating layout',
+                        helperText: canEditSeatingForRow
+                            ? 'Plan tables and chairs for this event (any event type).'
+                            : 'View seating layout output. Download as image or PDF.',
+                        buttonLabel: canEditSeatingForRow ? 'Edit seating layout' : 'View seating layout',
                         onOpenEditor: () async {
                           final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
                           await Navigator.push<SeatingPlanData?>(
@@ -21018,7 +21566,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 initialPlan: initialPlan.isEffectivelyEmpty ? null : initialPlan,
                                 cashierEmail: widget.state.userEmail,
                                 cashierPassword: widget.state.loginPassword,
-                                readOnly: true,
+                                readOnly: !canEditSeatingForRow,
                                 eventTitle: row.eventTitle,
                                 transactionNo: row.transactionNo,
                                 themeDesign: row.themeDesign,
@@ -23252,7 +23800,10 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                       padding: const EdgeInsets.all(12),
                       gridDelegate: gridDelegate,
                       itemCount: filtered.length,
-                      itemBuilder: (context, i) => _posDishCard(filtered[i]),
+                      itemBuilder: (context, i) => KeyedSubtree(
+                        key: ValueKey('pos-menu-${filtered[i].id}'),
+                        child: _posDishCard(filtered[i]),
+                      ),
                     ),
             ),
           ],
@@ -24011,6 +24562,12 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                           ].where((s) => s.isNotEmpty).join('\n'),
                           style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.25),
                         ),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 4,
+                          children: cashierPaymentProofAndReferenceSection(context, o),
+                        ),
                       ],
                     ),
                   ),
@@ -24408,8 +24965,6 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                   (st.contains('ORDER CONFIRMED') ||
                                       st.contains('OVERPAYMENT') ||
                                       fu == 'DELIVERED');
-                              final hasBalProof =
-                                  orderPaymentReferenceBalance(o) != null || orderHasBalancePaymentProofImage(o);
                               final track = o.deliveryTrackingUrl.trim();
                               return Card(
                                 elevation: 2,
@@ -24475,39 +25030,12 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                           ),
                                         ),
                                       ],
-                                      if (hasBalProof) ...[
-                                        if (orderPaymentReferenceBalance(o) != null)
-                                          Text(
-                                            'Balance ref: ${orderPaymentReferenceBalance(o)}',
-                                            style: TextStyle(fontSize: 12, color: Colors.grey.shade800),
-                                          ),
-                                        if (orderHasBalancePaymentProofImage(o))
-                                          TextButton(
-                                            style: TextButton.styleFrom(
-                                              padding: EdgeInsets.zero,
-                                              minimumSize: Size.zero,
-                                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                            ),
-                                            onPressed: () {
-                                              try {
-                                                final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
-                                                showProofFullScreen(
-                                                  context,
-                                                  Uint8List.fromList(bytes),
-                                                  title: 'Balance payment proof',
-                                                );
-                                              } catch (_) {
-                                                appSnack(context, 'Could not display image');
-                                              }
-                                            },
-                                            child: const Text('View balance payment proof'),
-                                          ),
-                                      ],
-                                      if (orderPaymentReferenceInitial(o) != null)
-                                        Text(
-                                          'Payment ref: ${orderPaymentReferenceInitial(o)}',
-                                          style: TextStyle(fontSize: 12, color: Colors.grey.shade800),
-                                        ),
+                                      const SizedBox(height: 6),
+                                      Wrap(
+                                        spacing: 6,
+                                        runSpacing: 4,
+                                        children: cashierPaymentProofAndReferenceSection(context, o),
+                                      ),
                                     ],
                                   ),
                                   trailing: Text(

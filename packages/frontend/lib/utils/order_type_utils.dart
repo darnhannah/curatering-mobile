@@ -22,14 +22,24 @@ bool orderSupportsSeatingLayout(String orderKind) {
   return k == 'catering' || k == 'event';
 }
 
-/// Show seating section on manager orders (catering or catering + event styling) in On Going only.
+/// Show seating section for catering and catering + event styling orders in active pipeline stages.
 bool canShowSeatingLayout(String status) {
-  return status.trim().toLowerCase() == 'for_ongoing';
+  final s = status.trim().toLowerCase();
+  return s == 'for_down_payment' || s == 'for_ongoing' || s == 'for_full_payment' || s == 'completed';
 }
 
-/// Edit seating layout only while the order is in On Going.
+/// Edit seating layout while the order is still in processing (not completed/cancelled).
 bool canEditSeatingLayout(String status) {
-  return status.trim().toLowerCase() == 'for_ongoing';
+  final s = status.trim().toLowerCase();
+  const editable = {
+    'new_event',
+    'online_inquiries',
+    'for_down_payment',
+    'for_ongoing',
+    'for_full_payment',
+    'for_processing',
+  };
+  return editable.contains(s);
 }
 
 String eventDesignSourceLabel(Map<String, dynamic> themeDesign) {

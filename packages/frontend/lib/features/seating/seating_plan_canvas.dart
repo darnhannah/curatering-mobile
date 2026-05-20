@@ -907,10 +907,13 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
                   style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
                 ),
                 const SizedBox(height: 8),
-                _VenueReferencePhotoStrip(
-                  photos: widget.venueReferencePhotosBase64,
-                  selectedB64: p.floorImageBase64,
-                  onSelect: _useVenueReferenceAsFloor,
+                RepaintBoundary(
+                  child: _VenueReferencePhotoStrip(
+                    key: const ValueKey('seating-venue-ref-strip'),
+                    photos: widget.venueReferencePhotosBase64,
+                    selectedB64: p.floorImageBase64,
+                    onSelect: _useVenueReferenceAsFloor,
+                  ),
                 ),
                 const SizedBox(height: 12),
               ],
@@ -986,6 +989,7 @@ class _SeatingPlanInteractiveState extends State<SeatingPlanInteractive> {
 /// Cached venue reference thumbnails — avoids re-decode flicker when the plan changes.
 class _VenueReferencePhotoStrip extends StatefulWidget {
   const _VenueReferencePhotoStrip({
+    super.key,
     required this.photos,
     required this.selectedB64,
     required this.onSelect,

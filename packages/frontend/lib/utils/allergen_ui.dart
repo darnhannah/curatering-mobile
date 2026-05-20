@@ -163,30 +163,21 @@ Future<void> showMenuDishDetailDialog(
       content: SizedBox(
         width: math.min(MediaQuery.sizeOf(ctx).width * 0.92, 520),
         child: SingleChildScrollView(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
             children: [
               if (imageWidget != null) ...[
-                imageWidget,
-                const SizedBox(width: 12),
+                Center(child: imageWidget),
+                const SizedBox(height: 12),
               ],
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    dishDetailSection('Description', desc),
-                    if (ing.isNotEmpty)
-                      dishDetailSection(
-                        'Ingredients',
-                        ing.join(', '),
-                      ),
-                    if (note.isNotEmpty) dishDetailSection('Notes', note),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              SizedBox(width: 108, child: dishDetailAllergenColumn(list)),
+              dishDetailSection('Description', desc),
+              if (ing.isNotEmpty) dishDetailSection('Ingredients', ing.join(', ')),
+              if (list.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                dishDetailAllergenColumn(list),
+              ],
+              if (note.isNotEmpty) dishDetailSection('Notes', note),
             ],
           ),
         ),
