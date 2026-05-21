@@ -6288,10 +6288,17 @@ class _AuthScreenState extends State<AuthScreen> {
               Positioned.fill(
                 child: LayoutBuilder(
                   builder: (context, constraints) {
-                    final panelW = math.min(constraints.maxWidth * 0.92, 400.0);
+                    final tablet = MediaQuery.sizeOf(context).shortestSide >= 600;
+                    final panelW = _staffAuthPanelMaxWidth(constraints.maxWidth);
+                    final panelPad = tablet
+                        ? const EdgeInsets.fromLTRB(28, 30, 28, 24)
+                        : const EdgeInsets.fromLTRB(20, 22, 20, 18);
                     return Center(
                       child: SingleChildScrollView(
-                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+                        padding: EdgeInsets.symmetric(
+                          horizontal: tablet ? 32 : 20,
+                          vertical: tablet ? 32 : 24,
+                        ),
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           mainAxisSize: MainAxisSize.min,
@@ -6299,30 +6306,31 @@ class _AuthScreenState extends State<AuthScreen> {
                           children: [
                             Image.asset(
                               AppBrandAssets.logoDashboard,
-                              height: _staffLogoHeight(context),
+                              height: _staffAuthTopLogoHeight(context),
                               fit: BoxFit.contain,
                             ),
-                            const SizedBox(height: 14),
+                            SizedBox(height: tablet ? 18 : 14),
                             SizedBox(
                               width: panelW,
                               child: Container(
-                                padding: const EdgeInsets.fromLTRB(20, 22, 20, 18),
+                                padding: panelPad,
                                 decoration: BoxDecoration(
                                   color: AppColors.brand,
-                                  borderRadius: BorderRadius.circular(24),
+                                  borderRadius: BorderRadius.circular(tablet ? 28 : 24),
                                 ),
                                 child: ConstrainedBox(
                                   constraints: BoxConstraints(
-                                    maxHeight: constraints.maxHeight * 0.58,
+                                    maxHeight: constraints.maxHeight *
+                                        _staffAuthPanelMaxHeightFraction(context),
                                   ),
                                   child: _authFormScroll(),
                                 ),
                               ),
                             ),
-                            const SizedBox(height: 20),
+                            SizedBox(height: tablet ? 24 : 20),
                             Image.asset(
                               AppBrandAssets.logoCuratering,
-                              height: 40,
+                              height: _staffAuthBottomLogoHeight(context),
                               fit: BoxFit.contain,
                             ),
                           ],
@@ -7127,6 +7135,35 @@ double _staffLogoHeight(BuildContext context) {
   if (w >= 900) return 100;
   if (w >= 600) return 88;
   return 76;
+}
+
+/// Staff log-in screen only (top Macrina's logo).
+double _staffAuthTopLogoHeight(BuildContext context) {
+  final w = MediaQuery.sizeOf(context).width;
+  if (w >= 900) return 132;
+  if (w >= 600) return 116;
+  return 76;
+}
+
+/// Staff log-in screen only (bottom Curatering logo).
+double _staffAuthBottomLogoHeight(BuildContext context) {
+  final w = MediaQuery.sizeOf(context).width;
+  if (w >= 900) return 68;
+  if (w >= 600) return 56;
+  return 40;
+}
+
+double _staffAuthPanelMaxWidth(double viewportWidth) {
+  if (viewportWidth >= 900) return 520;
+  if (viewportWidth >= 600) return 480;
+  return math.min(viewportWidth * 0.92, 400);
+}
+
+double _staffAuthPanelMaxHeightFraction(BuildContext context) {
+  final w = MediaQuery.sizeOf(context).width;
+  if (w >= 900) return 0.78;
+  if (w >= 600) return 0.72;
+  return 0.58;
 }
 
 /// Tray / checkout line with label and qty controls on one row.
