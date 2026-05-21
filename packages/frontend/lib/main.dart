@@ -904,6 +904,48 @@ const String kCustomerCateringInquiriesAreaNotice =
 /// Legacy combined notice (avoid breaking imports); prefer the specific constants above.
 const String kCustomerDeliveryAndCateringAreaNotice = kCustomerOnlineOrdersAreaNotice;
 
+const String kGuestPostPaymentProofNotice =
+    'After you submit payment proof, watch your email or track your order with your entered email address through the app for payment confirmation and order updates!';
+
+Widget guestPostPaymentProofNoticeBanner() {
+  return Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: const Color(0xFFFFF3CD),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: const Color(0xFFFFC107), width: 2),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(Icons.mark_email_read_outlined, color: Colors.orange.shade900, size: 28),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            kGuestPostPaymentProofNotice,
+            style: TextStyle(
+              fontSize: 14,
+              height: 1.4,
+              fontWeight: FontWeight.w800,
+              color: Colors.brown.shade900,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+/// Pops guest checkout stack to menu while keeping [GuestCustomerShell] bottom navigation.
+void guestPopToMenu(BuildContext context, AppState state) {
+  state.setGuestShellTab(0);
+  final nav = Navigator.of(context);
+  if (nav.canPop()) {
+    nav.popUntil((route) => route.isFirst);
+  }
+}
+
 bool isWithinPast30Days(DateTime t) => DateTime.now().difference(t) <= const Duration(days: 30);
 
 /// Catering/event loyalty (matches backend `loyalty-calculation` thresholds).
@@ -8536,7 +8578,7 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
   Widget _page(int i) {
     switch (i) {
       case 0:
-        return RestaurantMenuScreen(state: widget.state);
+        return _GuestMenuNavHost(state: widget.state);
       case 1:
         return InquiryScreen(state: widget.state);
       case 2:
@@ -8577,31 +8619,7 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
         }
         return Scaffold(
           backgroundColor: Colors.white,
-          body: Column(
-            children: [
-              Material(
-                color: const Color(0xFFFFF8E1),
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          'Guest mode — create an account to earn loyalty rewards.',
-                          style: TextStyle(fontSize: 12.5, height: 1.35, color: Colors.grey.shade900),
-                        ),
-                      ),
-                      TextButton(
-                        onPressed: widget.state.requestAuthSignup,
-                        child: const Text('Sign up'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              Expanded(child: _page(_tab)),
-            ],
-          ),
+          body: _page(_tab),
           bottomNavigationBar: _GuestBottomNavBar(
             selectedIndex: _tab,
             onSelected: (i) {
@@ -8614,6 +8632,21 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
           ),
         );
       },
+    );
+  }
+}
+
+/// Nested navigator for guest menu tab so checkout/payment keep bottom navigation.
+class _GuestMenuNavHost extends StatelessWidget {
+  const _GuestMenuNavHost({required this.state});
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return Navigator(
+      onGenerateRoute: (_) => MaterialPageRoute<void>(
+        builder: (_) => RestaurantMenuScreen(state: state),
+      ),
     );
   }
 }
@@ -8642,7 +8675,9 @@ class CustomerDashboardScreen extends StatelessWidget {
       title: 'DASHBOARD',
       showTrayShortcut: false,
       forceDrawerLeading: true,
-      body: Column(
+      body: ColoredBox(
+        color: const Color(0xFFF5F4F0),
+        child: Column(
         children: [
           Container(
             width: double.infinity,
@@ -8678,9 +8713,6 @@ class CustomerDashboardScreen extends StatelessWidget {
               },
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final w = constraints.maxWidth;
-                  final crossAxisCount = w >= 800 ? 3 : 2;
-                  final childAspectRatio = w >= 800 ? 1.15 : 1.35;
                   return ListView(
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
@@ -8712,49 +8744,39 @@ class CustomerDashboardScreen extends StatelessWidget {
                       const SizedBox(height: 14),
                       const Divider(height: 1),
                       const SizedBox(height: 12),
-                      GridView.builder(
-                        shrinkWrap: true,
-                        physics: const NeverScrollableScrollPhysics(),
-                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: crossAxisCount,
-                          crossAxisSpacing: 10,
-                          mainAxisSpacing: 10,
-                          childAspectRatio: childAspectRatio,
-                        ),
-                        itemCount: otherItems.length,
-                        itemBuilder: (context, index) {
-                          final item = otherItems[index];
-                          return Card(
-                            color: Colors.white,
-                            elevation: 2,
-                            shadowColor: Colors.black26,
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(12),
-                              onTap: () {
-                                if (item.onTap != null) {
-                                  item.onTap!();
-                                  return;
-                                }
-                                final screen = item.screen;
-                                if (screen == null) return;
-                                Navigator.of(context).push(
-                                  MaterialPageRoute<void>(builder: (_) => screen),
-                                );
-                              },
-                              child: Padding(
-                                padding: const EdgeInsets.all(14),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Icon(item.icon, color: AppColors.brand, size: 30),
-                                    const Spacer(),
-                                    Text(item.title, style: const TextStyle(fontWeight: FontWeight.w800)),
-                                  ],
-                                ),
-                              ),
+                      Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 520),
+                          child: GridView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 2,
+                              crossAxisSpacing: 10,
+                              mainAxisSpacing: 10,
+                              childAspectRatio: 1.35,
                             ),
-                          );
-                        },
+                            itemCount: otherItems.length,
+                            itemBuilder: (context, index) {
+                              final item = otherItems[index];
+                              return _CustomerDashTileCard(
+                                title: item.title,
+                                icon: item.icon,
+                                onTap: () {
+                                  if (item.onTap != null) {
+                                    item.onTap!();
+                                    return;
+                                  }
+                                  final screen = item.screen;
+                                  if (screen == null) return;
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute<void>(builder: (_) => screen),
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                        ),
                       ),
                     ],
                   );
@@ -8763,6 +8785,7 @@ class CustomerDashboardScreen extends StatelessWidget {
             ),
           ),
         ],
+        ),
       ),
     );
   }
@@ -9212,17 +9235,18 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                 onChanged: (v) => setState(() => _search = v),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: Align(
-                alignment: Alignment.center,
-                child: Text(
-                  kCustomerOnlineOrdersAreaNotice,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
+            if (!widget.state.isGuestSession)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: Align(
+                  alignment: Alignment.center,
+                  child: Text(
+                    kCustomerOnlineOrdersAreaNotice,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
+                  ),
                 ),
               ),
-            ),
             SizedBox(
               height: 44,
               child: ListView(
@@ -9323,6 +9347,7 @@ class _MenuThumb extends StatefulWidget {
 }
 
 class _MenuThumbState extends State<_MenuThumb> {
+  static final Map<String, Uint8List> _bytesCache = {};
   Uint8List? _bytes;
 
   @override
@@ -9340,13 +9365,21 @@ class _MenuThumbState extends State<_MenuThumb> {
   }
 
   void _decode() {
+    final id = widget.item.id;
+    final cached = _bytesCache[id];
+    if (cached != null) {
+      _bytes = cached;
+      return;
+    }
     final raw = widget.item.imageBase64?.trim();
     if (raw == null || raw.isEmpty) {
       _bytes = null;
       return;
     }
     try {
-      _bytes = Uint8List.fromList(base64Decode(raw));
+      final decoded = Uint8List.fromList(base64Decode(raw));
+      _bytesCache[id] = decoded;
+      _bytes = decoded;
     } catch (_) {
       _bytes = null;
     }
@@ -9359,7 +9392,6 @@ class _MenuThumbState extends State<_MenuThumb> {
     if (bytes != null && bytes.isNotEmpty) {
       final img = Image.memory(
         bytes,
-        key: ValueKey('menu-thumb-${widget.item.id}'),
         fit: BoxFit.cover,
         width: widget.compact ? 56 : double.infinity,
         height: widget.compact ? 56 : double.infinity,
@@ -11620,7 +11652,10 @@ class _PaymentScreenState extends State<PaymentScreen> {
           canPop: !interceptBack,
           onPopInvokedWithResult: (didPop, _) {
             if (didPop) return;
-            if (s.isGuestSession) return;
+            if (s.isGuestSession) {
+              guestPopToMenu(context, s);
+              return;
+            }
             Navigator.of(context).pushAndRemoveUntil(
               MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: s)),
               (_) => false,
@@ -11644,33 +11679,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                     padding: const EdgeInsets.all(12),
                     children: [
                     if (s.isGuestSession && (proofDone || _placedOrder != null)) ...[
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFFFF3CD),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: const Color(0xFFFFC107), width: 2),
-                        ),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Icon(Icons.mark_email_read_outlined, color: Colors.orange.shade900, size: 28),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                'After you submit payment proof, watch your email and text messages for payment confirmation and other order updates.',
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  height: 1.4,
-                                  fontWeight: FontWeight.w800,
-                                  color: Colors.brown.shade900,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
+                      guestPostPaymentProofNoticeBanner(),
                       const SizedBox(height: 12),
                     ],
                     _OrderNoCard(displayNo: paymentOrderNo),
@@ -12060,6 +12069,10 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
       state: state,
       title: 'YOUR ORDER',
       onBackPressed: () {
+        if (state.isGuestSession) {
+          guestPopToMenu(context, state);
+          return;
+        }
         Navigator.of(context).pushAndRemoveUntil(
           MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: state)),
           (_) => false,
@@ -12078,34 +12091,7 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 if (state.isGuestSession) ...[
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFFF3CD),
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: const Color(0xFFFFC107), width: 2),
-                    ),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Icon(Icons.sms_outlined, color: Colors.orange.shade900, size: 28),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            'Please wait for an email or text message from us about payment confirmation, insufficient payment, and delivery updates. '
-                            'Save the contact number and email you used at checkout so you do not miss our messages.',
-                            style: TextStyle(
-                              fontSize: 14,
-                              height: 1.4,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.brown.shade900,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  guestPostPaymentProofNoticeBanner(),
                   const SizedBox(height: 14),
                 ] else
                   Text(
@@ -12198,6 +12184,10 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
                 const SizedBox(height: 16),
                 FilledButton(
                   onPressed: () {
+                    if (state.isGuestSession) {
+                      guestPopToMenu(context, state);
+                      return;
+                    }
                     Navigator.of(context).pushAndRemoveUntil(
                       MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)),
                       (_) => false,
@@ -16384,15 +16374,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await Future<void>.delayed(const Duration(milliseconds: 120));
     widget.state.logout();
     if (!mounted) return;
-    Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
-      MaterialPageRoute<void>(
-        builder: (_) => AuthScreen(
-          state: widget.state,
-          cashierMode: kPosLoginBuild || widget.state.reopenAuthAsStaff,
+    if (kPosLoginBuild || widget.state.reopenAuthAsStaff) {
+      Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+        MaterialPageRoute<void>(
+          builder: (_) => AuthScreen(
+            key: ValueKey(widget.state.authSessionKey),
+            state: widget.state,
+            cashierMode: kPosLoginBuild || widget.state.reopenAuthAsStaff,
+          ),
         ),
-      ),
-      (_) => false,
-    );
+        (_) => false,
+      );
+    }
   }
 
   void _openHelp() {
@@ -24981,13 +24974,6 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                           ].where((s) => s.isNotEmpty).join('\n'),
                           style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.25),
                         ),
-                        if (cashierPaymentProofListIcon(context, o) != null) ...[
-                          const SizedBox(height: 4),
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: cashierPaymentProofListIcon(context, o),
-                          ),
-                        ],
                       ],
                     ),
                   ),
@@ -25452,17 +25438,9 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                       ],
                                     ],
                                   ),
-                                  trailing: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment: CrossAxisAlignment.end,
-                                    children: [
-                                      Text(
-                                        '₱${o.total.toStringAsFixed(2)}',
-                                        style: const TextStyle(fontWeight: FontWeight.w600),
-                                      ),
-                                      if (cashierPaymentProofListIcon(context, o) != null)
-                                        cashierPaymentProofListIcon(context, o)!,
-                                    ],
+                                  trailing: Text(
+                                    '₱${o.total.toStringAsFixed(2)}',
+                                    style: const TextStyle(fontWeight: FontWeight.w600),
                                   ),
                                   onTap: () async {
                                     await Navigator.of(context).push<void>(
