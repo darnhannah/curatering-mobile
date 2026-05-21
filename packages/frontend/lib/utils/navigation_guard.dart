@@ -99,6 +99,7 @@ Future<T?> showGuardedDialog<T>({
   required BuildContext context,
   required WidgetBuilder builder,
   bool barrierDismissible = true,
+  Color? barrierColor,
   bool useRootNavigator = false,
   String? dialogKey,
 }) {
@@ -110,6 +111,7 @@ Future<T?> showGuardedDialog<T>({
   return showDialog<T>(
     context: context,
     barrierDismissible: barrierDismissible,
+    barrierColor: barrierColor,
     useRootNavigator: useRootNavigator,
     builder: builder,
   ).whenComplete(() {
