@@ -90,11 +90,16 @@ class RunPodService {
   static String? _imageUrlFromOutput(Map<String, dynamic>? out) {
     if (out == null) return null;
     final direct = out['image_url'] as String?;
-    if (direct != null && direct.isNotEmpty) return direct;
+    if (direct != null && direct.trim().isNotEmpty) return direct.trim();
+    final legacy = out['image'];
+    if (legacy is String && legacy.trim().isNotEmpty) {
+      final s = legacy.trim();
+      if (s.startsWith('http://') || s.startsWith('https://')) return s;
+    }
     final diag = out['diagnostics'];
     if (diag is Map) {
       final uploaded = diag['public_url'] as String?;
-      if (uploaded != null && uploaded.isNotEmpty) return uploaded;
+      if (uploaded != null && uploaded.trim().isNotEmpty) return uploaded.trim();
     }
     return null;
   }

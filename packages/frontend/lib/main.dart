@@ -26,6 +26,7 @@ import 'features/seating/seating_layout_editor_screen.dart';
 import 'utils/image_pick_limits.dart';
 import 'features/seating/seating_plan.dart';
 import 'utils/allergen_ui.dart';
+import 'utils/navigation_guard.dart';
 import 'utils/order_type_utils.dart';
 import 'widgets/manager_theme_seating_blocks.dart';
 
@@ -260,7 +261,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
   void _showSessionExpiredOnRoot() {
     final navCtx = _rootNavKey.currentContext;
     if (navCtx == null) return;
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: navCtx,
       barrierDismissible: false,
       builder: (ctx) => _SessionExpiredDialog(
@@ -299,7 +300,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
       _stallPromptedOrderNos.add(o.orderNo);
       final navCtx = _rootNavKey.currentContext;
       if (navCtx == null || !navCtx.mounted) return;
-      showDialog<void>(
+      showGuardedDialog<void>(
         context: navCtx,
         barrierDismissible: false,
         builder: (ctx) => AlertDialog(
@@ -312,7 +313,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
             TextButton(
               onPressed: () {
                 Navigator.of(ctx).pop();
-                showDialog<void>(
+                showGuardedDialog<void>(
                   context: navCtx,
                   builder: (confirmCtx) => AlertDialog(
                     title: const Text('Cancel order?'),
@@ -469,7 +470,7 @@ class _PostLoginWelcomeScopeState extends State<_PostLoginWelcomeScope> {
     final s = widget.state;
     if (!s.showLoginWelcomeDialog || !mounted) return;
     s.clearLoginWelcomeFlag();
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Signed in'),
@@ -977,6 +978,9 @@ class AppColors {
   static const success = Color(0xFF2FCB76);
   static const ink = Color(0xFF201B16);
 }
+
+/// Gap between app bar title (or cashier tab header) and the first search field.
+const EdgeInsets kSearchBelowHeaderPadding = EdgeInsets.fromLTRB(12, 10, 12, 8);
 
 /// Customer inquiry + manager new-event dropdown (display labels).
 const List<String> kMobileEventTypeChoices = [
@@ -1833,7 +1837,7 @@ Future<void> showInquiryDetailDialog(
   bool allowFollowUp = false,
   Future<void> Function()? onFollowUp,
 }) async {
-  await showDialog<void>(
+  await showGuardedDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
       backgroundColor: Colors.white,
@@ -1988,7 +1992,7 @@ Future<void> showEventVenueMapPreview(BuildContext context, String address) asyn
     appSnack(context, 'No event venue address to show.');
     return;
   }
-  await showDialog<void>(
+  await showGuardedDialog<void>(
     context: context,
     builder: (ctx) => _EventVenueMapPreviewDialog(address: q),
   );
@@ -2135,7 +2139,7 @@ Widget? cashierPaymentProofListIcon(BuildContext context, OrderData o) {
 }
 
 void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
-  showDialog<void>(
+  showGuardedDialog<void>(
     context: context,
     builder: (ctx) => Dialog(
       insetPadding: const EdgeInsets.all(12),
@@ -2165,7 +2169,7 @@ Future<T?> withCashierBlockingProgress<T>(
   String message,
   Future<T> future,
 ) async {
-  showDialog<void>(
+  showGuardedDialog<void>(
     context: context,
     barrierDismissible: false,
     builder: (ctx) => AlertDialog(
@@ -2200,7 +2204,7 @@ Future<Map<String, dynamic>?> promptAdditionalCostLineItem(
   final amountCtrl = TextEditingController(
     text: initialAmount != null && initialAmount > 0 ? initialAmount.toStringAsFixed(2) : '',
   );
-  final ok = await showDialog<bool>(
+  final ok = await showGuardedDialog<bool>(
     context: context,
     builder: (dlgCtx) => AlertDialog(
       title: Text(initialLabel.isEmpty ? 'Add additional cost' : 'Edit additional cost'),
@@ -2250,7 +2254,7 @@ Future<bool> confirmManagerPaymentAmountMismatch(
   const tolerance = 0.01;
   if ((amountEntered - amountDue).abs() <= tolerance) return true;
   final insufficient = amountEntered < amountDue - tolerance;
-  final proceed = await showDialog<bool>(
+  final proceed = await showGuardedDialog<bool>(
     context: context,
     builder: (dlgCtx) => AlertDialog(
       title: Text(
@@ -4123,7 +4127,7 @@ class AppState extends ChangeNotifier {
         headerImage = null;
       }
     }
-    final ok = await showDialog<bool>(
+    final ok = await showGuardedDialog<bool>(
       context: context,
       builder: (ctx) {
         return StatefulBuilder(
@@ -5770,39 +5774,11 @@ class _AuthScreenState extends State<AuthScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF242424),
-      body: SafeArea(
-        child: Stack(
-          children: [
-            Column(
-              children: [
-            const SizedBox(height: 36),
-            if (widget.cashierMode)
-              Image.asset(AppBrandAssets.logoDashboard, height: _staffLogoHeight(context), fit: BoxFit.contain)
-            else
-              SizedBox(
-                height: _staffLogoHeight(context) + 64,
-                width: double.infinity,
-                child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
-              ),
-            const SizedBox(height: 24),
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
-                decoration: const BoxDecoration(
-                  color: AppColors.brand,
-                  borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-                ),
-                child: Column(
-                  children: [
-                    Expanded(
-                      child: SingleChildScrollView(
-                        child: Column(
-                          children: [
+
+  Widget _authFormScroll() {
+    return SingleChildScrollView(
+      child: Column(
+        children: [
                       Text(
                         signupMode ? 'SIGN UP' : 'LOG IN',
                         style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
@@ -6044,7 +6020,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                   forgotOtpController.clear();
                                   forgotNewPasswordController.clear();
                                   forgotConfirmPasswordController.clear();
-                                  await showDialog<void>(
+                                  await showGuardedDialog<void>(
                                     context: context,
                                     builder: (dCtx) {
                                       final step = <int>[0];
@@ -6296,21 +6272,93 @@ class _AuthScreenState extends State<AuthScreen> {
                             signupMode ? 'ALREADY HAVE AN ACCOUNT? LOG IN' : "DON'T HAVE AN ACCOUNT? SIGN UP",
                           ),
                         ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF242424),
+      body: SafeArea(
+        child: Stack(
+          children: [
+            if (widget.cashierMode)
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final panelW = math.min(constraints.maxWidth * 0.92, 400.0);
+                    return Center(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            Image.asset(
+                              AppBrandAssets.logoDashboard,
+                              height: _staffLogoHeight(context),
+                              fit: BoxFit.contain,
+                            ),
+                            const SizedBox(height: 14),
+                            SizedBox(
+                              width: panelW,
+                              child: Container(
+                                padding: const EdgeInsets.fromLTRB(20, 22, 20, 18),
+                                decoration: BoxDecoration(
+                                  color: AppColors.brand,
+                                  borderRadius: BorderRadius.circular(24),
+                                ),
+                                child: ConstrainedBox(
+                                  constraints: BoxConstraints(
+                                    maxHeight: constraints.maxHeight * 0.58,
+                                  ),
+                                  child: _authFormScroll(),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 20),
+                            Image.asset(
+                              AppBrandAssets.logoCuratering,
+                              height: 40,
+                              fit: BoxFit.contain,
+                            ),
                           ],
                         ),
                       ),
-                    ),
-                    if (widget.cashierMode) ...[
-                      const SizedBox(height: 12),
-                      Image.asset(AppBrandAssets.logoCuratering, height: 44, fit: BoxFit.contain),
-                      const SizedBox(height: 12),
-                    ],
-                  ],
+                    );
+                  },
                 ),
+              )
+            else
+              Column(
+                children: [
+                  const SizedBox(height: 36),
+                  SizedBox(
+                    height: _staffLogoHeight(context) + 64,
+                    width: double.infinity,
+                    child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
+                  ),
+                  const SizedBox(height: 24),
+                  Expanded(
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(20),
+                      decoration: const BoxDecoration(
+                        color: AppColors.brand,
+                        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+                      ),
+                      child: Column(
+                        children: [
+                          Expanded(child: _authFormScroll()),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
               ),
-            ),
-              ],
-            ),
             if (busyMessage != null)
               Positioned.fill(
                 child: ColoredBox(
@@ -6515,7 +6563,7 @@ class AppScaffold extends StatelessWidget {
             IconButton(
               tooltip: 'Your tray',
               onPressed: () {
-                Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => TrayScreen(state: state)));
+                pushMaterialPage<void>(context, TrayScreen(state: state));
               },
               icon: Badge(
                 isLabelVisible: qty > 0,
@@ -6537,7 +6585,8 @@ class AppDrawer extends StatelessWidget {
   final AppState state;
 
   void open(BuildContext context, Widget screen) {
-    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
+    Navigator.pop(context);
+    pushMaterialPage<void>(context, screen);
   }
 
   @override
@@ -6755,9 +6804,7 @@ class CashierRoleDrawer extends StatelessWidget {
             onTap: () {
               Navigator.pop(context);
               if (!closeExtraRouteForManageOrders) {
-                Navigator.of(context).push(
-                  MaterialPageRoute<void>(builder: (_) => PosOrderHistoryScreen(state: state)),
-                );
+                pushMaterialPage<void>(context, PosOrderHistoryScreen(state: state));
               }
             },
           ),
@@ -6774,9 +6821,7 @@ class CashierRoleDrawer extends StatelessWidget {
             title: const Text('Settings'),
             onTap: () {
               Navigator.pop(context);
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
-              );
+              pushMaterialPage<void>(context, SettingsScreen(state: state));
             },
           ),
         ],
@@ -6847,7 +6892,7 @@ class SupervisorStaffDrawer extends StatelessWidget {
             title: const Text('Settings'),
             onTap: () {
               Navigator.pop(context);
-              Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)));
+              pushMaterialPage<void>(context, SettingsScreen(state: state));
             },
           ),
         ],
@@ -6881,9 +6926,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
           drawer: SupervisorStaffDrawer(
             state: state,
             onOngoing: () {
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
-              );
+              pushMaterialPage<void>(context, SupervisorOngoingShellScreen(state: state));
             },
           ),
           body: Column(
@@ -6915,9 +6958,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
                     child: InkWell(
                       borderRadius: BorderRadius.circular(12),
                       onTap: () {
-                        Navigator.of(context).push(
-                          MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
-                        );
+                        pushMaterialPage<void>(context, SupervisorOngoingShellScreen(state: state));
                       },
                       child: Padding(
                         padding: const EdgeInsets.all(20),
@@ -7061,7 +7102,7 @@ class ManagerRoleDrawer extends StatelessWidget {
             title: const Text('Settings'),
             onTap: () {
               Navigator.pop(context);
-              Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)));
+              pushMaterialPage<void>(context, SettingsScreen(state: state));
             },
           ),
         ],
@@ -7326,7 +7367,7 @@ Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppStat
     od = state.orders.firstWhere((e) => e.id == o.id);
   } catch (_) {}
   final trackUrl = od.deliveryTrackingUrl.trim();
-  await showDialog<void>(
+  await showGuardedDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
       backgroundColor: Colors.white,
@@ -7439,7 +7480,7 @@ Future<void> _guestTrackCancelInquiry(
   InquiryRecord r, {
   required String contactEmail,
 }) async {
-  final ok = await showDialog<bool>(
+  final ok = await showGuardedDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
       title: const Text('Cancel inquiry?'),
@@ -7465,7 +7506,7 @@ Future<void> _guestTrackFollowUp(BuildContext context, AppState state, OrderData
 }
 
 Future<void> _guestTrackConfirmCancel(BuildContext context, AppState state, OrderData o) async {
-  final ok = await showDialog<bool>(
+  final ok = await showGuardedDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
       title: const Text('Cancel this order?'),
@@ -7983,7 +8024,7 @@ Future<void> showCustomerAuthDialog(
   bool offerGuestContinue = false,
   int guestContinueTabIndex = 0,
 }) async {
-  await showDialog<void>(
+  await showGuardedDialog<void>(
     context: context,
     builder: (dCtx) {
       return Dialog(
@@ -8241,7 +8282,7 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
 }
 
 void showCateringPackageDialog(BuildContext context) {
-  showDialog<void>(
+  showGuardedDialog<void>(
     context: context,
     builder: (ctx) {
       return DefaultTabController(
@@ -8741,9 +8782,7 @@ class CustomerDashboardScreen extends StatelessWidget {
                                     child: _CustomerDashTileCard(
                                       title: primaryPair[i].title,
                                       icon: primaryPair[i].icon,
-                                      onTap: () => Navigator.of(context).push(
-                                        MaterialPageRoute<void>(builder: (_) => primaryPair[i].screen),
-                                      ),
+                                      onTap: () => pushMaterialPage<void>(context, primaryPair[i].screen),
                                     ),
                                   ),
                                 ],
@@ -8780,9 +8819,7 @@ class CustomerDashboardScreen extends StatelessWidget {
                                   }
                                   final screen = item.screen;
                                   if (screen == null) return;
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute<void>(builder: (_) => screen),
-                                  );
+                                  pushMaterialPage<void>(context, screen);
                                 },
                               );
                             },
@@ -8893,9 +8930,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
           );
         },
         onManageEvents: () {
-          Navigator.of(context).push(
-            MaterialPageRoute<void>(builder: (_) => ManagerCateringShellScreen(state: state)),
-          );
+          pushMaterialPage<void>(context, ManagerCateringShellScreen(state: state));
         },
       ),
       body: Column(
@@ -8950,9 +8985,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
                         shadowColor: Colors.black26,
                         child: InkWell(
                           borderRadius: BorderRadius.circular(12),
-                          onTap: () => Navigator.of(context).push(
-                            MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
-                          ),
+                          onTap: () => pushMaterialPage<void>(context, SettingsScreen(state: state)),
                           child: const Padding(
                             padding: EdgeInsets.all(14),
                             child: Column(
@@ -9182,11 +9215,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                                   return;
                                 }
                                 if (!context.mounted) return;
-                                Navigator.of(context).push<void>(
-                                  MaterialPageRoute<void>(
-                                    builder: (_) => CheckoutScreen(state: widget.state),
-                                  ),
-                                );
+                                pushMaterialPage<void>(context, CheckoutScreen(state: widget.state));
                               },
                         child: const Text('CHECKOUT'),
                       ),
@@ -9240,7 +9269,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
         final menuBody = Column(
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              padding: kSearchBelowHeaderPadding,
               child: TextField(
                 decoration: const InputDecoration(hintText: 'SEARCH'),
                 onChanged: (v) => setState(() => _search = v),
@@ -9876,7 +9905,7 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
 
   Future<void> _recolorFirstObject() async {
     if (_extractedObjects.isEmpty) return;
-    final selection = await showDialog<Map<String, dynamic>>(
+    final selection = await showGuardedDialog<Map<String, dynamic>>(
       context: context,
       builder: (ctx) {
         String? selectedObjectId = '${_extractedObjects.first['id'] ?? ''}';
@@ -10660,7 +10689,7 @@ class TrayScreen extends StatelessWidget {
                           return;
                         }
                         if (!context.mounted) return;
-                        Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => CheckoutScreen(state: state)));
+                        pushMaterialPage<void>(context, CheckoutScreen(state: state));
                       },
               ),
             ],
@@ -10898,7 +10927,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 
   Future<void> _openGuestMapsDialog() async {
     final addrHint = _guestDeliveryCtl.text.trim();
-    final r = await showDialog<MapPinResult>(
+    final r = await showGuardedDialog<MapPinResult>(
       context: context,
       builder: (ctx) => _MapPinPickerDialog(
         initialSearchQuery: addrHint,
@@ -11165,6 +11194,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                           },
                         ),
                       ],
+                      const SizedBox(height: 12),
                       LockedField(label: 'TIME OF DELIVERY', value: deliveryTimeLabel),
                       const SizedBox(height: 8),
                       Wrap(
@@ -11306,7 +11336,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 s.profile.deliveryAddress = _selectedDeliveryAddress!.trim();
               }
               s.updateCheckoutDraftDeliveryTime(_selectedDeliveryTime);
-              final okCheckout = await showDialog<bool>(
+              final okCheckout = await showGuardedDialog<bool>(
                 context: context,
                 builder: (ctx) => AlertDialog(
                   title: const Text('Confirm order'),
@@ -11320,14 +11350,13 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 ),
               );
               if (okCheckout != true || !context.mounted) return;
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => PaymentScreen(
-                    state: s,
-                    order: null,
-                    note: noteController.text,
-                    draftCheckout: true,
-                  ),
+              pushMaterialPage<void>(
+                context,
+                PaymentScreen(
+                  state: s,
+                  order: null,
+                  note: noteController.text,
+                  draftCheckout: true,
                 ),
               );
             },
@@ -11972,7 +12001,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                     );
                     return;
                   }
-                  showDialog<bool>(
+                  showGuardedDialog<bool>(
                     context: context,
                     builder: (ctx) => AlertDialog(
                       title: Text(insNow ? 'Submit balance payment?' : 'Submit order?'),
@@ -12210,7 +12239,7 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
                   const SizedBox(height: 10),
                   OutlinedButton(
                     onPressed: () {
-                      Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => MyOrdersScreen(state: state)));
+                      pushMaterialPage<void>(context, MyOrdersScreen(state: state));
                     },
                     child: const Text('MY ORDERS'),
                   ),
@@ -12253,7 +12282,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
   }
 
   Future<void> _confirmCancelOrder(OrderData o) async {
-    final ok = await showDialog<bool>(
+    final ok = await showGuardedDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Cancel this order?'),
@@ -12375,7 +12404,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
       final n = int.tryParse('$prevStars');
       if (n != null) stars = n.clamp(1, 5);
     }
-    final ok = await showDialog<bool>(
+    final ok = await showGuardedDialog<bool>(
       context: context,
       builder: (ctx) {
         return StatefulBuilder(
@@ -12425,7 +12454,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
     final msg = ctl.text.trim();
     ctl.dispose();
     if (ok != true || !mounted) return;
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (_) => const Center(child: CircularProgressIndicator()),
@@ -12722,7 +12751,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                       widget.state.markOrderAttentionRead(o.orderNo);
                       await widget.state.loadRestaurantOrderDetail(o.id);
                       if (!context.mounted) return;
-                      showDialog<void>(
+                      showGuardedDialog<void>(
                         context: context,
                         builder: (ctx) {
                           OrderData od = o;
@@ -12838,10 +12867,10 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                               TextButton(
                                 onPressed: () {
                                   Navigator.of(ctx).pop();
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute<void>(
-                                      builder: (_) => PaymentScreen(state: widget.state, order: od, note: od.note),
-                                    ),
+                                  pushMaterialPage<void>(
+                                    context,
+                                    PaymentScreen(state: widget.state, order: od, note: od.note),
+                                    routeKey: 'PaymentScreen:${od.orderNo}',
                                   );
                                 },
                                 child: const Text('Balance payment'),
@@ -12957,7 +12986,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
           body: Column(
             children: [
               Padding(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
                 child: Row(
                   children: [
                     Expanded(
@@ -13317,7 +13346,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
   Future<void> _openMapsDialog() async {
     final p = widget.state.profile;
     final addrHint = addressController.text.trim().isNotEmpty ? addressController.text.trim() : p.deliveryAddress;
-    final r = await showDialog<MapPinResult>(
+    final r = await showGuardedDialog<MapPinResult>(
       context: context,
       builder: (ctx) => _MapPinPickerDialog(
         initialSearchQuery: addrHint,
@@ -14039,6 +14068,25 @@ class _InquiryEventWindow {
   TimeOfDay? to;
 }
 
+DateTime _inquiryDateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
+
+DateTime? _inquiryWindowStart(_InquiryEventWindow w) {
+  if (w.date == null || w.from == null) return null;
+  return DateTime(w.date!.year, w.date!.month, w.date!.day, w.from!.hour, w.from!.minute);
+}
+
+DateTime? _inquiryWindowEnd(_InquiryEventWindow w) {
+  if (w.date == null || w.to == null) return null;
+  return DateTime(w.date!.year, w.date!.month, w.date!.day, w.to!.hour, w.to!.minute);
+}
+
+bool _inquiryDateTimeIsPast(DateTime dt) => dt.isBefore(DateTime.now());
+
+TimeOfDay _inquiryEarliestTimeToday() {
+  final n = DateTime.now();
+  return TimeOfDay(hour: n.hour, minute: n.minute);
+}
+
 class InquiryScreen extends StatefulWidget {
   const InquiryScreen({super.key, required this.state});
   final AppState state;
@@ -14307,40 +14355,148 @@ class _InquiryScreenState extends State<InquiryScreen> {
   Future<void> _pickWindowDate(int index) async {
     final ctx = context;
     final w = _eventWindows[index];
-    final base = w.date ?? DateTime.now();
+    final today = _inquiryDateOnly(DateTime.now());
+    final base = w.date != null && !_inquiryDateTimeIsPast(_inquiryWindowStart(w) ?? today)
+        ? w.date!
+        : today;
     final d = await showDatePicker(
       context: ctx,
-      initialDate: base,
-      firstDate: DateTime.now().subtract(const Duration(days: 1)),
+      initialDate: base.isBefore(today) ? today : base,
+      firstDate: today,
       lastDate: DateTime.now().add(const Duration(days: 365 * 3)),
     );
     if (!ctx.mounted || d == null) return;
-    setState(() => _eventWindows[index].date = DateTime(d.year, d.month, d.day));
+    final picked = DateTime(d.year, d.month, d.day);
+    setState(() {
+      _eventWindows[index].date = picked;
+      final start = _inquiryWindowStart(_eventWindows[index]);
+      if (start != null && _inquiryDateTimeIsPast(start)) {
+        _eventWindows[index].from = null;
+        _eventWindows[index].to = null;
+      }
+    });
     _scheduleConflictRefresh();
   }
 
   Future<void> _pickWindowFrom(int index) async {
     final ctx = context;
     final w = _eventWindows[index];
+    if (w.date == null) {
+      appSnack(ctx, 'Choose the event date first.');
+      return;
+    }
+    final today = _inquiryDateOnly(DateTime.now());
+    final isToday = _inquiryDateOnly(w.date!) == today;
+    var initial = w.from ?? const TimeOfDay(hour: 12, minute: 0);
+    if (isToday) {
+      final earliest = _inquiryEarliestTimeToday();
+      if (initial.hour < earliest.hour ||
+          (initial.hour == earliest.hour && initial.minute < earliest.minute)) {
+        initial = earliest;
+      }
+    }
     final t = await showTimePicker(
       context: ctx,
-      initialTime: w.from ?? const TimeOfDay(hour: 12, minute: 0),
+      initialTime: initial,
     );
     if (!ctx.mounted || t == null) return;
-    setState(() => _eventWindows[index].from = t);
+    final start = DateTime(w.date!.year, w.date!.month, w.date!.day, t.hour, t.minute);
+    if (_inquiryDateTimeIsPast(start)) {
+      appSnack(ctx, 'Start time cannot be in the past.');
+      return;
+    }
+    setState(() {
+      _eventWindows[index].from = t;
+      final end = _inquiryWindowEnd(_eventWindows[index]);
+      if (end != null && !end.isAfter(start)) {
+        _eventWindows[index].to = null;
+      }
+    });
     _scheduleConflictRefresh();
   }
 
   Future<void> _pickWindowTo(int index) async {
     final ctx = context;
     final w = _eventWindows[index];
+    if (w.date == null) {
+      appSnack(ctx, 'Choose the event date first.');
+      return;
+    }
+    if (w.from == null) {
+      appSnack(ctx, 'Choose the start time first.');
+      return;
+    }
+    final start = _inquiryWindowStart(w)!;
+    final today = _inquiryDateOnly(DateTime.now());
+    final isToday = _inquiryDateOnly(w.date!) == today;
+    var initial = w.to ?? TimeOfDay(hour: (w.from!.hour + 1) % 24, minute: w.from!.minute);
+    if (isToday) {
+      final earliest = _inquiryEarliestTimeToday();
+      if (initial.hour < earliest.hour ||
+          (initial.hour == earliest.hour && initial.minute < earliest.minute)) {
+        initial = TimeOfDay(hour: earliest.hour, minute: earliest.minute);
+      }
+    }
     final t = await showTimePicker(
       context: ctx,
-      initialTime: w.to ?? const TimeOfDay(hour: 14, minute: 0),
+      initialTime: initial,
     );
     if (!ctx.mounted || t == null) return;
+    final end = DateTime(w.date!.year, w.date!.month, w.date!.day, t.hour, t.minute);
+    if (_inquiryDateTimeIsPast(end)) {
+      appSnack(ctx, 'End time cannot be in the past.');
+      return;
+    }
+    if (!end.isAfter(start)) {
+      appSnack(ctx, 'End time must be after start time.');
+      return;
+    }
     setState(() => _eventWindows[index].to = t);
     _scheduleConflictRefresh();
+  }
+
+  Future<void> _pickFoodTastingDate() async {
+    final today = _inquiryDateOnly(DateTime.now());
+    final d = await showDatePicker(
+      context: context,
+      initialDate: today,
+      firstDate: today,
+      lastDate: DateTime.now().add(const Duration(days: 365 * 2)),
+    );
+    if (!mounted || d == null) return;
+    setState(() {
+      foodTastingDate.text =
+          '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+      foodTastingTime.clear();
+    });
+  }
+
+  Future<void> _pickFoodTastingTime() async {
+    if (foodTastingDate.text.trim().isEmpty) {
+      appSnack(context, 'Choose the food tasting date first.');
+      return;
+    }
+    final parts = foodTastingDate.text.trim().split('-');
+    if (parts.length != 3) return;
+    final y = int.tryParse(parts[0]);
+    final m = int.tryParse(parts[1]);
+    final day = int.tryParse(parts[2]);
+    if (y == null || m == null || day == null) return;
+    final dateOnly = DateTime(y, m, day);
+    final today = _inquiryDateOnly(DateTime.now());
+    var initial = const TimeOfDay(hour: 13, minute: 0);
+    if (dateOnly == today) initial = _inquiryEarliestTimeToday();
+    final t = await showTimePicker(context: context, initialTime: initial);
+    if (!mounted || t == null) return;
+    final dt = DateTime(y, m, day, t.hour, t.minute);
+    if (_inquiryDateTimeIsPast(dt)) {
+      appSnack(context, 'Food tasting time cannot be in the past.');
+      return;
+    }
+    setState(() {
+      foodTastingTime.text =
+          '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+    });
   }
 
   void _onVenueChanged() {
@@ -14380,10 +14536,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
   }
 
   Future<void> _pickVenueOnMap() async {
-    final res = await Navigator.of(context).push<MapPinResult>(
+    final res = await pushGuardedRoute<MapPinResult>(
+      context,
       MaterialPageRoute(
         builder: (_) => _MapPinPickerDialog(initialSearchQuery: eventCity.text.trim()),
       ),
+      routeKey: '_MapPinPickerDialog',
     );
     if (res == null || !mounted) return;
     setState(() {
@@ -14549,6 +14707,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
     final completeWindows = _eventWindows.where((w) => w.date != null && w.from != null && w.to != null).toList();
     if (completeWindows.isEmpty) return 'Set at least one event day with start and end time.';
     for (final w in completeWindows) {
+      final start = _inquiryWindowStart(w);
+      final end = _inquiryWindowEnd(w);
+      if (start != null && _inquiryDateTimeIsPast(start)) {
+        return 'Event date and time cannot be in the past.';
+      }
+      if (end != null && _inquiryDateTimeIsPast(end)) {
+        return 'Event end time cannot be in the past.';
+      }
       final sm = w.from!.hour * 60 + w.from!.minute;
       final em = w.to!.hour * 60 + w.to!.minute;
       if (em <= sm) return 'End time must be after start time for each event.';
@@ -14576,6 +14742,21 @@ class _InquiryScreenState extends State<InquiryScreen> {
     if (foodTastingRequested &&
         (foodTastingDate.text.trim().isEmpty || foodTastingTime.text.trim().isEmpty)) {
       return 'Enter date and time for food tasting.';
+    }
+    if (foodTastingRequested) {
+      final dp = foodTastingDate.text.trim().split('-');
+      final tp = foodTastingTime.text.trim().split(':');
+      if (dp.length == 3 && tp.length >= 2) {
+        final y = int.tryParse(dp[0]);
+        final mo = int.tryParse(dp[1]);
+        final d = int.tryParse(dp[2]);
+        final h = int.tryParse(tp[0]);
+        final mi = int.tryParse(tp[1]);
+        if (y != null && mo != null && d != null && h != null && mi != null) {
+          final ft = DateTime(y, mo, d, h, mi);
+          if (_inquiryDateTimeIsPast(ft)) return 'Food tasting date and time cannot be in the past.';
+        }
+      }
     }
     final rawGuests = guestCount.text.trim();
     if (rawGuests.isEmpty) return 'Enter number of guests.';
@@ -15122,7 +15303,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                 appSnack(context, 'Enter your email before opening theme design.');
                                 return;
                               }
-                              final result = await Navigator.push<Map<String, dynamic>?>(
+                              final result = await pushGuardedRoute<Map<String, dynamic>?>(
                                 context,
                                 MaterialPageRoute<Map<String, dynamic>?>(
                                   builder: (_) => EventThemeDesignScreen(
@@ -15136,6 +15317,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                     eventSetting: eventSetting,
                                   ),
                                 ),
+                                routeKey: 'EventThemeDesignScreen:inquiry',
                               );
                               if (result != null && mounted) {
                                 setState(() => _aiThemeDesignPayload = result);
@@ -15349,19 +15531,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                     invalid: foodTastingRequested && foodTastingDate.text.trim().isEmpty,
                                     hint: 'date',
                                   ),
-                                  onTap: () async {
-                                    final d = await showDatePicker(
-                                      context: context,
-                                      initialDate: DateTime.now(),
-                                      firstDate: DateTime.now().subtract(const Duration(days: 1)),
-                                      lastDate: DateTime.now().add(const Duration(days: 365 * 2)),
-                                    );
-                                    if (d == null) return;
-                                    setState(() {
-                                      foodTastingDate.text =
-                                          '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
-                                    });
-                                  },
+                                  onTap: _pickFoodTastingDate,
                                 ),
                               ),
                               const SizedBox(width: 8),
@@ -15374,14 +15544,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                     invalid: foodTastingRequested && foodTastingTime.text.trim().isEmpty,
                                     hint: 'time',
                                   ),
-                                  onTap: () async {
-                                    final t = await showTimePicker(context: context, initialTime: const TimeOfDay(hour: 13, minute: 0));
-                                    if (t == null) return;
-                                    setState(() {
-                                      foodTastingTime.text =
-                                          '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
-                                    });
-                                  },
+                                  onTap: _pickFoodTastingTime,
                                 ),
                               ),
                             ],
@@ -15512,7 +15675,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
               }
               final est = _estimatedCost();
               final typeLabel = _resolvedEventType();
-              final ok = await showDialog<bool>(
+              final ok = await showGuardedDialog<bool>(
                 context: context,
                 builder: (ctx) => AlertDialog(
                   title: const Text('Submit inquiry?'),
@@ -15550,7 +15713,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 ),
               );
               if (ok != true || !context.mounted) return;
-              showDialog<void>(
+              showGuardedDialog<void>(
                 context: context,
                 barrierDismissible: false,
                 builder: (loadingCtx) => PopScope(
@@ -15852,7 +16015,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
   }
 
   Future<void> _cancelInquiry(InquiryRecord r) async {
-    final ok = await showDialog<bool>(
+    final ok = await showGuardedDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Cancel inquiry/order?'),
@@ -15881,7 +16044,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
       final n = int.tryParse('$prevStars');
       if (n != null) stars = n.clamp(1, 5);
     }
-    final ok = await showDialog<bool>(
+    final ok = await showGuardedDialog<bool>(
       context: context,
       builder: (ctx) {
         return StatefulBuilder(
@@ -15930,7 +16093,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     );
     final msg = ctl.text.trim();
     if (ok != true || !mounted) return;
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (_) => const Center(child: CircularProgressIndicator()),
@@ -15963,7 +16126,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     final feedback = _feedbackByInquiryId[r.id];
     final themeImg =
         '${r.themeDesign['generatedImageUrl'] ?? r.themeDesign['imageUrl'] ?? ''}'.trim();
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(r.displayTransactionRef),
@@ -16369,7 +16532,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _confirmLogout() async {
-    final ok = await showDialog<bool>(
+    final ok = await showGuardedDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Log out?'),
@@ -16405,7 +16568,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   void _openHelp() {
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Help request'),
@@ -16491,13 +16654,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   title: const Text('Event theme design options'),
                   subtitle: const Text('Edit style, mood, color, and decor choices shown to customers.'),
                   onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute<void>(
-                        builder: (_) => EventDesignAdminScreen(
-                          apiBase: widget.state.apiBase,
-                          staffEmail: widget.state.userEmail!.trim(),
-                          staffPassword: widget.state.loginPassword,
-                        ),
+                    pushMaterialPage<void>(
+                      context,
+                      EventDesignAdminScreen(
+                        apiBase: widget.state.apiBase,
+                        staffEmail: widget.state.userEmail!.trim(),
+                        staffPassword: widget.state.loginPassword,
                       ),
                     );
                   },
@@ -16810,7 +16972,7 @@ void showCashierHelpDialog(BuildContext context, AppState state) {
   final area = TextEditingController();
   final problem = TextEditingController();
   final outcome = TextEditingController();
-  showDialog<void>(
+  showGuardedDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
       title: const Text('Help request'),
@@ -16906,7 +17068,7 @@ class _PosOrderHistoryScreenState extends State<PosOrderHistoryScreen> {
     final p2 = _historyProofImage(context, o.supplementalPaymentProofBase64, title: 'Additional payment proof');
     final showP1 = o.paymentProofBase64 != null && o.paymentProofBase64!.trim().isNotEmpty;
     final showP2 = o.supplementalPaymentProofBase64 != null && o.supplementalPaymentProofBase64!.trim().isNotEmpty;
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(uiOrderNo(o.orderNo)),
@@ -17231,11 +17393,7 @@ class _ManagerNewEventListTab extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
             child: FilledButton.icon(
               onPressed: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (ctx) => ManagerNewEventCreateScreen(state: state),
-                  ),
-                );
+                pushMaterialPage<void>(context, ManagerNewEventCreateScreen(state: state));
               },
               icon: const Icon(Icons.add_circle_outline),
               label: const Text('NEW EVENT'),
@@ -17751,10 +17909,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   }
 
   Future<void> _pickVenueOnMap() async {
-    final res = await Navigator.of(context).push<MapPinResult>(
+    final res = await pushGuardedRoute<MapPinResult>(
+      context,
       MaterialPageRoute(
         builder: (_) => _MapPinPickerDialog(initialSearchQuery: eventCity.text.trim()),
       ),
+      routeKey: '_MapPinPickerDialog',
     );
     if (res == null || !mounted) return;
     setState(() {
@@ -17814,7 +17974,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
           {'label': 'Theme design cost', 'amount': _themeCostComputed()},
         {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
       ];
-      final yes = await showDialog<bool>(
+      final yes = await showGuardedDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Text('Create new event?'),
@@ -18530,7 +18690,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   appSnack(context, 'Enter customer email before opening theme design.');
                   return;
                 }
-                final result = await Navigator.push<Map<String, dynamic>?>(
+                final result = await pushGuardedRoute<Map<String, dynamic>?>(
                   context,
                   MaterialPageRoute<Map<String, dynamic>?>(
                     builder: (_) => EventThemeDesignScreen(
@@ -18546,6 +18706,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                       cashierPassword: widget.state.loginPassword,
                     ),
                   ),
+                  routeKey: 'EventThemeDesignScreen:new_event',
                 );
                 if (result != null && mounted) {
                   setState(() => _newEventThemeDesign = result);
@@ -18578,7 +18739,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   appSnack(context, 'Enter customer email before editing seating.');
                   return;
                 }
-                final result = await Navigator.push<SeatingPlanData?>(
+                final result = await pushGuardedRoute<SeatingPlanData?>(
                   context,
                   MaterialPageRoute<SeatingPlanData?>(
                     builder: (_) => SeatingLayoutEditorScreen(
@@ -18590,6 +18751,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                       themeDesign: _newEventThemeDesign ?? const {},
                     ),
                   ),
+                  routeKey: 'SeatingLayoutEditorScreen:new_event_draft',
                 );
                 if (result != null && mounted) {
                   setState(() => _newEventSeatingPlan = result);
@@ -19042,7 +19204,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                     if (stage == 'new_event' || stage == 'online_inquiries')
                                       TextButton(
                                         onPressed: () async {
-                                          final ok = await showDialog<bool>(
+                                          final ok = await showGuardedDialog<bool>(
                                             context: context,
                                             builder: (ctx) => AlertDialog(
                                               title: const Text('Cancel this inquiry?'),
@@ -19077,15 +19239,15 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                   ],
                                 ),
                           onTap: () {
-                            Navigator.of(context).push<void>(
-                              MaterialPageRoute<void>(
-                                builder: (_) => ManagerCateringDetailScreen(
-                                  state: state,
-                                  row: r,
-                                  stage: stage,
-                                  supervisorMode: widget.supervisorMode,
-                                ),
+                            pushMaterialPage<void>(
+                              context,
+                              ManagerCateringDetailScreen(
+                                state: state,
+                                row: r,
+                                stage: stage,
+                                supervisorMode: widget.supervisorMode,
                               ),
+                              routeKey: 'ManagerCateringDetailScreen:${r.id}',
                             );
                           },
                         ),
@@ -20361,10 +20523,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   Future<void> _pickManagerVenueOnMap() async {
-    final res = await Navigator.of(context).push<MapPinResult>(
+    final res = await pushGuardedRoute<MapPinResult>(
+      context,
       MaterialPageRoute(
         builder: (_) => _MapPinPickerDialog(initialSearchQuery: managerAddressController.text.trim()),
       ),
+      routeKey: '_MapPinPickerDialog:manager',
     );
     if (res == null || !mounted) return;
     setState(() {
@@ -20644,7 +20808,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       _pristineManagerDetailSig.isNotEmpty && _pristineManagerDetailSig != _computeManagerDetailSignature();
 
   void _showManagerBlockingProgress(String message) {
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       barrierDismissible: false,
       useRootNavigator: true,
@@ -21090,7 +21254,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               )) {
                                 return;
                               }
-                              final ok = await showDialog<bool>(
+                              final ok = await showGuardedDialog<bool>(
                                 context: context,
                                 builder: (dlgCtx) => AlertDialog(
                                   title: const Text('Confirm additional costs payment'),
@@ -21174,9 +21338,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           },
           onManageEvents: () {
             Navigator.of(context).popUntil((route) => route.isFirst);
-            Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => ManagerCateringShellScreen(state: widget.state)),
-            );
+            pushMaterialPage<void>(context, ManagerCateringShellScreen(state: widget.state));
           },
         ),
         body: const Center(child: CircularProgressIndicator()),
@@ -21296,7 +21458,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         }
       }
       if (showConfirmDialog) {
-        final okSave = await showDialog<bool>(
+        final okSave = await showGuardedDialog<bool>(
           context: context,
           builder: (ctx) => AlertDialog(
             title: Text(isDraftStageHere ? 'Save draft' : 'Save changes'),
@@ -21606,7 +21768,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
     Future<void> _openChecklistEditor({bool statusOnly = false}) async {
       final draft = checklistRows.map((e) => Map<String, dynamic>.from(e)).toList();
-      final saved = await showDialog<bool>(
+      final saved = await showGuardedDialog<bool>(
         context: context,
         builder: (ctx) => StatefulBuilder(
           builder: (ctx, setDialogState) => AlertDialog(
@@ -21723,7 +21885,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
     Future<void> _openTaskEditor() async {
       final draft = taskRows.map((e) => Map<String, dynamic>.from(e)).toList();
-      final saved = await showDialog<bool>(
+      final saved = await showGuardedDialog<bool>(
         context: context,
         builder: (ctx) => StatefulBuilder(
           builder: (ctx, setDialogState) => AlertDialog(
@@ -21983,7 +22145,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         buttonLabel: canEditSeatingForRow ? 'Edit seating layout' : 'View seating layout',
                         onOpenEditor: () async {
                           final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
-                          await Navigator.push<SeatingPlanData?>(
+                          await pushGuardedRoute<SeatingPlanData?>(
                             context,
                             MaterialPageRoute<SeatingPlanData?>(
                               builder: (_) => SeatingLayoutEditorScreen(
@@ -22000,6 +22162,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 themeDesign: row.themeDesign,
                               ),
                             ),
+                            routeKey: 'SeatingLayoutEditorScreen:${row.id}',
                           );
                         },
                       ),
@@ -22021,7 +22184,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           appSnack(context, 'Confirm down payment with proof before continuing to On Going.');
           return;
         }
-        final okCont = await showDialog<bool>(
+        final okCont = await showGuardedDialog<bool>(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Continue to On Going'),
@@ -22196,7 +22359,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSubmit)},
       ];
       final advancingToFullPayment = widget.stage == kStageForOngoing && target == kStageForFullPayment;
-      final confirm = await showDialog<bool>(
+      final confirm = await showGuardedDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: Text(advancingToFullPayment ? 'Continue to For Full Payment' : 'Confirm submission'),
@@ -22297,7 +22460,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           if (context.mounted) Navigator.of(context).pop();
           return;
         }
-        final choice = await showDialog<String>(
+        final choice = await showGuardedDialog<String>(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Unsaved changes'),
@@ -22525,7 +22688,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               )) {
                                 return;
                               }
-                              final ok = await showDialog<bool>(
+                              final ok = await showGuardedDialog<bool>(
                                 context: context,
                                 builder: (dlgCtx) => AlertDialog(
                                   title: const Text('Confirm down payment'),
@@ -22761,7 +22924,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               )) {
                                 return;
                               }
-                              final ok = await showDialog<bool>(
+                              final ok = await showGuardedDialog<bool>(
                                 context: context,
                                 builder: (dlgCtx) => AlertDialog(
                                   title: const Text('Confirm full payment'),
@@ -23602,7 +23765,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               final email = managerEmailController.text.trim().isNotEmpty
                                   ? managerEmailController.text.trim()
                                   : row.emailAddress;
-                              final updated = await Navigator.push<Map<String, dynamic>?>(
+                              final updated = await pushGuardedRoute<Map<String, dynamic>?>(
                                 context,
                                 MaterialPageRoute<Map<String, dynamic>?>(
                                   builder: (_) => EventThemeDesignScreen(
@@ -23621,6 +23784,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                     persistToOrder: true,
                                   ),
                                 ),
+                                routeKey: 'EventThemeDesignScreen:${row.id}',
                               );
                               if (updated != null && mounted) {
                                 final m = await widget.state.loadManagerCateringItem(
@@ -23682,7 +23846,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               : 'Edit seating layout',
                       onOpenEditor: () async {
                         final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
-                        await Navigator.push<SeatingPlanData?>(
+                        await pushGuardedRoute<SeatingPlanData?>(
                           context,
                           MaterialPageRoute<SeatingPlanData?>(
                             builder: (_) => SeatingLayoutEditorScreen(
@@ -23699,6 +23863,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               themeDesign: row.themeDesign,
                             ),
                           ),
+                          routeKey: 'SeatingLayoutEditorScreen:detail:${row.id}',
                         );
                         if (!mounted) return;
                         final m = await widget.state.loadManagerCateringItem(
@@ -24154,8 +24319,9 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                       child: FilledButton(
                         style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                         onPressed: () {
-                          Navigator.of(context).push<void>(
-                            MaterialPageRoute<void>(builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal)),
+                          pushMaterialPage<void>(
+                            context,
+                            PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal),
                           );
                         },
                         child: const Text('CHECKOUT'),
@@ -24196,7 +24362,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
         final menuBody = Column(
           children: [
             Padding(
-              padding: const EdgeInsets.all(12),
+              padding: kSearchBelowHeaderPadding,
               child: TextField(
                 decoration: const InputDecoration(hintText: 'SEARCH'),
                 onChanged: (v) => setState(() => search = v),
@@ -24262,9 +24428,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                         child: FilledButton(
                           style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                           onPressed: () {
-                            Navigator.of(context).push<void>(
-                              MaterialPageRoute<void>(builder: (_) => PosYourTrayScreen(state: widget.state, subtotal: subtotal)),
-                            );
+                            pushMaterialPage<void>(context, PosYourTrayScreen(state: widget.state, subtotal: subtotal));
                           },
                           child: Row(
                             mainAxisAlignment: MainAxisAlignment.center,
@@ -24345,7 +24509,7 @@ class PosYourTrayScreen extends StatelessWidget {
                       child: FilledButton(
                         style: FilledButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.ink),
                         onPressed: () async {
-                          final ok = await showDialog<bool>(
+                          final ok = await showGuardedDialog<bool>(
                             context: context,
                             builder: (ctx) => AlertDialog(
                               title: const Text('Clear tray?'),
@@ -24368,10 +24532,9 @@ class PosYourTrayScreen extends StatelessWidget {
                         onPressed: state.tray.isEmpty
                             ? null
                             : () {
-                                Navigator.of(context).push<void>(
-                                  MaterialPageRoute<void>(
-                                    builder: (_) => PosWalkInCheckoutScreen(state: state, subtotal: subtotal),
-                                  ),
+                                pushMaterialPage<void>(
+                                  context,
+                                  PosWalkInCheckoutScreen(state: state, subtotal: subtotal),
                                 );
                               },
                         child: const Text('NEXT'),
@@ -24399,7 +24562,7 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
   void _showGcashProofFullscreen() {
     final b = gcashProofBytes;
     if (b == null) return;
-    showDialog<void>(
+    showGuardedDialog<void>(
       context: context,
       barrierColor: Colors.black87,
       builder: (ctx) => Dialog(
@@ -24585,7 +24748,7 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                 );
                 return;
               }
-              final ok = await showDialog<bool>(
+              final ok = await showGuardedDialog<bool>(
                 context: context,
                 builder: (ctx) => AlertDialog(
                   title: const Text('Confirm walk-in sale'),
@@ -24597,7 +24760,7 @@ class _PosWalkInCheckoutScreenState extends State<PosWalkInCheckoutScreen> {
                 ),
               );
               if (ok != true || !context.mounted) return;
-              showDialog<void>(
+              showGuardedDialog<void>(
                 context: context,
                 barrierDismissible: false,
                 builder: (ctx) => const AlertDialog(
@@ -24668,7 +24831,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
   }
 
   Future<void> _showWalkInDetail(OrderData o) async {
-    await showDialog<void>(
+    await showGuardedDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(uiOrderNo(o.orderNo)),
@@ -24747,7 +24910,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                 ),
               ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
               child: Row(
                 children: [
                   Expanded(
@@ -25010,7 +25173,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                           children: [
                             TextButton(
                               onPressed: () async {
-                                final yes = await showDialog<bool>(
+                                final yes = await showGuardedDialog<bool>(
                                   context: context,
                                   builder: (ctx) => AlertDialog(
                                     title: const Text('Cancel this walk-in order?'),
@@ -25036,7 +25199,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                             ),
                             FilledButton(
                               onPressed: () async {
-                                final yes = await showDialog<bool>(
+                                final yes = await showGuardedDialog<bool>(
                                   context: context,
                                   builder: (ctx) => AlertDialog(
                                     title: const Text('Mark order claimed?'),
@@ -25263,7 +25426,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                 ),
               ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+              padding: const EdgeInsets.fromLTRB(12, 14, 12, 6),
               child: Row(
                 children: [
                   Expanded(
@@ -25459,10 +25622,10 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                     style: const TextStyle(fontWeight: FontWeight.w600),
                                   ),
                                   onTap: () async {
-                                    await Navigator.of(context).push<void>(
-                                      MaterialPageRoute<void>(
-                                        builder: (_) => PosOnlineOrderDetailScreen(state: widget.state, order: o),
-                                      ),
+                                    await pushMaterialPage<void>(
+                                      context,
+                                      PosOnlineOrderDetailScreen(state: widget.state, order: o),
+                                      routeKey: 'PosOnlineOrderDetailScreen:${o.orderNo}',
                                     );
                                     if (context.mounted) await widget.state.loadCashierOnlineOrders(force: true);
                                   },
@@ -25727,7 +25890,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
   }
 
   Future<bool> _confirmDialog(String title, String body) async {
-    final r = await showDialog<bool>(
+    final r = await showGuardedDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(title),

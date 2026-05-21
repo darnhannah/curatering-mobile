@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ui' as ui;
 
@@ -313,9 +314,7 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       );
       if (!mounted) return;
       if (url == null || url.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Generation finished but no image URL was returned.')),
-        );
+        _showSnack('Generation finished but no image URL was returned.', isError: true);
         return;
       }
       setState(() {
@@ -326,27 +325,25 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
         }
         _generatedUrl = url;
         if (!_previousUrls.contains(url)) _previousUrls.insert(0, url);
+        _generating = false;
       });
-      await _loadHistory();
-      if (mounted) {
-        await _pageController.animateToPage(
-          3,
-          duration: const Duration(milliseconds: 280),
-          curve: Curves.easeOut,
-        );
-        setState(() => _pageIndex = 3);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Your event design is ready!')),
-        );
-      }
+      unawaited(_loadHistory());
+      _goToGenerateStep();
+      _showSnack('Your event design is ready!');
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$e'), backgroundColor: Colors.red.shade700),
-        );
+      if (!mounted) return;
+      final msg = e.toString();
+      if (msg.contains('Bad state') && (_generatedUrl?.isNotEmpty ?? false)) {
+        _goToGenerateStep();
+        return;
       }
+      if (msg.contains('Bad state')) return;
+      _showSnack(
+        msg.replaceFirst(RegExp(r'^Exception:\s*'), ''),
+        isError: true,
+      );
     } finally {
-      if (mounted) setState(() => _generating = false);
+      if (mounted && _generating) setState(() => _generating = false);
     }
   }
 
@@ -556,6 +553,26 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
     }
   }
 
+  void _goToGenerateStep() {
+    setState(() => _pageIndex = 3);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_pageController.hasClients) return;
+      _pageController.jumpToPage(3);
+    });
+  }
+
+  void _showSnack(String message, {bool isError = false}) {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red.shade700 : null,
+      ),
+    );
+  }
+
   Widget _stepTile({required String title, required List<Widget> children}) {
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
@@ -636,19 +653,9 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
               ),
           ],
         ),
-        body: _generating
-            ? const Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircularProgressIndicator(),
-                    SizedBox(height: 16),
-                    Text('Generating your event design…'),
-                    Text('This may take a few minutes.', style: TextStyle(color: Colors.grey)),
-                  ],
-                ),
-              )
-            : Column(
+        body: Stack(
+          children: [
+            Column(
                 children: [
                   _pageIndicator(),
                   Expanded(
@@ -900,6 +907,30 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
                   ),
                 ],
               ),
+            if (_generating)
+              Positioned.fill(
+                child: ColoredBox(
+                  color: Colors.black54,
+                  child: const Center(
+                    child: Card(
+                      child: Padding(
+                        padding: EdgeInsets.all(24),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            CircularProgressIndicator(),
+                            SizedBox(height: 16),
+                            Text('Generating your event design…'),
+                            Text('This may take a few minutes.', style: TextStyle(color: Colors.grey)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
