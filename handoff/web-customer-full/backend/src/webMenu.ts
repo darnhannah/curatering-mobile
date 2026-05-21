@@ -1,0 +1,220 @@
+import type pg from "pg";
+
+/**
+ * Reads dish / set-menu data from your existing web-app tables.
+ *
+ * Configure either full SQL via WEB_MENU_SQL / WEB_SET_MENUS_SQL,
+ * or table+column mapping via WEB_MENU_TABLE / WEB_SET_MENU_TABLE / …
+ *
+ * If none of those are set, we use the Curatering public schema defaults:
+ *   public.menu_dishes + public.set_menus (see DEFAULT_PUBLIC_* below).
+ *
+ * Expected column aliases from menu query:
+ *   id (text uuid ok), name, description (dish copy), listing_subtitle (optional type/category line),
+ *   price, dips (JSON text array), dish_type (optional)
+ *
+ * Set menus query expected columns:
+ *   name, description, dishes (JSON text array of dish names)
+ */
+
+/** Matches `public.menu_dishes`: sauces → dips, price text → numeric. */
+export const DEFAULT_PUBLIC_MENU_SQL = `
+  SELECT
+    md.id::text AS id,
+    md.name::text AS name,
+    COALESCE(NULLIF(TRIM(md.description), ''), '')::text AS description,
+    CASE
+      WHEN LOWER(TRIM(COALESCE(md.meal_type, md.type, ''))) = 'restaurant'
+        THEN NULLIF(TRIM(md.category), '')
+      ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), NULLIF(TRIM(md.category), '')))
+    END AS listing_subtitle,
+    COALESCE(NULLIF(TRIM(md.price), '')::numeric, 0) AS price,
+    COALESCE(md.sauces::text, '[]') AS dips,
+    COALESCE(md.ingredients::text, '[]') AS ingredients,
+    COALESCE(TRIM(md.category), '')::text AS category,
+    COALESCE(NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), '')::text AS dish_type,
+    md.image_base64::text AS image_base64,
+    COALESCE(NULLIF(TRIM(md.allergens), ''), '[]') AS allergens
+  FROM public.menu_dishes md
+  WHERE NOT md.archived
+  ORDER BY md.name
+`.trim();
+
+/** Resolves `set_menus.dish_ids` (text[]) to dish names via `menu_dishes`. */
+export const DEFAULT_PUBLIC_SET_MENUS_SQL = `
+  SELECT
+    sm.name::text AS name,
+    ''::text AS description,
+    COALESCE(
+      (
+        SELECT json_agg(md.name ORDER BY u.ord)::text
+        FROM unnest(sm.dish_ids) WITH ORDINALITY AS u(dish_id, ord)
+        INNER JOIN public.menu_dishes md ON md.id::text = TRIM(BOTH FROM u.dish_id::text)
+      ),
+      '[]'
+    ) AS dishes
+  FROM public.set_menus sm
+  WHERE NOT sm.archived
+  ORDER BY sm.name
+`.trim();
+
+function escapeIdent(raw: string): string {
+  const s = raw.trim();
+  if (!/^[\w.]+$/.test(s)) {
+    throw new Error(`Unsafe SQL identifier in menu config: ${raw}`);
+  }
+  return s.split(".").map((part) => `"${part.replace(/"/g, '""')}"`).join(".");
+}
+
+/** Full custom SQL for dishes (must select id, name, description, price, dips). */
+export function resolveMenuSql(): string | null {
+  const sql = process.env.WEB_MENU_SQL?.trim();
+  if (sql) return sql;
+
+  const table = process.env.WEB_MENU_TABLE?.trim();
+  if (!table) {
+    if (process.env.DISABLE_DEFAULT_PUBLIC_MENU === "true") {
+      return null;
+    }
+    return DEFAULT_PUBLIC_MENU_SQL;
+  }
+
+  const schema = process.env.WEB_MENU_SCHEMA?.trim();
+  const qualified = schema ? `${escapeIdent(schema)}.${escapeIdent(table)}` : escapeIdent(table);
+
+  const idCol = process.env.WEB_MENU_ID_COL?.trim() || "id";
+  const nameCol = process.env.WEB_MENU_NAME_COL?.trim() || "name";
+  const descCol = process.env.WEB_MENU_DESC_COL?.trim() || "description";
+  const priceCol = process.env.WEB_MENU_PRICE_COL?.trim() || "price";
+  const dipsCol = process.env.WEB_MENU_DIPS_COL?.trim();
+
+  const dipsExpr = dipsCol
+    ? `COALESCE(${escapeIdent(dipsCol)}::text, '[]')`
+    : `'[]'::text`;
+
+  const categoryCol = process.env.WEB_MENU_CATEGORY_COL?.trim();
+  const typeCol = process.env.WEB_MENU_TYPE_COL?.trim();
+  const imageCol = process.env.WEB_MENU_IMAGE_COL?.trim();
+  const ingredientsCol = process.env.WEB_MENU_INGREDIENTS_COL?.trim();
+  const categoryExpr = categoryCol
+    ? `COALESCE(${escapeIdent(categoryCol)}::text, '')`
+    : `''::text`;
+  const dishTypeExpr = typeCol ? `COALESCE(${escapeIdent(typeCol)}::text, '')` : `''::text`;
+  const imageExpr = imageCol ? `${escapeIdent(imageCol)}::text` : `NULL::text`;
+  const ingredientsExpr = ingredientsCol
+    ? `COALESCE(${escapeIdent(ingredientsCol)}::text, '[]')`
+    : `'[]'::text`;
+
+  const where = process.env.WEB_MENU_WHERE?.trim();
+
+  return `
+    SELECT
+      ${escapeIdent(idCol)}::text AS id,
+      ${escapeIdent(nameCol)}::text AS name,
+      COALESCE(${escapeIdent(descCol)}::text, '') AS description,
+      ''::text AS listing_subtitle,
+      ${escapeIdent(priceCol)}::numeric AS price,
+      ${dipsExpr} AS dips,
+      ${ingredientsExpr} AS ingredients,
+      ${categoryExpr} AS category,
+      ${dishTypeExpr} AS dish_type,
+      ${imageExpr} AS image_base64
+    FROM ${qualified}
+    ${where ? `WHERE ${where}` : ""}
+    ORDER BY ${escapeIdent(idCol)}
+  `.trim();
+}
+
+const DEFAULT_MENU_ALLERGENS_LEGACY =
+  "COALESCE(NULLIF(TRIM(md.allergens), ''), '[]') AS allergens";
+
+async function columnExists(pool: pg.Pool, table: string, column: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+     LIMIT 1`,
+    [table, column],
+  );
+  return rows.length > 0;
+}
+
+/** Resolve allergen label column on menu_dishes_allergens (name vs legacy allergen_name). */
+export async function menuAllergenLabelSql(pool: pg.Pool): Promise<string> {
+  const hasName = await columnExists(pool, "menu_dishes_allergens", "name");
+  const hasLegacy = await columnExists(pool, "menu_dishes_allergens", "allergen_name");
+  if (hasName && hasLegacy) return "COALESCE(ma.name, ma.allergen_name)";
+  if (hasName) return "ma.name";
+  if (hasLegacy) return "ma.allergen_name";
+  return "''";
+}
+
+/** SELECT expression for menu_dishes.allergens (TEXT JSON vs BIGINT[] of allergen_id). */
+export async function menuAllergensSelectExpr(pool: pg.Pool, dishAlias = "md"): Promise<string> {
+  const { rows } = await pool.query(
+    `SELECT data_type FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'menu_dishes' AND column_name = 'allergens'
+     LIMIT 1`,
+  );
+  if (rows.length === 0) return `'[]'::text`;
+  const dataType = String((rows[0] as { data_type: string }).data_type ?? "").toLowerCase();
+  if (dataType === "array") {
+    const label = await menuAllergenLabelSql(pool);
+    return `COALESCE(
+      (
+        SELECT COALESCE(json_agg(TRIM(${label}::text) ORDER BY ord)::text, '[]')
+        FROM unnest(COALESCE(${dishAlias}.allergens, ARRAY[]::bigint[])) WITH ORDINALITY AS u(allergen_id, ord)
+        LEFT JOIN public.menu_dishes_allergens ma ON ma.allergen_id = u.allergen_id
+        WHERE COALESCE(TRIM(${label}::text), '') <> ''
+      ),
+      '[]'
+    )`;
+  }
+  return `COALESCE(NULLIF(TRIM(${dishAlias}.allergens::text), ''), '[]')`;
+}
+
+let cachedMenuSqlWithAllergens: string | null = null;
+
+/** Default public menu SQL with allergens expression matched to the live DB schema. */
+export async function resolveMenuSqlForPool(pool: pg.Pool): Promise<string | null> {
+  const base = resolveMenuSql();
+  if (!base) return null;
+  if (!base.includes(DEFAULT_MENU_ALLERGENS_LEGACY.split(" AS ")[0]!)) {
+    return base;
+  }
+  if (cachedMenuSqlWithAllergens) return cachedMenuSqlWithAllergens;
+  const allergenExpr = await menuAllergensSelectExpr(pool);
+  cachedMenuSqlWithAllergens = base.replace(DEFAULT_MENU_ALLERGENS_LEGACY, `${allergenExpr} AS allergens`);
+  return cachedMenuSqlWithAllergens;
+}
+
+export function resolveSetMenusSql(): string | null {
+  const sql = process.env.WEB_SET_MENUS_SQL?.trim();
+  if (sql) return sql;
+
+  const table = process.env.WEB_SET_MENU_TABLE?.trim();
+  if (!table) {
+    if (process.env.DISABLE_DEFAULT_PUBLIC_MENU === "true") {
+      return null;
+    }
+    return DEFAULT_PUBLIC_SET_MENUS_SQL;
+  }
+
+  const schema = process.env.WEB_SET_MENU_SCHEMA?.trim();
+  const qualified = schema ? `${escapeIdent(schema)}.${escapeIdent(table)}` : escapeIdent(table);
+
+  const nameCol = process.env.WEB_SET_MENU_NAME_COL?.trim() || "name";
+  const descCol = process.env.WEB_SET_MENU_DESC_COL?.trim() || "description";
+  const dishesCol = process.env.WEB_SET_MENU_DISHES_COL?.trim() || "dishes";
+
+  const where = process.env.WEB_SET_MENU_WHERE?.trim();
+
+  return `
+    SELECT
+      ${escapeIdent(nameCol)}::text AS name,
+      COALESCE(${escapeIdent(descCol)}::text, '') AS description,
+      COALESCE(${escapeIdent(dishesCol)}::text, '[]') AS dishes
+    FROM ${qualified}
+    ${where ? `WHERE ${where}` : ""}
+    ORDER BY ${escapeIdent(nameCol)}
+  `.trim();
+}

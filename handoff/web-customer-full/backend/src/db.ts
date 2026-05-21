@@ -1,0 +1,586 @@
+import pg from "pg";
+import { runSchemaNormalize } from "./schemaNormalize.js";
+
+const { Pool } = pg;
+
+/** Extra stderr lines when startup fails (e.g. DNS); empty string if no tailored hint. */
+export function formatDbStartupError(err: unknown): string {
+  const e = err as NodeJS.ErrnoException & { hostname?: string };
+  if (e?.code !== "ENOTFOUND" || !e.hostname) return "";
+  return [
+    `[db] Cannot resolve database host "${e.hostname}" (DNS lookup failed).`,
+    "Update DATABASE_URL in packages/backend/.env using Supabase → Project Settings → Database → Connection string (URI).",
+    "If the pooler host keeps failing on your network, try the Direct connection (host db.<project-ref>.supabase.co, port 5432).",
+    "On Windows you can run: ipconfig /flushdns   or temporarily set DNS to 1.1.1.1 / 8.8.8.8.",
+  ].join("\n");
+}
+
+let pool: pg.Pool | null = null;
+
+/** How `restaurant_orders.customer_id` is stored (set during [initDb]). */
+export type RestaurantOrdersCustomerIdKind = "uuid" | "text" | "absent";
+
+let restaurantOrdersCustomerIdKindCache: RestaurantOrdersCustomerIdKind = "text";
+
+export function getRestaurantOrdersCustomerIdKind(): RestaurantOrdersCustomerIdKind {
+  return restaurantOrdersCustomerIdKindCache;
+}
+
+async function columnExists(
+  client: pg.Pool | pg.PoolClient,
+  table: string,
+  column: string,
+): Promise<boolean> {
+  const { rows } = await client.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+     ) AS exists`,
+    [table, column],
+  );
+  return rows[0]?.exists === true;
+}
+
+export async function detectRestaurantOrdersCustomerIdKind(
+  client: pg.Pool | pg.PoolClient = getPool(),
+): Promise<RestaurantOrdersCustomerIdKind> {
+  const { rows } = await client.query<{ data_type: string }>(
+    `SELECT data_type
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'restaurant_orders'
+       AND column_name = 'customer_id'
+     LIMIT 1`,
+  );
+  if (rows.length === 0) return "absent";
+  const dt = String(rows[0]?.data_type ?? "").toLowerCase();
+  if (dt === "uuid") return "uuid";
+  return "text";
+}
+
+function rawDatabaseUrl(): string {
+  const url = process.env.DATABASE_URL?.trim();
+  if (!url) {
+    throw new Error("DATABASE_URL is missing. Copy .env.example to .env and set your Postgres URL.");
+  }
+  return url;
+}
+
+/** Remove libpq TLS query params so Pool `ssl` options are not overridden by URI parsing. */
+function stripTlsQueryParams(connectionString: string): string {
+  const qIdx = connectionString.indexOf("?");
+  if (qIdx === -1) return connectionString;
+  const base = connectionString.slice(0, qIdx);
+  const qs = connectionString.slice(qIdx + 1);
+  const params = new URLSearchParams(qs);
+  for (const k of ["sslmode", "sslrootcert", "sslcert", "sslkey", "sslcrl"]) {
+    params.delete(k);
+  }
+  const rest = params.toString();
+  return rest ? `${base}?${rest}` : base;
+}
+
+function connectionStringForVerify(): string {
+  const url = rawDatabaseUrl();
+  return url.includes("sslmode=") ? url : `${url}${url.includes("?") ? "&" : "?"}sslmode=require`;
+}
+
+/**
+ * When true (default), TLS must validate the server cert chain.
+ * Set DATABASE_SSL_REJECT_UNAUTHORIZED=false in .env only if you hit
+ * SELF_SIGNED_CERT_IN_CHAIN with your host (e.g. corporate proxy); never in production unless you trust the network.
+ *
+ * Important: when false, we strip `sslmode` / SSL file params from the URL. Otherwise `pg`
+ * treats `sslmode=require` as verify-full and still fails with SELF_SIGNED_CERT_IN_CHAIN
+ * even if we pass `ssl: { rejectUnauthorized: false }`.
+ */
+function tlsRejectUnauthorized(): boolean {
+  const v = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED?.trim().toLowerCase();
+  if (v === "false" || v === "0") {
+    return false;
+  }
+  return true;
+}
+
+const poolCommon = {
+  max: 10,
+  /** Recycle pooled sockets so Supabase pooler / idle disconnects (XX000 / EDBHANDLEREXITED) are less likely. */
+  idleTimeoutMillis: 20_000,
+  connectionTimeoutMillis: 15_000,
+  // @types/pg includes maxUses on PoolConfig for pg 8+ pooler recycling.
+  maxUses: 200,
+} as const;
+
+export function getPool(): pg.Pool {
+  if (!pool) {
+    const verify = tlsRejectUnauthorized();
+    if (verify) {
+      pool = new Pool({
+        connectionString: connectionStringForVerify(),
+        ...poolCommon,
+      });
+    } else {
+      pool = new Pool({
+        connectionString: stripTlsQueryParams(rawDatabaseUrl()),
+        ...poolCommon,
+        ssl: { rejectUnauthorized: false },
+      });
+    }
+  }
+  return pool;
+}
+
+/** Ensure app tables exist (safe to call on every startup). */
+export async function initDb(): Promise<void> {
+  const p = getPool();
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS mobile_users (
+      id BIGSERIAL PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS customer_accounts (
+      id BIGSERIAL PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      phone_number TEXT NOT NULL DEFAULT '',
+      password_hash TEXT NOT NULL,
+      full_name TEXT NOT NULL DEFAULT '',
+      is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      signup_otp_code TEXT,
+      signup_otp_expires_at TIMESTAMPTZ,
+      password_reset_otp TEXT,
+      password_reset_expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS action_logs (
+      id BIGSERIAL PRIMARY KEY,
+      actor_email TEXT NOT NULL DEFAULT '',
+      action TEXT NOT NULL DEFAULT '',
+      details TEXT NOT NULL DEFAULT '',
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await p.query(`ALTER TABLE mobile_users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'customer'`);
+  await p.query(`ALTER TABLE mobile_users ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS phone_number TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS signup_otp_code TEXT`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS signup_otp_expires_at TIMESTAMPTZ`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS password_reset_otp TEXT`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ`);
+  await p.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await p.query(`
+    INSERT INTO customer_accounts (email, password_hash, full_name, is_verified)
+    SELECT mu.email, mu.password_hash, COALESCE(NULLIF(mu.display_name, ''), ''), TRUE
+    FROM mobile_users mu
+    ON CONFLICT (email) DO NOTHING
+  `);
+
+  // Legacy `mobile_users` is no longer used for customer auth/profile.
+  // Keep it around only long enough to backfill `customer_accounts`, then remove.
+  await p.query(`DROP TABLE IF EXISTS mobile_users`);
+
+  // Restaurant orders table serves as the canonical table for mobile/POS restaurant flows.
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS mobile_id BIGINT`);
+  await p.query(`CREATE SEQUENCE IF NOT EXISTS restaurant_orders_mobile_id_seq`);
+  await p.query(`ALTER TABLE restaurant_orders ALTER COLUMN mobile_id SET DEFAULT nextval('restaurant_orders_mobile_id_seq')`);
+  await p.query(`UPDATE restaurant_orders SET mobile_id = nextval('restaurant_orders_mobile_id_seq') WHERE mobile_id IS NULL`);
+  // Keep sequence aligned with existing rows so inserts never reuse an existing mobile_id.
+  await p.query(`
+    SELECT setval(
+      'restaurant_orders_mobile_id_seq',
+      COALESCE((SELECT MAX(mobile_id) FROM restaurant_orders), 1),
+      COALESCE((SELECT MAX(mobile_id) FROM restaurant_orders), 0) > 0
+    )
+  `);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS user_email TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_no TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_mode TEXT NOT NULL DEFAULT 'GCASH ONLY'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_uploaded BOOLEAN NOT NULL DEFAULT FALSE`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS payment_proof TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_name TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_contact TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_time TEXT NOT NULL DEFAULT 'NOW'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS total NUMERIC(12,2) NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_source TEXT NOT NULL DEFAULT 'MOBILE_APP'`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_amount_received NUMERIC(12,2)`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_change NUMERIC(12,2)`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_status TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS delivery_tracking_url TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_lines_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_claimed BOOLEAN NOT NULL DEFAULT FALSE`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS supplemental_payment_proof TEXT`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS cashier_secondary_amount_received NUMERIC(12,2)`);
+  await p.query(
+    `ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS balance_proof_pending_review BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
+  const customerIdKindBefore = await detectRestaurantOrdersCustomerIdKind(p);
+  if (customerIdKindBefore === "absent") {
+    await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id TEXT`);
+  }
+  const restaurantOrdersCustomerIdKind = await detectRestaurantOrdersCustomerIdKind(p);
+  restaurantOrdersCustomerIdKindCache = restaurantOrdersCustomerIdKind;
+  // Keep web PK `id` (UUID) separate from business `order_id` (ORD-*). repairRestaurantOrdersIdentity() in schemaNormalize fixes mistaken renames.
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS id UUID`);
+  await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
+  try {
+    await p.query(`ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_status_check`);
+  } catch {
+    // Constraint may not exist in all environments.
+  }
+  if (await columnExists(p, "restaurant_orders", "status")) {
+    await p.query(`
+      UPDATE restaurant_orders
+      SET order_status = COALESCE(NULLIF(TRIM(order_status), ''), status)
+      WHERE order_status IS NULL OR TRIM(order_status) = ''
+    `);
+  }
+  try {
+    await p.query(
+      `ALTER TABLE restaurant_orders ALTER COLUMN order_status SET DEFAULT 'WAITING FOR ORDER CONFIRMATION'`,
+    );
+  } catch {
+    // Column may not exist yet in minimal dev DBs.
+  }
+  // Some migrated datasets contain duplicate order numbers (ex: ORD-0001).
+  // Keep the newest row's value and clear older duplicates so unique index creation succeeds.
+  await p.query(`
+    UPDATE restaurant_orders
+    SET order_no = NULL
+    WHERE order_no IS NOT NULL
+      AND TRIM(order_no) = ''
+  `);
+  await p.query(`
+    DO $$
+    DECLARE pk_col text;
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'mobile_id'
+      ) THEN
+        pk_col := 'mobile_id';
+      ELSIF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'restaurant_orders' AND column_name = 'id'
+      ) THEN
+        pk_col := 'id';
+      ELSE
+        RETURN;
+      END IF;
+      EXECUTE format(
+        'WITH ranked AS (
+           SELECT %1$I AS pk,
+             ROW_NUMBER() OVER (
+               PARTITION BY order_no
+               ORDER BY COALESCE(updated_at, created_at) DESC, %1$I DESC
+             ) AS rn
+           FROM restaurant_orders
+           WHERE order_no IS NOT NULL
+         )
+         UPDATE restaurant_orders ro
+         SET order_no = NULL
+         FROM ranked r
+         WHERE ro.%1$I = r.pk AND r.rn > 1',
+        pk_col
+      );
+    END $$
+  `);
+  await p.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS restaurant_orders_mobile_id_uq ON restaurant_orders (mobile_id)`,
+  );
+  await p.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS restaurant_orders_order_no_uq ON restaurant_orders (order_no) WHERE order_no IS NOT NULL`,
+  );
+  const mobileOrdersTable = await p.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'mobile_orders'
+     ) AS exists`,
+  );
+  if (mobileOrdersTable.rows[0]?.exists) {
+    const migratedCustomerIdExpr = `(SELECT ca.customer_id FROM customer_accounts ca
+            WHERE LOWER(TRIM(ca.email)) = LOWER(TRIM(mo.user_email)) LIMIT 1)`;
+    await p.query(`
+      INSERT INTO restaurant_orders (
+        mobile_id, user_email, customer_id, order_id, order_status, delivery_notes, payment_mode,
+        payment_uploaded_initial, payment_proof_initial, full_name, contact_number, delivery_address,
+        delivery_time, total_cost, order_source, pos_customer_label, cashier_amount_received_initial,
+        delivery_tracking_url, tray_items, created_at, updated_at
+      )
+      SELECT
+        mo.id, mo.user_email,
+        ${migratedCustomerIdExpr},
+        mo.order_no, mo.status, mo.note, mo.payment_mode, mo.payment_uploaded, mo.payment_proof,
+        mo.delivery_name, mo.delivery_contact, mo.delivery_address, mo.delivery_time, COALESCE(mo.total, 0),
+        mo.order_source, mo.pos_customer_label, mo.cashier_amount_received,
+        mo.delivery_tracking_url, COALESCE(mo.order_lines_snapshot, '[]'::jsonb), mo.created_at, mo.updated_at
+      FROM mobile_orders mo
+      WHERE NOT EXISTS (
+        SELECT 1 FROM restaurant_orders ro
+        WHERE ro.mobile_id = mo.id OR (ro.order_no IS NOT NULL AND ro.order_no = mo.order_no)
+      )
+    `);
+    await p.query(`DROP TRIGGER IF EXISTS trg_sync_mobile_orders_into_restaurant_orders ON mobile_orders`);
+    await p.query(`DROP FUNCTION IF EXISTS sync_mobile_orders_into_restaurant_orders()`);
+    await p.query(`DROP TABLE mobile_orders CASCADE`);
+  }
+
+  if (restaurantOrdersCustomerIdKind === "uuid") {
+    try {
+      await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS customer_id_text TEXT`);
+      await p.query(`
+        UPDATE restaurant_orders ro
+        SET customer_id_text = ca.customer_id
+        FROM customer_accounts ca
+        WHERE ro.user_email IS NOT NULL
+          AND TRIM(ro.user_email) <> ''
+          AND ca.customer_id IS NOT NULL
+          AND LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email))
+      `);
+      await p.query(`ALTER TABLE restaurant_orders DROP COLUMN IF EXISTS customer_id`);
+      await p.query(`ALTER TABLE restaurant_orders RENAME COLUMN customer_id_text TO customer_id`);
+      restaurantOrdersCustomerIdKindCache = "text";
+    } catch (err) {
+      console.warn("[db] restaurant_orders customer_id uuid→CUS migration skipped:", err);
+    }
+  } else {
+    await p.query(`
+      UPDATE restaurant_orders ro
+      SET customer_id = ca.customer_id
+      FROM customer_accounts ca
+      WHERE (ro.customer_id IS NULL OR TRIM(ro.customer_id::text) = '' OR ro.customer_id::text !~ '^CUS-')
+        AND ro.user_email IS NOT NULL
+        AND TRIM(ro.user_email) <> ''
+        AND ca.customer_id IS NOT NULL
+        AND LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email))
+    `);
+  }
+
+  await p.query(`
+    UPDATE restaurant_orders
+    SET order_status = 'IN_PREPARATION'
+    WHERE COALESCE(order_status, '') = 'PENDING_CASHIER'
+      AND upper(COALESCE(order_source, '')) IN ('POS', 'POS_MOBILE', 'POS_WEB')
+  `);
+  await p.query(`
+    UPDATE restaurant_orders
+    SET order_status = 'IN_PREPARATION'
+    WHERE COALESCE(order_status, '') = 'PENDING_CASHIER'
+      AND order_source = 'MOBILE_APP'
+      AND user_email IS NOT NULL
+      AND (
+        upper(COALESCE(order_status, '')) LIKE '%ORDER CONFIRMED%'
+        OR upper(COALESCE(order_status, '')) LIKE '%OVERPAYMENT%'
+      )
+  `);
+
+  await p.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pos_role TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_otp TEXT`);
+  await p.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ`);
+  // Ensure legacy role constraint accepts cashier accounts used by POS login.
+  try {
+    await p.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
+    await p.query(`
+      ALTER TABLE users
+      ADD CONSTRAINT users_role_check
+      CHECK (role IN ('admin', 'manager', 'supervisor', 'cashier', 'customer'))
+    `);
+  } catch {
+    // Some environments may define role constraints differently; keep startup resilient.
+  }
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS labor_cost NUMERIC NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS travel_cost NUMERIC NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS theme_design_cost NUMERIC NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS full_payment_due_at TIMESTAMPTZ`);
+  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'`);
+  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS labor_cost NUMERIC NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS travel_cost NUMERIC NOT NULL DEFAULT 0`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ`);
+  await p.query(`ALTER TABLE event_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS checklist JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await p.query(`ALTER TABLE catering_orders ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ`);
+  await p.query(
+    `UPDATE event_orders SET stage_entered_at = updated_at WHERE stage_entered_at IS NULL`,
+  );
+  await p.query(
+    `UPDATE catering_orders SET stage_entered_at = updated_at WHERE stage_entered_at IS NULL`,
+  );
+  await p.query(`ALTER TABLE event_orders ALTER COLUMN stage_entered_at SET DEFAULT NOW()`);
+  await p.query(`ALTER TABLE catering_orders ALTER COLUMN stage_entered_at SET DEFAULT NOW()`);
+
+  await p.query(`DROP TABLE IF EXISTS loyalty_point_history CASCADE`);
+
+  try {
+    await p.query(
+      `UPDATE menu_dishes SET type = 'others' WHERE LOWER(TRIM(type)) IN ('other', 'special')`,
+    );
+  } catch {
+    // Table/column may not exist in minimal dev DBs.
+  }
+
+  // Canonical allergen labels; menu_dishes.allergens holds BIGINT[] allergen_id values.
+  try {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS menu_dishes_allergens (
+        allergen_id BIGSERIAL PRIMARY KEY,
+        allergen_name TEXT NOT NULL UNIQUE
+      );
+    `);
+    await p.query(`
+      INSERT INTO menu_dishes_allergens (allergen_name) VALUES
+        ('Milk / Dairy'),
+        ('Eggs'),
+        ('Fish'),
+        ('Shellfish / Crustaceans'),
+        ('Tree nuts'),
+        ('Peanuts'),
+        ('Wheat / Gluten'),
+        ('Soy'),
+        ('Sesame'),
+        ('Mustard'),
+        ('Celery'),
+        ('Lupin'),
+        ('Sulfites'),
+        ('Mollusks'),
+        ('Corn'),
+        ('Garlic'),
+        ('Onion'),
+        ('Coconut'),
+        ('Chocolate / Cocoa'),
+        ('Caffeine'),
+        ('Other: [manual input]')
+      ON CONFLICT (allergen_name) DO NOTHING
+    `);
+    await p.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'menu_dishes'
+            AND column_name = 'allergens'
+        ) THEN
+          ALTER TABLE public.menu_dishes
+            ADD COLUMN allergens BIGINT[] NOT NULL DEFAULT '{}'::bigint[];
+        END IF;
+      END $$;
+    `);
+    await p.query(`
+      COMMENT ON COLUMN public.menu_dishes.allergens IS
+        'Array of menu_dishes_allergens.allergen_id. Resolve display text via menu_dishes_allergens.allergen_name.'
+    `);
+    await p.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'menu_dishes'
+            AND column_name = 'description'
+        ) THEN
+          ALTER TABLE public.menu_dishes
+            ADD COLUMN description TEXT NOT NULL DEFAULT '';
+        END IF;
+      END $$;
+    `);
+  } catch {
+    // menu_dishes may be absent in minimal dev DBs.
+  }
+
+  try {
+    await p.query(`
+      CREATE OR REPLACE VIEW public.menu_dishes_with_allergen_names AS
+      SELECT
+        md.*,
+        COALESCE(
+          (
+            SELECT array_agg(ma.allergen_name ORDER BY ord)
+            FROM unnest(COALESCE(md.allergens, '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
+            INNER JOIN public.menu_dishes_allergens ma ON ma.allergen_id = t.allergen_id
+          ),
+          ARRAY[]::text[]
+        ) AS allergen_name_list
+      FROM public.menu_dishes md;
+    `);
+  } catch {
+    // View creation may fail if menu_dishes or allergens column layout differs.
+  }
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS customer_tray_drafts (
+      user_email TEXT PRIMARY KEY,
+      tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS guest_order_track_otp (
+      email TEXT PRIMARY KEY,
+      otp_code TEXT NOT NULL,
+      otp_expires_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+
+  await ensureCateringPipelineStatusChecks(p);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS customer_order_feedback (
+      id BIGSERIAL PRIMARY KEY,
+      user_email TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      reference TEXT NOT NULL,
+      rating INTEGER NOT NULL DEFAULT 5,
+      comment TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await p.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS customer_order_feedback_user_kind_ref_idx
+     ON customer_order_feedback (user_email, kind, reference)`,
+  );
+
+  await runSchemaNormalize(p);
+  await ensureCateringPipelineStatusChecks(p);
+  restaurantOrdersCustomerIdKindCache = await detectRestaurantOrdersCustomerIdKind(p);
+}
+
+const CATERING_PIPELINE_STATUSES_SQL = `ARRAY[
+  'new_event'::text, 'online_inquiries'::text,
+  'for_down_payment'::text, 'for_ongoing'::text, 'for_full_payment'::text,
+  'for_processing'::text, 'for_post_analysis'::text,
+  'completed'::text, 'cancelled'::text
+]`;
+
+/** (Re)apply pipeline status CHECK on event_orders + catering_orders — required for for_ongoing / for_down_payment tabs. */
+export async function ensureCateringPipelineStatusChecks(p: pg.Pool): Promise<void> {
+  for (const table of ["event_orders", "catering_orders"] as const) {
+    const constraint = `${table}_status_check`;
+    try {
+      await p.query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${constraint}`);
+      await p.query(`
+        ALTER TABLE ${table} ADD CONSTRAINT ${constraint}
+        CHECK (status = ANY (${CATERING_PIPELINE_STATUSES_SQL}))
+      `);
+      console.log(`[schema] ${constraint} updated (includes for_ongoing, for_down_payment)`);
+    } catch (e) {
+      console.error(
+        `[schema] ${constraint} could not be applied — manager stage moves may use legacy for_processing until fixed:`,
+        e instanceof Error ? e.message : e,
+      );
+    }
+  }
+}
