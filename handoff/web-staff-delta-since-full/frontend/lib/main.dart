@@ -268,22 +268,11 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           if (Navigator.of(ctx).canPop()) {
             Navigator.of(ctx).pop();
           }
-          appState.logout();
           final nav = _rootNavKey.currentState;
-          if (nav == null) return;
-          final staff = kPosLoginBuild || appState.reopenAuthAsStaff;
-          nav.pushAndRemoveUntil(
-            MaterialPageRoute<void>(
-              builder: (_) => staff
-                  ? AuthScreen(
-                      key: ValueKey(appState.authSessionKey),
-                      state: appState,
-                      cashierMode: staff,
-                    )
-                  : CustomerPreAuthShell(state: appState),
-            ),
-            (_) => false,
-          );
+          while (nav != null && nav.canPop()) {
+            nav.pop();
+          }
+          appState.logout();
         },
       ),
     );
@@ -16382,25 +16371,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
     if (ok != true || !context.mounted) return;
     setState(() => _loggingOut = true);
-    try {
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-      widget.state.logout();
-      if (!mounted) return;
-      final staff = kPosLoginBuild || widget.state.reopenAuthAsStaff;
-      await Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    widget.state.logout();
+    if (!mounted) return;
+    if (kPosLoginBuild || widget.state.reopenAuthAsStaff) {
+      Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
         MaterialPageRoute<void>(
-          builder: (_) => staff
-              ? AuthScreen(
-                  key: ValueKey(widget.state.authSessionKey),
-                  state: widget.state,
-                  cashierMode: staff,
-                )
-              : CustomerPreAuthShell(state: widget.state),
+          builder: (_) => AuthScreen(
+            key: ValueKey(widget.state.authSessionKey),
+            state: widget.state,
+            cashierMode: kPosLoginBuild || widget.state.reopenAuthAsStaff,
+          ),
         ),
         (_) => false,
       );
-    } finally {
-      if (mounted) setState(() => _loggingOut = false);
     }
   }
 
