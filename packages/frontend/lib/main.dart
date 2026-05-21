@@ -7161,8 +7161,8 @@ double _staffAuthPanelMaxWidth(double viewportWidth) {
 
 double _staffAuthPanelMaxHeightFraction(BuildContext context) {
   final w = MediaQuery.sizeOf(context).width;
-  if (w >= 900) return 0.78;
-  if (w >= 600) return 0.72;
+  if (w >= 900) return 0.88;
+  if (w >= 600) return 0.82;
   return 0.58;
 }
 
