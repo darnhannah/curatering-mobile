@@ -6285,7 +6285,7 @@ class _AuthScreenState extends State<AuthScreen> {
         child: Stack(
           children: [
             if (widget.cashierMode)
-              Expanded(
+              Positioned.fill(
                 child: LayoutBuilder(
                   builder: (context, constraints) {
                     final panelW = math.min(constraints.maxWidth * 0.92, 400.0);
@@ -6333,31 +6333,33 @@ class _AuthScreenState extends State<AuthScreen> {
                 ),
               )
             else
-              Column(
-                children: [
-                  const SizedBox(height: 36),
-                  SizedBox(
-                    height: _staffLogoHeight(context) + 64,
-                    width: double.infinity,
-                    child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
-                  ),
-                  const SizedBox(height: 24),
-                  Expanded(
-                    child: Container(
+              Positioned.fill(
+                child: Column(
+                  children: [
+                    const SizedBox(height: 36),
+                    SizedBox(
+                      height: _staffLogoHeight(context) + 64,
                       width: double.infinity,
-                      padding: const EdgeInsets.all(20),
-                      decoration: const BoxDecoration(
-                        color: AppColors.brand,
-                        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-                      ),
-                      child: Column(
-                        children: [
-                          Expanded(child: _authFormScroll()),
-                        ],
+                      child: Image.asset(AppBrandAssets.logoLogin, fit: BoxFit.contain),
+                    ),
+                    const SizedBox(height: 24),
+                    Expanded(
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(20),
+                        decoration: const BoxDecoration(
+                          color: AppColors.brand,
+                          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+                        ),
+                        child: Column(
+                          children: [
+                            Expanded(child: _authFormScroll()),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             if (busyMessage != null)
               Positioned.fill(
