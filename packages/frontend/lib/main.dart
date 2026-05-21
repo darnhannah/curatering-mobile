@@ -1788,7 +1788,13 @@ Future<void> showInquiryDetailDialog(
       content: SingleChildScrollView(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: inquiryDetailLineWidgets(r),
+          children: [
+            ...inquiryDetailLineWidgets(r),
+            const Divider(height: 24),
+            const Text('Payment', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+            const SizedBox(height: 8),
+            ...inquiryPaymentProofDetailWidgets(context, r),
+          ],
         ),
       ),
       actions: [
@@ -1942,6 +1948,137 @@ int paxBufferFromCateringRow(CateringEventRecord row) {
   if (raw is num) return raw.toInt().clamp(0, 999999);
   final n = int.tryParse('$raw'.trim());
   return (n == null || n < 0) ? 0 : n;
+}
+
+List<Widget> orderPaymentProofDetailWidgets(BuildContext context, OrderData o) {
+  final widgets = <Widget>[];
+  void addImage(String? b64, String title) {
+    if (b64 == null || !looksLikeBase64ImageProof(b64)) return;
+    try {
+      final bytes = Uint8List.fromList(base64Decode(b64.trim()));
+      widgets.add(
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+              const SizedBox(height: 6),
+              InkWell(
+                onTap: () => showProofFullScreen(context, bytes, title: title),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.memory(bytes, height: 160, width: double.infinity, fit: BoxFit.contain),
+                ),
+              ),
+              Text('Tap image to view full size', style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+            ],
+          ),
+        ),
+      );
+    } catch (_) {}
+  }
+
+  addImage(o.paymentProofBase64, 'Proof of payment');
+  final initRef = orderPaymentReferenceInitial(o);
+  if (!orderHasInitialPaymentProofImage(o) && initRef != null) {
+    widgets.add(_orderDetailLineWidget('Payment reference', initRef));
+  }
+  addImage(o.supplementalPaymentProofBase64, 'Balance payment proof');
+  final balRef = orderPaymentReferenceBalance(o);
+  if (!orderHasBalancePaymentProofImage(o) && balRef != null) {
+    widgets.add(_orderDetailLineWidget('Balance payment reference', balRef));
+  }
+  if (widgets.isEmpty) {
+    widgets.add(
+      Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Text('No payment proof on file.', style: TextStyle(color: Colors.grey.shade700)),
+      ),
+    );
+  }
+  return widgets;
+}
+
+List<Widget> inquiryPaymentProofDetailWidgets(BuildContext context, InquiryRecord r) {
+  final widgets = <Widget>[];
+  final downB64 = '${r.postAnalysis['manager_down_payment_proof_b64'] ?? ''}'.trim();
+  final fullB64 = '${r.postAnalysis['manager_full_payment_proof_b64'] ?? ''}'.trim();
+  void addImage(String b64, String title) {
+    if (!looksLikeBase64ImageProof(b64)) return;
+    try {
+      final bytes = Uint8List.fromList(base64Decode(b64));
+      widgets.add(
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+              const SizedBox(height: 6),
+              InkWell(
+                onTap: () => showProofFullScreen(context, bytes, title: title),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.memory(bytes, height: 160, width: double.infinity, fit: BoxFit.contain),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    } catch (_) {}
+  }
+
+  if (r.downPaymentAmount > 0) {
+    widgets.add(_orderDetailLineWidget('Down payment recorded', '₱${r.downPaymentAmount.toStringAsFixed(2)}'));
+  }
+  if (r.fullPaymentAmount > 0) {
+    widgets.add(_orderDetailLineWidget('Full payment recorded', '₱${r.fullPaymentAmount.toStringAsFixed(2)}'));
+  }
+  addImage(downB64, 'Down payment proof');
+  addImage(fullB64, 'Full payment proof');
+  if (widgets.isEmpty) {
+    widgets.add(
+      Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Text('No payment proof on file.', style: TextStyle(color: Colors.grey.shade700)),
+      ),
+    );
+  }
+  return widgets;
+}
+
+Widget? cashierPaymentProofListIcon(BuildContext context, OrderData o) {
+  if (orderHasInitialPaymentProofImage(o)) {
+    return IconButton(
+      icon: const Icon(Icons.image_outlined, size: 22),
+      tooltip: 'View proof of payment',
+      onPressed: () {
+        try {
+          final bytes = base64Decode(o.paymentProofBase64!.trim());
+          showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Proof of payment');
+        } catch (_) {
+          appSnack(context, 'Could not display image');
+        }
+      },
+    );
+  }
+  if (orderHasBalancePaymentProofImage(o)) {
+    return IconButton(
+      icon: const Icon(Icons.image_outlined, size: 22),
+      tooltip: 'View balance payment proof',
+      onPressed: () {
+        try {
+          final bytes = base64Decode(o.supplementalPaymentProofBase64!.trim());
+          showProofFullScreen(context, Uint8List.fromList(bytes), title: 'Balance payment proof');
+        } catch (_) {
+          appSnack(context, 'Could not display image');
+        }
+      },
+    );
+  }
+  return null;
 }
 
 void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
@@ -2205,6 +2342,7 @@ class InquiryRecord {
     this.themeDesign = const {},
     this.seatingPlan = const {},
     this.orderKind = 'catering',
+    this.postAnalysis = const {},
   });
 
   final String id;
@@ -2244,6 +2382,7 @@ class InquiryRecord {
   final Map<String, dynamic> themeDesign;
   final Map<String, dynamic> seatingPlan;
   final String orderKind;
+  final Map<String, dynamic> postAnalysis;
 
   bool get isCateringPlusEvent =>
       isInquiryCateringWithEventStyling(inquiryType) ||
@@ -3425,6 +3564,8 @@ class AppState extends ChangeNotifier {
     _readAttentionOrderNos.clear();
     _setMenusLoadedAt = null;
     _loyaltyHistoryLoadedAt = null;
+    guestShellInitialTabIndex = 0;
+    guestShellOpenLanding = false;
     if (persistedEmail != null) {
       SharedPreferences.getInstance().then((p) async {
         await p.remove('customer_tray_v1_$persistedEmail');
@@ -3449,6 +3590,7 @@ class AppState extends ChangeNotifier {
   Future<void> enterGuestCheckoutSession({int? initialShellTabIndex}) async {
     guestShellOpenLanding = false;
     guestShellInitialTabIndex = (initialShellTabIndex ?? 0).clamp(0, 3);
+    // Default guest entry is restaurant menu (tab 0), not a separate landing page.
     final salt = DateTime.now().millisecondsSinceEpoch;
     final r = math.Random().nextInt(1 << 30);
     userEmail = 'guest_${salt}_$r@guest.curatering.internal'.toLowerCase();
@@ -4438,6 +4580,11 @@ class AppState extends ChangeNotifier {
           if (sp is Map) return Map<String, dynamic>.from(sp);
           return const <String, dynamic>{};
         }(),
+        postAnalysis: () {
+          final pa = map['post_analysis'];
+          if (pa is Map) return Map<String, dynamic>.from(pa);
+          return const <String, dynamic>{};
+        }(),
         orderKind: '${map['order_kind'] ?? 'catering'}',
       );
     } catch (_) {
@@ -5088,6 +5235,11 @@ class AppState extends ChangeNotifier {
             seatingPlan: () {
               final sp = map['seating_plan'];
               if (sp is Map) return Map<String, dynamic>.from(sp);
+              return const <String, dynamic>{};
+            }(),
+            postAnalysis: () {
+              final pa = map['post_analysis'];
+              if (pa is Map) return Map<String, dynamic>.from(pa);
               return const <String, dynamic>{};
             }(),
             orderKind: '${map['order_kind'] ?? 'catering'}',
@@ -7164,6 +7316,9 @@ Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppStat
                 ),
               ),
             _orderDetailLineWidget('Payment method', od.paymentMode.isEmpty ? 'GCASH ONLY' : od.paymentMode),
+            if (orderCustomerPaymentSummaryText(od).isNotEmpty)
+              _orderDetailLineWidget('Payment summary', orderCustomerPaymentSummaryText(od)),
+            ...orderPaymentProofDetailWidgets(context, od),
             if (od.note.trim().isNotEmpty) _orderDetailLineWidget('Your note', od.note.trim()),
             const SizedBox(height: 16),
             const Text('Dishes ordered', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
@@ -8134,52 +8289,67 @@ class CustomerPreAuthShell extends StatefulWidget {
 }
 
 class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
-  int? _navHighlight;
+  bool _booting = true;
+  String? _bootError;
 
-  Future<void> _startGuest(int tab) async {
-    widget.state.setGuestShellTab(tab);
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _bootGuestMenu());
+  }
+
+  Future<void> _bootGuestMenu() async {
+    if (widget.state.isGuestSession) {
+      if (mounted) setState(() => _booting = false);
+      return;
+    }
+    setState(() {
+      _booting = true;
+      _bootError = null;
+    });
     try {
-      await widget.state.enterGuestCheckoutSession(initialShellTabIndex: tab);
-      if (!mounted) return;
-      widget.state.setGuestShellTab(tab);
+      await widget.state.enterGuestCheckoutSession(initialShellTabIndex: 0);
     } catch (e) {
-      if (!mounted) return;
-      appSnack(context, describeApiNetworkError(e, normalizeApiBase(widget.state.apiBase)));
+      if (mounted) {
+        setState(() => _bootError = describeApiNetworkError(e, normalizeApiBase(widget.state.apiBase)));
+      }
+    } finally {
+      if (mounted) setState(() => _booting = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final s = widget.state;
-    return Scaffold(
-      backgroundColor: Colors.white,
-      body: SafeArea(
-        child: _CustomerGuestLandingBody(
-          onOrderNow: () => _startGuest(0),
-          onInquireCatering: () => _startGuest(1),
+    if (widget.state.isGuestSession) {
+      return GuestCustomerShell(state: widget.state);
+    }
+    if (_booting) {
+      return const Scaffold(
+        backgroundColor: Colors.white,
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    if (_bootError != null) {
+      return Scaffold(
+        backgroundColor: Colors.white,
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(_bootError!, textAlign: TextAlign.center),
+                const SizedBox(height: 16),
+                FilledButton(onPressed: _bootGuestMenu, child: const Text('Try again')),
+              ],
+            ),
+          ),
         ),
-      ),
-      bottomNavigationBar: _GuestBottomNavBar(
-        selectedIndex: _navHighlight,
-        onSelected: (i) async {
-          if (i == 0) {
-            setState(() => _navHighlight = 0);
-            await _startGuest(0);
-          } else if (i == 1) {
-            setState(() => _navHighlight = 1);
-            await _startGuest(1);
-          } else if (i == 2) {
-            setState(() => _navHighlight = 2);
-            await Navigator.of(context).push<void>(
-              MaterialPageRoute<void>(builder: (_) => GuestTrackOrdersScreen(state: widget.state)),
-            );
-            if (mounted) setState(() => _navHighlight = null);
-          } else {
-            await showCustomerAuthDialog(context, s);
-            if (mounted) setState(() => _navHighlight = null);
-          }
-        },
-      ),
+      );
+    }
+    return const Scaffold(
+      backgroundColor: Colors.white,
+      body: Center(child: CircularProgressIndicator()),
     );
   }
 }
@@ -8515,23 +8685,28 @@ class CustomerDashboardScreen extends StatelessWidget {
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
                     children: [
-                      IntrinsicHeight(
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            for (var i = 0; i < primaryPair.length; i++) ...[
-                              if (i > 0) const SizedBox(width: 10),
-                              Expanded(
-                                child: _CustomerDashTileCard(
-                                  title: primaryPair[i].title,
-                                  icon: primaryPair[i].icon,
-                                  onTap: () => Navigator.of(context).push(
-                                    MaterialPageRoute<void>(builder: (_) => primaryPair[i].screen),
+                      Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 520),
+                          child: IntrinsicHeight(
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                for (var i = 0; i < primaryPair.length; i++) ...[
+                                  if (i > 0) const SizedBox(width: 10),
+                                  Expanded(
+                                    child: _CustomerDashTileCard(
+                                      title: primaryPair[i].title,
+                                      icon: primaryPair[i].icon,
+                                      onTap: () => Navigator.of(context).push(
+                                        MaterialPageRoute<void>(builder: (_) => primaryPair[i].screen),
+                                      ),
+                                    ),
                                   ),
-                                ),
-                              ),
-                            ],
-                          ],
+                                ],
+                              ],
+                            ),
+                          ),
                         ),
                       ),
                       const SizedBox(height: 14),
@@ -8871,45 +9046,49 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   }
 
   Widget _dishCard(BuildContext context, MenuItemData item) {
-    return Material(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(14),
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: AppColors.border),
-        ),
-        child: Column(
-          children: [
-            Expanded(
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  ClipRRect(
-                    borderRadius: const BorderRadius.vertical(top: Radius.circular(13)),
-                    child: _MenuThumb(item: item),
-                  ),
-                ],
-              ),
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: ClipRRect(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
+              child: _MenuThumb(item: item),
             ),
-            Text(item.name.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
-              if (_dishCardDescription(item).isNotEmpty)
-                Text(
-                  _dishCardDescription(item).toUpperCase(),
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 12),
-                ),
-              Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
-              const SizedBox(height: 8),
-              FilledButton(
-                onPressed: () => _addToTray(context, item),
-                style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
-                child: const Text('ADD TO TRAY'),
-              ),
-              const SizedBox(height: 8),
-            ],
           ),
-        ),
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  item.name,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12),
+                ),
+                Row(
+                  children: [
+                    Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                    const Spacer(),
+                    IconButton(
+                      onPressed: () => _addToTray(context, item),
+                      icon: const Icon(Icons.add_box_outlined),
+                      color: AppColors.ink,
+                      tooltip: 'Add to tray',
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -9014,6 +9193,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
         if (land && mq.size.shortestSide >= 600) {
           aspect = 0.62;
         }
+        // Match cashier New Order grid proportions (image-forward tiles).
         final gridDelegate = SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: cw,
           crossAxisSpacing: 10,
@@ -24801,12 +24981,13 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
                           ].where((s) => s.isNotEmpty).join('\n'),
                           style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.25),
                         ),
-                        const SizedBox(height: 6),
-                        Wrap(
-                          spacing: 6,
-                          runSpacing: 4,
-                          children: cashierPaymentProofAndReferenceSection(context, o),
-                        ),
+                        if (cashierPaymentProofListIcon(context, o) != null) ...[
+                          const SizedBox(height: 4),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: cashierPaymentProofListIcon(context, o),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -25269,17 +25450,19 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                           ),
                                         ),
                                       ],
-                                      const SizedBox(height: 6),
-                                      Wrap(
-                                        spacing: 6,
-                                        runSpacing: 4,
-                                        children: cashierPaymentProofAndReferenceSection(context, o),
-                                      ),
                                     ],
                                   ),
-                                  trailing: Text(
-                                    '₱${o.total.toStringAsFixed(2)}',
-                                    style: const TextStyle(fontWeight: FontWeight.w600),
+                                  trailing: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment: CrossAxisAlignment.end,
+                                    children: [
+                                      Text(
+                                        '₱${o.total.toStringAsFixed(2)}',
+                                        style: const TextStyle(fontWeight: FontWeight.w600),
+                                      ),
+                                      if (cashierPaymentProofListIcon(context, o) != null)
+                                        cashierPaymentProofListIcon(context, o)!,
+                                    ],
                                   ),
                                   onTap: () async {
                                     await Navigator.of(context).push<void>(
@@ -25425,7 +25608,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   ),
                 LockedField(label: 'AMOUNT DUE', value: o.total.toStringAsFixed(2)),
                 const SizedBox(height: 10),
-                ...cashierPaymentProofAndReferenceSection(context, o),
+                ...orderPaymentProofDetailWidgets(context, o),
               ],
             ),
           ),
