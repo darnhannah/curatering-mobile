@@ -1,4 +1,5 @@
 import pg from "pg";
+import { backfillPublicFeedbackFromLegacy, ensurePublicFeedbackTable } from "./feedbackSync.js";
 import { runSchemaNormalize } from "./schemaNormalize.js";
 
 const { Pool } = pg;
@@ -552,6 +553,18 @@ export async function initDb(): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS customer_order_feedback_user_kind_ref_idx
      ON customer_order_feedback (user_email, kind, reference)`,
   );
+
+  await ensurePublicFeedbackTable(p);
+  try {
+    const counts = await backfillPublicFeedbackFromLegacy(p);
+    if (counts.fromCustomerOrderFeedback > 0 || counts.fromRestaurantOrders > 0) {
+      console.log(
+        `[feedback] backfill inserted customer_order_feedback=${counts.fromCustomerOrderFeedback} restaurant_orders=${counts.fromRestaurantOrders}`,
+      );
+    }
+  } catch (e) {
+    console.warn("[feedback] backfill skipped:", e instanceof Error ? e.message : e);
+  }
 
   await runSchemaNormalize(p);
   await ensureCateringPipelineStatusChecks(p);

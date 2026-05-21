@@ -18,6 +18,7 @@ import {
   getRestaurantOrdersCustomerIdKind,
   initDb,
 } from "./db.js";
+import { upsertPublicFeedbackFromMobile } from "./feedbackSync.js";
 import { normalizeSeatingPlan, registerEventDesignSeatingRoutes } from "./eventDesignSeating.js";
 import {
   CATERING_POST_ANALYSIS_JSON,
@@ -5792,9 +5793,14 @@ app.post("/api/mobile/order-feedback", async (req, res) => {
     return;
   }
   try {
+    let customerName: string | null = null;
+    let transactionLabel: string | null = reference;
     if (kind === "restaurant_order") {
       const { rows } = await getPool().query(
-        `SELECT 1 FROM restaurant_orders ro
+        `SELECT 1 AS ok,
+                COALESCE(NULLIF(TRIM(ro.full_name), ''), NULLIF(TRIM(ca.full_name), '')) AS customer_name
+         FROM restaurant_orders ro
+         LEFT JOIN customer_accounts ca ON LOWER(TRIM(ca.email)) = LOWER(TRIM(ro.user_email))
          WHERE LOWER(TRIM(ro.user_email)) = $1
            AND ${restaurantOrderIdExpr("ro")} = $2
            AND (
@@ -5809,13 +5815,33 @@ app.post("/api/mobile/order-feedback", async (req, res) => {
         res.status(400).json({ error: "order not found or not completed" });
         return;
       }
+      customerName = String((rows[0] as { customer_name?: string }).customer_name ?? "").trim() || null;
+      transactionLabel = reference;
+      await getPool().query(
+        `UPDATE restaurant_orders ro
+         SET feedback_stars = $3,
+             feedback_remarks = $4,
+             feedback_submitted_at = NOW(),
+             updated_at = NOW()
+         WHERE LOWER(TRIM(ro.user_email)) = $1
+           AND ${restaurantOrderIdExpr("ro")} = $2`,
+        [userEmail, reference, rating, comment],
+      ).catch(() => {
+        /* columns may be absent on very old DBs until schema normalize runs */
+      });
     } else {
       const { rows } = await getPool().query(
-        `SELECT 1 FROM event_orders
-         WHERE id::text = $2 AND LOWER(TRIM(email_address)) = $1 AND LOWER(TRIM(status)) = 'completed'
-         UNION ALL
-         SELECT 1 FROM catering_orders
-         WHERE id::text = $2 AND LOWER(TRIM(email_address)) = $1 AND LOWER(TRIM(status)) = 'completed'
+        `SELECT customer_name, transaction_no FROM (
+           SELECT COALESCE(NULLIF(TRIM(e.customer_name), ''), '') AS customer_name,
+                  COALESCE(NULLIF(TRIM(e.transaction_no), ''), '') AS transaction_no
+           FROM event_orders e
+           WHERE e.id::text = $2 AND LOWER(TRIM(e.email_address)) = $1 AND LOWER(TRIM(e.status)) = 'completed'
+           UNION ALL
+           SELECT COALESCE(NULLIF(TRIM(c.customer_name), ''), '') AS customer_name,
+                  COALESCE(NULLIF(TRIM(c.transaction_no), ''), '') AS transaction_no
+           FROM catering_orders c
+           WHERE c.id::text = $2 AND LOWER(TRIM(c.email_address)) = $1 AND LOWER(TRIM(c.status)) = 'completed'
+         ) sub
          LIMIT 1`,
         [userEmail, reference],
       );
@@ -5823,6 +5849,9 @@ app.post("/api/mobile/order-feedback", async (req, res) => {
         res.status(400).json({ error: "inquiry not found or not completed" });
         return;
       }
+      const row = rows[0] as { customer_name?: string; transaction_no?: string };
+      customerName = String(row.customer_name ?? "").trim() || null;
+      transactionLabel = String(row.transaction_no ?? "").trim() || reference;
     }
     await getPool().query(
       `INSERT INTO customer_order_feedback (user_email, kind, reference, rating, comment)
@@ -5831,6 +5860,16 @@ app.post("/api/mobile/order-feedback", async (req, res) => {
        DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = NOW()`,
       [userEmail, kind, reference, rating, comment],
     );
+    await upsertPublicFeedbackFromMobile({
+      pool: getPool(),
+      customerEmail: userEmail,
+      customerName,
+      kind,
+      reference,
+      rating,
+      comment,
+      transactionLabel,
+    });
     const msg = `Customer order feedback\nFrom: ${userEmail}\nKind: ${kind}\nRef: ${reference}\nRating: ${rating}/5\n${comment || "(no remarks)"}`;
     await getPool().query(
       `INSERT INTO notifications (user_id, message)
