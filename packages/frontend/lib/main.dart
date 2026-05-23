@@ -897,6 +897,199 @@ String inquiryTypeDisplayLabel(String inquiryType) {
   return inquiryType;
 }
 
+/// `service_included` stores event-styling choice: yes = with styling, no = without.
+bool inquiryIncludesEventStyling({required String inquiryType, String serviceIncluded = ''}) {
+  if (isInquiryCateringWithEventStyling(inquiryType)) return true;
+  return serviceIncluded.trim().toLowerCase() == 'yes';
+}
+
+String inquiryEventStylingChoiceLabel({required String inquiryType, String serviceIncluded = ''}) {
+  return inquiryIncludesEventStyling(inquiryType: inquiryType, serviceIncluded: serviceIncluded)
+      ? 'With event styling'
+      : 'Without event styling';
+}
+
+/// Extra styling charge per guest when styling is selected below [kInquiryLandingEventStylingMinPax].
+const double kEventStylingSurchargePerPaxBelow50 = kPesosPerPax;
+
+class InquiryMenuModifications {
+  const InquiryMenuModifications({
+    required this.setMenu,
+    required this.removed,
+    required this.added,
+    required this.replaced,
+    required this.displayLines,
+    required this.totalExtraCharge,
+  });
+
+  final String setMenu;
+  final List<String> removed;
+  final List<({String name, double perPax})> added;
+  final List<({String from, String to, double perPax})> replaced;
+  final List<String> displayLines;
+  final double totalExtraCharge;
+
+  Map<String, dynamic> toJson() => {
+        'set_menu': setMenu,
+        'removed': removed,
+        'added': added.map((e) => {'name': e.name, 'additional_charge_per_pax': e.perPax}).toList(),
+        'replaced': replaced
+            .map((e) => {'from': e.from, 'to': e.to, 'additional_charge_per_pax': e.perPax})
+            .toList(),
+        'display_lines': displayLines,
+        'total_extra_charge': totalExtraCharge,
+      };
+
+  static InquiryMenuModifications? fromDynamic(dynamic raw) {
+    if (raw is! Map) return null;
+    final m = Map<String, dynamic>.from(raw);
+    final lines = m['display_lines'];
+    final removedRaw = m['removed'];
+    final addedRaw = m['added'];
+    final replacedRaw = m['replaced'];
+    final removed = removedRaw is List ? removedRaw.map((e) => '$e').toList() : const <String>[];
+    final added = <({String name, double perPax})>[];
+    if (addedRaw is List) {
+      for (final item in addedRaw) {
+        if (item is! Map) continue;
+        final name = '${item['name'] ?? ''}'.trim();
+        if (name.isEmpty) continue;
+        added.add((name: name, perPax: jsonToDouble(item['additional_charge_per_pax'])));
+      }
+    }
+    final replaced = <({String from, String to, double perPax})>[];
+    if (replacedRaw is List) {
+      for (final item in replacedRaw) {
+        if (item is! Map) continue;
+        final from = '${item['from'] ?? ''}'.trim();
+        final to = '${item['to'] ?? ''}'.trim();
+        if (from.isEmpty || to.isEmpty) continue;
+        replaced.add((from: from, to: to, perPax: jsonToDouble(item['additional_charge_per_pax'])));
+      }
+    }
+    return InquiryMenuModifications(
+      setMenu: '${m['set_menu'] ?? ''}',
+      removed: removed,
+      added: added,
+      replaced: replaced,
+      displayLines: lines is List ? lines.map((e) => '$e').toList() : const [],
+      totalExtraCharge: jsonToDouble(m['total_extra_charge']),
+    );
+  }
+}
+
+InquiryMenuModifications? computeInquiryMenuModifications({
+  required String selectedSetMenu,
+  required Iterable<String> selectedDishes,
+  required List<SetMenuData> setMenus,
+  required List<MenuItemData> cateringMenu,
+  required int billableGuests,
+}) {
+  if (selectedSetMenu.trim().isEmpty || selectedSetMenu == 'All Dishes') return null;
+  final baselineRows = setMenus.where((m) => m.name == selectedSetMenu).toList();
+  if (baselineRows.isEmpty) return null;
+  final baseline = baselineRows.first.dishes.map((d) => d.trim()).where((d) => d.isNotEmpty).toSet();
+  if (baseline.isEmpty) return null;
+  final selected = selectedDishes.map((d) => d.trim()).where((d) => d.isNotEmpty).toSet();
+  final removed = baseline.difference(selected).toList()..sort();
+  final addedNames = selected.difference(baseline).toList()..sort();
+  double perPaxFor(String dishName) {
+    for (final m in cateringMenu) {
+      if (m.name.trim() == dishName.trim()) {
+        final c = m.additionalChargeAmount;
+        return c.isFinite && c > 0 ? c : 0;
+      }
+    }
+    return 0;
+  }
+  final pairCount = math.min(removed.length, addedNames.length);
+  final replaced = <({String from, String to, double perPax})>[];
+  for (var i = 0; i < pairCount; i++) {
+    final perPax = perPaxFor(addedNames[i]);
+    replaced.add((from: removed[i], to: addedNames[i], perPax: perPax));
+  }
+  final removedOnly = removed.sublist(pairCount);
+  final addedOnly = <({String name, double perPax})>[];
+  for (var i = pairCount; i < addedNames.length; i++) {
+    addedOnly.add((name: addedNames[i], perPax: perPaxFor(addedNames[i])));
+  }
+  final displayLines = <String>[];
+  if (replaced.isNotEmpty) {
+    for (final r in replaced) {
+      final extra = r.perPax > 0 ? ' (+Php${r.perPax.toStringAsFixed(0)} per pax)' : '';
+      displayLines.add('Replaced: ${r.from} → ${r.to}$extra');
+    }
+  }
+  if (removedOnly.isNotEmpty) {
+    displayLines.add('Removed: ${removedOnly.join(', ')}');
+  }
+  if (addedOnly.isNotEmpty) {
+    for (final a in addedOnly) {
+      final extra = a.perPax > 0 ? ' (+Php${a.perPax.toStringAsFixed(0)} per pax)' : '';
+      displayLines.add('Added: ${a.name}$extra');
+    }
+  }
+  if (displayLines.isEmpty) return null;
+  var totalExtra = 0.0;
+  for (final r in replaced) {
+    if (r.perPax > 0) totalExtra += r.perPax * billableGuests;
+  }
+  for (final a in addedOnly) {
+    if (a.perPax > 0) totalExtra += a.perPax * billableGuests;
+  }
+  return InquiryMenuModifications(
+    setMenu: selectedSetMenu,
+    removed: removedOnly,
+    added: addedOnly,
+    replaced: replaced,
+    displayLines: displayLines,
+    totalExtraCharge: totalExtra,
+  );
+}
+
+void appendInquiryMenuModificationDetailLines(List<Widget> lines, Widget Function(String) line, dynamic menuModRaw) {
+  InquiryMenuModifications? mod;
+  if (menuModRaw is Map) {
+    mod = InquiryMenuModifications.fromDynamic(menuModRaw);
+    if (mod != null && mod.displayLines.isEmpty) {
+      final removed = menuModRaw['removed'];
+      final added = menuModRaw['added'];
+      if (removed is List && removed.isNotEmpty) {
+        lines.add(line('Removed: ${removed.map((e) => '$e').join(', ')}'));
+      }
+      if (added is List) {
+        for (final item in added) {
+          if (item is Map) {
+            final name = '${item['name'] ?? ''}'.trim();
+            final perPax = jsonToDouble(item['additional_charge_per_pax']);
+            final suffix = perPax > 0 ? ' (+Php${perPax.toStringAsFixed(0)} per pax)' : '';
+            if (name.isNotEmpty) lines.add(line('Added: $name$suffix'));
+          }
+        }
+      }
+      final replaced = menuModRaw['replaced'];
+      if (replaced is List) {
+        for (final item in replaced) {
+          if (item is Map) {
+            final from = '${item['from'] ?? ''}'.trim();
+            final to = '${item['to'] ?? ''}'.trim();
+            final perPax = jsonToDouble(item['additional_charge_per_pax']);
+            final suffix = perPax > 0 ? ' (+Php${perPax.toStringAsFixed(0)} per pax)' : '';
+            if (from.isNotEmpty && to.isNotEmpty) lines.add(line('Replaced: $from → $to$suffix'));
+          }
+        }
+      }
+      return;
+    }
+  }
+  mod ??= InquiryMenuModifications.fromDynamic(menuModRaw);
+  if (mod == null || mod.displayLines.isEmpty) return;
+  lines.add(line('Menu Modifications:'));
+  for (final ln in mod.displayLines) {
+    lines.add(line(ln));
+  }
+}
+
 /// Layout variant for manager catering order summary PDFs.
 enum _ManagerOrderSummaryPdfVariant {
   /// Quote before down payment is received.
@@ -1896,9 +2089,11 @@ List<Widget> inquiryDetailLineWidgets(InquiryRecord r) {
       }
     }
   }
-  if (r.serviceIncluded.trim().isNotEmpty) {
-    lines.add(line('Service: ${r.serviceIncluded == 'yes' ? 'With service' : 'Without service'}'));
-  }
+  lines.add(
+    line(
+      'Event styling: ${inquiryEventStylingChoiceLabel(inquiryType: r.inquiryType, serviceIncluded: r.serviceIncluded)}',
+    ),
+  );
   lines.add(line('Food tasting requested: ${r.foodTastingRequested ? 'Yes' : 'No'}'));
   if (r.note.trim().isNotEmpty) lines.add(line('Note: ${r.note}'));
   lines.add(line('Curate own menu: ${r.curateOwnMenu ? 'Yes' : 'No'}'));
@@ -1906,6 +2101,11 @@ List<Widget> inquiryDetailLineWidgets(InquiryRecord r) {
     lines.add(line('Set menu: ${r.selectedSetMenu}'));
   }
   if (r.selectedDishes.isNotEmpty) lines.add(line('Dishes: ${r.selectedDishes.join(', ')}'));
+  appendInquiryMenuModificationDetailLines(
+    lines,
+    line,
+    r.postAnalysis['menu_modifications'] ?? r.themeDesign['menu_modifications'],
+  );
   if (r.menuSuggestionNote.trim().isNotEmpty &&
       !r.menuSuggestionNote.toLowerCase().contains('suggest me a menu instead')) {
     lines.add(line('Menu note: ${r.menuSuggestionNote}'));
@@ -1917,7 +2117,7 @@ List<Widget> inquiryDetailLineWidgets(InquiryRecord r) {
         st == kStageForFullPayment ||
         st == 'completed';
     lines.add(
-      line('${useFinal ? 'Final cost' : 'Estimated cost'}: ₱${r.estimatedTotal.toStringAsFixed(2)}'),
+      line('${useFinal ? 'Final cost' : 'Estimated Cost'}: ₱${r.estimatedTotal.toStringAsFixed(2)}'),
     );
   }
   if (r.downPaymentAmount > 0) lines.add(line('Down payment paid: ₱${r.downPaymentAmount.toStringAsFixed(2)}'));
@@ -2773,9 +2973,21 @@ class CateringEventRecord {
       fullPaymentStatus: '${m['full_payment_status'] ?? ''}',
       postAnalysis: () {
         final pa = m['post_analysis'];
-        if (pa is Map<String, dynamic>) return pa;
-        if (pa is Map) return Map<String, dynamic>.from(pa.map((k, v) => MapEntry('$k', v)));
-        return const <String, dynamic>{};
+        final out = pa is Map<String, dynamic>
+            ? Map<String, dynamic>.from(pa)
+            : pa is Map
+                ? Map<String, dynamic>.from(pa.map((k, v) => MapEntry('$k', v)))
+                : <String, dynamic>{};
+        if (m['menu_modifications'] is Map) {
+          out['menu_modifications'] = m['menu_modifications'];
+        }
+        if (m['selected_set_menu'] != null) {
+          out['selected_set_menu'] = m['selected_set_menu'];
+        }
+        if (m['cost_breakdown'] is List) {
+          out['cost_breakdown'] = m['cost_breakdown'];
+        }
+        return out;
       }(),
       checklist: checklistItemsFromApi(m['checklist']),
       scheduleSlots: () {
@@ -4936,11 +5148,15 @@ class AppState extends ChangeNotifier {
     required int guestCount,
     required String paymentMethod,
     required List<Map<String, dynamic>> costBreakdown,
+    String serviceIncluded = 'no',
+    String selectedSetMenu = '',
+    int paxBuffer = 0,
+    List<Map<String, dynamic>> additionalCosts = const [],
+    double? manualTotalCost,
     required int laborMaleCount,
     required int laborFemaleCount,
     required double laborManualException,
     required double travelCost,
-    double? manualTotalCost,
     List<dynamic> scheduleSlots = const [],
     List<dynamic> menu = const [],
     Map<String, dynamic> themeDesign = const {},
@@ -4967,6 +5183,10 @@ class AppState extends ChangeNotifier {
               'guest_count': guestCount,
               'payment_method': paymentMethod,
               'cost_breakdown': costBreakdown,
+              'service_included': serviceIncluded,
+              'selected_set_menu': selectedSetMenu,
+              'pax_buffer': paxBuffer,
+              'additional_costs': additionalCosts,
               'labor_male_count': laborMaleCount,
               'labor_female_count': laborFemaleCount,
               'labor_manual_exception': laborManualException,
@@ -8759,9 +8979,21 @@ class CustomerDashboardScreen extends StatelessWidget {
     final who = state.profile.fullName.trim().isNotEmpty
         ? state.profile.fullName.trim()
         : (state.userEmail ?? '').trim();
-    final primaryPair = <({String title, IconData icon, Widget screen})>[
-      (title: 'Order Now', icon: Icons.restaurant_menu_outlined, screen: RestaurantMenuScreen(state: state)),
-      (title: 'Inquire Catering', icon: Icons.event_available_outlined, screen: InquiryScreen(state: state)),
+    final primaryPair = <({String headline, String subtitle, IconData icon, Color iconColor, Widget screen})>[
+      (
+        headline: "Macrina's Kitchen",
+        subtitle: 'Order Now',
+        icon: Icons.restaurant_menu_outlined,
+        iconColor: const Color(0xFFE65100),
+        screen: RestaurantMenuScreen(state: state),
+      ),
+      (
+        headline: "Macrina's Catering",
+        subtitle: 'Inquire now',
+        icon: Icons.event_available_outlined,
+        iconColor: const Color(0xFF2E7D32),
+        screen: InquiryScreen(state: state),
+      ),
     ];
     final otherItems = <({String title, IconData icon, Widget? screen, VoidCallback? onTap})>[
       (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state), onTap: null),
@@ -8827,12 +9059,14 @@ class CustomerDashboardScreen extends StatelessWidget {
                                   if (i > 0) const SizedBox(width: 10),
                                   Expanded(
                                     child: _CustomerDashTileCard(
-                                      title: primaryPair[i].title,
+                                      headline: primaryPair[i].headline,
+                                      subtitle: primaryPair[i].subtitle,
                                       icon: primaryPair[i].icon,
+                                      iconColor: primaryPair[i].iconColor,
                                       onTap: () => pushScreenOnce(
                                         context,
                                         primaryPair[i].screen,
-                                        routeKey: primaryPair[i].title,
+                                        routeKey: primaryPair[i].subtitle,
                                       ),
                                     ),
                                   ),
@@ -8861,8 +9095,9 @@ class CustomerDashboardScreen extends StatelessWidget {
                             itemBuilder: (context, index) {
                               final item = otherItems[index];
                               return _CustomerDashTileCard(
-                                title: item.title,
+                                headline: item.title,
                                 icon: item.icon,
+                                iconColor: AppColors.brand,
                                 onTap: () {
                                   if (item.onTap != null) {
                                     item.onTap!();
@@ -8892,9 +9127,17 @@ class CustomerDashboardScreen extends StatelessWidget {
 
 /// Compact tile used on the registered-customer dashboard primary row.
 class _CustomerDashTileCard extends StatelessWidget {
-  const _CustomerDashTileCard({required this.title, required this.icon, required this.onTap});
-  final String title;
+  const _CustomerDashTileCard({
+    required this.headline,
+    this.subtitle,
+    required this.icon,
+    required this.iconColor,
+    required this.onTap,
+  });
+  final String headline;
+  final String? subtitle;
   final IconData icon;
+  final Color iconColor;
   final VoidCallback onTap;
 
   @override
@@ -8911,9 +9154,16 @@ class _CustomerDashTileCard extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(icon, color: AppColors.brand, size: 30),
+              Icon(icon, color: iconColor, size: 30),
               const Spacer(),
-              Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
+              Text(headline, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+              if (subtitle != null && subtitle!.trim().isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  subtitle!,
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.grey.shade700),
+                ),
+              ],
             ],
           ),
         ),
@@ -14140,6 +14390,174 @@ TimeOfDay _inquiryEarliestTimeToday() {
   return TimeOfDay(hour: n.hour, minute: n.minute);
 }
 
+const _kInquiryWizardStepLabels = <String>[
+  'Catering Packages',
+  'Enter number of guests',
+  'Fill Inquiry Form',
+  'Completed',
+];
+
+const _kInquiryWizardStepIcons = <IconData>[
+  Icons.menu_book_outlined,
+  Icons.groups_outlined,
+  Icons.edit_note_outlined,
+  Icons.check_circle_outline,
+];
+
+class _InquiryWizardProgressBar extends StatelessWidget {
+  const _InquiryWizardProgressBar({required this.currentStep});
+  final int currentStep;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFFF5F4F0),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 10, 8, 6),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: List.generate(_kInquiryWizardStepLabels.length, (i) {
+            final done = i < currentStep;
+            final active = i == currentStep;
+            final reached = i <= currentStep;
+            return Expanded(
+              child: Column(
+                children: [
+                  Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      if (i > 0)
+                        Positioned(
+                          left: -999,
+                          right: 999,
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: Container(
+                              height: 2,
+                              margin: const EdgeInsets.only(right: 28),
+                              color: done || active ? AppColors.brand : Colors.grey.shade300,
+                            ),
+                          ),
+                        ),
+                      CircleAvatar(
+                        radius: active ? 16 : 14,
+                        backgroundColor: reached ? AppColors.brand : Colors.grey.shade300,
+                        child: Icon(
+                          done ? Icons.check : _kInquiryWizardStepIcons[i],
+                          size: active ? 18 : 16,
+                          color: reached ? AppColors.ink : Colors.grey.shade600,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    _kInquiryWizardStepLabels[i],
+                    textAlign: TextAlign.center,
+                    maxLines: 3,
+                    style: TextStyle(
+                      fontSize: 10,
+                      height: 1.2,
+                      fontWeight: active ? FontWeight.w800 : FontWeight.w600,
+                      color: reached ? Colors.black87 : Colors.grey.shade600,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ),
+      ),
+    );
+  }
+}
+
+class _CateringPackagesPanel extends StatelessWidget {
+  const _CateringPackagesPanel({this.maxHeight = 420});
+  final double maxHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const TabBar(
+            tabs: [
+              Tab(text: 'Within Taguig'),
+              Tab(text: 'Outside Taguig'),
+            ],
+          ),
+          SizedBox(
+            height: maxHeight,
+            child: TabBarView(
+              children: [
+                SingleChildScrollView(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Text('Catering', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      const Text('1) Php 500 per pax'),
+                      const Text('2) Setup: staff and buffet service'),
+                      const SizedBox(height: 6),
+                      Text(
+                        'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
+                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                      ),
+                      const SizedBox(height: 16),
+                      const Text('Catering with Event Styling', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      const Text('1) Php 500 per pax'),
+                      const Text('2) Minimal Design: tables and chairs with linen and centerpiece'),
+                      const Text('3) Setup: staff and buffet service'),
+                      const SizedBox(height: 6),
+                      Text(
+                        'For extensive event styling and other requests, please include in your notes upon inquiry submission.',
+                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                      ),
+                    ],
+                  ),
+                ),
+                SingleChildScrollView(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Text('Catering', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      const Text('1) Php 500 per pax'),
+                      const Text('2) Setup: staff and buffet service'),
+                      const SizedBox(height: 6),
+                      Text(
+                        'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
+                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                      ),
+                      const SizedBox(height: 16),
+                      const Text('Catering with Event Styling', style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      const Text('1) Php 500 per pax'),
+                      const Text('2) Setup: staff and buffet service'),
+                      const SizedBox(height: 6),
+                      Text(
+                        'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
+                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class InquiryScreen extends StatefulWidget {
   const InquiryScreen({super.key, required this.state});
   final AppState state;
@@ -14148,7 +14566,8 @@ class InquiryScreen extends StatefulWidget {
 }
 
 class _InquiryScreenState extends State<InquiryScreen> {
-  bool _showLanding = true;
+  int _inquiryStep = 0;
+  final List<String> _completedInquiryDetailLines = [];
   final _landingPaxController = TextEditingController();
   String inquiryType = kInquiryTypeCatering;
   bool curateOwn = false;
@@ -14264,7 +14683,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
   void _resetInquiryForm() {
     setState(() {
       inquiryType = kInquiryTypeCatering;
-      _showLanding = true;
+      _inquiryStep = 0;
+      _completedInquiryDetailLines.clear();
       curateOwn = false;
       _menuChoicePicked = false;
       _attemptedSubmit = false;
@@ -14305,8 +14725,21 @@ class _InquiryScreenState extends State<InquiryScreen> {
     menuSearchController.clear();
   }
 
-  int _minPaxForCurrentInquiry() =>
-      isInquiryCateringWithEventStyling(inquiryType) ? kMinCateringEventPax : kMinCateringOnlyPax;
+  int _minPaxForCurrentInquiry() => kMinCateringOnlyPax;
+
+  void _applyEventStylingChoice(bool withStyling) {
+    setState(() {
+      serviceIncluded = withStyling ? 'yes' : 'no';
+      inquiryType = withStyling ? kInquiryTypeCateringWithEventStyling : kInquiryTypeCatering;
+    });
+  }
+
+  bool get _eventStylingSurchargeApplies {
+    final guests = _billableGuestCountForPricing();
+    return inquiryIncludesEventStyling(inquiryType: inquiryType, serviceIncluded: serviceIncluded) &&
+        guests > 0 &&
+        guests < kInquiryLandingEventStylingMinPax;
+  }
 
   int? get _landingPaxParsed {
     final raw = _landingPaxController.text.trim();
@@ -14321,9 +14754,33 @@ class _InquiryScreenState extends State<InquiryScreen> {
       return;
     }
     guestCount.text = '$pax';
-    inquiryType =
-        pax >= kInquiryLandingEventStylingMinPax ? kInquiryTypeCateringWithEventStyling : kInquiryTypeCatering;
-    setState(() => _showLanding = false);
+    setState(() => _inquiryStep = 2);
+  }
+
+  List<Map<String, dynamic>> _costBreakdownLines(List<MenuItemData> cateringMenu) {
+    final guests = _guestCountForSubmit();
+    final buffer = _paxBufferForPricing();
+    final lines = <Map<String, dynamic>>[
+      {'label': 'Base food cost', 'amount': guests * kPesosPerPax},
+      if (buffer > 0) {'label': 'Pax buffer', 'amount': buffer * kPesosPerPax},
+    ];
+    final mod = computeInquiryMenuModifications(
+      selectedSetMenu: selectedSetMenu,
+      selectedDishes: selectedDishes,
+      setMenus: widget.state.setMenus,
+      cateringMenu: cateringMenu,
+      billableGuests: _billableGuestCountForPricing(),
+    );
+    if (mod != null && mod.totalExtraCharge > 0) {
+      lines.add({'label': 'Menu modifications', 'amount': mod.totalExtraCharge});
+    }
+    if (_eventStylingSurchargeApplies) {
+      lines.add({
+        'label': 'Event styling (below $kInquiryLandingEventStylingMinPax guests)',
+        'amount': _billableGuestCountForPricing() * kEventStylingSurchargePerPaxBelow50,
+      });
+    }
+    return lines;
   }
 
   /// For estimate: empty guests → 0; otherwise clamp to the minimum for this inquiry type.
@@ -14603,7 +15060,53 @@ class _InquiryScreenState extends State<InquiryScreen> {
     });
   }
 
-  double _estimatedCost() => (_billableGuestCountForPricing() + _paxBufferForPricing()) * kPesosPerPax;
+  double _estimatedCost(List<MenuItemData> cateringMenu) {
+    final guests = _billableGuestCountForPricing();
+    final buffer = _paxBufferForPricing();
+    var total = (guests + buffer) * kPesosPerPax;
+    final mod = computeInquiryMenuModifications(
+      selectedSetMenu: selectedSetMenu,
+      selectedDishes: selectedDishes,
+      setMenus: widget.state.setMenus,
+      cateringMenu: cateringMenu,
+      billableGuests: guests,
+    );
+    if (mod != null) total += mod.totalExtraCharge;
+    if (_eventStylingSurchargeApplies) {
+      total += guests * kEventStylingSurchargePerPaxBelow50;
+    }
+    return total;
+  }
+
+  List<String> _inquirySummaryLines(List<MenuItemData> cateringMenu) {
+    final lines = <String>[
+      'Type: ${inquiryTypeDisplayLabel(inquiryType)}',
+      'Event styling: ${inquiryEventStylingChoiceLabel(inquiryType: inquiryType, serviceIncluded: serviceIncluded)}',
+      if (eventTitle.text.trim().isNotEmpty) 'Event: ${eventTitle.text.trim()}',
+      'Event type: ${_resolvedEventType()}',
+      'Guests: ${guestCount.text.trim()}',
+      if (_paxBufferForPricing() > 0) 'Pax buffer: ${_paxBufferForPricing()}',
+      'Venue: ${eventCity.text.trim()}',
+      'When: ${_serializedEventDates()}',
+      'Contact: ${contactPerson.text.trim()} / ${contactNumber.text.trim()}',
+      'Email: ${inquiryEmail.text.trim()}',
+      if (selectedSetMenu != 'All Dishes') 'Set menu: $selectedSetMenu',
+      if (selectedDishes.isNotEmpty) 'Dishes: ${selectedDishes.join(', ')}',
+    ];
+    final mod = computeInquiryMenuModifications(
+      selectedSetMenu: selectedSetMenu,
+      selectedDishes: selectedDishes,
+      setMenus: widget.state.setMenus,
+      cateringMenu: cateringMenu,
+      billableGuests: _billableGuestCountForPricing(),
+    );
+    if (mod != null && mod.displayLines.isNotEmpty) {
+      lines.add('Menu Modifications:');
+      lines.addAll(mod.displayLines);
+    }
+    lines.add('Estimated Cost: ₱${_estimatedCost(cateringMenu).toStringAsFixed(2)}');
+    return lines;
+  }
 
   String _resolvedEventType() {
     if (eventTypeChoice != 'Other') return eventTypeChoice;
@@ -14845,77 +15348,136 @@ class _InquiryScreenState extends State<InquiryScreen> {
     );
   }
 
-  Widget _buildInquiryLanding(BuildContext context) {
-    final state = widget.state;
+  Widget _buildInquiryPackagesStep() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text(
+          'Review our catering packages',
+          style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+        ),
+        const SizedBox(height: 12),
+        const _CateringPackagesPanel(),
+        const SizedBox(height: 20),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            onPressed: () => setState(() => _inquiryStep = 1),
+            child: const Text('NEXT'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildInquiryGuestsStep() {
     final pax = _landingPaxParsed;
-    return AppScaffold(
-      state: state,
-      title: 'INQUIRE CATERING SERVICE',
-      showTrayShortcut: false,
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 420),
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Text(
+          'How many guests will you have?',
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _landingPaxController,
+          keyboardType: TextInputType.number,
+          maxLength: 4,
+          textAlign: TextAlign.center,
+          inputFormatters: [
+            FilteringTextInputFormatter.digitsOnly,
+            LengthLimitingTextInputFormatter(4),
+          ],
+          decoration: const InputDecoration(hintText: 'Number of guests', counterText: ''),
+          onChanged: (_) => setState(() {}),
+        ),
+        if (pax != null && pax > 0) ...[
+          const SizedBox(height: 12),
+          Text(
+            'Estimated base cost for $pax guests is Php ${pax * kPesosPerPax}. Additional charges apply for event styling (below $kInquiryLandingEventStylingMinPax guests), menu modifications, and other requests.',
+            style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey.shade800),
+          ),
+        ],
+        const SizedBox(height: 24),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton(
+                onPressed: () => setState(() => _inquiryStep = 0),
+                child: const Text('BACK'),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: FilledButton(onPressed: _proceedFromLanding, child: const Text('NEXT')),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildInquiryCompletedStep() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Icon(Icons.check_circle, color: Colors.green.shade700, size: 56),
+        const SizedBox(height: 12),
+        const Text(
+          'Inquiry Submitted! Please stay tuned for an email or contact number response from Macrina\'s Team. Thank you!',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16, height: 1.35),
+        ),
+        const SizedBox(height: 20),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
             child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  'How many guests will you have?',
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _landingPaxController,
-                  keyboardType: TextInputType.number,
-                  maxLength: 4,
-                  textAlign: TextAlign.center,
-                  inputFormatters: [
-                    FilteringTextInputFormatter.digitsOnly,
-                    LengthLimitingTextInputFormatter(4),
-                  ],
-                  decoration: const InputDecoration(
-                    hintText: 'Number of guests',
-                    counterText: '',
+                const Text('Inquiry details', style: TextStyle(fontWeight: FontWeight.w800)),
+                const SizedBox(height: 10),
+                for (final ln in _completedInquiryDetailLines)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text(ln, style: const TextStyle(height: 1.35)),
                   ),
-                  onChanged: (_) => setState(() {}),
-                ),
-                if (pax != null && pax > 0) ...[
-                  const SizedBox(height: 12),
-                  Text(
-                    'Total cost for $pax with standard package is Php ${pax * kPesosPerPax}. Additional charges apply if you have additional requests not included in the package.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey.shade800),
-                  ),
-                ],
-                const SizedBox(height: 20),
-                SizedBox(
-                  width: 200,
-                  child: OutlinedButton.icon(
-                    onPressed: () => showCateringPackageDialog(context),
-                    icon: const Icon(Icons.menu_book_outlined, size: 18),
-                    label: const Text('View Package'),
-                  ),
-                ),
-                const SizedBox(height: 28),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton(onPressed: _proceedFromLanding, child: const Text('NEXT')),
-                ),
               ],
             ),
           ),
         ),
-      ),
+        const SizedBox(height: 20),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            onPressed: () {
+              if (widget.state.userEmail != null && !widget.state.isGuestSession) {
+                pushScreenOnce(context, MyInquiriesScreen(state: widget.state));
+              } else {
+                showCustomerAuthDialog(context, widget.state);
+              }
+            },
+            child: const Text('View My Catering Inquiries'),
+          ),
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton(
+            onPressed: () {
+              _resetInquiryForm();
+            },
+            child: const Text('Submit another inquiry'),
+          ),
+        ),
+      ],
     );
   }
 
   @override
   Widget build(BuildContext context) {
     final state = widget.state;
-    if (_showLanding) return _buildInquiryLanding(context);
     final cateringMenu = state.menu.where((m) => m.isCateringDish).toList();
     final setMenuNames = ['All Dishes', ...state.setMenus.map((m) => m.name)];
     final effectiveSetMenu = setMenuNames.contains(selectedSetMenu) ? selectedSetMenu : 'All Dishes';
@@ -14926,15 +15488,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
         .toSet()
         .where((n) => q.isEmpty || n.toLowerCase().contains(q))
         .toList();
-    final estimate = _estimatedCost();
-    return AppScaffold(
-      state: state,
-      title: 'INQUIRE CATERING SERVICE',
-      showTrayShortcut: false,
-      body: Column(
-        children: [
-          Expanded(
-            child: RefreshIndicator(
+    final estimate = _estimatedCost(cateringMenu);
+    final formBody = RefreshIndicator(
               onRefresh: () async {
                 await Future.wait([
                   state.loadMenu(force: true),
@@ -14954,7 +15509,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  'Catering: minimum $kMinCateringOnlyPax guests. Catering with Event Styling: minimum $kMinCateringEventPax guests. Estimated cost is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer).',
+                  'Minimum $kMinCateringOnlyPax guests. Base estimate is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer). Event styling below $kInquiryLandingEventStylingMinPax guests adds ₱${kEventStylingSurchargePerPaxBelow50.toStringAsFixed(0)} per guest. Menu modifications may add per-pax charges.',
                   style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 10),
@@ -15228,30 +15783,25 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         maxLines: 3,
                       ),
                       const SizedBox(height: 8),
-                      Text('Service', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: RadioListTile<String>(
-                              dense: true,
-                              contentPadding: EdgeInsets.zero,
-                              title: const Text('With service'),
-                              value: 'yes',
-                              groupValue: serviceIncluded,
-                              onChanged: (v) => setState(() => serviceIncluded = v ?? 'yes'),
-                            ),
-                          ),
-                          Expanded(
-                            child: RadioListTile<String>(
-                              dense: true,
-                              contentPadding: EdgeInsets.zero,
-                              title: const Text('Without service'),
-                              value: 'no',
-                              groupValue: serviceIncluded,
-                              onChanged: (v) => setState(() => serviceIncluded = v ?? 'no'),
-                            ),
-                          ),
-                        ],
+                      Text(
+                        'Do you wish to include event styling? It will count as additional charge for number of guests below $kInquiryLandingEventStylingMinPax.',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                      RadioListTile<String>(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Without event styling'),
+                        value: 'no',
+                        groupValue: serviceIncluded,
+                        onChanged: (v) => _applyEventStylingChoice(false),
+                      ),
+                      RadioListTile<String>(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('With event styling'),
+                        value: 'yes',
+                        groupValue: serviceIncluded,
+                        onChanged: (v) => _applyEventStylingChoice(true),
                       ),
                     ],
                   ),
@@ -15681,31 +16231,57 @@ class _InquiryScreenState extends State<InquiryScreen> {
                               style: TextStyle(color: Colors.red.shade700, fontSize: 12),
                             ),
                           ),
+                        if (curateOwn && effectiveSetMenu != 'All Dishes') ...[
+                          Builder(
+                            builder: (context) {
+                              final mod = computeInquiryMenuModifications(
+                                selectedSetMenu: selectedSetMenu,
+                                selectedDishes: selectedDishes,
+                                setMenus: state.setMenus,
+                                cateringMenu: cateringMenu,
+                                billableGuests: _billableGuestCountForPricing(),
+                              );
+                              if (mod == null || mod.displayLines.isEmpty) {
+                                return const SizedBox.shrink();
+                              }
+                              return Padding(
+                                padding: const EdgeInsets.only(top: 10),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      'Menu Modifications:',
+                                      style: TextStyle(fontWeight: FontWeight.w800),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    ...mod.displayLines.map(
+                                      (l) => Padding(
+                                        padding: const EdgeInsets.only(bottom: 4),
+                                        child: Text(l, style: const TextStyle(height: 1.35)),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        ],
                       ],
                     ],
                   ),
                 ),
               ],
               ),
-            ),
-          ),
-          Column(
+            );
+    final formColumn = Column(
+      children: [
+        Expanded(child: formBody),
+        Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Center(
-                child: SizedBox(
-                  width: 200,
-                  child: OutlinedButton.icon(
-                    onPressed: () => showCateringPackageDialog(context),
-                    icon: const Icon(Icons.menu_book_outlined, size: 18),
-                    label: const Text('View Package'),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
               SummaryFooter(
                 lines: [
-                  SummaryLine('Total Cost', '₱${estimate.toStringAsFixed(2)}', isTotal: true),
+                  SummaryLine('Estimated Cost', '₱${estimate.toStringAsFixed(2)}', isTotal: true),
                 ],
                 secondaryLabel: 'CANCEL',
                 actionLabel: 'SUBMIT',
@@ -15726,7 +16302,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 appSnack(context, v);
                 return;
               }
-              final est = _estimatedCost();
+              final est = _estimatedCost(cateringMenu);
+              final menuMod = computeInquiryMenuModifications(
+                selectedSetMenu: selectedSetMenu,
+                selectedDishes: selectedDishes,
+                setMenus: state.setMenus,
+                cateringMenu: cateringMenu,
+                billableGuests: _billableGuestCountForPricing(),
+              );
               final typeLabel = _resolvedEventType();
               final ok = await showDialog<bool>(
                 context: context,
@@ -15755,7 +16338,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         const SizedBox(height: 6),
                         Text('When: ${_serializedEventDates()}'),
                         const SizedBox(height: 6),
-                        Text('Estimated: ₱${est.toStringAsFixed(2)}'),
+                        Text('Estimated Cost: ₱${est.toStringAsFixed(2)}'),
                       ],
                     ),
                   ),
@@ -15808,10 +16391,8 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'guest_count': guestsSaved,
                 'pax_buffer': paxBufferSaved,
                 'estimated_total': est,
-                'cost_breakdown': [
-                  {'label': 'Base food cost', 'amount': guestsSaved * kPesosPerPax},
-                  {'label': 'Pax buffer', 'amount': paxBufferSaved * kPesosPerPax},
-                ],
+                'cost_breakdown': _costBreakdownLines(cateringMenu),
+                if (menuMod != null) 'menu_modifications': menuMod.toJson(),
                 'menu_suggestion_note': curateOwn ? '' : menuSuggestionNote,
                 'theme_suggestion_note': themeNotesController.text.trim(),
                 if (isInquiryCateringWithEventStyling(inquiryType))
@@ -15839,16 +16420,33 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 appSnack(context, err);
                 return;
               }
-              appSnack(context, 'Inquiry submitted');
-              if (state.isGuestSession) {
-                _resetInquiryForm();
-                pushReplacementScreenOnce(context, RestaurantMenuScreen(state: state));
-              } else {
-                pushReplacementScreenOnce(context, MyInquiriesScreen(state: state));
-              }
+              setState(() {
+                _completedInquiryDetailLines
+                  ..clear()
+                  ..addAll(_inquirySummaryLines(cateringMenu));
+                _inquiryStep = 3;
+              });
             },
               ),
             ],
+          ),
+      ],
+    );
+    return AppScaffold(
+      state: state,
+      title: 'INQUIRE CATERING SERVICE',
+      showTrayShortcut: false,
+      body: Column(
+        children: [
+          _InquiryWizardProgressBar(currentStep: _inquiryStep),
+          Expanded(
+            child: switch (_inquiryStep) {
+              0 => _buildInquiryPackagesStep(),
+              1 => _buildInquiryGuestsStep(),
+              2 => formColumn,
+              3 => _buildInquiryCompletedStep(),
+              _ => _buildInquiryPackagesStep(),
+            },
           ),
         ],
       ),
@@ -16016,7 +16614,16 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
       }
     }
     if (r.serviceIncluded.trim().isNotEmpty) {
-      lines.add(line('Service: ${r.serviceIncluded == 'yes' ? 'With service' : 'Without service'}'));
+      lines.add(
+        line(
+          'Event styling: ${inquiryEventStylingChoiceLabel(inquiryType: r.inquiryType, serviceIncluded: r.serviceIncluded)}',
+        ),
+      );
+      appendInquiryMenuModificationDetailLines(
+        lines,
+        line,
+        r.postAnalysis['menu_modifications'] ?? r.themeDesign['menu_modifications'],
+      );
     }
     lines.add(line('Food tasting requested: ${r.foodTastingRequested ? 'Yes' : 'No'}'));
     if (r.note.trim().isNotEmpty) lines.add(line('Note: ${r.note}'));
@@ -16038,7 +16645,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
           st == kStageForFullPayment ||
           st == 'completed';
       lines.add(
-        line('${useFinal ? 'Final cost' : 'Estimated cost'}: ₱${r.estimatedTotal.toStringAsFixed(2)}'),
+        line('${useFinal ? 'Final cost' : 'Estimated Cost'}: ₱${r.estimatedTotal.toStringAsFixed(2)}'),
       );
     }
     if (r.downPaymentAmount > 0) {
@@ -17609,8 +18216,24 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     super.dispose();
   }
 
-  int _minPaxForCurrentInquiry() =>
-      isInquiryCateringWithEventStyling(inquiryType) ? kMinCateringEventPax : kMinCateringOnlyPax;
+  int _minPaxForCurrentInquiry() => kMinCateringOnlyPax;
+
+  bool get _managerNewEventStylingSurchargeApplies {
+    final guests = _billableGuestCountForPricing();
+    return inquiryIncludesEventStyling(inquiryType: inquiryType, serviceIncluded: serviceIncluded) &&
+        guests > 0 &&
+        guests < kInquiryLandingEventStylingMinPax;
+  }
+
+  InquiryMenuModifications? _managerNewEventMenuModifications(List<MenuItemData> cateringMenu) {
+    return computeInquiryMenuModifications(
+      selectedSetMenu: selectedSetMenu,
+      selectedDishes: selectedDishes,
+      setMenus: widget.state.setMenus,
+      cateringMenu: cateringMenu,
+      billableGuests: _billableGuestCountForPricing(),
+    );
+  }
 
   int _billableGuestCountForPricing() {
     final raw = guestCount.text.trim();
@@ -17693,12 +18316,44 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
 
   double _themeCostComputed() => double.tryParse(themeCostController.text.trim()) ?? 0;
 
-  double _estimatedCost() =>
-      ((_billableGuestCountForPricing() + _paxBufferForPricing()) * kPesosPerPax) +
-      _laborCostComputed() +
-      _travelCostComputed() +
-      (isInquiryCateringWithEventStyling(inquiryType) ? _themeCostComputed() : 0) +
-      _sumCostRows(additionalCosts);
+  double _estimatedCostForMenu(List<MenuItemData> cateringMenu) {
+    var total = ((_billableGuestCountForPricing() + _paxBufferForPricing()) * kPesosPerPax) +
+        _laborCostComputed() +
+        _travelCostComputed() +
+        (isInquiryCateringWithEventStyling(inquiryType) ? _themeCostComputed() : 0) +
+        _sumCostRows(additionalCosts);
+    final mod = _managerNewEventMenuModifications(cateringMenu);
+    if (mod != null) total += mod.totalExtraCharge;
+    if (_managerNewEventStylingSurchargeApplies) {
+      total += _billableGuestCountForPricing() * kEventStylingSurchargePerPaxBelow50;
+    }
+    return total;
+  }
+
+  List<Map<String, dynamic>> _managerNewEventCostBreakdown(List<MenuItemData> cateringMenu) {
+    final lines = <Map<String, dynamic>>[
+      {'label': 'Base food cost', 'amount': _billableGuestCountForPricing() * kPesosPerPax},
+      {'label': 'Pax buffer', 'amount': _paxBufferForPricing() * kPesosPerPax},
+    ];
+    final mod = _managerNewEventMenuModifications(cateringMenu);
+    if (mod != null && mod.totalExtraCharge > 0) {
+      lines.add({'label': 'Menu modifications', 'amount': mod.totalExtraCharge});
+    }
+    if (_managerNewEventStylingSurchargeApplies) {
+      lines.add({
+        'label': 'Event styling (below $kInquiryLandingEventStylingMinPax guests)',
+        'amount': _billableGuestCountForPricing() * kEventStylingSurchargePerPaxBelow50,
+      });
+    }
+    lines.addAll([
+      {'label': 'Labor cost', 'amount': _laborCostComputed()},
+      {'label': 'Travel cost', 'amount': _travelCostComputed()},
+      if (isInquiryCateringWithEventStyling(inquiryType))
+        {'label': 'Theme design cost', 'amount': _themeCostComputed()},
+      {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
+    ]);
+    return lines;
+  }
 
   String _resolvedEventType() {
     if (eventTypeChoice != 'Other') return eventTypeChoice;
@@ -17987,9 +18642,11 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         .toSet()
         .where((n) => q.isEmpty || n.toLowerCase().contains(q))
         .toList();
-    final estimate = _estimatedCost();
+    final estimate = _estimatedCostForMenu(cateringMenu);
     final scheduleConflictsForProcessing = _conflictCountWithForProcessing();
-    final orderKind = inquiryType == 'CATERING' ? 'catering' : 'event';
+    final orderKind = inquiryIncludesEventStyling(inquiryType: inquiryType, serviceIncluded: serviceIncluded)
+        ? 'event'
+        : 'catering';
 
     Future<void> createNewEvent() async {
       final v = _validateManagerNewEvent();
@@ -17997,15 +18654,18 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         appSnack(context, v);
         return;
       }
-      final est = _estimatedCost();
+      final est = _estimatedCostForMenu(cateringMenu);
       final guestsSaved = _guestCountForSubmit();
       final menuPayload = selectedDishes.toList();
+      final menuMod = _managerNewEventMenuModifications(cateringMenu);
+      final setMenuForSave = selectedSetMenu != 'All Dishes' ? selectedSetMenu : '';
       final themeDesign = <String, dynamic>{
         ...?_newEventThemeDesign,
         'note': note.text.trim(),
         'pax_buffer': _paxBufferForPricing(),
         'event_setting': eventSetting,
         'service_included': serviceIncluded,
+        if (menuMod != null) 'menu_modifications': menuMod.toJson(),
         'food_tasting_requested': foodTastingRequested,
         'food_tasting_date': foodTastingDate.text.trim(),
         'food_tasting_time': foodTastingTime.text.trim(),
@@ -18016,15 +18676,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         if (_selectedGuestAllergens.isNotEmpty) 'guest_allergens': _selectedGuestAllergens.toList(),
         if (isInquiryCateringWithEventStyling(inquiryType)) 'theme_suggestion_note': themeSuggestionNote,
       };
-      final costBreakdown = <Map<String, dynamic>>[
-        {'label': 'Base food cost', 'amount': _billableGuestCountForPricing() * kPesosPerPax},
-        {'label': 'Pax buffer', 'amount': _paxBufferForPricing() * kPesosPerPax},
-        {'label': 'Labor cost', 'amount': _laborCostComputed()},
-        {'label': 'Travel cost', 'amount': _travelCostComputed()},
-        if (isInquiryCateringWithEventStyling(inquiryType))
-          {'label': 'Theme design cost', 'amount': _themeCostComputed()},
-        {'label': 'Additional costs', 'amount': _sumCostRows(additionalCosts)},
-      ];
+      final costBreakdown = _managerNewEventCostBreakdown(cateringMenu);
       final yes = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -18050,7 +18702,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 const SizedBox(height: 6),
                 Text('Venue: ${eventCity.text.trim()}'),
                 const SizedBox(height: 6),
-                Text('Estimated: ₱${est.toStringAsFixed(2)}'),
+                Text('Estimated Cost: ₱${est.toStringAsFixed(2)}'),
               ],
             ),
           ),
@@ -18077,11 +18729,15 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             guestCount: guestsSaved,
             paymentMethod: 'cash',
             costBreakdown: costBreakdown,
+            serviceIncluded: serviceIncluded,
+            selectedSetMenu: setMenuForSave,
+            paxBuffer: _paxBufferForPricing(),
+            additionalCosts: additionalCosts,
             laborMaleCount: int.tryParse(laborMaleController.text.trim()) ?? 0,
             laborFemaleCount: int.tryParse(laborFemaleController.text.trim()) ?? 0,
             laborManualException: _sumCostRows(laborManualCosts),
             travelCost: _travelCostComputed(),
-            manualTotalCost: null,
+            manualTotalCost: est,
             scheduleSlots: _scheduleSlotsPayload(),
             menu: menuPayload,
             themeDesign: themeDesign,
@@ -18125,10 +18781,11 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final travelCost = _travelCostComputed();
       final themeCost = _themeCostComputed();
       final additionalCostTotal = _sumCostRows(additionalCosts);
-      final total = _estimatedCost();
+      final total = _estimatedCostForMenu(cateringMenu);
       final downPaymentDue = total * 0.5;
       final settingLabel = eventSetting == 'closed' ? 'Closed space' : 'Open space';
       final cateringType = inquiryTypeDisplayLabel(inquiryType);
+      final menuModPdf = _managerNewEventMenuModifications(cateringMenu);
 
       pw.Widget labelValueRow(String k, String v) => pw.Padding(
             padding: const pw.EdgeInsets.only(bottom: 5),
@@ -18175,7 +18832,13 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             labelValueRow('Catering type', cateringType),
             labelValueRow('Event type', _resolvedEventType()),
             labelValueRow('Address of event', eventCity.text.trim()),
-            labelValueRow('Service', serviceIncluded == 'yes' ? 'With service' : 'Without service'),
+            labelValueRow(
+              'Event styling',
+              inquiryEventStylingChoiceLabel(inquiryType: inquiryType, serviceIncluded: serviceIncluded),
+            ),
+            if (menuModPdf != null && menuModPdf.displayLines.isNotEmpty) ...[
+              labelValueRow('Menu Modifications', menuModPdf.displayLines.join('; ')),
+            ],
             labelValueRow('Event setting', settingLabel),
             labelValueRow('Formality level', formalityLevel),
             labelValueRow('Menu dishes', menuLines.isEmpty ? '—' : menuLines.join(', ')),
@@ -18196,7 +18859,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
             labelValueRow('Labor cost', 'PHP ${laborCost.toStringAsFixed(2)}'),
             labelValueRow('Travel cost', 'PHP ${travelCost.toStringAsFixed(2)}'),
             labelValueRow('Total invoice', 'PHP ${total.toStringAsFixed(2)}'),
-            labelValueRow('Total Cost', 'PHP ${total.toStringAsFixed(2)}'),
+            labelValueRow('Estimated Cost', 'PHP ${total.toStringAsFixed(2)}'),
             labelValueRow('Down payment due (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
             labelValueRow('Note', note.text.trim().isEmpty ? '—' : note.text.trim()),
           ],
@@ -18469,30 +19132,31 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               const SizedBox(height: 8),
               TextField(controller: note, decoration: const InputDecoration(labelText: 'Note'), maxLines: 3),
               const SizedBox(height: 8),
-              Text('Service', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
-              Row(
-                children: [
-                  Expanded(
-                    child: RadioListTile<String>(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('With service'),
-                      value: 'yes',
-                      groupValue: serviceIncluded,
-                      onChanged: (v) => setState(() => serviceIncluded = v ?? 'yes'),
-                    ),
-                  ),
-                  Expanded(
-                    child: RadioListTile<String>(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('Without service'),
-                      value: 'no',
-                      groupValue: serviceIncluded,
-                      onChanged: (v) => setState(() => serviceIncluded = v ?? 'no'),
-                    ),
-                  ),
-                ],
+              Text(
+                'Do you wish to include event styling? It will count as additional charge for number of guests below $kInquiryLandingEventStylingMinPax.',
+                style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              RadioListTile<String>(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Without event styling'),
+                value: 'no',
+                groupValue: serviceIncluded,
+                onChanged: (v) => setState(() {
+                  serviceIncluded = 'no';
+                  inquiryType = kInquiryTypeCatering;
+                }),
+              ),
+              RadioListTile<String>(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('With event styling'),
+                value: 'yes',
+                groupValue: serviceIncluded,
+                onChanged: (v) => setState(() {
+                  serviceIncluded = 'yes';
+                  inquiryType = kInquiryTypeCateringWithEventStyling;
+                }),
               ),
             ],
           ),
@@ -18612,6 +19276,28 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                       if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
                     }
                   });
+                },
+              ),
+              Builder(
+                builder: (context) {
+                  final mod = _managerNewEventMenuModifications(cateringMenu);
+                  if (mod == null || mod.displayLines.isEmpty) return const SizedBox.shrink();
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 10),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Menu Modifications:', style: TextStyle(fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 6),
+                        ...mod.displayLines.map(
+                          (l) => Padding(
+                            padding: const EdgeInsets.only(bottom: 4),
+                            child: Text(l, style: const TextStyle(height: 1.35)),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
                 },
               ),
               const SizedBox(height: 8),
@@ -18989,7 +19675,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
               Center(
                 child: Column(
                   children: [
-                    const Text('Total Cost', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const Text('Estimated Cost', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 2),
                     Text(
                       '₱${estimate.toStringAsFixed(2)}',
@@ -19433,12 +20119,110 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     return sum;
   }
 
-  double _baseFoodCost() {
+  List<MenuItemData> _managerCateringMenu() => widget.state.menu.where((m) => m.isCateringDish).toList();
+
+  int _managerBillableGuestCountForPricing() {
+    if (_isManagerDraftDetailStage) {
+      final raw = managerGuestCountController.text.trim();
+      if (raw.isEmpty) {
+        final g = d.guestCount;
+        if (g <= 0) return 0;
+        return g < kMinCateringOnlyPax ? kMinCateringOnlyPax : g;
+      }
+      final g = int.tryParse(raw) ?? 0;
+      if (g <= 0) return 0;
+      return g < kMinCateringOnlyPax ? kMinCateringOnlyPax : g;
+    }
     final g = d.guestCount;
-    final minGuests = d.orderKind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
-    final billable = g < minGuests ? minGuests : g;
-    return billable * kPesosPerPax;
+    if (g <= 0) return 0;
+    return g < kMinCateringOnlyPax ? kMinCateringOnlyPax : g;
   }
+
+  int _managerPaxBufferForPricing() {
+    if (_isManagerDraftDetailStage) {
+      final raw = managerPaxBufferController.text.trim();
+      if (raw.isEmpty) return _paxBufferCount(d);
+      final n = int.tryParse(raw) ?? 0;
+      return n < 0 ? 0 : n;
+    }
+    return _paxBufferCount(d);
+  }
+
+  bool _managerIncludesEventStyling() {
+    if (_isManagerDraftDetailStage) {
+      return inquiryIncludesEventStyling(
+        inquiryType: _draftOrderKind == 'event' ? kInquiryTypeCateringWithEventStyling : kInquiryTypeCatering,
+        serviceIncluded: managerServiceIncluded,
+      );
+    }
+    return inquiryIncludesEventStyling(
+      inquiryType: d.orderKind == 'event' ? kInquiryTypeCateringWithEventStyling : kInquiryTypeCatering,
+      serviceIncluded: managerServiceIncluded.isNotEmpty ? managerServiceIncluded : '${d.themeDesign['service_included'] ?? d.serviceIncluded}',
+    );
+  }
+
+  bool get _managerEventStylingSurchargeApplies {
+    final guests = _managerBillableGuestCountForPricing();
+    return _managerIncludesEventStyling() && guests > 0 && guests < kInquiryLandingEventStylingMinPax;
+  }
+
+  InquiryMenuModifications? _managerDetailMenuModifications() {
+    if (_isManagerDraftDetailStage && selectedDishes.isNotEmpty) {
+      return computeInquiryMenuModifications(
+        selectedSetMenu: selectedSetMenu,
+        selectedDishes: selectedDishes,
+        setMenus: widget.state.setMenus,
+        cateringMenu: _managerCateringMenu(),
+        billableGuests: _managerBillableGuestCountForPricing(),
+      );
+    }
+    final raw = d.postAnalysis['menu_modifications'] ?? d.themeDesign['menu_modifications'];
+    return InquiryMenuModifications.fromDynamic(raw);
+  }
+
+  double _menuModificationCharge() => _managerDetailMenuModifications()?.totalExtraCharge ?? 0;
+
+  double _eventStylingSurchargeAmount() {
+    if (!_managerEventStylingSurchargeApplies) return 0;
+    return _managerBillableGuestCountForPricing() * kEventStylingSurchargePerPaxBelow50;
+  }
+
+  double _managerFoodSubtotal() =>
+      (_managerBillableGuestCountForPricing() + _managerPaxBufferForPricing()) * kPesosPerPax +
+      _menuModificationCharge() +
+      _eventStylingSurchargeAmount();
+
+  double _baseFoodCost() => _managerBillableGuestCountForPricing() * kPesosPerPax;
+
+  List<Map<String, dynamic>> _managerCostBreakdown({List<Map<String, dynamic>>? additionalCostsOverride}) {
+    final additional = additionalCostsOverride ?? _flattenAdditionalCostsFromGroups();
+    final lines = <Map<String, dynamic>>[
+      {'label': 'Base food cost', 'amount': _baseFoodCost()},
+    ];
+    final buffer = _managerPaxBufferForPricing();
+    if (buffer > 0) lines.add({'label': 'Pax buffer', 'amount': buffer * kPesosPerPax});
+    final modCharge = _menuModificationCharge();
+    if (modCharge > 0) lines.add({'label': 'Menu modifications', 'amount': modCharge});
+    final styling = _eventStylingSurchargeAmount();
+    if (styling > 0) {
+      lines.add({
+        'label': 'Event styling (below $kInquiryLandingEventStylingMinPax guests)',
+        'amount': styling,
+      });
+    }
+    lines.addAll([
+      {'label': 'Labor cost', 'amount': _laborCostComputed()},
+      {'label': 'Travel cost', 'amount': _travelCostComputed()},
+    ]);
+    if (_includesThemeDesignInTotals) {
+      lines.add({'label': 'Theme design cost', 'amount': _themeDesignCostAmount()});
+    }
+    lines.add({'label': 'Additional costs', 'amount': _sumCostRows(additional)});
+    return lines;
+  }
+
+  String get _managerCostTotalLabel =>
+      _isManagerDraftDetailStage ? 'Estimated Cost' : 'Total Cost';
 
   /// Guest count as entered on inquiry / new event (excludes pax buffer).
   int _guestCountEntered(CateringEventRecord row) => row.guestCount < 0 ? 0 : row.guestCount;
@@ -20006,7 +20790,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   double _travelCostComputed() => double.tryParse(travelCostController.text.trim()) ?? 0;
 
-  bool get _includesThemeDesignInTotals => d.orderKind == 'event';
+  bool get _includesThemeDesignInTotals => _managerIncludesEventStyling();
 
   double _themeDesignCostAmount() {
     if (!_includesThemeDesignInTotals) return 0;
@@ -20026,7 +20810,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   double _grandTotalComputed() =>
-      _baseFoodCost() +
+      _managerFoodSubtotal() +
       _laborCostComputed() +
       _travelCostComputed() +
       _sumCostRows(_flattenAdditionalCostsFromGroups()) +
@@ -20183,7 +20967,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     final laborLine = _laborCostComputed();
     final travelLine = _travelCostComputed();
-    final totalComputed = _baseFoodCost() + laborLine + travelLine + themeCost + additionalCostTotal;
+    final totalComputed = _grandTotalComputed();
     final guestEntered = _guestCountEntered(d);
     final paxBufferCount = _paxBufferCount(d);
     final guestPaxAmount = _guestPaxCostAmount(d);
@@ -20214,7 +20998,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     switch (variant) {
       case _ManagerOrderSummaryPdfVariant.beforeDownPayment:
         tailRows.addAll([
-          labelValueRow('Total Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
+          labelValueRow('Estimated Cost', 'PHP ${totalComputed.toStringAsFixed(2)}'),
           labelValueRow('Down payment due (50%)', 'PHP ${downPaymentDue.toStringAsFixed(2)}'),
         ]);
         break;
@@ -20269,10 +21053,24 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ),
           if (_includesThemeDesignInTotals)
             labelValueRow('Event theme design cost', 'PHP ${themeCost.toStringAsFixed(2)}'),
-          if (variant != _ManagerOrderSummaryPdfVariant.beforeDownPayment && additionalCostTotal > 0.01) ...[
+          if (additionalCostTotal > 0.01) ...[
             labelValueRow('Additional costs', additionalCostsSummaryForPdf(additionalCostsForPdf)),
             labelValueRow('Additional costs (total)', 'PHP ${additionalCostTotal.toStringAsFixed(2)}'),
           ],
+          ...(() {
+            final mod = _managerDetailMenuModifications();
+            if (mod == null || mod.displayLines.isEmpty) return <pw.Widget>[];
+            return [
+              labelValueRow('Menu modifications', mod.displayLines.join('; ')),
+            ];
+          })(),
+          labelValueRow(
+            'Event styling',
+            inquiryEventStylingChoiceLabel(
+              inquiryType: d.orderKind == 'event' ? kInquiryTypeCateringWithEventStyling : kInquiryTypeCatering,
+              serviceIncluded: d.serviceIncluded,
+            ),
+          ),
           labelValueRow('Labor cost', 'PHP ${laborLine.toStringAsFixed(2)}'),
           labelValueRow('Travel cost', 'PHP ${travelLine.toStringAsFixed(2)}'),
           ...tailRows,
@@ -20430,7 +21228,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
   void _refreshDueAndDefaults() {
     final total = widget.stage == kStageForDownPayment || widget.stage == kStageForOngoing
-        ? _baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(additionalCosts)
+        ? (_managerFoodSubtotal() + _themeDesignCostAmount() + _sumCostRows(additionalCosts))
         : _grandTotalComputed();
     downPaymentController.text = (total * 0.5).toStringAsFixed(2);
     if (fullPaymentController.text.trim().isEmpty || jsonToDouble(fullPaymentController.text) <= 0) {
@@ -20626,7 +21424,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         managerEventTypeOtherController.text = existingEventType;
       }
     }
-    managerServiceIncluded = '${tdInit['service_included'] ?? row.serviceIncluded ?? 'no'}' == 'yes' ? 'yes' : 'no';
+    final svc = row.serviceIncluded.trim().isNotEmpty
+        ? row.serviceIncluded
+        : '${tdInit['service_included'] ?? ''}';
+    managerServiceIncluded = svc.trim().toLowerCase() == 'yes' ? 'yes' : 'no';
     managerFormalityLevel =
         row.formalityLevel.trim().isEmpty ? '${tdInit['formality_level'] ?? 'casual'}'.trim() : row.formalityLevel.trim();
     if (!{'casual', 'semiformal', 'formal'}.contains(managerFormalityLevel)) managerFormalityLevel = 'casual';
@@ -20651,6 +21452,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
     }
     _draftOrderKind = row.orderKind;
+    final rowSetMenu =
+        '${row.postAnalysis['selected_set_menu'] ?? row.themeDesign['selected_set_menu'] ?? ''}'.trim();
+    selectedSetMenu = rowSetMenu.isNotEmpty ? rowSetMenu : 'All Dishes';
     if (widget.stage == 'new_event' || widget.stage == 'online_inquiries') {
       _eventWindows
         ..clear()
@@ -21419,7 +22223,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final canComplete = widget.state.isManager;
     final totalComputed = _grandTotalComputed();
     final displayInvoiceTotal = isProcessing
-        ? (_baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(_flattenAdditionalCostsFromGroups()))
+        ? (_managerFoodSubtotal() + _themeDesignCostAmount() + _sumCostRows(_flattenAdditionalCostsFromGroups()))
         : totalComputed;
     final scheduleConflictsForProcessing = _conflictCountWithForProcessing();
     final downPaymentDue = displayInvoiceTotal * 0.5;
@@ -21495,8 +22299,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       final travelNow = _travelCostComputed();
       final flatAdditionalSave = _flattenAdditionalCostsFromGroups();
       final totalNow = isProcessingHere
-          ? (_baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(flatAdditionalSave))
+          ? (_managerFoodSubtotal() + _themeDesignCostAmount() + _sumCostRows(flatAdditionalSave))
           : _grandTotalComputed();
+      final menuModSave = _managerDetailMenuModifications();
       final et =
           managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
 
@@ -21589,7 +22394,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           'event_setting': managerEventSetting,
           'formality_level': managerFormalityLevel,
           if (managerGuestAllergens.isNotEmpty) 'guest_allergens': managerGuestAllergens.toList(),
+          if (menuModSave != null) 'menu_modifications': menuModSave.toJson(),
         };
+        if (menuModSave != null) {
+          postAnalysis['menu_modifications'] = menuModSave.toJson();
+        }
 
         if (isDraftStageHere) {
           final gc = int.tryParse(managerGuestCountController.text.trim());
@@ -21615,14 +22424,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               'labor_cost': laborCostComputedNow,
               'travel_cost': travelNow,
               'total_cost': totalNow,
-              'cost_breakdown': [
-                {'label': 'Base food cost', 'amount': _baseFoodCost()},
-                {'label': 'Labor cost', 'amount': laborCostComputedNow},
-                {'label': 'Travel cost', 'amount': travelNow},
-                if (_includesThemeDesignInTotals)
-                  {'label': 'Theme design cost', 'amount': _themeDesignCostAmount()},
-                {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
-              ],
+              'cost_breakdown': _managerCostBreakdown(additionalCostsOverride: flatAdditionalSave),
+              if (selectedSetMenu != 'All Dishes') 'selected_set_menu': selectedSetMenu,
               if (gc != null && gc >= 0) 'guest_count': gc,
               'pax_buffer': int.tryParse(managerPaxBufferController.text.trim()) ?? 0,
               if (_includesThemeDesignInTotals) 'theme_design_cost': _themeDesignCostAmount(),
@@ -21662,14 +22465,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           laborCost: laborCostComputedNow,
           travelCost: travelNow,
           totalCost: totalNow,
-          costBreakdown: [
-            {'label': 'Base food cost', 'amount': _baseFoodCost()},
-            {'label': 'Labor cost', 'amount': laborCostComputedNow},
-            {'label': 'Travel cost', 'amount': travelNow},
-            if (_includesThemeDesignInTotals)
-              {'label': 'Theme design cost', 'amount': _themeDesignCostAmount()},
-            {'label': 'Additional costs', 'amount': _sumCostRows(flatAdditionalSave)},
-          ],
+          costBreakdown: _managerCostBreakdown(additionalCostsOverride: flatAdditionalSave),
           themeDesign: themeDesign,
           themeDesignCost: _includesThemeDesignInTotals ? _themeDesignCostAmount() : null,
           menu: selectedDishes.isEmpty ? rowBase.menu : selectedDishes.toList(),
@@ -23579,28 +24375,33 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     ],
                     const SizedBox(height: 8),
                     const SizedBox(height: 6),
-                    const Text('Service', style: TextStyle(fontWeight: FontWeight.w600)),
-                    RadioListTile<String>(
-                      value: 'yes',
-                      groupValue: managerServiceIncluded,
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('With service'),
-                      onChanged: canEditStage
-                          ? (v) => setState(() {
-                                managerServiceIncluded = v ?? 'no';
-                              })
-                          : null,
+                    Text(
+                      'Event styling (below $kInquiryLandingEventStylingMinPax guests may incur additional charge)',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
                     ),
                     RadioListTile<String>(
                       value: 'no',
                       groupValue: managerServiceIncluded,
                       dense: true,
                       contentPadding: EdgeInsets.zero,
-                      title: const Text('Without service'),
+                      title: const Text('Without event styling'),
                       onChanged: canEditStage
                           ? (v) => setState(() {
-                                managerServiceIncluded = v ?? 'no';
+                                managerServiceIncluded = 'no';
+                                _draftOrderKind = 'catering';
+                              })
+                          : null,
+                    ),
+                    RadioListTile<String>(
+                      value: 'yes',
+                      groupValue: managerServiceIncluded,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('With event styling'),
+                      onChanged: canEditStage
+                          ? (v) => setState(() {
+                                managerServiceIncluded = 'yes';
+                                _draftOrderKind = 'event';
                               })
                           : null,
                     ),
@@ -23684,6 +24485,28 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 }
                               });
                             },
+                    ),
+                    Builder(
+                      builder: (context) {
+                        final mod = _managerDetailMenuModifications();
+                        if (mod == null || mod.displayLines.isEmpty) return const SizedBox.shrink();
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('Menu Modifications:', style: TextStyle(fontWeight: FontWeight.w800)),
+                              const SizedBox(height: 6),
+                              ...mod.displayLines.map(
+                                (l) => Padding(
+                                  padding: const EdgeInsets.only(bottom: 4),
+                                  child: Text(l, style: const TextStyle(height: 1.35)),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
                     ),
                     const SizedBox(height: 8),
                     SizedBox(
@@ -23790,11 +24613,29 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         );
                       }),
                   ],
+                  if (row.postAnalysis['menu_modifications'] != null ||
+                      row.themeDesign['menu_modifications'] != null) ...[
+                    const SizedBox(height: 12),
+                    const Text('Menu Modifications:', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 6),
+                    ...(() {
+                      final modLines = <Widget>[];
+                      appendInquiryMenuModificationDetailLines(
+                        modLines,
+                        (t) => Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Text(t, style: const TextStyle(height: 1.35)),
+                        ),
+                        row.postAnalysis['menu_modifications'] ?? row.themeDesign['menu_modifications'],
+                      );
+                      return modLines;
+                    })(),
+                  ],
                 ],
               ),
             ),
           ),
-          if (row.orderKind == 'event')
+          if (_isManagerDraftDetailStage ? _managerIncludesEventStyling() : row.orderKind == 'event')
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -24029,9 +24870,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     Center(
                       child: Column(
                         children: [
-                          const Text(
-                            'Total Cost',
-                            style: TextStyle(fontWeight: FontWeight.w800),
+                          Text(
+                            _managerCostTotalLabel,
+                            style: const TextStyle(fontWeight: FontWeight.w800),
                           ),
                           const SizedBox(height: 2),
                           Text(

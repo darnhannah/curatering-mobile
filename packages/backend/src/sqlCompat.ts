@@ -115,9 +115,17 @@ export {
   CATERING_TRANSACTION_ID,
   EVENT_POST_ANALYSIS_JSON,
   EVENT_TRANSACTION_ID,
+  cateringCostBreakdownSql,
   cateringEventSettingSql,
+  cateringMenuModificationsSql,
+  cateringSelectedSetMenuSql,
+  cateringServiceIncludedSql,
   eventAdditionalCostsSql,
+  eventCostBreakdownSql,
+  eventMenuModificationsSql,
   eventPostAnalysisPersistSet,
+  eventSelectedSetMenuSql,
+  eventServiceIncludedSql,
   eventSettingSql,
 } from "./eventOrdersCompat.js";
 

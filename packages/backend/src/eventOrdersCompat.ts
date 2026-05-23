@@ -40,6 +40,73 @@ export function eventAdditionalCostsSql(stageParamRef: string): string {
   END`;
 }
 
+/** Event styling: yes = with styling, no = without (column + legacy JSON fallbacks). */
+export function cateringServiceIncludedSql(): string {
+  return `COALESCE(
+    NULLIF(TRIM(service_included), ''),
+    NULLIF(TRIM((${CATERING_POST_ANALYSIS_JSON})->>'service_included'), ''),
+    'no'
+  )`;
+}
+
+export function eventServiceIncludedSql(): string {
+  return `COALESCE(
+    NULLIF(TRIM(service_included), ''),
+    NULLIF(TRIM(theme_design->>'service_included'), ''),
+    NULLIF(TRIM((${EVENT_POST_ANALYSIS_JSON})->>'service_included'), ''),
+    'no'
+  )`;
+}
+
+export function cateringMenuModificationsSql(): string {
+  return `COALESCE(
+    NULLIF(menu_modifications, '{}'::jsonb),
+    (${CATERING_POST_ANALYSIS_JSON})->'menu_modifications',
+    '{}'::jsonb
+  )`;
+}
+
+export function eventMenuModificationsSql(): string {
+  return `COALESCE(
+    NULLIF(menu_modifications, '{}'::jsonb),
+    NULLIF(theme_design->'menu_modifications', 'null'::jsonb),
+    (${EVENT_POST_ANALYSIS_JSON})->'menu_modifications',
+    '{}'::jsonb
+  )`;
+}
+
+export function cateringCostBreakdownSql(): string {
+  return `COALESCE(
+    NULLIF(cost_breakdown, '[]'::jsonb),
+    (${CATERING_POST_ANALYSIS_JSON})->'cost_breakdown',
+    '[]'::jsonb
+  )`;
+}
+
+export function eventCostBreakdownSql(): string {
+  return `COALESCE(
+    NULLIF(cost_breakdown, '[]'::jsonb),
+    (${EVENT_POST_ANALYSIS_JSON})->'cost_breakdown',
+    '[]'::jsonb
+  )`;
+}
+
+export function cateringSelectedSetMenuSql(): string {
+  return `COALESCE(
+    NULLIF(TRIM(selected_set_menu), ''),
+    NULLIF(TRIM((${CATERING_POST_ANALYSIS_JSON})->>'selected_set_menu'), ''),
+    ''
+  )`;
+}
+
+export function eventSelectedSetMenuSql(): string {
+  return `COALESCE(
+    NULLIF(TRIM(selected_set_menu), ''),
+    NULLIF(TRIM((${EVENT_POST_ANALYSIS_JSON})->>'selected_set_menu'), ''),
+    ''
+  )`;
+}
+
 export function eventPostAnalysisPersistSet(paramRef: string): string {
   return `checklist = jsonb_set(
       COALESCE(checklist, '{}'::jsonb),
