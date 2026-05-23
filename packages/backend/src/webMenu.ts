@@ -11,7 +11,7 @@ import type pg from "pg";
  *
  * Expected column aliases from menu query:
  *   id (text uuid ok), name, description (dish copy), listing_subtitle (optional type/category line),
- *   price, dips (JSON text array), dish_type (optional)
+ *   price, additional_charge_amount (numeric), dips (JSON text array), dish_type (optional)
  *
  * Set menus query expected columns:
  *   name, description, dishes (JSON text array of dish names)
@@ -29,6 +29,7 @@ export const DEFAULT_PUBLIC_MENU_SQL = `
       ELSE TRIM(CONCAT_WS(' • ', NULLIF(TRIM(COALESCE(md.meal_type, md.type)), ''), NULLIF(TRIM(md.category), '')))
     END AS listing_subtitle,
     COALESCE(NULLIF(TRIM(md.price), '')::numeric, 0) AS price,
+    COALESCE(md.additional_charge_amount, 0)::numeric AS additional_charge_amount,
     COALESCE(md.sauces::text, '[]') AS dips,
     COALESCE(md.ingredients::text, '[]') AS ingredients,
     COALESCE(TRIM(md.category), '')::text AS category,

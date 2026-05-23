@@ -1560,6 +1560,12 @@ async function normalizeMenuDishes(pool: pg.Pool): Promise<void> {
   if (!(await columnExists(pool, "menu_dishes", "description"))) {
     await safeExec(pool, `ALTER TABLE public.menu_dishes ADD COLUMN description TEXT NOT NULL DEFAULT ''`);
   }
+  if (!(await columnExists(pool, "menu_dishes", "additional_charge_amount"))) {
+    await safeExec(
+      pool,
+      `ALTER TABLE public.menu_dishes ADD COLUMN additional_charge_amount NUMERIC(12, 2) NOT NULL DEFAULT 0`,
+    );
+  }
   await renameColumnIfExists(pool, "menu_dishes", "type", "meal_type");
   await pool.query(`
     CREATE TABLE IF NOT EXISTS menu_dishes_meal_types (

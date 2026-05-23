@@ -1243,6 +1243,7 @@ app.get("/api/mobile/menu", async (_req, res) => {
         description: String((r as Record<string, unknown>).description ?? ""),
         listing_subtitle: String((r as Record<string, unknown>).listing_subtitle ?? ""),
         price: Number((r as Record<string, unknown>).price ?? 0),
+        additional_charge_amount: Number((r as Record<string, unknown>).additional_charge_amount ?? 0),
         dips: parseJsonTextArray((r as Record<string, unknown>).dips),
         ingredients: parseJsonTextArray((r as Record<string, unknown>).ingredients),
         category: String((r as Record<string, unknown>).category ?? ""),

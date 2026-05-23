@@ -495,7 +495,21 @@ export async function initDb(): Promise<void> {
           ALTER TABLE public.menu_dishes
             ADD COLUMN description TEXT NOT NULL DEFAULT '';
         END IF;
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'menu_dishes'
+            AND column_name = 'additional_charge_amount'
+        ) THEN
+          ALTER TABLE public.menu_dishes
+            ADD COLUMN additional_charge_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
+        END IF;
       END $$;
+    `);
+    await p.query(`
+      COMMENT ON COLUMN public.menu_dishes.additional_charge_amount IS
+        'PHP charged per extra add-on unit beyond the first (per main dish qty). 0 = use app default.'
     `);
   } catch {
     // menu_dishes may be absent in minimal dev DBs.

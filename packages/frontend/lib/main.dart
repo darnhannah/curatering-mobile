@@ -788,6 +788,95 @@ void appSnack(BuildContext context, String message) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
 
+/// Prevents duplicate routes/dialogs when buttons or tiles are tapped repeatedly.
+final Set<String> _navSingleFlightLocks = {};
+
+String _navLockKey(Object scope, String routeKey) => '${identityHashCode(scope)}|$routeKey';
+
+bool _acquireNavLock(Object scope, String routeKey) {
+  final k = _navLockKey(scope, routeKey);
+  if (_navSingleFlightLocks.contains(k)) return false;
+  _navSingleFlightLocks.add(k);
+  return true;
+}
+
+void _releaseNavLock(Object scope, String routeKey) {
+  _navSingleFlightLocks.remove(_navLockKey(scope, routeKey));
+}
+
+/// Push [screen] once until that route is popped (per [routeKey]).
+Future<T?> pushScreenOnce<T extends Object?>(
+  BuildContext context,
+  Widget screen, {
+  String? routeKey,
+  bool rootNavigator = false,
+}) {
+  if (!context.mounted) return Future<T?>.value(null);
+  final nav = Navigator.of(context, rootNavigator: rootNavigator);
+  final key = routeKey ?? screen.runtimeType.toString();
+  if (!_acquireNavLock(nav, key)) return Future<T?>.value(null);
+  return nav
+      .push<T>(
+        MaterialPageRoute<T>(
+          settings: RouteSettings(name: key),
+          builder: (_) => screen,
+        ),
+      )
+      .whenComplete(() => _releaseNavLock(nav, key));
+}
+
+Future<T?> pushRouteOnce<T extends Object?>(
+  BuildContext context,
+  Route<T> route, {
+  String? routeKey,
+  bool rootNavigator = false,
+}) {
+  if (!context.mounted) return Future<T?>.value(null);
+  final nav = Navigator.of(context, rootNavigator: rootNavigator);
+  final key = routeKey ?? route.settings.name ?? route.runtimeType.toString();
+  if (!_acquireNavLock(nav, key)) return Future<T?>.value(null);
+  return nav.push<T>(route).whenComplete(() => _releaseNavLock(nav, key));
+}
+
+Future<T?> pushReplacementScreenOnce<T extends Object?, TO extends Object?>(
+  BuildContext context,
+  Widget screen, {
+  String? routeKey,
+  TO? result,
+  bool rootNavigator = false,
+}) {
+  if (!context.mounted) return Future<T?>.value(null);
+  final nav = Navigator.of(context, rootNavigator: rootNavigator);
+  final key = routeKey ?? screen.runtimeType.toString();
+  if (!_acquireNavLock(nav, 'replace:$key')) return Future<T?>.value(null);
+  return nav
+      .pushReplacement<T, TO>(
+        MaterialPageRoute<T>(
+          settings: RouteSettings(name: key),
+          builder: (_) => screen,
+        ),
+        result: result,
+      )
+      .whenComplete(() => _releaseNavLock(nav, 'replace:$key'));
+}
+
+Future<T?> showAppDialogOnce<T>(
+  BuildContext context,
+  Widget Function(BuildContext ctx) builder, {
+  String? dedupeKey,
+  bool barrierDismissible = true,
+}) {
+  if (!context.mounted) return Future<T?>.value(null);
+  final key = dedupeKey ?? 'app-dialog';
+  final scope = Navigator.of(context, rootNavigator: true);
+  if (!_acquireNavLock(scope, 'dialog:$key')) return Future<T?>.value(null);
+  return showDialog<T>(
+    context: context,
+    barrierDismissible: barrierDismissible,
+    builder: builder,
+  ).whenComplete(() => _releaseNavLock(scope, 'dialog:$key'));
+}
+
 const int kMinCateringOnlyPax = 10;
 const int kMinCateringEventPax = 50;
 const double kPesosPerPax = 500;
@@ -999,6 +1088,7 @@ class MenuItemData {
     required this.description,
     this.listingSubtitle = '',
     required this.price,
+    this.additionalChargeAmount = 0,
     required this.dips,
     this.ingredients = const [],
     this.allergens = const [],
@@ -1014,6 +1104,8 @@ class MenuItemData {
   /// Meal type / category line for list cards (API `listing_subtitle`).
   final String listingSubtitle;
   final double price;
+  /// Per extra add-on unit beyond the first (`menu_dishes.additional_charge_amount`). 0 → app default.
+  final double additionalChargeAmount;
   final List<String> dips;
   final List<String> ingredients;
   final List<String> allergens;
@@ -1089,14 +1181,21 @@ class MenuItemData {
   }
 }
 
-/// Extra add-on units beyond the first (per main dish qty) are charged this amount (matches server).
+/// Extra add-on units beyond the first (per main dish qty) when dish has no DB amount set.
 const double kRestaurantAddonExtraPhp = 15;
+
+double restaurantAddonExtraPerUnit(MenuItemData menu) {
+  final db = menu.additionalChargeAmount;
+  if (db.isFinite && db > 0) return db;
+  return kRestaurantAddonExtraPhp;
+}
 
 double cartLineSubtotal(CartItem item) {
   final dip = item.dip.trim();
   final hasDip = dip.isNotEmpty;
   final dq = hasDip ? item.dipQty.clamp(0, 999999) : 0;
-  final extra = hasDip ? math.max(0, dq - 1) * kRestaurantAddonExtraPhp * item.qty : 0;
+  final unitExtra = restaurantAddonExtraPerUnit(item.menu);
+  final extra = hasDip ? math.max(0, dq - 1) * unitExtra * item.qty : 0;
   return item.qty * item.menu.price + extra;
 }
 
@@ -1198,7 +1297,7 @@ double cartAddonExtraSubtotal(CartItem item) {
   final dip = item.dip.trim();
   if (dip.isEmpty) return 0;
   final dq = item.dipQty.clamp(0, 999999);
-  return math.max(0, dq - 1) * kRestaurantAddonExtraPhp * item.qty;
+  return math.max(0, dq - 1) * restaurantAddonExtraPerUnit(item.menu) * item.qty;
 }
 
 double orderLineAddonExtraSubtotal(OrderLineItem line) {
@@ -1988,9 +2087,10 @@ Future<void> showEventVenueMapPreview(BuildContext context, String address) asyn
     appSnack(context, 'No event venue address to show.');
     return;
   }
-  await showDialog<void>(
-    context: context,
-    builder: (ctx) => _EventVenueMapPreviewDialog(address: q),
+  await showAppDialogOnce<void>(
+    context,
+    (ctx) => _EventVenueMapPreviewDialog(address: q),
+    dedupeKey: 'event-venue-map',
   );
 }
 
@@ -2135,9 +2235,9 @@ Widget? cashierPaymentProofListIcon(BuildContext context, OrderData o) {
 }
 
 void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 'Payment proof'}) {
-  showDialog<void>(
-    context: context,
-    builder: (ctx) => Dialog(
+  showAppDialogOnce<void>(
+    context,
+    (ctx) => Dialog(
       insetPadding: const EdgeInsets.all(12),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -2156,6 +2256,7 @@ void showProofFullScreen(BuildContext context, Uint8List bytes, {String title = 
         ],
       ),
     ),
+    dedupeKey: 'proof-fullscreen:$title',
   );
 }
 
@@ -3850,6 +3951,7 @@ class AppState extends ChangeNotifier {
               description: '${map['description']}',
               listingSubtitle: '${map['listing_subtitle'] ?? ''}',
               price: jsonToDouble(map['price']),
+              additionalChargeAmount: jsonToDouble(map['additional_charge_amount']),
               dips: dipValues,
               ingredients: ingValues,
               allergens: allergenValues,
@@ -5976,9 +6078,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                               : st.isManager
                                                   ? ManagerDashboardScreen(state: st)
                                                   : CustomerDashboardScreen(state: st);
-                                      Navigator.of(context).pushReplacement(
-                                        MaterialPageRoute<void>(builder: (_) => landing),
-                                      );
+                                      pushReplacementScreenOnce(context, landing, routeKey: landing.runtimeType.toString());
                                     });
                                   } finally {
                                     if (mounted) setState(() => busyMessage = null);
@@ -6514,9 +6614,7 @@ class AppScaffold extends StatelessWidget {
           if (showTrayShortcut && state.userEmail != null)
             IconButton(
               tooltip: 'Your tray',
-              onPressed: () {
-                Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => TrayScreen(state: state)));
-              },
+              onPressed: () => pushScreenOnce(context, TrayScreen(state: state)),
               icon: Badge(
                 isLabelVisible: qty > 0,
                 label: Text('$qty'),
@@ -6537,7 +6635,7 @@ class AppDrawer extends StatelessWidget {
   final AppState state;
 
   void open(BuildContext context, Widget screen) {
-    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
+    pushScreenOnce(context, screen);
   }
 
   @override
@@ -6755,9 +6853,7 @@ class CashierRoleDrawer extends StatelessWidget {
             onTap: () {
               Navigator.pop(context);
               if (!closeExtraRouteForManageOrders) {
-                Navigator.of(context).push(
-                  MaterialPageRoute<void>(builder: (_) => PosOrderHistoryScreen(state: state)),
-                );
+                pushScreenOnce(context, PosOrderHistoryScreen(state: state));
               }
             },
           ),
@@ -6774,9 +6870,7 @@ class CashierRoleDrawer extends StatelessWidget {
             title: const Text('Settings'),
             onTap: () {
               Navigator.pop(context);
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
-              );
+              pushScreenOnce(context, SettingsScreen(state: state));
             },
           ),
         ],
@@ -6847,7 +6941,7 @@ class SupervisorStaffDrawer extends StatelessWidget {
             title: const Text('Settings'),
             onTap: () {
               Navigator.pop(context);
-              Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)));
+              pushScreenOnce(context, SettingsScreen(state: state));
             },
           ),
         ],
@@ -6881,9 +6975,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
           drawer: SupervisorStaffDrawer(
             state: state,
             onOngoing: () {
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
-              );
+              pushScreenOnce(context, SupervisorOngoingShellScreen(state: state));
             },
           ),
           body: Column(
@@ -6915,9 +7007,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
                     child: InkWell(
                       borderRadius: BorderRadius.circular(12),
                       onTap: () {
-                        Navigator.of(context).push(
-                          MaterialPageRoute<void>(builder: (_) => SupervisorOngoingShellScreen(state: state)),
-                        );
+                        pushScreenOnce(context, SupervisorOngoingShellScreen(state: state));
                       },
                       child: Padding(
                         padding: const EdgeInsets.all(20),
@@ -7061,7 +7151,7 @@ class ManagerRoleDrawer extends StatelessWidget {
             title: const Text('Settings'),
             onTap: () {
               Navigator.pop(context);
-              Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)));
+              pushScreenOnce(context, SettingsScreen(state: state));
             },
           ),
         ],
@@ -7983,9 +8073,9 @@ Future<void> showCustomerAuthDialog(
   bool offerGuestContinue = false,
   int guestContinueTabIndex = 0,
 }) async {
-  await showDialog<void>(
-    context: context,
-    builder: (dCtx) {
+  await showAppDialogOnce<void>(
+    context,
+    (dCtx) {
       return Dialog(
         insetPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 24),
         child: ConstrainedBox(
@@ -7998,6 +8088,7 @@ Future<void> showCustomerAuthDialog(
         ),
       );
     },
+    dedupeKey: 'customer-auth:$offerGuestContinue:$guestContinueTabIndex',
   );
 }
 
@@ -8181,11 +8272,7 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
                           }
                           Navigator.of(context).pop();
                           if (!context.mounted) return;
-                          Navigator.of(context).pushReplacement(
-                            MaterialPageRoute<void>(
-                              builder: (_) => CustomerDashboardScreen(state: state),
-                            ),
-                          );
+                          pushReplacementScreenOnce(context, CustomerDashboardScreen(state: state));
                         } finally {
                           if (mounted) setState(() => busy = null);
                         }
@@ -8241,9 +8328,9 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
 }
 
 void showCateringPackageDialog(BuildContext context) {
-  showDialog<void>(
-    context: context,
-    builder: (ctx) {
+  showAppDialogOnce<void>(
+    context,
+    (ctx) {
       return DefaultTabController(
         length: 2,
         child: AlertDialog(
@@ -8330,6 +8417,7 @@ void showCateringPackageDialog(BuildContext context) {
         ),
       );
     },
+    dedupeKey: 'catering-packages',
   );
 }
 
@@ -8741,8 +8829,10 @@ class CustomerDashboardScreen extends StatelessWidget {
                                     child: _CustomerDashTileCard(
                                       title: primaryPair[i].title,
                                       icon: primaryPair[i].icon,
-                                      onTap: () => Navigator.of(context).push(
-                                        MaterialPageRoute<void>(builder: (_) => primaryPair[i].screen),
+                                      onTap: () => pushScreenOnce(
+                                        context,
+                                        primaryPair[i].screen,
+                                        routeKey: primaryPair[i].title,
                                       ),
                                     ),
                                   ),
@@ -8780,9 +8870,7 @@ class CustomerDashboardScreen extends StatelessWidget {
                                   }
                                   final screen = item.screen;
                                   if (screen == null) return;
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute<void>(builder: (_) => screen),
-                                  );
+                                  pushScreenOnce(context, screen, routeKey: item.title);
                                 },
                               );
                             },
@@ -8893,9 +8981,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
           );
         },
         onManageEvents: () {
-          Navigator.of(context).push(
-            MaterialPageRoute<void>(builder: (_) => ManagerCateringShellScreen(state: state)),
-          );
+          pushScreenOnce(context, ManagerCateringShellScreen(state: state));
         },
       ),
       body: Column(
@@ -8950,9 +9036,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
                         shadowColor: Colors.black26,
                         child: InkWell(
                           borderRadius: BorderRadius.circular(12),
-                          onTap: () => Navigator.of(context).push(
-                            MaterialPageRoute<void>(builder: (_) => SettingsScreen(state: state)),
-                          ),
+                          onTap: () => pushScreenOnce(context, SettingsScreen(state: state)),
                           child: const Padding(
                             padding: EdgeInsets.all(14),
                             child: Column(
@@ -8977,10 +9061,10 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
                       child: InkWell(
                         borderRadius: BorderRadius.circular(12),
                         onTap: () {
-                          Navigator.of(context).pushReplacement(
-                            MaterialPageRoute<void>(
-                              builder: (_) => ManagerCateringShellScreen(state: state, initialTabIndex: item.tabIdx),
-                            ),
+                          pushReplacementScreenOnce(
+                            context,
+                            ManagerCateringShellScreen(state: state, initialTabIndex: item.tabIdx),
+                            routeKey: 'ManagerCateringShell:${item.tabIdx}',
                           );
                         },
                         child: Padding(
@@ -9182,11 +9266,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                                   return;
                                 }
                                 if (!context.mounted) return;
-                                Navigator.of(context).push<void>(
-                                  MaterialPageRoute<void>(
-                                    builder: (_) => CheckoutScreen(state: widget.state),
-                                  ),
-                                );
+                                pushScreenOnce(context, CheckoutScreen(state: widget.state));
                               },
                         child: const Text('CHECKOUT'),
                       ),
@@ -10660,7 +10740,7 @@ class TrayScreen extends StatelessWidget {
                           return;
                         }
                         if (!context.mounted) return;
-                        Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => CheckoutScreen(state: state)));
+                        pushScreenOnce(context, CheckoutScreen(state: state));
                       },
               ),
             ],
@@ -10898,13 +10978,14 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 
   Future<void> _openGuestMapsDialog() async {
     final addrHint = _guestDeliveryCtl.text.trim();
-    final r = await showDialog<MapPinResult>(
-      context: context,
-      builder: (ctx) => _MapPinPickerDialog(
+    final r = await showAppDialogOnce<MapPinResult>(
+      context,
+      (ctx) => _MapPinPickerDialog(
         initialSearchQuery: addrHint,
         initialLat: _guestMapLat ?? widget.state.profile.deliveryLat,
         initialLng: _guestMapLng ?? widget.state.profile.deliveryLng,
       ),
+      dedupeKey: 'map-pin:guest-checkout',
     );
     if (r != null && mounted) {
       setState(() {
@@ -11320,14 +11401,13 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 ),
               );
               if (okCheckout != true || !context.mounted) return;
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => PaymentScreen(
-                    state: s,
-                    order: null,
-                    note: noteController.text,
-                    draftCheckout: true,
-                  ),
+              pushScreenOnce(
+                context,
+                PaymentScreen(
+                  state: s,
+                  order: null,
+                  note: noteController.text,
+                  draftCheckout: true,
                 ),
               );
             },
@@ -11998,10 +12078,10 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       await _submitGcashReferenceOnly(s, insufficient: false);
                       if (!context.mounted) return;
                     }
-                    Navigator.of(context).pushReplacement(
-                      MaterialPageRoute<void>(
-                        builder: (_) => OrderStatusScreen(state: s, order: ordNow, paymentUploaded: true),
-                      ),
+                    pushReplacementScreenOnce(
+                      context,
+                      OrderStatusScreen(state: s, order: ordNow, paymentUploaded: true),
+                      routeKey: 'OrderStatus:${ordNow.orderNo}',
                     );
                     // Requirement: navigate to the order page first, then clear tray/draft.
                     if (widget.draftCheckout) unawaited(s.clearCheckoutAfterSuccessfulOrderAndPayment());
@@ -12210,7 +12290,7 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
                   const SizedBox(height: 10),
                   OutlinedButton(
                     onPressed: () {
-                      Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => MyOrdersScreen(state: state)));
+                      pushScreenOnce(context, MyOrdersScreen(state: state));
                     },
                     child: const Text('MY ORDERS'),
                   ),
@@ -12722,9 +12802,9 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                       widget.state.markOrderAttentionRead(o.orderNo);
                       await widget.state.loadRestaurantOrderDetail(o.id);
                       if (!context.mounted) return;
-                      showDialog<void>(
-                        context: context,
-                        builder: (ctx) {
+                      showAppDialogOnce<void>(
+                        context,
+                        (ctx) {
                           OrderData od = o;
                           try {
                             od = widget.state.orders.firstWhere((e) => e.id == o.id);
@@ -12838,10 +12918,10 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                               TextButton(
                                 onPressed: () {
                                   Navigator.of(ctx).pop();
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute<void>(
-                                      builder: (_) => PaymentScreen(state: widget.state, order: od, note: od.note),
-                                    ),
+                                  pushScreenOnce(
+                                    context,
+                                    PaymentScreen(state: widget.state, order: od, note: od.note),
+                                    routeKey: 'PaymentScreen:${od.orderNo}',
                                   );
                                 },
                                 child: const Text('Balance payment'),
@@ -12850,6 +12930,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                           ],
                         );
                         },
+                        dedupeKey: 'order-detail:${o.orderNo}',
                       );
                     },
                         ),
@@ -13317,13 +13398,14 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
   Future<void> _openMapsDialog() async {
     final p = widget.state.profile;
     final addrHint = addressController.text.trim().isNotEmpty ? addressController.text.trim() : p.deliveryAddress;
-    final r = await showDialog<MapPinResult>(
-      context: context,
-      builder: (ctx) => _MapPinPickerDialog(
+    final r = await showAppDialogOnce<MapPinResult>(
+      context,
+      (ctx) => _MapPinPickerDialog(
         initialSearchQuery: addrHint,
         initialLat: mapLat ?? p.deliveryLat,
         initialLng: mapLng ?? p.deliveryLng,
       ),
+      dedupeKey: 'map-pin:profile',
     );
     if (r != null && mounted) {
       setState(() {
@@ -14507,10 +14589,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
   }
 
   Future<void> _pickVenueOnMap() async {
-    final res = await Navigator.of(context).push<MapPinResult>(
+    final res = await pushRouteOnce<MapPinResult>(
+      context,
       MaterialPageRoute(
         builder: (_) => _MapPinPickerDialog(initialSearchQuery: eventCity.text.trim()),
       ),
+      routeKey: 'MapPinPicker:inquiry',
     );
     if (res == null || !mounted) return;
     setState(() {
@@ -15272,7 +15356,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                 appSnack(context, 'Enter your email before opening theme design.');
                                 return;
                               }
-                              final result = await Navigator.push<Map<String, dynamic>?>(
+                              final result = await pushRouteOnce<Map<String, dynamic>?>(
                                 context,
                                 MaterialPageRoute<Map<String, dynamic>?>(
                                   builder: (_) => EventThemeDesignScreen(
@@ -15286,6 +15370,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                     eventSetting: eventSetting,
                                   ),
                                 ),
+                                routeKey: 'EventThemeDesign:inquiry',
                               );
                               if (result != null && mounted) {
                                 setState(() => _aiThemeDesignPayload = result);
@@ -15757,13 +15842,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
               appSnack(context, 'Inquiry submitted');
               if (state.isGuestSession) {
                 _resetInquiryForm();
-                Navigator.of(context).pushReplacement(
-                  MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)),
-                );
+                pushReplacementScreenOnce(context, RestaurantMenuScreen(state: state));
               } else {
-                Navigator.of(context).pushReplacement(
-                  MaterialPageRoute<void>(builder: (_) => MyInquiriesScreen(state: state)),
-                );
+                pushReplacementScreenOnce(context, MyInquiriesScreen(state: state));
               }
             },
               ),
@@ -16094,9 +16175,9 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
     final feedback = _feedbackByInquiryId[r.id];
     final themeImg =
         '${r.themeDesign['generatedImageUrl'] ?? r.themeDesign['imageUrl'] ?? ''}'.trim();
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
+    showAppDialogOnce<void>(
+      context,
+      (ctx) => AlertDialog(
         title: Text(r.displayTransactionRef),
         content: SingleChildScrollView(
           child: Column(
@@ -16165,6 +16246,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
           TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close')),
         ],
       ),
+      dedupeKey: 'inquiry-detail:${r.id}',
     );
   }
 
@@ -16622,13 +16704,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   title: const Text('Event theme design options'),
                   subtitle: const Text('Edit style, mood, color, and decor choices shown to customers.'),
                   onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute<void>(
-                        builder: (_) => EventDesignAdminScreen(
-                          apiBase: widget.state.apiBase,
-                          staffEmail: widget.state.userEmail!.trim(),
-                          staffPassword: widget.state.loginPassword,
-                        ),
+                    pushScreenOnce(
+                      context,
+                      EventDesignAdminScreen(
+                        apiBase: widget.state.apiBase,
+                        staffEmail: widget.state.userEmail!.trim(),
+                        staffPassword: widget.state.loginPassword,
                       ),
                     );
                   },
@@ -16941,9 +17022,9 @@ void showCashierHelpDialog(BuildContext context, AppState state) {
   final area = TextEditingController();
   final problem = TextEditingController();
   final outcome = TextEditingController();
-  showDialog<void>(
-    context: context,
-    builder: (ctx) => AlertDialog(
+  showAppDialogOnce<void>(
+    context,
+    (ctx) => AlertDialog(
       title: const Text('Help request'),
       content: SingleChildScrollView(
         child: Column(
@@ -16978,6 +17059,7 @@ void showCashierHelpDialog(BuildContext context, AppState state) {
         ),
       ],
     ),
+    dedupeKey: 'cashier-help',
   );
 }
 
@@ -17362,11 +17444,7 @@ class _ManagerNewEventListTab extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
             child: FilledButton.icon(
               onPressed: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (ctx) => ManagerNewEventCreateScreen(state: state),
-                  ),
-                );
+                pushScreenOnce(context, ManagerNewEventCreateScreen(state: state));
               },
               icon: const Icon(Icons.add_circle_outline),
               label: const Text('NEW EVENT'),
@@ -17882,10 +17960,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   }
 
   Future<void> _pickVenueOnMap() async {
-    final res = await Navigator.of(context).push<MapPinResult>(
+    final res = await pushRouteOnce<MapPinResult>(
+      context,
       MaterialPageRoute(
         builder: (_) => _MapPinPickerDialog(initialSearchQuery: eventCity.text.trim()),
       ),
+      routeKey: 'MapPinPicker:inquiry',
     );
     if (res == null || !mounted) return;
     setState(() {
@@ -18661,7 +18741,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   appSnack(context, 'Enter customer email before opening theme design.');
                   return;
                 }
-                final result = await Navigator.push<Map<String, dynamic>?>(
+                final result = await pushRouteOnce<Map<String, dynamic>?>(
                   context,
                   MaterialPageRoute<Map<String, dynamic>?>(
                     builder: (_) => EventThemeDesignScreen(
@@ -18677,6 +18757,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                       cashierPassword: widget.state.loginPassword,
                     ),
                   ),
+                  routeKey: 'EventThemeDesign:manager-new',
                 );
                 if (result != null && mounted) {
                   setState(() => _newEventThemeDesign = result);
@@ -18709,7 +18790,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   appSnack(context, 'Enter customer email before editing seating.');
                   return;
                 }
-                final result = await Navigator.push<SeatingPlanData?>(
+                final result = await pushRouteOnce<SeatingPlanData?>(
                   context,
                   MaterialPageRoute<SeatingPlanData?>(
                     builder: (_) => SeatingLayoutEditorScreen(
@@ -18721,6 +18802,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                       themeDesign: _newEventThemeDesign ?? const {},
                     ),
                   ),
+                  routeKey: 'SeatingLayoutEditor:manager-new',
                 );
                 if (result != null && mounted) {
                   setState(() => _newEventSeatingPlan = result);
@@ -19208,15 +19290,15 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                                   ],
                                 ),
                           onTap: () {
-                            Navigator.of(context).push<void>(
-                              MaterialPageRoute<void>(
-                                builder: (_) => ManagerCateringDetailScreen(
-                                  state: state,
-                                  row: r,
-                                  stage: stage,
-                                  supervisorMode: widget.supervisorMode,
-                                ),
+                            pushScreenOnce(
+                              context,
+                              ManagerCateringDetailScreen(
+                                state: state,
+                                row: r,
+                                stage: stage,
+                                supervisorMode: widget.supervisorMode,
                               ),
+                              routeKey: 'ManagerCateringDetail:${r.id}:$stage',
                             );
                           },
                         ),
@@ -20492,10 +20574,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   Future<void> _pickManagerVenueOnMap() async {
-    final res = await Navigator.of(context).push<MapPinResult>(
+    final res = await pushRouteOnce<MapPinResult>(
+      context,
       MaterialPageRoute(
         builder: (_) => _MapPinPickerDialog(initialSearchQuery: managerAddressController.text.trim()),
       ),
+      routeKey: 'MapPinPicker:manager',
     );
     if (res == null || !mounted) return;
     setState(() {
@@ -21305,9 +21389,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           },
           onManageEvents: () {
             Navigator.of(context).popUntil((route) => route.isFirst);
-            Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => ManagerCateringShellScreen(state: widget.state)),
-            );
+            pushScreenOnce(context, ManagerCateringShellScreen(state: widget.state));
           },
         ),
         body: const Center(child: CircularProgressIndicator()),
@@ -22114,7 +22196,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         buttonLabel: canEditSeatingForRow ? 'Edit seating layout' : 'View seating layout',
                         onOpenEditor: () async {
                           final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
-                          await Navigator.push<SeatingPlanData?>(
+                          await pushRouteOnce<SeatingPlanData?>(
                             context,
                             MaterialPageRoute<SeatingPlanData?>(
                               builder: (_) => SeatingLayoutEditorScreen(
@@ -22131,6 +22213,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 themeDesign: row.themeDesign,
                               ),
                             ),
+                            routeKey: 'SeatingLayoutEditor:supervisor:${row.id}',
                           );
                         },
                       ),
@@ -23733,7 +23816,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               final email = managerEmailController.text.trim().isNotEmpty
                                   ? managerEmailController.text.trim()
                                   : row.emailAddress;
-                              final updated = await Navigator.push<Map<String, dynamic>?>(
+                              final updated = await pushRouteOnce<Map<String, dynamic>?>(
                                 context,
                                 MaterialPageRoute<Map<String, dynamic>?>(
                                   builder: (_) => EventThemeDesignScreen(
@@ -23752,6 +23835,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                     persistToOrder: true,
                                   ),
                                 ),
+                                routeKey: 'EventThemeDesign:manager-detail:${row.id}',
                               );
                               if (updated != null && mounted) {
                                 final m = await widget.state.loadManagerCateringItem(
@@ -23813,7 +23897,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               : 'Edit seating layout',
                       onOpenEditor: () async {
                         final initialPlan = SeatingPlanData.fromJson(row.seatingPlan);
-                        await Navigator.push<SeatingPlanData?>(
+                        await pushRouteOnce<SeatingPlanData?>(
                           context,
                           MaterialPageRoute<SeatingPlanData?>(
                             builder: (_) => SeatingLayoutEditorScreen(
@@ -23830,6 +23914,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               themeDesign: row.themeDesign,
                             ),
                           ),
+                          routeKey: 'SeatingLayoutEditor:manager-detail:${row.id}',
                         );
                         if (!mounted) return;
                         final m = await widget.state.loadManagerCateringItem(
@@ -24285,9 +24370,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                       child: FilledButton(
                         style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                         onPressed: () {
-                          Navigator.of(context).push<void>(
-                            MaterialPageRoute<void>(builder: (_) => PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal)),
-                          );
+                          pushScreenOnce(context, PosWalkInCheckoutScreen(state: widget.state, subtotal: subtotal));
                         },
                         child: const Text('CHECKOUT'),
                       ),
@@ -24393,9 +24476,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                         child: FilledButton(
                           style: FilledButton.styleFrom(backgroundColor: AppColors.brand, foregroundColor: AppColors.ink),
                           onPressed: () {
-                            Navigator.of(context).push<void>(
-                              MaterialPageRoute<void>(builder: (_) => PosYourTrayScreen(state: widget.state, subtotal: subtotal)),
-                            );
+                            pushScreenOnce(context, PosYourTrayScreen(state: widget.state, subtotal: subtotal));
                           },
                           child: Row(
                             mainAxisAlignment: MainAxisAlignment.center,
@@ -24499,11 +24580,7 @@ class PosYourTrayScreen extends StatelessWidget {
                         onPressed: state.tray.isEmpty
                             ? null
                             : () {
-                                Navigator.of(context).push<void>(
-                                  MaterialPageRoute<void>(
-                                    builder: (_) => PosWalkInCheckoutScreen(state: state, subtotal: subtotal),
-                                  ),
-                                );
+                                pushScreenOnce(context, PosWalkInCheckoutScreen(state: state, subtotal: subtotal));
                               },
                         child: const Text('NEXT'),
                       ),
@@ -24799,9 +24876,9 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
   }
 
   Future<void> _showWalkInDetail(OrderData o) async {
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
+    await showAppDialogOnce<void>(
+      context,
+      (ctx) => AlertDialog(
         title: Text(uiOrderNo(o.orderNo)),
         content: SingleChildScrollView(
           child: Column(
@@ -24856,6 +24933,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
         ],
       ),
+      dedupeKey: 'pos-walkin-detail:${o.orderNo}',
     );
   }
 
@@ -25590,10 +25668,10 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                                     style: const TextStyle(fontWeight: FontWeight.w600),
                                   ),
                                   onTap: () async {
-                                    await Navigator.of(context).push<void>(
-                                      MaterialPageRoute<void>(
-                                        builder: (_) => PosOnlineOrderDetailScreen(state: widget.state, order: o),
-                                      ),
+                                    await pushScreenOnce(
+                                      context,
+                                      PosOnlineOrderDetailScreen(state: widget.state, order: o),
+                                      routeKey: 'PosOnlineOrderDetail:${o.orderNo}',
                                     );
                                     if (context.mounted) await widget.state.loadCashierOnlineOrders(force: true);
                                   },
