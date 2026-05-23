@@ -1021,47 +1021,71 @@ InquiryMenuModifications? computeInquiryMenuModifications({
   );
 }
 
-void appendInquiryMenuModificationDetailLines(List<Widget> lines, Widget Function(String) line, dynamic menuModRaw) {
-  InquiryMenuModifications? mod;
-  if (menuModRaw is Map) {
-    mod = InquiryMenuModifications.fromDynamic(menuModRaw);
-    if (mod != null && mod.displayLines.isEmpty) {
-      final removed = menuModRaw['removed'];
-      final added = menuModRaw['added'];
-      if (removed is List && removed.isNotEmpty) {
-        lines.add(line('Removed: ${removed.map((e) => '$e').join(', ')}'));
-      }
-      if (added is List) {
-        for (final item in added) {
-          if (item is Map) {
-            final name = '${item['name'] ?? ''}'.trim();
-            final perPax = jsonToDouble(item['additional_charge_per_pax']);
-            final suffix = perPax > 0 ? ' (+Php${perPax.toStringAsFixed(0)} per pax)' : '';
-            if (name.isNotEmpty) lines.add(line('Added: $name$suffix'));
-          }
-        }
-      }
-      final replaced = menuModRaw['replaced'];
-      if (replaced is List) {
-        for (final item in replaced) {
-          if (item is Map) {
-            final from = '${item['from'] ?? ''}'.trim();
-            final to = '${item['to'] ?? ''}'.trim();
-            final perPax = jsonToDouble(item['additional_charge_per_pax']);
-            final suffix = perPax > 0 ? ' (+Php${perPax.toStringAsFixed(0)} per pax)' : '';
-            if (from.isNotEmpty && to.isNotEmpty) lines.add(line('Replaced: $from → $to$suffix'));
-          }
-        }
-      }
-      return;
-    }
+String _menuModChargeCell(double perPax, int billableGuests) {
+  if (perPax <= 0 || billableGuests <= 0) return '—';
+  return '₱${(perPax * billableGuests).toStringAsFixed(2)}';
+}
+
+/// Four-column menu modification table: dish | action | result | additional charge.
+Widget buildMenuModificationsTable(InquiryMenuModifications mod, {required int billableGuests}) {
+  final headerStyle = TextStyle(fontWeight: FontWeight.w800, fontSize: 12, color: Colors.grey.shade800);
+  final cellStyle = const TextStyle(fontSize: 13, height: 1.35);
+  TableRow row(String c1, String c2, String c3, String c4) {
+    return TableRow(
+      children: [
+        Padding(padding: const EdgeInsets.only(bottom: 8, right: 6), child: Text(c1, style: cellStyle)),
+        Padding(padding: const EdgeInsets.only(bottom: 8, right: 6), child: Text(c2, style: cellStyle)),
+        Padding(padding: const EdgeInsets.only(bottom: 8, right: 6), child: Text(c3, style: cellStyle)),
+        Padding(padding: const EdgeInsets.only(bottom: 8), child: Text(c4, style: cellStyle)),
+      ],
+    );
   }
-  mod ??= InquiryMenuModifications.fromDynamic(menuModRaw);
-  if (mod == null || mod.displayLines.isEmpty) return;
-  lines.add(line('Menu Modifications:'));
-  for (final ln in mod.displayLines) {
-    lines.add(line(ln));
+
+  final rows = <TableRow>[
+    TableRow(
+      children: [
+        Padding(padding: const EdgeInsets.only(bottom: 6), child: Text('Dish', style: headerStyle)),
+        Padding(padding: const EdgeInsets.only(bottom: 6), child: Text('Action', style: headerStyle)),
+        Padding(padding: const EdgeInsets.only(bottom: 6), child: Text('Result', style: headerStyle)),
+        Padding(padding: const EdgeInsets.only(bottom: 6), child: Text('Add\'l charge', style: headerStyle)),
+      ],
+    ),
+  ];
+  for (final r in mod.replaced) {
+    rows.add(row(r.from, 'REPLACED', r.to, _menuModChargeCell(r.perPax, billableGuests)));
   }
+  for (final name in mod.removed) {
+    rows.add(row(name, 'REMOVED', '—', '—'));
+  }
+  for (final a in mod.added) {
+    rows.add(row('—', 'ADDED', a.name, _menuModChargeCell(a.perPax, billableGuests)));
+  }
+  return Table(
+    columnWidths: const {
+      0: FlexColumnWidth(2.2),
+      1: FlexColumnWidth(1.1),
+      2: FlexColumnWidth(2.2),
+      3: FlexColumnWidth(1.1),
+    },
+    defaultVerticalAlignment: TableCellVerticalAlignment.top,
+    children: rows,
+  );
+}
+
+void appendInquiryMenuModificationDetailLines(
+  List<Widget> lines,
+  Widget Function(String) line,
+  dynamic menuModRaw, {
+  int billableGuests = 0,
+}) {
+  final mod = InquiryMenuModifications.fromDynamic(menuModRaw);
+  if (mod == null) return;
+  if (mod.replaced.isEmpty && mod.removed.isEmpty && mod.added.isEmpty) return;
+  final guests = billableGuests > 0 ? billableGuests : 1;
+  lines.add(Padding(
+    padding: const EdgeInsets.only(top: 4, bottom: 8),
+    child: buildMenuModificationsTable(mod, billableGuests: guests),
+  ));
 }
 
 /// Layout variant for manager catering order summary PDFs.
@@ -4837,6 +4861,8 @@ class AppState extends ChangeNotifier {
         customerDisplayName: profile.fullName.trim().isNotEmpty ? profile.fullName.trim() : null,
         loyaltyPointsEarned: 0,
       );
+      tray.clear();
+      notifyListeners();
       if (!clearCheckoutDraft) {
         try {
           await loadOrders(force: true);
@@ -4847,8 +4873,6 @@ class AppState extends ChangeNotifier {
         return SubmitOrderResult(order: order);
       }
       checkoutNote = '';
-      tray.clear();
-      notifyListeners();
       await clearPersistedCustomerDraft();
       try {
         await loadOrders(force: true);
@@ -12575,13 +12599,15 @@ class _PaymentScreenState extends State<PaymentScreen> {
                       await _submitGcashReferenceOnly(s, insufficient: false);
                       if (!context.mounted) return;
                     }
+                    s.tray.clear();
+                    s.notifyListeners();
+                    unawaited(s.clearCheckoutAfterSuccessfulOrderAndPayment());
+                    if (!context.mounted) return;
                     pushReplacementScreenOnce(
                       context,
                       OrderStatusScreen(state: s, order: ordNow, paymentUploaded: true),
                       routeKey: 'OrderStatus:${ordNow.orderNo}',
                     );
-                    // Requirement: navigate to the order page first, then clear tray/draft.
-                    if (widget.draftCheckout) unawaited(s.clearCheckoutAfterSuccessfulOrderAndPayment());
                   });
                 },
               ),
@@ -14808,6 +14834,7 @@ class _CateringPackagesPanel extends StatelessWidget {
 /// Card wrapper for inquire-catering wizard steps.
 Widget inquiryWizardTile({required Widget child}) {
   return Card(
+    color: AppColors.canvas,
     elevation: 1,
     margin: const EdgeInsets.only(bottom: 10),
     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -15380,8 +15407,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
       cateringMenu: cateringMenu,
       billableGuests: _billableGuestCountForPricing(),
     );
-    if (mod != null && mod.displayLines.isNotEmpty) {
-      lines.add('Menu Modifications:');
+    if (mod != null && (mod.replaced.isNotEmpty || mod.removed.isNotEmpty || mod.added.isNotEmpty)) {
       lines.addAll(mod.displayLines);
     }
     lines.add('Estimated Cost: ₱${_estimatedCost(cateringMenu).toStringAsFixed(2)}');
@@ -15805,7 +15831,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         subtitle: Text(inquiryTypeDisplayLabel(inquiryType)),
                       ),
                       Text(
-                        'Minimum $kMinCateringOnlyPax guests. Base estimate is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer). Event styling below $kInquiryLandingEventStylingMinPax guests adds ₱${kEventStylingSurchargePerPaxBelow50.toStringAsFixed(0)} per guest. Menu modifications may add per-pax charges.',
+                        isInquiryCateringWithEventStyling(inquiryType)
+                            ? 'Minimum $kInquiryLandingEventStylingMinPax guests.'
+                            : 'Maximum ${kInquiryLandingEventStylingMinPax - 1} guests. Event styling below $kInquiryLandingEventStylingMinPax guests has additional charge depending on your requests.',
                         style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                       ),
                     ],
@@ -16086,7 +16114,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       if (!isInquiryCateringWithEventStyling(inquiryType)) ...[
                         const SizedBox(height: 8),
                         Text(
-                          'Do you wish to include event styling? It will count as additional charge for number of guests below $kInquiryLandingEventStylingMinPax.',
+                          'Do you wish to include event styling? It will count as additional charge for number of guests.',
                           style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
                         ),
                         RadioListTile<String>(
@@ -16384,15 +16412,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     const Text(
-                                      'Menu Modifications:',
+                                      'Menu modifications',
                                       style: TextStyle(fontWeight: FontWeight.w800),
                                     ),
-                                    const SizedBox(height: 6),
-                                    ...mod.displayLines.map(
-                                      (l) => Padding(
-                                        padding: const EdgeInsets.only(bottom: 4),
-                                        child: Text(l, style: const TextStyle(height: 1.35)),
-                                      ),
+                                    const SizedBox(height: 8),
+                                    buildMenuModificationsTable(
+                                      mod,
+                                      billableGuests: _billableGuestCountForPricing(),
                                     ),
                                   ],
                                 ),
@@ -19491,18 +19517,9 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   if (mod == null || mod.displayLines.isEmpty) return const SizedBox.shrink();
                   return Padding(
                     padding: const EdgeInsets.only(top: 10),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Menu Modifications:', style: TextStyle(fontWeight: FontWeight.w800)),
-                        const SizedBox(height: 6),
-                        ...mod.displayLines.map(
-                          (l) => Padding(
-                            padding: const EdgeInsets.only(bottom: 4),
-                            child: Text(l, style: const TextStyle(height: 1.35)),
-                          ),
-                        ),
-                      ],
+                    child: buildMenuModificationsTable(
+                      mod,
+                      billableGuests: int.tryParse(guestCount.text.trim()) ?? 0,
                     ),
                   );
                 },
@@ -21969,11 +21986,50 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     );
   }
 
+  Widget _managerSectionShell({required String title, required List<Widget> children}) {
+    final shell = Card(
+      color: AppColors.canvas,
+      elevation: 0,
+      surfaceTintColor: AppColors.canvas,
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: children,
+        ),
+      ),
+    );
+    if (widget.stage == 'online_inquiries') {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: ToggleSection(
+          title: title.toUpperCase(),
+          expanded: true,
+          onToggle: () {},
+          hideToggleIcon: true,
+          child: shell,
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 8),
+          shell,
+        ],
+      ),
+    );
+  }
+
   Widget _laborCostCard({required bool allowLaborEdits, required bool showTravelReadOnly}) {
     return Card(
-      color: Colors.white,
+      color: AppColors.canvas,
       elevation: 0,
-      surfaceTintColor: Colors.white,
+      surfaceTintColor: AppColors.canvas,
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
@@ -23572,7 +23628,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           cardTheme: const CardThemeData(
             color: AppColors.canvas,
             elevation: 0,
-            surfaceTintColor: Colors.white,
+            surfaceTintColor: AppColors.canvas,
           ),
         ),
         child: Scaffold(
@@ -24263,14 +24319,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Event Information', style: TextStyle(fontWeight: FontWeight.w800)),
-                  const SizedBox(height: 8),
+          _managerSectionShell(
+            title: 'Event Information',
+            children: [
                   if (!isDraftStage) ...[
                     Text(
                       'Order type: ${row.orderType == 'catering_event' || row.orderKind == 'event' ? 'Catering with Event Styling' : 'Catering Only'}',
@@ -24666,17 +24717,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   ],
                   const SizedBox(height: 8),
                 ],
-              ),
-            ),
           ),
           if (_isManagerDraftDetailStage)
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Allergens', style: TextStyle(fontWeight: FontWeight.w800)),
+            _managerSectionShell(
+              title: 'Allergens',
+              children: [
                     const SizedBox(height: 6),
                     const Text(
                       'Select allergens your guests must avoid (optional).',
@@ -24696,19 +24741,25 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       }),
                     ),
                   ],
-                ),
-              ),
             ),
           if (_isManagerDraftDetailStage) const SizedBox(height: 8),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Menu', style: TextStyle(fontWeight: FontWeight.w800)),
-                  const SizedBox(height: 8),
+          _managerSectionShell(
+            title: 'Menu',
+            children: [
                   if (isDraftStage) ...[
+                    if (isOnlineInquiry && _managerMenuChoicePicked && !managerCurateOwn) ...[
+                      Text(
+                        managerMenuSuggestionNote.trim().isNotEmpty
+                            ? managerMenuSuggestionNote.trim()
+                            : 'No, suggest me a menu instead.',
+                        style: const TextStyle(fontWeight: FontWeight.w600, height: 1.35),
+                      ),
+                      if (selectedSetMenu.trim().isNotEmpty && selectedSetMenu != 'All Dishes') ...[
+                        const SizedBox(height: 6),
+                        Text('Set menu: $selectedSetMenu'),
+                      ],
+                      const SizedBox(height: 8),
+                    ] else ...[
                     const Text('Would you like to curate your own menu?'),
                     const SizedBox(height: 6),
                     RadioListTile<bool>(
@@ -24742,6 +24793,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 managerMenuSuggestionNote = 'No, suggest me a menu instead.';
                               }),
                     ),
+                    ],
                     if (_managerMenuChoicePicked && managerCurateOwn) ...[
                       TextField(
                         controller: menuSearchController,
@@ -24800,30 +24852,57 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         if (mod == null || mod.displayLines.isEmpty) return const SizedBox.shrink();
                         return Padding(
                           padding: const EdgeInsets.only(top: 10),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text('Menu Modifications:', style: TextStyle(fontWeight: FontWeight.w800)),
-                              const SizedBox(height: 6),
-                              ...mod.displayLines.map(
-                                (l) => Padding(
-                                  padding: const EdgeInsets.only(bottom: 4),
-                                  child: Text(l, style: const TextStyle(height: 1.35)),
-                                ),
-                              ),
-                            ],
+                          child: buildMenuModificationsTable(
+                            mod,
+                            billableGuests: int.tryParse(managerGuestCountController.text.trim()) ?? row.guestCount,
                           ),
                         );
                       },
                     ),
-                    if (_managerMenuChoicePicked && managerCurateOwn) ...[
+                    if (_managerMenuChoicePicked &&
+                        (managerCurateOwn || (isOnlineInquiry && !managerCurateOwn && rowMenu.isNotEmpty))) ...[
                       const SizedBox(height: 8),
                       SizedBox(
                         height: math.min(420, MediaQuery.sizeOf(context).height * 0.42),
                         child: ListView(
                           padding: EdgeInsets.zero,
                           children: [
-                            ...(() {
+                            if (isOnlineInquiry && !managerCurateOwn && rowMenu.isNotEmpty)
+                              ...rowMenu.map((m) {
+                                final dishName = dishNameFromCateringMenuEntry(m);
+                                MenuItemData? lookup;
+                                for (final dish in widget.state.menu) {
+                                  if (dish.name.toLowerCase() == dishName.toLowerCase()) {
+                                    lookup = dish;
+                                    break;
+                                  }
+                                }
+                                final thumbItem = MenuItemData(
+                                  id: lookup?.id ?? dishName,
+                                  name: dishName,
+                                  description: lookup?.description ?? '',
+                                  listingSubtitle: lookup?.listingSubtitle ?? '',
+                                  price: lookup?.price ?? 0,
+                                  dips: const [],
+                                  category: lookup?.category ?? '',
+                                  dishType: lookup?.dishType ?? '',
+                                  imageBase64: imageBase64FromCateringMenuEntry(m) ?? lookup?.imageBase64,
+                                );
+                                return ListTile(
+                                  dense: true,
+                                  contentPadding: EdgeInsets.zero,
+                                  leading: SizedBox(
+                                    width: 42,
+                                    height: 42,
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: _MenuThumb(item: thumbItem, compact: true),
+                                    ),
+                                  ),
+                                  title: Text(dishName),
+                                );
+                              })
+                            else ...(() {
                               final seen = <String>{};
                               final dishes = widget.state.menu.where((m) => m.isCateringDish).where((m) {
                               final q = menuSearchController.text.trim().toLowerCase();
@@ -24927,7 +25006,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   if (row.postAnalysis['menu_modifications'] != null ||
                       row.themeDesign['menu_modifications'] != null) ...[
                     const SizedBox(height: 12),
-                    const Text('Menu Modifications:', style: TextStyle(fontWeight: FontWeight.w800)),
+                    const Text('Menu Modifications', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 6),
                     ...(() {
                       final modLines = <Widget>[];
@@ -24938,24 +25017,19 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                           child: Text(t, style: const TextStyle(height: 1.35)),
                         ),
                         row.postAnalysis['menu_modifications'] ?? row.themeDesign['menu_modifications'],
+                        billableGuests: row.guestCount + row.paxBuffer,
                       );
                       return modLines;
                     })(),
                   ],
                 ],
-              ),
-            ),
           ),
           if (!_isManagerDraftDetailStage &&
               row.orderKind == 'event' &&
               managerServiceIncluded != 'yes')
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Event Theme Design', style: TextStyle(fontWeight: FontWeight.w800)),
+            _managerSectionShell(
+              title: 'Event Theme Design',
+              children: [
                     const SizedBox(height: 8),
                     buildManagerThemeDesignBlock(
                       context: context,
@@ -25019,17 +25093,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       ),
                     ],
                   ],
-                ),
-              ),
             ),
           if (showSeatingSection)
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Seating layout', style: TextStyle(fontWeight: FontWeight.w800)),
+            _managerSectionShell(
+              title: 'Seating layout',
+              children: [
                     const SizedBox(height: 8),
                     buildManagerSeatingLayoutBlock(
                       context: context,
@@ -25079,8 +25147,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       },
                     ),
                   ],
-                ),
-              ),
             ),
           if (!isCompleted && isDraftStage)
             _laborCostCard(
@@ -27128,6 +27194,8 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         final pendingBalReview = hasSupProof && (o.balanceProofPendingReview || awaitingBalanceConfirm);
         final waitingCustomerBalance = insufficientStatus && !hasSupProof && stage == 'PENDING_CASHIER';
         final firstPaid = o.cashierAmountReceived ?? 0;
+        final recordBalanceOnPending =
+            !paymentLocked && insufficientStatus && firstPaid > 0.009 && stage == 'PENDING_CASHIER';
         final balanceDue = o.total > firstPaid ? o.total - firstPaid : 0.0;
         final entered = parsed;
         final amountClassified = entered != null;
@@ -27135,11 +27203,13 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
         final insufficientAmount = amountClassified && entered + 0.009 < o.total;
         final overAmount = amountClassified && entered - o.total > 0.009;
         final balanceClassified = parsedSupp != null;
-        final exactBalance = pendingBalReview && balanceClassified && (parsedSupp - balanceDue).abs() <= 0.009;
-        final insufficientBalance = pendingBalReview && balanceClassified && parsedSupp + 0.009 < balanceDue;
-        final overBalance = pendingBalReview && balanceClassified && parsedSupp - balanceDue > 0.009;
-        final showInsufficientBtn = pendingBalReview ? insufficientBalance : insufficientAmount;
-        final showOverBtn = pendingBalReview ? overBalance : overAmount;
+        final balancePaymentEntry = pendingBalReview || recordBalanceOnPending;
+        final suppAmt = parsedSupp;
+        final exactBalance = balancePaymentEntry && balanceClassified && suppAmt != null && (suppAmt - balanceDue).abs() <= 0.009;
+        final insufficientBalance = balancePaymentEntry && balanceClassified && suppAmt != null && suppAmt + 0.009 < balanceDue;
+        final overBalance = balancePaymentEntry && balanceClassified && suppAmt != null && suppAmt - balanceDue > 0.009;
+        final showInsufficientBtn = balancePaymentEntry ? insufficientBalance : insufficientAmount;
+        final showOverBtn = balancePaymentEntry ? overBalance : overAmount;
 
         final paymentAtTop = stage == 'PENDING_CASHIER';
         final forDeliveryAtTop = stage == 'IN_PREPARATION';
@@ -27225,6 +27295,25 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onChanged: (_) => setState(() {}),
                           ),
                           ...cashierPaymentReferenceOnlyWidgets(o),
+                        ] else if (recordBalanceOnPending) ...[
+                          cashierLockedPaymentWithProofIcon(
+                            context,
+                            o,
+                            label: 'INITIAL PAYMENT RECORDED',
+                            value: firstPaid.toStringAsFixed(2),
+                            balance: false,
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: supplementalAmount,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'BALANCE AMOUNT RECEIVED',
+                              helperText: 'Saved on the order when you confirm, or mark insufficient or overpayment.',
+                            ),
+                            onChanged: (_) => setState(() {}),
+                          ),
+                          ...cashierPaymentReferenceOnlyWidgets(o),
                         ] else ...[
                           TextField(
                             controller: amountReceived,
@@ -27244,8 +27333,8 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           ...cashierPaymentReferenceOnlyWidgets(o, includeBalance: false),
                         ],
                         LockedField(
-                          label: pendingBalReview ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',
-                          value: pendingBalReview ? balanceDue.toStringAsFixed(2) : o.total.toStringAsFixed(2),
+                          label: balancePaymentEntry ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',
+                          value: balancePaymentEntry ? balanceDue.toStringAsFixed(2) : o.total.toStringAsFixed(2),
                         ),
                         if (waitingCustomerBalance)
                           Padding(
@@ -27268,7 +27357,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onPressed: showInsufficientBtn
                                 ? () => _submitInsufficientPayment(
                                       o,
-                                      forBalance: pendingBalReview,
+                                      forBalance: balancePaymentEntry,
                                       initialAmount: ar,
                                       balanceAmount: parsedSupp,
                                     )
@@ -27281,7 +27370,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onPressed: showOverBtn
                                 ? () => _submitOverpayment(
                                       o,
-                                      forBalance: pendingBalReview,
+                                      forBalance: balancePaymentEntry,
                                       initialAmount: ar,
                                       balanceAmount: parsedSupp,
                                     )
@@ -27501,6 +27590,25 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onChanged: (_) => setState(() {}),
                           ),
                           ...cashierPaymentReferenceOnlyWidgets(o),
+                        ] else if (recordBalanceOnPending) ...[
+                          cashierLockedPaymentWithProofIcon(
+                            context,
+                            o,
+                            label: 'INITIAL PAYMENT RECORDED',
+                            value: firstPaid.toStringAsFixed(2),
+                            balance: false,
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: supplementalAmount,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'BALANCE AMOUNT RECEIVED',
+                              helperText: 'Saved on the order when you confirm, or mark insufficient or overpayment.',
+                            ),
+                            onChanged: (_) => setState(() {}),
+                          ),
+                          ...cashierPaymentReferenceOnlyWidgets(o),
                         ] else ...[
                           TextField(
                             controller: amountReceived,
@@ -27520,8 +27628,8 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                           ...cashierPaymentReferenceOnlyWidgets(o, includeBalance: false),
                         ],
                         LockedField(
-                          label: pendingBalReview ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',
-                          value: pendingBalReview ? balanceDue.toStringAsFixed(2) : o.total.toStringAsFixed(2),
+                          label: balancePaymentEntry ? 'REMAINING BALANCE DUE' : 'AMOUNT DUE',
+                          value: balancePaymentEntry ? balanceDue.toStringAsFixed(2) : o.total.toStringAsFixed(2),
                         ),
                         if (waitingCustomerBalance)
                           Padding(
@@ -27544,7 +27652,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onPressed: showInsufficientBtn
                                 ? () => _submitInsufficientPayment(
                                       o,
-                                      forBalance: pendingBalReview,
+                                      forBalance: balancePaymentEntry,
                                       initialAmount: ar,
                                       balanceAmount: parsedSupp,
                                     )
@@ -27557,7 +27665,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             onPressed: showOverBtn
                                 ? () => _submitOverpayment(
                                       o,
-                                      forBalance: pendingBalReview,
+                                      forBalance: balancePaymentEntry,
                                       initialAmount: ar,
                                       balanceAmount: parsedSupp,
                                     )
@@ -27633,7 +27741,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                   ],
                 ),
               )
-            else if (pendingBalReview)
+            else if (pendingBalReview || recordBalanceOnPending)
               SummaryFooter(
                 lines: [
                   SummaryLine('First payment recorded', '₱${(o.cashierAmountReceived ?? 0).toStringAsFixed(2)}'),

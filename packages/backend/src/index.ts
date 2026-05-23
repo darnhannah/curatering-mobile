@@ -2191,13 +2191,20 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
       }
     }
 
+    const supplementalForBalance =
+      (action === "insufficient" || action === "overpayment") &&
+      Number.isFinite(supplementalAmtIn) &&
+      supplementalAmtIn >= 0
+        ? supplementalAmtIn
+        : null;
     await getPool().query(
       `UPDATE restaurant_orders
        SET order_status = $2,
            cashier_amount_received_initial = COALESCE($3::numeric, cashier_amount_received_initial),
+           cashier_amount_received_balance = COALESCE($4::numeric, cashier_amount_received_balance),
            last_updated_order_status_dt_stamp = NOW()
        WHERE mobile_id = $1`,
-      [id, newStatus, cashReceived],
+      [id, newStatus, cashReceived, supplementalForBalance],
     );
 
     let inApp = `[${ord.order_no}] Status: ${newStatus}`;
@@ -5074,10 +5081,10 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
              ELSE event_setting
            END,
            menu = COALESCE($13::jsonb, menu),
-           service_included = COALESCE($15, service_included),
-           menu_modifications = COALESCE($16::jsonb, menu_modifications),
-           cost_breakdown = COALESCE($17::jsonb, cost_breakdown),
-           stage_entered_at = CASE WHEN $18::boolean THEN NOW() ELSE stage_entered_at END
+           service_included = COALESCE($14, service_included),
+           menu_modifications = COALESCE($15::jsonb, menu_modifications),
+           cost_breakdown = COALESCE($16::jsonb, cost_breakdown),
+           stage_entered_at = CASE WHEN $17::boolean THEN NOW() ELSE stage_entered_at END
        WHERE id::text = $1
        RETURNING id::text, email_address, ${txSelect} AS transaction_no, total_cost`,
           [
