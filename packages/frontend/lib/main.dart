@@ -4863,10 +4863,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  void applyLocalPaymentProofUpload(int orderId, {required String proofBase64, String? orderNo}) {
+  void applyLocalPaymentProofUpload(
+    int orderId, {
+    required String proofBase64,
+    String? orderNo,
+    bool balanceProof = false,
+  }) {
     final idx = orders.indexWhere((o) => o.id == orderId);
     if (idx < 0) return;
     final o = orders[idx];
+    final st = o.status.toUpperCase();
+    final asBalance = balanceProof || st.contains('INSUFFICIENT');
     orders[idx] = OrderData(
       id: o.id,
       orderNo: (orderNo ?? o.orderNo).trim().isNotEmpty ? (orderNo ?? o.orderNo) : o.orderNo,
@@ -4875,7 +4882,7 @@ class AppState extends ChangeNotifier {
       createdAt: o.createdAt,
       updatedAt: DateTime.now(),
       paymentUploaded: true,
-      paymentProofBase64: proofBase64,
+      paymentProofBase64: asBalance ? o.paymentProofBase64 : proofBase64,
       lines: o.lines,
       userEmail: o.userEmail,
       note: o.note,
@@ -4890,9 +4897,9 @@ class AppState extends ChangeNotifier {
       cashierChange: o.cashierChange,
       fulfillmentStage: o.fulfillmentStage,
       deliveryTrackingUrl: o.deliveryTrackingUrl,
-      supplementalPaymentProofBase64: o.supplementalPaymentProofBase64,
+      supplementalPaymentProofBase64: asBalance ? proofBase64 : o.supplementalPaymentProofBase64,
+      balanceProofPendingReview: asBalance ? true : o.balanceProofPendingReview,
       cashierSecondaryAmountReceived: o.cashierSecondaryAmountReceived,
-      balanceProofPendingReview: o.balanceProofPendingReview,
       customerDisplayName: o.customerDisplayName,
       loyaltyPointsEarned: o.loyaltyPointsEarned,
       paymentReferenceInitial: o.paymentReferenceInitial,
@@ -4909,6 +4916,7 @@ class AppState extends ChangeNotifier {
     XFile? file,
     String? paymentProofBase64,
     String? paymentReferenceInitial,
+    bool balanceProof = false,
   }) async {
     try {
       var encoded = paymentProofBase64?.trim() ?? '';
@@ -4952,7 +4960,12 @@ class AppState extends ChangeNotifier {
         final body = jsonDecode(res.body);
         if (body is Map) orderNo = '${body['order_no'] ?? ''}'.trim();
       } catch (_) {}
-      applyLocalPaymentProofUpload(orderId, proofBase64: encoded, orderNo: orderNo);
+      applyLocalPaymentProofUpload(
+        orderId,
+        proofBase64: encoded,
+        orderNo: orderNo,
+        balanceProof: balanceProof,
+      );
       return null;
     } catch (e) {
       return describeApiNetworkError(e, normalizeApiBase(apiBase));
@@ -7797,16 +7810,21 @@ Widget _orderDetailLineWidget(String label, String value) {
 }
 
 Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppState state, OrderData o) async {
-  await state.loadRestaurantOrderDetail(o.id);
-  if (!context.mounted) return;
-  OrderData od = o;
-  try {
-    od = state.orders.firstWhere((e) => e.id == o.id);
-  } catch (_) {}
-  final trackUrl = od.deliveryTrackingUrl.trim();
+  final odHolder = <OrderData>[o];
   await showDialog<void>(
     context: context,
-    builder: (ctx) => AlertDialog(
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setDlg) {
+        unawaited(
+          state.loadRestaurantOrderDetail(o.id).then((fresh) {
+            if (fresh == null || !ctx.mounted) return;
+            odHolder[0] = fresh;
+            setDlg(() {});
+          }),
+        );
+        final od = odHolder[0];
+        final trackUrl = od.deliveryTrackingUrl.trim();
+        return AlertDialog(
       backgroundColor: Colors.white,
       title: Text(uiOrderNo(od.orderNo)),
       content: SingleChildScrollView(
@@ -7872,6 +7890,8 @@ Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppStat
         ),
       ),
       actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+        );
+      },
     ),
   );
 }
@@ -9479,13 +9499,13 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
                   itemCount: cards.length + 1,
                   itemBuilder: (context, index) {
                     if (index == cards.length) {
-                      return Card(
-                        color: Colors.white,
-                        elevation: 2,
-                        shadowColor: Colors.black26,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(12),
-                          onTap: () => pushScreenOnce(context, SettingsScreen(state: state)),
+                    return Card(
+                      color: AppColors.canvas,
+                      elevation: 2,
+                      shadowColor: Colors.black26,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () => pushScreenOnce(context, SettingsScreen(state: state)),
                           child: const Padding(
                             padding: EdgeInsets.all(14),
                             child: Column(
@@ -9504,7 +9524,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
                     final badgeCount = state.managerCateringCountForTab(item.tabIdx);
                     final showBadge = item.tabIdx <= 4 && badgeCount > 0;
                     return Card(
-                      color: Colors.white,
+                      color: AppColors.canvas,
                       elevation: 2,
                       shadowColor: Colors.black26,
                       child: InkWell(
@@ -12088,11 +12108,15 @@ class _PaymentScreenState extends State<PaymentScreen> {
       }
     }
     final oid = (_placedOrder ?? widget.order)!.id;
+    final ordForUpload = _placedOrder ?? widget.order;
+    final insUpload = ordForUpload != null &&
+        ordForUpload.status.toUpperCase().contains('INSUFFICIENT');
     final err = await s.uploadPaymentProof(
       oid,
       file: file,
       paymentProofBase64: proofB64,
-      paymentReferenceInitial: paymentReferenceController.text.trim(),
+      paymentReferenceInitial: insUpload ? null : paymentReferenceController.text.trim(),
+      balanceProof: insufficient || insUpload,
     );
     if (!mounted) return;
     if (err != null) {
@@ -12100,9 +12124,11 @@ class _PaymentScreenState extends State<PaymentScreen> {
       return;
     }
     setState(() {
-      uploadedFile = file;
-      _localProofBytes = bytes;
-      localProofUploaded = true;
+      if (!insUpload && !insufficient) {
+        uploadedFile = file;
+        _localProofBytes = bytes;
+        localProofUploaded = true;
+      }
     });
     final syPin = _syncedOrder(s);
     if (syPin != null && mounted) {
@@ -12116,6 +12142,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
   }
 
   Widget _paymentProofPreview(OrderData? synced) {
+    final st = (synced ?? widget.order)?.status.toUpperCase() ?? '';
+    if (st.contains('INSUFFICIENT')) return const SizedBox.shrink();
     if (_localProofBytes != null) {
       final bytes = _localProofBytes!;
       return Padding(
@@ -14981,6 +15009,17 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return int.tryParse(raw);
   }
 
+  void _syncInquiryPackageFromGuestCount() {
+    final fromField = int.tryParse(guestCount.text.trim());
+    final pax = fromField ?? _landingPaxParsed ?? 0;
+    if (pax >= kInquiryLandingEventStylingMinPax) {
+      inquiryType = kInquiryTypeCateringWithEventStyling;
+      serviceIncluded = 'yes';
+    } else if (!isInquiryCateringWithEventStyling(inquiryType)) {
+      inquiryType = kInquiryTypeCatering;
+    }
+  }
+
   void _proceedFromLanding() {
     final pax = _landingPaxParsed;
     if (pax == null || pax < 1) {
@@ -14988,6 +15027,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
       return;
     }
     guestCount.text = '$pax';
+    if (pax >= kInquiryLandingEventStylingMinPax) {
+      inquiryType = kInquiryTypeCateringWithEventStyling;
+      serviceIncluded = 'yes';
+    } else {
+      inquiryType = kInquiryTypeCatering;
+      serviceIncluded = 'no';
+    }
     setState(() => _inquiryStep = 2);
   }
 
@@ -15504,15 +15550,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
     if (curateOwn && selectedDishes.length > _maxSelectedDishesRequired) {
       return 'Select at most $_maxSelectedDishesRequired dishes for the menu.';
     }
-    if (isInquiryCateringWithEventStyling(inquiryType) && _themeDesignChoice.isEmpty) {
-      return 'Choose an event theme design option.';
-    }
-    if (isInquiryCateringWithEventStyling(inquiryType) &&
-        _themeDesignChoice == 'create_own' &&
-        (_aiThemeDesignPayload == null ||
-            '${_aiThemeDesignPayload!['generatedImageUrl'] ?? ''}'.trim().isEmpty)) {
-      return 'Create your theme design before submitting.';
-    }
     if (isInquiryCateringWithEventStyling(inquiryType) && eventTitle.text.trim().isEmpty) return 'Enter event title.';
     if (eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty) {
       return 'Describe the event type for “Other”.';
@@ -15631,6 +15668,19 @@ class _InquiryScreenState extends State<InquiryScreen> {
                   ),
                 ),
               ),
+              if (pax != null && pax >= kInquiryLandingEventStylingMinPax) ...[
+                const SizedBox(height: 12),
+                Text(
+                  '$kInquiryLandingEventStylingMinPax+ guests: your inquiry will use Catering with Event Styling.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.4,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.deepOrange.shade800,
+                  ),
+                ),
+              ],
               if (pax != null && pax > 0) ...[
                 const SizedBox(height: 12),
                 Text(
@@ -16013,7 +16063,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           invalid: _guestCountInvalid,
                         ),
                         keyboardType: TextInputType.number,
-                        onChanged: (_) => setState(() {}),
+                        onChanged: (_) => setState(() {
+                          _syncInquiryPackageFromGuestCount();
+                        }),
                       ),
                       const SizedBox(height: 8),
                       TextField(
@@ -16054,177 +16106,23 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           onChanged: (v) => _applyEventStylingChoice(true),
                         ),
                       ],
+                      if (serviceIncluded == 'yes' && !isInquiryCateringWithEventStyling(inquiryType)) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Event styling is included. Theme and design details will be coordinated with you after submission.',
+                          style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey.shade800),
+                        ),
+                      ],
                     ],
                   ),
                 ),
                 ),
                 if (isInquiryCateringWithEventStyling(inquiryType)) ...[
                   inquiryWizardTile(
-                    child: ToggleSection(
-                    title: 'EVENT THEME DESIGN',
-                    expanded: true,
-                    onToggle: () {},
-                    hideToggleIcon: true,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        const Text(
-                          'Before we submit, tell us how you want to approach your event look and feel.',
-                          style: TextStyle(height: 1.35),
-                        ),
-                        const SizedBox(height: 12),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: _eventDesignChoiceCard(
-                                title: "Have Macrina's design my event",
-                                subtitle: 'Share your palette and theme; our team will propose a look.',
-                                selected: _themeDesignChoice == 'suggest',
-                                onTap: () => setState(() {
-                                  _themeDesignChoice = 'suggest';
-                                  _aiThemeDesignPayload = null;
-                                }),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: _eventDesignChoiceCard(
-                                title: 'I want to design my event',
-                                subtitle: 'Use AI to explore styles, then submit with your inquiry.',
-                                selected: _themeDesignChoice == 'create_own',
-                                onTap: () => setState(() => _themeDesignChoice = 'create_own'),
-                              ),
-                            ),
-                          ],
-                        ),
-                        if (_attemptedSubmit && _themeDesignChoice.isEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 8),
-                            child: Text(
-                              'Choose how you want to handle event design.',
-                              style: TextStyle(color: Colors.red.shade700, fontSize: 12),
-                            ),
-                          ),
-                        if (_themeDesignChoice == 'suggest') ...[
-                          const SizedBox(height: 12),
-                          Text(
-                            'You may upload multiple reference images (max ${kMaxImageAttachmentBytes ~/ (1024 * 1024)} MB each).',
-                            style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3),
-                          ),
-                          const SizedBox(height: 8),
-                          TextField(
-                            controller: themeNotesController,
-                            maxLines: 4,
-                            decoration: const InputDecoration(
-                              labelText: 'Theme / styling notes',
-                              hintText: 'Describe preferred look, colors, motif, and styling notes',
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          Row(
-                            children: [
-                              OutlinedButton.icon(
-                                onPressed: _pickThemeReferenceImage,
-                                icon: const Icon(Icons.upload_file),
-                                label: const Text('Upload reference images'),
-                              ),
-                              const SizedBox(width: 8),
-                              Text('${_themeReferenceImagesB64.length} image(s)'),
-                            ],
-                          ),
-                        ],
-                        if (_themeDesignChoice == 'create_own') ...[
-                          const SizedBox(height: 12),
-                          if (_aiThemeDesignPayload != null &&
-                              '${_aiThemeDesignPayload!['generatedImageUrl'] ?? ''}'.trim().isNotEmpty)
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.network(
-                                  '${_aiThemeDesignPayload!['generatedImageUrl']}',
-                                  height: 120,
-                                  width: double.infinity,
-                                  fit: BoxFit.cover,
-                                ),
-                              ),
-                            ),
-                          FilledButton.icon(
-                            onPressed: () async {
-                              final email = inquiryEmail.text.trim().isNotEmpty
-                                  ? inquiryEmail.text.trim()
-                                  : (widget.state.userEmail ?? '');
-                              if (email.isEmpty) {
-                                appSnack(context, 'Enter your email before opening theme design.');
-                                return;
-                              }
-                              final result = await pushRouteOnce<Map<String, dynamic>?>(
-                                context,
-                                MaterialPageRoute<Map<String, dynamic>?>(
-                                  builder: (_) => EventThemeDesignScreen(
-                                    apiBase: widget.state.apiBase,
-                                    userEmail: email,
-                                    designSessionId: _themeDesignSessionId,
-                                    initialEventType: _resolvedEventType(),
-                                    initialThemeDesign: _aiThemeDesignPayload,
-                                    eventTitle: eventTitle.text.trim(),
-                                    formalityLevel: formalityLevel,
-                                    eventSetting: eventSetting,
-                                  ),
-                                ),
-                                routeKey: 'EventThemeDesign:inquiry',
-                              );
-                              if (result != null && mounted) {
-                                setState(() => _aiThemeDesignPayload = result);
-                              }
-                            },
-                            icon: const Icon(Icons.auto_awesome),
-                            label: Text(
-                              _aiThemeDesignPayload == null
-                                  ? 'Create my own theme design'
-                                  : 'Edit theme design',
-                            ),
-                          ),
-                        ],
-                        if (_themeReferenceImagesB64.isNotEmpty && _themeDesignChoice == 'suggest') ...[
-                          const SizedBox(height: 8),
-                          SizedBox(
-                            height: 82,
-                            child: ListView.separated(
-                              scrollDirection: Axis.horizontal,
-                              itemCount: _themeReferenceImagesB64.length,
-                              separatorBuilder: (_, __) => const SizedBox(width: 8),
-                              itemBuilder: (context, i) => Stack(
-                                children: [
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(8),
-                                    child: Image.memory(
-                                      base64Decode(_themeReferenceImagesB64[i]),
-                                      width: 82,
-                                      height: 82,
-                                      fit: BoxFit.cover,
-                                    ),
-                                  ),
-                                  Positioned(
-                                    right: 0,
-                                    top: 0,
-                                    child: InkWell(
-                                      onTap: () => setState(() => _themeReferenceImagesB64.removeAt(i)),
-                                      child: Container(
-                                        color: Colors.black54,
-                                        padding: const EdgeInsets.all(2),
-                                        child: const Icon(Icons.close, size: 14, color: Colors.white),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ],
+                    child: Text(
+                      'This inquiry includes event styling (${kInquiryLandingEventStylingMinPax}+ guests). Theme and design details will be coordinated with you after submission.',
+                      style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey.shade800),
                     ),
-                  ),
                   ),
                 ],
                 inquiryWizardTile(
@@ -18318,6 +18216,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   static const String _managerNewEventDraftKey = 'manager_new_event_unsaved_draft_v1';
   String inquiryType = 'CATERING';
   bool curateOwn = false;
+  bool _menuChoicePicked = false;
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
@@ -18371,6 +18270,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   void _resetNewEventFormKeepContactOnly() {
     inquiryType = 'CATERING';
     curateOwn = false;
+    _menuChoicePicked = false;
     selectedSetMenu = 'All Dishes';
     selectedDishes.clear();
     guestCount.clear();
@@ -18469,6 +18369,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   }
 
   InquiryMenuModifications? _managerNewEventMenuModifications(List<MenuItemData> cateringMenu) {
+    if (!_menuChoicePicked || !curateOwn) return null;
     return computeInquiryMenuModifications(
       selectedSetMenu: selectedSetMenu,
       selectedDishes: selectedDishes,
@@ -18766,16 +18667,14 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
       final em = w.to!.hour * 60 + w.to!.minute;
       if (em <= sm) return 'End time must be after start time for each event.';
     }
-    if (selectedSetMenu == 'All Dishes' && selectedDishes.length < 4) {
-      return 'Select at least 4 dishes for the menu.';
+    if (!_menuChoicePicked) return 'Choose a menu preference (curate or suggest).';
+    if (curateOwn) {
+      if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
+      if (selectedSetMenu == 'All Dishes' && selectedDishes.length < 4) {
+        return 'Select at least 4 dishes for the menu.';
+      }
     }
-    if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
     if (eventTitle.text.trim().isEmpty) return 'Enter event title.';
-    if (isInquiryCateringWithEventStyling(inquiryType) &&
-        themeSuggestionNote.trim().isEmpty &&
-        themeCostController.text.trim().isEmpty) {
-      return 'Enter theme design notes or theme design cost for Catering with Event Styling.';
-    }
     if (travelCostController.text.trim().isEmpty) return 'Enter travel cost.';
     final maleN = int.tryParse(laborMaleController.text.trim()) ?? 0;
     final femaleN = int.tryParse(laborFemaleController.text.trim()) ?? 0;
@@ -18918,7 +18817,9 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         'formality_level': formalityLevel,
         if (_managerGuestAllergensForSubmit.isNotEmpty)
           'guest_allergens': _managerGuestAllergensForSubmit.toList(),
-        if (isInquiryCateringWithEventStyling(inquiryType)) 'theme_suggestion_note': themeSuggestionNote,
+        'curate_own_menu': curateOwn,
+        'menu_suggestion_note': curateOwn ? '' : menuSuggestionNote,
+        if (setMenuForSave.isNotEmpty) 'selected_set_menu': setMenuForSave,
       };
       await widget.state.persistCustomGuestAllergens(
         _selectedGuestAllergens,
@@ -19365,7 +19266,17 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 controller: guestCount,
                 decoration: const InputDecoration(labelText: 'Number of guests'),
                 keyboardType: TextInputType.number,
-                onChanged: (_) => setState(() {}),
+                onChanged: (_) {
+                  final pax = int.tryParse(guestCount.text.trim()) ?? 0;
+                  if (pax >= kInquiryLandingEventStylingMinPax) {
+                    setState(() {
+                      serviceIncluded = 'yes';
+                      inquiryType = kInquiryTypeCateringWithEventStyling;
+                    });
+                  } else {
+                    setState(() {});
+                  }
+                },
               ),
               const SizedBox(height: 8),
               TextField(
@@ -19446,8 +19357,36 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
           hideToggleIcon: true,
           child: Column(
             children: [
-              const Text('Build or modify menu by selecting dishes below.'),
-              const SizedBox(height: 8),
+              const Text('Would you like to curate your own menu?'),
+              const SizedBox(height: 6),
+              RadioListTile<bool>(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: true,
+                groupValue: _menuChoicePicked ? curateOwn : null,
+                title: const Text('Yes, curate my own menu'),
+                onChanged: (_) => setState(() {
+                  _menuChoicePicked = true;
+                  curateOwn = true;
+                  menuSuggestionNote = '';
+                  selectedSetMenu = 'All Dishes';
+                  selectedDishes.clear();
+                }),
+              ),
+              RadioListTile<bool>(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: false,
+                groupValue: _menuChoicePicked ? curateOwn : null,
+                title: const Text('No, suggest a menu'),
+                onChanged: (_) => setState(() {
+                  _menuChoicePicked = true;
+                  curateOwn = false;
+                  selectedDishes.clear();
+                  menuSuggestionNote = 'No, suggest me a menu instead.';
+                }),
+              ),
+              if (_menuChoicePicked && curateOwn) ...[
               CheckboxListTile(
                 dense: true,
                 contentPadding: EdgeInsets.zero,
@@ -19519,14 +19458,32 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 onChanged: (v) {
                   final next = v ?? 'All Dishes';
                   setState(() {
+                    final prev = selectedSetMenu;
+                    if (curateOwn && prev != next && prev != 'All Dishes') {
+                      final prevRows = state.setMenus.where((m) => m.name == prev).toList();
+                      if (prevRows.isNotEmpty) {
+                        for (final d in prevRows.first.dishes) {
+                          selectedDishes.remove(d);
+                        }
+                      }
+                    }
                     selectedSetMenu = next;
-                    selectedDishes.clear();
-                    if (next != 'All Dishes') {
+                    if (curateOwn && next != 'All Dishes') {
                       final rows = state.setMenus.where((m) => m.name == next).toList();
                       if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
                     }
                   });
                 },
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => setState(() {
+                    selectedDishes.clear();
+                    selectedSetMenu = 'All Dishes';
+                  }),
+                  child: const Text('Clear selections'),
+                ),
               ),
               Builder(
                 builder: (context) {
@@ -19655,53 +19612,17 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                   ],
                 ),
               ),
+              ],
             ],
           ),
         ),
-        if (isInquiryCateringWithEventStyling(inquiryType)) ...[
+        if (inquiryIncludesEventStyling(inquiryType: inquiryType, serviceIncluded: serviceIncluded)) ...[
           const SizedBox(height: 10),
-          ToggleSection(
-            title: 'Event Theme Design',
-            expanded: true,
-            onToggle: () {},
-            hideToggleIcon: true,
-            child: buildManagerThemeDesignBlock(
-              context: context,
-              themeDesign: _newEventThemeDesign ?? const {},
-              openEditorLabel: _newEventThemeDesign == null ? 'Create my own theme design' : 'Edit theme design',
-              onOpenEditor: () async {
-                final email = inquiryEmail.text.trim().isNotEmpty
-                    ? inquiryEmail.text.trim()
-                    : (widget.state.userEmail ?? '');
-                if (email.isEmpty) {
-                  appSnack(context, 'Enter customer email before opening theme design.');
-                  return;
-                }
-                final result = await pushRouteOnce<Map<String, dynamic>?>(
-                  context,
-                  MaterialPageRoute<Map<String, dynamic>?>(
-                    builder: (_) => EventThemeDesignScreen(
-                      apiBase: widget.state.apiBase,
-                      userEmail: email,
-                      designSessionId: _newEventThemeSessionId,
-                      initialEventType: _resolvedEventType(),
-                      initialThemeDesign: _newEventThemeDesign,
-                      eventTitle: eventTitle.text.trim(),
-                      formalityLevel: formalityLevel,
-                      eventSetting: eventSetting,
-                      cashierEmail: widget.state.userEmail,
-                      cashierPassword: widget.state.loginPassword,
-                    ),
-                  ),
-                  routeKey: 'EventThemeDesign:manager-new',
-                );
-                if (result != null && mounted) {
-                  setState(() => _newEventThemeDesign = result);
-                }
-              },
-              showCostFields: true,
-              noteController: note,
-              costController: themeCostController,
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Text(
+              'Event styling is included. Theme and design details will be coordinated after submission.',
+              style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey.shade800),
             ),
           ),
           const SizedBox(height: 10),
@@ -20143,6 +20064,7 @@ class _ManagerStageListTabState extends State<_ManagerStageListTab> {
                         if (loyaltyLine.isNotEmpty) Text(loyaltyLine),
                       ];
                       return Card(
+                        color: AppColors.canvas,
                         child: ListTile(
                           leading: (stage == kStageForDownPayment || stage == kStageForOngoing) &&
                               r.processingScheduleOverlaps > 0
@@ -20358,6 +20280,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   String _managerDownPaymentMethod = 'Cash';
   String _managerFullPaymentMethod = 'Cash';
   final Set<String> managerGuestAllergens = {};
+  bool managerCurateOwn = false;
+  bool _managerMenuChoicePicked = false;
+  String managerMenuSuggestionNote = '';
   final _managerOtherAllergenController = TextEditingController();
   final List<String> _managerVenueSuggestions = [];
   Timer? _managerVenueDebounce;
@@ -20418,6 +20343,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   InquiryMenuModifications? _managerDetailMenuModifications() {
+    if (_isManagerDraftDetailStage && (!_managerMenuChoicePicked || !managerCurateOwn)) {
+      return null;
+    }
     if (_isManagerDraftDetailStage && selectedDishes.isNotEmpty) {
       return computeInquiryMenuModifications(
         selectedSetMenu: selectedSetMenu,
@@ -21512,10 +21440,20 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         if (mounted) setState(() {});
       });
     }
+    _initControllersFromRow(widget.row);
+    _detailReady = true;
     Future.microtask(() async {
-      await widget.state.loadAllergenCatalog();
+      unawaited(widget.state.loadAllergenCatalog());
+      final full = await widget.state.loadManagerCateringItem(
+        id: widget.row.id,
+        orderKind: widget.row.orderKind,
+      );
       if (!mounted) return;
-      await _bootstrapDetail();
+      if (full != null) {
+        _loadedDetailRow = full;
+        _initControllersFromRow(full);
+      }
+      setState(() {});
       _startDetailLivePollIfNeeded();
     });
   }
@@ -21638,17 +21576,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   }
 
   String get _localDraftKey => '$_managerDraftDetailKeyPrefix${widget.row.id}_${widget.stage}';
-
-  Future<void> _bootstrapDetail() async {
-    final full = await widget.state.loadManagerCateringItem(
-      id: widget.row.id,
-      orderKind: widget.row.orderKind,
-    );
-    if (!mounted) return;
-    _loadedDetailRow = full ?? widget.row;
-    _initControllersFromRow(_loadedDetailRow!);
-    setState(() => _detailReady = true);
-  }
 
   void _initControllersFromRow(CateringEventRecord row) {
     additionalCosts.clear();
@@ -21865,7 +21792,21 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     }
     _refreshDueAndDefaults();
     _pristineManagerDetailSig = _computeManagerDetailSignature();
-    _managerDraftAdvanceGateSig = '';
+    _managerDraftAdvanceGateSig = _pristineManagerDetailSig;
+    managerCurateOwn = jsonToBool(row.postAnalysis['curate_own_menu']);
+    _managerMenuChoicePicked = row.postAnalysis.containsKey('curate_own_menu') ||
+        managerCurateOwn ||
+        selectedDishes.isNotEmpty;
+    managerMenuSuggestionNote = '${row.postAnalysis['menu_suggestion_note'] ?? ''}'.trim();
+  }
+
+  void _syncManagerDraftPackageFromGuestCount() {
+    if (!_isManagerDraftDetailStage) return;
+    final pax = int.tryParse(managerGuestCountController.text.trim()) ?? 0;
+    if (pax >= kInquiryLandingEventStylingMinPax) {
+      managerServiceIncluded = 'yes';
+      _draftOrderKind = 'event';
+    }
   }
 
   String _computeManagerDetailSignature() {
@@ -22481,10 +22422,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     final canEditSeatingForRow = canEditSeatingLayout(row.status);
     final seatingEventDateTime = _eventDateTimeJoinedFromRowScheduleSlots(row.scheduleSlots);
     final seatingVenueAddress = row.address.trim();
-    final managerDraftCanAdvanceToNext =
-        !isDraftStage ||
-            (_managerDraftAdvanceGateSig.isNotEmpty &&
-                _managerDraftAdvanceGateSig == _computeManagerDetailSignature());
     final isThemeReadOnly = isProcessing || isPost || isCompleted;
     final canEditStage = !isCompleted;
     final canComplete = widget.state.isManager;
@@ -22527,7 +22464,6 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       final sch = _validateDraftScheduleCoherence();
       if (sch != null) return sch;
       if (widget.stage != 'new_event' && widget.stage != 'online_inquiries') return null;
-      final kind = d.orderKind;
       final et =
           managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice;
       if (et.trim().isEmpty) return 'Choose or describe the event type.';
@@ -22548,11 +22484,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
       final gc = int.tryParse(managerGuestCountController.text.trim());
       if (gc == null || gc < 1) return 'Enter a valid number of guests.';
-      final minPax = kind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
+      final minPax = _draftOrderKind == 'event' ? kMinCateringEventPax : kMinCateringOnlyPax;
       if (gc < minPax) return 'Minimum guests for this inquiry type is $minPax.';
       final complete = _eventWindows.where((x) => x.date != null && x.from != null && x.to != null).toList();
       if (complete.isEmpty) return 'Add at least one event date with start and end time.';
-      if (selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
+      if (!_managerMenuChoicePicked) return 'Choose a menu preference (curate or suggest).';
+      if (managerCurateOwn && selectedDishes.isEmpty) return 'Select at least one dish for the menu.';
       return null;
     }
 
@@ -22638,6 +22575,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           if (rowBase.postAnalysis['additional_costs_payment_confirmed'] == true)
             'additional_costs_payment_confirmed': true,
           if (isOnlineInquiry || widget.stage == 'new_event') 'event_type': et,
+          if (isDraftStageHere) ...{
+            'curate_own_menu': managerCurateOwn,
+            'menu_suggestion_note': managerCurateOwn ? '' : managerMenuSuggestionNote,
+          },
           if (isProcessingHere) ...{
             'manager_down_payment_method': _managerDownPaymentMethod,
             'processing_phase': _processingSubstageForUi,
@@ -23382,12 +23323,20 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         return;
       }
       final isDraftAdvance = widget.stage == 'new_event' || widget.stage == 'online_inquiries';
+      if (!isDraftAdvance && (isProcessing || isPost)) {
+        final saved = await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+        if (!mounted) return;
+        if (!saved) return;
+      }
       if (isDraftAdvance) {
         final verr = _validateDraftReadyForNextStage();
         if (verr != null) {
           appSnack(context, verr);
           return;
         }
+        final saved = await saveCurrentStage(showConfirmDialog: false, popAfterSuccess: false);
+        if (!mounted) return;
+        if (!saved) return;
       }
       if (isDraftAdvance && _draftOrderKind != d.orderKind) {
         final errSwitch = await widget.state.managerSwitchCateringOrderKind(
@@ -23440,6 +23389,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           'event_type': managerEventTypeChoice == 'Other'
               ? managerEventTypeOtherController.text.trim()
               : managerEventTypeChoice,
+        if (isDraftStage) ...{
+          'curate_own_menu': managerCurateOwn,
+          'menu_suggestion_note': managerCurateOwn ? '' : managerMenuSuggestionNote,
+        },
         if (isProcessing) ...{
           'manager_down_payment_method': _managerDownPaymentMethod,
           'processing_phase': _processingSubstageForUi,
@@ -23454,6 +23407,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       }
       final laborForSubmit = laborCostComputed;
       final travelForSubmit = _travelCostComputed();
+      final menuModSave = _managerDetailMenuModifications();
       final invoiceTotalSubmit = isProcessing
           ? (_baseFoodCost() + _themeDesignCostAmount() + _sumCostRows(flatAdditionalSubmit))
           : totalComputed;
@@ -23469,7 +23423,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
         'formality_level': managerFormalityLevel,
         if (_managerDetailGuestAllergensForSubmit.isNotEmpty)
           'guest_allergens': _managerDetailGuestAllergensForSubmit.toList(),
+        if (menuModSave != null) 'menu_modifications': menuModSave.toJson(),
       };
+      if (menuModSave != null) {
+        postAnalysis['menu_modifications'] = menuModSave.toJson();
+      }
       await widget.state.persistCustomGuestAllergens(
         managerGuestAllergens,
         othersText: _managerOtherAllergenController.text,
@@ -23612,13 +23570,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       child: Theme(
         data: Theme.of(context).copyWith(
           cardTheme: const CardThemeData(
-            color: Colors.white,
+            color: AppColors.canvas,
             elevation: 0,
             surfaceTintColor: Colors.white,
           ),
         ),
         child: Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: isDraftStage ? AppColors.canvas : Colors.white,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -24199,14 +24157,15 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (!isCompleted && !isDownPaymentSubstage)
+          if (!isCompleted && !isDownPaymentSubstage && !isDraftStage)
             _additionalCostsCard(
               draft: isDraftStage,
               processing: isProcessing && !isPost,
               post: isPost,
               row: row,
             ),
-          if (isDraftStage || (!isDraftStage && (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted)))
+          if (!isDraftStage &&
+              (isDownPaymentSubstage || isOngoingSubstage || isPost || isCompleted))
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -24637,7 +24596,20 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       keyboardType: TextInputType.number,
                       readOnly: !canEditStage,
                       decoration: const InputDecoration(labelText: 'Number of guests'),
+                      onChanged: canEditStage
+                          ? (_) => setState(() {
+                                _syncManagerDraftPackageFromGuestCount();
+                                _refreshDueAndDefaults();
+                              })
+                          : null,
                     ),
+                    if (_isManagerDraftDetailStage) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        'Package: ${_draftOrderKind == 'event' ? 'Catering with Event Styling' : 'Catering'}',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ],
                     if (_isManagerDraftDetailStage) ...[
                       const SizedBox(height: 8),
                       TextField(
@@ -24737,34 +24709,91 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                   const Text('Menu', style: TextStyle(fontWeight: FontWeight.w800)),
                   const SizedBox(height: 8),
                   if (isDraftStage) ...[
-                    TextField(
-                      controller: menuSearchController,
-                      decoration: const InputDecoration(
-                        labelText: 'Search dishes',
-                        prefixIcon: Icon(Icons.search),
-                      ),
-                      onChanged: (_) => setState(() {}),
-                    ),
-                    const SizedBox(height: 8),
-                    DropdownButtonFormField<String>(
-                      value: selectedSetMenu,
-                      items: ['All Dishes', ...widget.state.setMenus.map((m) => m.name)]
-                          .map((name) => DropdownMenuItem(value: name, child: Text(name)))
-                          .toList(),
+                    const Text('Would you like to curate your own menu?'),
+                    const SizedBox(height: 6),
+                    RadioListTile<bool>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: true,
+                      groupValue: _managerMenuChoicePicked ? managerCurateOwn : null,
+                      title: const Text('Yes, curate my own menu'),
                       onChanged: !canEditStage
                           ? null
-                          : (v) {
-                              final next = v ?? 'All Dishes';
-                              setState(() {
-                                selectedSetMenu = next;
+                          : (_) => setState(() {
+                                _managerMenuChoicePicked = true;
+                                managerCurateOwn = true;
+                                managerMenuSuggestionNote = '';
+                                selectedSetMenu = 'All Dishes';
                                 selectedDishes.clear();
-                                if (next != 'All Dishes') {
-                                  final rows = widget.state.setMenus.where((m) => m.name == next).toList();
-                                  if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
-                                }
-                              });
-                            },
+                              }),
                     ),
+                    RadioListTile<bool>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: false,
+                      groupValue: _managerMenuChoicePicked ? managerCurateOwn : null,
+                      title: const Text('No, suggest a menu'),
+                      onChanged: !canEditStage
+                          ? null
+                          : (_) => setState(() {
+                                _managerMenuChoicePicked = true;
+                                managerCurateOwn = false;
+                                selectedDishes.clear();
+                                managerMenuSuggestionNote = 'No, suggest me a menu instead.';
+                              }),
+                    ),
+                    if (_managerMenuChoicePicked && managerCurateOwn) ...[
+                      TextField(
+                        controller: menuSearchController,
+                        decoration: const InputDecoration(
+                          labelText: 'Search dishes',
+                          prefixIcon: Icon(Icons.search),
+                        ),
+                        onChanged: (_) => setState(() {}),
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButtonFormField<String>(
+                        value: selectedSetMenu,
+                        items: ['All Dishes', ...widget.state.setMenus.map((m) => m.name)]
+                            .map((name) => DropdownMenuItem(value: name, child: Text(name)))
+                            .toList(),
+                        onChanged: !canEditStage
+                            ? null
+                            : (v) {
+                                final next = v ?? 'All Dishes';
+                                setState(() {
+                                  final prev = selectedSetMenu;
+                                  if (prev != next && prev != 'All Dishes') {
+                                    final prevRows =
+                                        widget.state.setMenus.where((m) => m.name == prev).toList();
+                                    if (prevRows.isNotEmpty) {
+                                      for (final d in prevRows.first.dishes) {
+                                        selectedDishes.remove(d);
+                                      }
+                                    }
+                                  }
+                                  selectedSetMenu = next;
+                                  if (next != 'All Dishes') {
+                                    final rows =
+                                        widget.state.setMenus.where((m) => m.name == next).toList();
+                                    if (rows.isNotEmpty) selectedDishes.addAll(rows.first.dishes);
+                                  }
+                                });
+                              },
+                      ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton(
+                          onPressed: !canEditStage
+                              ? null
+                              : () => setState(() {
+                                    selectedDishes.clear();
+                                    selectedSetMenu = 'All Dishes';
+                                  }),
+                          child: const Text('Clear selections'),
+                        ),
+                      ),
+                    ],
                     Builder(
                       builder: (context) {
                         final mod = _managerDetailMenuModifications();
@@ -24787,15 +24816,16 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         );
                       },
                     ),
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      height: math.min(420, MediaQuery.sizeOf(context).height * 0.42),
-                      child: ListView(
-                        padding: EdgeInsets.zero,
-                        children: [
-                          ...(() {
-                            final seen = <String>{};
-                            final dishes = widget.state.menu.where((m) => m.isCateringDish).where((m) {
+                    if (_managerMenuChoicePicked && managerCurateOwn) ...[
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        height: math.min(420, MediaQuery.sizeOf(context).height * 0.42),
+                        child: ListView(
+                          padding: EdgeInsets.zero,
+                          children: [
+                            ...(() {
+                              final seen = <String>{};
+                              final dishes = widget.state.menu.where((m) => m.isCateringDish).where((m) {
                               final q = menuSearchController.text.trim().toLowerCase();
                               final n = m.name.trim().toLowerCase();
                               if (n.isEmpty || seen.contains(n)) return false;
@@ -24849,10 +24879,11 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 ),
                               ),
                             );
-                          }),
-                        ],
+                            }),
+                          ],
+                        ),
                       ),
-                    ),
+                    ],
                   ] else ...[
                     if (rowMenu.isEmpty)
                       const Text('No menu selected.')
@@ -24915,7 +24946,9 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ),
             ),
           ),
-          if (_isManagerDraftDetailStage ? _managerIncludesEventStyling() : row.orderKind == 'event')
+          if (!_isManagerDraftDetailStage &&
+              row.orderKind == 'event' &&
+              managerServiceIncluded != 'yes')
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -25081,6 +25114,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             ),
           ],
           if (isDraftStage)
+            _additionalCostsCard(
+              draft: true,
+              processing: false,
+              post: false,
+              row: row,
+            ),
+          if (isDraftStage)
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -25204,22 +25244,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         child: Text(isDraftStage ? 'Save draft' : 'Save'),
                       ),
                     ],
-                    if (isDraftStage && !managerDraftCanAdvanceToNext) ...[
-                      const SizedBox(height: 6),
-                      Text(
-                        'Save and confirm your draft before moving to the next stage.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 12,
-                          height: 1.3,
-                          color: Colors.black.withValues(alpha: 0.65),
-                        ),
-                      ),
-                    ],
                     if (isDraftStage || isProcessing || isPost) ...[
                       const SizedBox(height: 8),
                       FilledButton(
-                        onPressed: (isDraftStage && !managerDraftCanAdvanceToNext) ? null : submitNext,
+                        onPressed: submitNext,
                         child: Text(
                           isDraftStage
                               ? 'Move to For Down Payment'

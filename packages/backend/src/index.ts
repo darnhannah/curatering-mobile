@@ -1183,11 +1183,11 @@ async function applyLoyaltyRewardsBestEffort(
 
     await getPool().query(
       `INSERT INTO restaurant_orders (
-         user_email, customer_id, tray_items, total_cost, delivery_notes,
+         user_email, customer_id, tray_items, total_cost, delivery_notes, delivery_address,
          order_status, payment_reference_initial, payment_confirmed_initial,
          loyalty_points_restaurant_obtained, order_source
        )
-       VALUES ($1, $2, '[]'::jsonb, $3, $4, 'DELIVERED', $5, TRUE, $6, 'LOYALTY_SYNC')`,
+       VALUES ($1, $2, '[]'::jsonb, $3, $4, 'Loyalty reward (no delivery)', 'DELIVERED', $5, TRUE, $6, 'LOYALTY_SYNC')`,
       [email, customerId, totalAmount, deliveryNotes, paymentRef, pointsEarned],
     );
 
@@ -2194,7 +2194,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
     await getPool().query(
       `UPDATE restaurant_orders
        SET order_status = $2,
-           cashier_amount_received_initial = COALESCE($3, cashier_amount_received_initial),
+           cashier_amount_received_initial = COALESCE($3::numeric, cashier_amount_received_initial),
            last_updated_order_status_dt_stamp = NOW()
        WHERE mobile_id = $1`,
       [id, newStatus, cashReceived],
@@ -5340,7 +5340,7 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           total_cost = COALESCE($9, total_cost),
           down_payment_amount = COALESCE($10, down_payment_amount),
           guest_count = COALESCE($11, guest_count),
-          pax_buffer = COALESCE($12, pax_buffer),
+          pax_buffer = COALESCE($12::integer, pax_buffer),
           address = COALESCE($13, address),
           schedule_slots = COALESCE($14::jsonb, schedule_slots),
           customer_name = COALESCE($15, customer_name),
@@ -5402,7 +5402,7 @@ app.patch("/api/mobile/pos/catering/:id/draft", async (req, res) => {
           theme_design_cost = COALESCE($11, theme_design_cost),
           down_payment_amount = COALESCE($12, down_payment_amount),
           guest_count = COALESCE($13, guest_count),
-          pax_buffer = COALESCE($14, pax_buffer),
+          pax_buffer = COALESCE($14::integer, pax_buffer),
           address = COALESCE($15, address),
           schedule_slots = COALESCE($16::jsonb, schedule_slots),
           event_title = COALESCE($17, event_title),
