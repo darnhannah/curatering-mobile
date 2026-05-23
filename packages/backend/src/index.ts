@@ -2192,7 +2192,7 @@ app.patch("/api/mobile/pos/online-orders/:id/review", async (req, res) => {
     }
 
     const supplementalForBalance =
-      (action === "insufficient" || action === "overpayment") &&
+      (action === "insufficient" || action === "overpayment" || action === "confirm") &&
       Number.isFinite(supplementalAmtIn) &&
       supplementalAmtIn >= 0
         ? supplementalAmtIn
@@ -3220,6 +3220,13 @@ app.post("/api/mobile/orders", async (req, res) => {
       customerId,
     });
     await client.query("COMMIT");
+    try {
+      const pool = getPool();
+      await clearCustomerTrayDraftForEmail(pool, userEmail);
+      if (isGuest && contactEmail) await clearCustomerTrayDraftForEmail(pool, contactEmail);
+    } catch (trayErr) {
+      console.warn("[tray-draft] clear after order submit failed:", trayErr);
+    }
     // Loyalty is awarded when the cashier confirms the order (see online-orders review), not on submit.
     void logActionBestEffort("order.submit", userEmail, `Order submitted: ${orderNo}`, {
       order_no: orderNo,
@@ -5734,6 +5741,34 @@ app.get("/api/mobile/notifications", async (req, res) => {
     res.status(500).json({ error: "database error" });
   }
 });
+
+async function clearCustomerTrayDraftForEmail(
+  pool: ReturnType<typeof getPool>,
+  userEmail: string,
+): Promise<void> {
+  const email = userEmail.trim().toLowerCase();
+  if (!email) return;
+  let customerId = email;
+  const { rows: acct } = await pool.query(
+    `SELECT COALESCE(NULLIF(TRIM(customer_id), ''), id::text) AS cid
+     FROM customer_accounts
+     WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+     LIMIT 1`,
+    [email],
+  );
+  if (acct[0]?.cid) customerId = String(acct[0].cid);
+  await pool.query(
+    `DELETE FROM customer_tray_drafts
+     WHERE customer_id = $1
+        OR LOWER(TRIM(COALESCE(user_email, ''))) = LOWER(TRIM($2))`,
+    [customerId, email],
+  );
+  await pool.query(
+    `INSERT INTO customer_tray_drafts (customer_id, user_email, tray_items, updated_at)
+     VALUES ($1, $2, '[]'::jsonb, NOW())`,
+    [customerId, email],
+  );
+}
 
 app.get("/api/mobile/customer/tray-draft", async (req, res) => {
   const userEmail = String(req.query.user_email ?? "")

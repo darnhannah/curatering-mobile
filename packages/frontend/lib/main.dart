@@ -1948,8 +1948,19 @@ OrderData orderDataFromApiMap(Map<String, dynamic> map, List<OrderLineItem> line
     deliveryTrackingUrl: '${map['delivery_tracking_url'] ?? ''}'.trim(),
     supplementalPaymentProofBase64:
         supStr.isNotEmpty && looksLikeBase64ImageProof(supStr) ? supStr : null,
-    cashierSecondaryAmountReceived:
-        map['cashier_secondary_amount_received'] != null ? jsonToDouble(map['cashier_secondary_amount_received']) : null,
+    cashierSecondaryAmountReceived: () {
+      final bal = map['cashier_amount_received_balance'];
+      if (bal != null && bal != '') {
+        final n = jsonToDouble(bal);
+        if (n > 0.009) return n;
+      }
+      final sec = map['cashier_secondary_amount_received'];
+      if (sec != null && sec != '') {
+        final n = jsonToDouble(sec);
+        if (n > 0.009) return n;
+      }
+      return null;
+    }(),
     balanceProofPendingReview: jsonToBool(map['balance_proof_pending_review']),
     customerDisplayName: () {
       final v = map['customer_display_name'];
@@ -3627,10 +3638,17 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> clearPersistedCustomerDraft() async {
+    final syncEmail = _trayDraftSyncEmail();
     final e = userEmail?.toLowerCase();
-    if (e == null) return;
     final p = await SharedPreferences.getInstance();
-    await p.remove('customer_tray_v1_$e');
+    if (syncEmail != null) {
+      await p.remove('customer_tray_v1_$syncEmail');
+      await _pushCustomerTrayDraftToServer([]);
+    }
+    if (e != null && e != syncEmail) {
+      await p.remove('customer_tray_v1_$e');
+    }
+    if (e == null) return;
     await p.remove('customer_checkout_note_v1_$e');
     await p.remove('customer_checkout_addr_v1_$e');
     await p.remove('customer_checkout_time_v1_$e');
@@ -3642,11 +3660,12 @@ class AppState extends ChangeNotifier {
     tray.clear();
     _pendingTrayLines.clear();
     notifyListeners();
-    final e = userEmail?.toLowerCase();
-    if (e == null || userRole != 'customer') return;
-    final p = await SharedPreferences.getInstance();
-    await p.remove('customer_tray_v1_$e');
-    unawaited(_pushCustomerTrayDraftToServer([]));
+    final syncEmail = _trayDraftSyncEmail();
+    if (syncEmail != null) {
+      final p = await SharedPreferences.getInstance();
+      await p.remove('customer_tray_v1_$syncEmail');
+      unawaited(_pushCustomerTrayDraftToServer([]));
+    }
   }
 
   Future<void> restoreCustomerDraftAfterLogin() async {
@@ -3829,6 +3848,7 @@ class AppState extends ChangeNotifier {
           )
           .timeout(_apiTimeout);
       if (res.statusCode != 200) return;
+      if (lines.isEmpty) _lastTrayServerStamp = '';
       final body = jsonDecode(res.body);
       if (body is Map<String, dynamic>) {
         _lastTrayServerStamp = '${body['updated_at'] ?? ''}';
@@ -4874,6 +4894,7 @@ class AppState extends ChangeNotifier {
       );
       tray.clear();
       notifyListeners();
+      await clearPersistedCustomerDraft();
       if (!clearCheckoutDraft) {
         try {
           await loadOrders(force: true);
@@ -4884,7 +4905,6 @@ class AppState extends ChangeNotifier {
         return SubmitOrderResult(order: order);
       }
       checkoutNote = '';
-      await clearPersistedCustomerDraft();
       try {
         await loadOrders(force: true);
       } catch (_) {
@@ -6165,6 +6185,7 @@ class AppState extends ChangeNotifier {
           return 'Update failed (${res.statusCode})';
         }
       }
+      await loadCashierOrderDetail(orderId);
       unawaited(loadCashierOnlineOrders());
       notifyListeners();
       return null;
@@ -12610,7 +12631,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                     }
                     s.tray.clear();
                     s.notifyListeners();
-                    unawaited(s.clearCheckoutAfterSuccessfulOrderAndPayment());
+                    await s.clearCheckoutAfterSuccessfulOrderAndPayment();
                     if (!context.mounted) return;
                     pushReplacementScreenOnce(
                       context,
@@ -27089,6 +27110,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
       appSnack(context, err);
       return;
     }
+    _syncAmountFieldsFromOrder(_currentOrder());
     appSnack(context, 'Customer notified (insufficient payment)');
     Navigator.pop(context);
   }
@@ -27123,6 +27145,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
       appSnack(context, err);
       return;
     }
+    _syncAmountFieldsFromOrder(_currentOrder());
     appSnack(context, 'Customer notified (overpayment)');
     Navigator.pop(context);
   }
