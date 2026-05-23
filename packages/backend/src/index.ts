@@ -128,7 +128,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-/** Older DBs only allowed for_processing / for_post_analysis; map canonical tab statuses when CHECK is stale. */
+/** Last-resort remap when CHECK constraints are stale (should be rare after status normalize). */
 function cateringStatusLegacyWriteFallback(
   nextStatus: string,
   post: Record<string, unknown> | null,
@@ -136,11 +136,11 @@ function cateringStatusLegacyWriteFallback(
   const base = post ? { ...post } : {};
   switch (nextStatus.trim().toLowerCase()) {
     case "for_ongoing":
-      return { status: "for_processing", post: { ...base, processing_phase: "ongoing" } };
+      return { status: "for_ongoing", post: { ...base, processing_phase: "ongoing" } };
     case "for_down_payment":
-      return { status: "for_processing", post: { ...base, processing_phase: "down_payment" } };
+      return { status: "for_down_payment", post: { ...base, processing_phase: "down_payment" } };
     case "for_full_payment":
-      return { status: "for_post_analysis", post: base };
+      return { status: "for_full_payment", post: base };
     default:
       return null;
   }
@@ -5114,10 +5114,10 @@ app.patch("/api/mobile/pos/catering/:id/stage", async (req, res) => {
            travel_cost = COALESCE($9, travel_cost),
            total_cost = COALESCE($10, total_cost),
            menu = COALESCE($11::jsonb, menu),
-           service_included = COALESCE($13, service_included),
-           menu_modifications = COALESCE($14::jsonb, menu_modifications),
-           cost_breakdown = COALESCE($15::jsonb, cost_breakdown),
-           stage_entered_at = CASE WHEN $16::boolean THEN NOW() ELSE stage_entered_at END
+           service_included = COALESCE($12, service_included),
+           menu_modifications = COALESCE($13::jsonb, menu_modifications),
+           cost_breakdown = COALESCE($14::jsonb, cost_breakdown),
+           stage_entered_at = CASE WHEN $15::boolean THEN NOW() ELSE stage_entered_at END
        WHERE id::text = $1
        RETURNING id::text, email_address, ${txSelect} AS transaction_no, total_cost`,
         [
@@ -5745,15 +5745,18 @@ app.get("/api/mobile/customer/tray-draft", async (req, res) => {
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT tray_lines, updated_at
+      `SELECT tray_items, updated_at
        FROM customer_tray_drafts
-       WHERE LOWER(user_email) = $1
+       WHERE LOWER(TRIM(COALESCE(user_email, ''))) = $1
+          OR LOWER(TRIM(customer_id)) = $1
        LIMIT 1`,
       [userEmail],
     );
-    const row = (rows[0] ?? null) as { tray_lines?: unknown; updated_at?: string } | null;
+    const row = (rows[0] ?? null) as { tray_items?: unknown; updated_at?: string } | null;
+    const trayItems = Array.isArray(row?.tray_items) ? row?.tray_items : [];
     res.json({
-      tray_lines: Array.isArray(row?.tray_lines) ? row?.tray_lines : [],
+      tray_items: trayItems,
+      tray_lines: trayItems,
       updated_at: row?.updated_at ?? "",
     });
   } catch (err) {
@@ -5766,9 +5769,10 @@ app.put("/api/mobile/customer/tray-draft", async (req, res) => {
   const userEmail = String(req.body?.user_email ?? "")
     .trim()
     .toLowerCase();
-  const trayLines = Array.isArray(req.body?.tray_lines) ? req.body.tray_lines : null;
-  if (!userEmail || trayLines == null) {
-    res.status(400).json({ error: "user_email and tray_lines are required" });
+  const trayItemsRaw = req.body?.tray_items ?? req.body?.tray_lines;
+  const trayItems = Array.isArray(trayItemsRaw) ? trayItemsRaw : null;
+  if (!userEmail || trayItems == null) {
+    res.status(400).json({ error: "user_email and tray_items are required" });
     return;
   }
   try {
@@ -5782,7 +5786,7 @@ app.put("/api/mobile/customer/tray-draft", async (req, res) => {
       [userEmail],
     );
     if (acct[0]?.cid) customerId = String(acct[0].cid);
-    const linesJson = JSON.stringify(trayLines);
+    const itemsJson = JSON.stringify(trayItems);
     await pool.query(
       `DELETE FROM customer_tray_drafts
        WHERE customer_id = $1
@@ -5790,10 +5794,10 @@ app.put("/api/mobile/customer/tray-draft", async (req, res) => {
       [customerId, userEmail],
     );
     const { rows } = await pool.query(
-      `INSERT INTO customer_tray_drafts (customer_id, user_email, tray_lines, tray_items, updated_at)
-       VALUES ($1, $2, $3::jsonb, $3::jsonb, NOW())
+      `INSERT INTO customer_tray_drafts (customer_id, user_email, tray_items, updated_at)
+       VALUES ($1, $2, $3::jsonb, NOW())
        RETURNING updated_at`,
-      [customerId, userEmail, linesJson],
+      [customerId, userEmail, itemsJson],
     );
     res.json({
       ok: true,

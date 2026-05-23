@@ -262,6 +262,7 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await normalizeEventOrders(pool);
   await normalizeIdCounters(pool);
   await normalizeMenuDishes(pool);
+  await normalizeCustomerTrayDrafts(pool);
   await migratePostAnalysisIntoChecklistAndDrop(pool);
   await dropEventOrdersLegacyColumns(pool);
   await dropCateringOrdersLegacyColumns(pool);
@@ -1260,6 +1261,38 @@ async function dropRestaurantOrdersLegacyColumns(pool: pg.Pool): Promise<void> {
     }
   }
   await safeExec(pool, `DROP INDEX IF EXISTS restaurant_orders_order_no_uq`);
+}
+
+/** `customer_tray_drafts`: store tray lines only in `tray_items`; drop legacy columns. */
+async function normalizeCustomerTrayDrafts(pool: pg.Pool): Promise<void> {
+  if (!(await tableExists(pool, "customer_tray_drafts"))) return;
+  await safeExec(
+    pool,
+    `ALTER TABLE customer_tray_drafts ADD COLUMN IF NOT EXISTS tray_items JSONB NOT NULL DEFAULT '[]'::jsonb`,
+  );
+  await safeExec(
+    pool,
+    `ALTER TABLE customer_tray_drafts ADD COLUMN IF NOT EXISTS user_email TEXT`,
+  );
+  if (await columnExists(pool, "customer_tray_drafts", "tray_lines")) {
+    await safeExec(
+      pool,
+      `UPDATE customer_tray_drafts
+       SET tray_items = COALESCE(NULLIF(tray_items, '[]'::jsonb), tray_lines, '[]'::jsonb)
+       WHERE tray_items IS NULL OR tray_items = '[]'::jsonb`,
+    );
+  }
+  if (await columnExists(pool, "customer_tray_drafts", "items")) {
+    await safeExec(
+      pool,
+      `UPDATE customer_tray_drafts
+       SET tray_items = COALESCE(NULLIF(tray_items, '[]'::jsonb), items, '[]'::jsonb)
+       WHERE tray_items IS NULL OR tray_items = '[]'::jsonb`,
+    );
+  }
+  for (const legacy of ["items", "email", "tray_lines"] as const) {
+    await dropColumnIfExists(pool, "customer_tray_drafts", legacy);
+  }
 }
 
 /** Merge legacy `post_analysis` column into checklist.post_analysis (keep both columns). */

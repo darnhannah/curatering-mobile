@@ -536,8 +536,9 @@ export async function initDb(): Promise<void> {
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS customer_tray_drafts (
-      user_email TEXT PRIMARY KEY,
-      tray_lines JSONB NOT NULL DEFAULT '[]'::jsonb,
+      customer_id TEXT PRIMARY KEY,
+      user_email TEXT,
+      tray_items JSONB NOT NULL DEFAULT '[]'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
@@ -592,8 +593,49 @@ const CATERING_PIPELINE_STATUSES_SQL = `ARRAY[
   'completed'::text, 'cancelled'::text
 ]`;
 
+const CATERING_PIPELINE_STATUS_CANONICAL = [
+  "new_event",
+  "online_inquiries",
+  "for_down_payment",
+  "for_ongoing",
+  "for_full_payment",
+  "for_processing",
+  "for_post_analysis",
+  "completed",
+  "cancelled",
+] as const;
+
+/** Normalize legacy / invalid status values before applying CHECK constraints. */
+async function normalizeCateringPipelineStatusRows(p: pg.Pool): Promise<void> {
+  const allowed = CATERING_PIPELINE_STATUS_CANONICAL.map((s) => `'${s}'`).join(", ");
+  for (const table of ["event_orders", "catering_orders"] as const) {
+    await p.query(
+      `UPDATE ${table}
+       SET status = LOWER(TRIM(status))
+       WHERE status IS NOT NULL AND status <> LOWER(TRIM(status))`,
+    );
+    await p.query(
+      `UPDATE ${table}
+       SET status = CASE
+         WHEN LOWER(TRIM(status)) IN ('online_inquiry', 'online inquiry') THEN 'online_inquiries'
+         WHEN LOWER(TRIM(status)) = 'for_post_analysis' THEN 'for_full_payment'
+         WHEN LOWER(TRIM(status)) = 'for_processing' THEN
+           CASE
+             WHEN COALESCE(LOWER(TRIM(checklist->'post_analysis'->>'processing_phase')), '') = 'down_payment'
+               THEN 'for_down_payment'
+             ELSE 'for_ongoing'
+           END
+         WHEN LOWER(TRIM(status)) NOT IN (${allowed}) THEN 'cancelled'
+         ELSE LOWER(TRIM(status))
+       END
+       WHERE status IS NOT NULL`,
+    );
+  }
+}
+
 /** (Re)apply pipeline status CHECK on event_orders + catering_orders — required for for_ongoing / for_down_payment tabs. */
 export async function ensureCateringPipelineStatusChecks(p: pg.Pool): Promise<void> {
+  await normalizeCateringPipelineStatusRows(p);
   for (const table of ["event_orders", "catering_orders"] as const) {
     const constraint = `${table}_status_check`;
     try {

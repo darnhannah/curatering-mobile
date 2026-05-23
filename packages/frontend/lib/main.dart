@@ -1094,7 +1094,7 @@ enum _ManagerOrderSummaryPdfVariant {
   beforeDownPayment,
   /// After down payment; balance still due until full payment.
   afterDownPayment,
-  /// Supplemental sheet for post-analysis additional costs.
+  /// Supplemental sheet for additional costs (For Full Payment stage).
   additionalCostsSheet,
   /// Completed / fully settled totals.
   fullyPaid,
@@ -2095,8 +2095,9 @@ const kStageForFullPayment = 'for_full_payment';
 
 String normalizeCateringPipelineStatus(String raw) {
   final s = raw.trim().toLowerCase();
+  if (s == 'for_post_analysis') return kStageForFullPayment;
   if (s == 'for_full_payment') return kStageForFullPayment;
-  if (s == 'for_ongoing') return kStageForOngoing;
+  if (s == 'for_ongoing' || s == 'for_processing') return kStageForOngoing;
   if (s == 'for_down_payment') return kStageForDownPayment;
   return s;
 }
@@ -2117,9 +2118,7 @@ String inquiryStatusReadable(String status) {
     case 'for_full_payment':
       return 'For Full Payment';
     case 'for_processing':
-      return 'For Processing';
-    case 'for_post_analysis':
-      return 'For Post Analysis';
+      return 'On Going';
     case 'completed':
       return 'Completed';
     case 'cancelled':
@@ -3674,9 +3673,20 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  String? _trayDraftSyncEmail() {
+    if (userEmail == null) return null;
+    if (isCashier) return 'pos:${userEmail!.toLowerCase()}';
+    if (isGuestSession) {
+      final guestEmail = profile.contactEmail.trim().toLowerCase();
+      return guestEmail.contains('@') ? guestEmail : null;
+    }
+    if (userRole == 'customer') return userEmail!.toLowerCase();
+    return null;
+  }
+
   Future<void> _refreshTrayServerStampOnly() async {
-    final email = userEmail;
-    if (email == null || userRole != 'customer' || isGuestSession) return;
+    final email = _trayDraftSyncEmail();
+    if (email == null) return;
     try {
       final res =
           await http.get(_uri('/api/mobile/customer/tray-draft', {'user_email': email})).timeout(_apiTimeout);
@@ -3692,7 +3702,7 @@ class AppState extends ChangeNotifier {
   }
 
   bool get _shouldSkipTrayServerPull {
-    if (isGuestSession) return true;
+    if (isGuestSession && _trayDraftSyncEmail() == null) return true;
     final hold = _trayServerSyncHoldUntil;
     return hold != null && DateTime.now().isBefore(hold);
   }
@@ -3721,9 +3731,10 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _persistCustomerTraySnapshot() async {
-    if (userEmail == null || userRole != 'customer') return;
+    final syncEmail = _trayDraftSyncEmail();
+    if (syncEmail == null) return;
     final prefs = await SharedPreferences.getInstance();
-    final k = userEmail!.toLowerCase();
+    final k = syncEmail;
     final lines = tray
         .map(
           (e) => <String, dynamic>{
@@ -3807,14 +3818,14 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _pushCustomerTrayDraftToServer(List<Map<String, dynamic>> lines) async {
-    final email = userEmail;
-    if (email == null || userRole != 'customer' || isGuestSession) return;
+    final email = _trayDraftSyncEmail();
+    if (email == null) return;
     try {
       final res = await http
           .put(
             _uri('/api/mobile/customer/tray-draft'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'user_email': email, 'tray_lines': lines}),
+            body: jsonEncode({'user_email': email, 'tray_items': lines}),
           )
           .timeout(_apiTimeout);
       if (res.statusCode != 200) return;
@@ -3826,8 +3837,8 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> pullCustomerTrayDraftFromServer() async {
-    final email = userEmail;
-    if (email == null || userRole != 'customer' || isGuestSession) return;
+    final email = _trayDraftSyncEmail();
+    if (email == null) return;
     if (_shouldSkipTrayServerPull) return;
     try {
       final res =
@@ -3835,15 +3846,15 @@ class AppState extends ChangeNotifier {
       if (res.statusCode != 200) return;
       final body = jsonDecode(res.body);
       if (body is! Map<String, dynamic>) return;
-      final trayLines = body['tray_lines'];
+      final trayItems = body['tray_items'] ?? body['tray_lines'];
       final updatedAt = '${body['updated_at'] ?? ''}';
-      if (trayLines is! List) return;
-      if (tray.isNotEmpty && trayLines.isEmpty) return;
-      if (tray.isNotEmpty && _trayLineQtyTotal(trayLines) < _trayLineQtyTotal(_trayLinesSnapshot())) return;
-      _applyTrayLinesSnapshot(trayLines, allowEmptyClear: true);
+      if (trayItems is! List) return;
+      if (tray.isNotEmpty && trayItems.isEmpty) return;
+      if (tray.isNotEmpty && _trayLineQtyTotal(trayItems) < _trayLineQtyTotal(_trayLinesSnapshot())) return;
+      _applyTrayLinesSnapshot(trayItems, allowEmptyClear: true);
       final prefs = await SharedPreferences.getInstance();
       final k = email.toLowerCase();
-      await prefs.setString('customer_tray_v1_$k', jsonEncode(trayLines));
+      await prefs.setString('customer_tray_v1_$k', jsonEncode(trayItems));
       _lastTrayServerStamp = updatedAt;
       notifyListeners();
     } catch (_) {}
@@ -8196,8 +8207,6 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
       DropdownMenuItem(value: 'for_down_payment', child: Text('For down payment')),
       DropdownMenuItem(value: 'for_ongoing', child: Text('On going')),
       DropdownMenuItem(value: 'for_full_payment', child: Text('For full payment')),
-      DropdownMenuItem(value: 'for_processing', child: Text('For processing')),
-      DropdownMenuItem(value: 'for_post_analysis', child: Text('For post analysis')),
       DropdownMenuItem(value: 'completed', child: Text('Completed')),
       DropdownMenuItem(value: 'cancelled', child: Text('Cancelled')),
     ];
@@ -15019,7 +15028,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
   void _applyEventStylingChoice(bool withStyling) {
     setState(() {
       serviceIncluded = withStyling ? 'yes' : 'no';
-      inquiryType = withStyling ? kInquiryTypeCateringWithEventStyling : kInquiryTypeCatering;
     });
   }
 
@@ -24759,7 +24767,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         Text('Set menu: $selectedSetMenu'),
                       ],
                       const SizedBox(height: 8),
-                    ] else ...[
+                    ],
                     const Text('Would you like to curate your own menu?'),
                     const SizedBox(height: 6),
                     RadioListTile<bool>(
@@ -24793,8 +24801,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                                 managerMenuSuggestionNote = 'No, suggest me a menu instead.';
                               }),
                     ),
-                    ],
-                    if (_managerMenuChoicePicked && managerCurateOwn) ...[
+                    if (_managerMenuChoicePicked) ...[
                       TextField(
                         controller: menuSearchController,
                         decoration: const InputDecoration(
@@ -24859,50 +24866,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                         );
                       },
                     ),
-                    if (_managerMenuChoicePicked &&
-                        (managerCurateOwn || (isOnlineInquiry && !managerCurateOwn && rowMenu.isNotEmpty))) ...[
+                    if (_managerMenuChoicePicked) ...[
                       const SizedBox(height: 8),
                       SizedBox(
                         height: math.min(420, MediaQuery.sizeOf(context).height * 0.42),
                         child: ListView(
                           padding: EdgeInsets.zero,
                           children: [
-                            if (isOnlineInquiry && !managerCurateOwn && rowMenu.isNotEmpty)
-                              ...rowMenu.map((m) {
-                                final dishName = dishNameFromCateringMenuEntry(m);
-                                MenuItemData? lookup;
-                                for (final dish in widget.state.menu) {
-                                  if (dish.name.toLowerCase() == dishName.toLowerCase()) {
-                                    lookup = dish;
-                                    break;
-                                  }
-                                }
-                                final thumbItem = MenuItemData(
-                                  id: lookup?.id ?? dishName,
-                                  name: dishName,
-                                  description: lookup?.description ?? '',
-                                  listingSubtitle: lookup?.listingSubtitle ?? '',
-                                  price: lookup?.price ?? 0,
-                                  dips: const [],
-                                  category: lookup?.category ?? '',
-                                  dishType: lookup?.dishType ?? '',
-                                  imageBase64: imageBase64FromCateringMenuEntry(m) ?? lookup?.imageBase64,
-                                );
-                                return ListTile(
-                                  dense: true,
-                                  contentPadding: EdgeInsets.zero,
-                                  leading: SizedBox(
-                                    width: 42,
-                                    height: 42,
-                                    child: ClipRRect(
-                                      borderRadius: BorderRadius.circular(8),
-                                      child: _MenuThumb(item: thumbItem, compact: true),
-                                    ),
-                                  ),
-                                  title: Text(dishName),
-                                );
-                              })
-                            else ...(() {
+                            ...(() {
                               final seen = <String>{};
                               final dishes = widget.state.menu.where((m) => m.isCateringDish).where((m) {
                               final q = menuSearchController.text.trim().toLowerCase();
@@ -26935,13 +26906,17 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
   @override
   void initState() {
     super.initState();
-    final o = widget.order;
-    amountReceived.text = o.cashierAmountReceived?.toStringAsFixed(2) ?? '';
-    supplementalAmount.text = o.cashierSecondaryAmountReceived?.toStringAsFixed(2) ?? '';
-    trackingUrl.text = o.deliveryTrackingUrl;
+    _syncAmountFieldsFromOrder(widget.order);
+    trackingUrl.text = widget.order.deliveryTrackingUrl;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       widget.state.loadCashierOrderDetail(widget.order.id);
     });
+  }
+
+  void _syncAmountFieldsFromOrder(OrderData o) {
+    amountReceived.text = o.cashierAmountReceived?.toStringAsFixed(2) ?? '';
+    final bal = o.cashierSecondaryAmountReceived;
+    supplementalAmount.text = bal != null && bal > 0.009 ? bal.toStringAsFixed(2) : '';
   }
 
   @override
@@ -27173,6 +27148,12 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
       animation: widget.state,
       builder: (context, _) {
         final o = _currentOrder();
+        final balLoaded = o.cashierSecondaryAmountReceived;
+        if (balLoaded != null &&
+            balLoaded > 0.009 &&
+            supplementalAmount.text.trim().isEmpty) {
+          supplementalAmount.text = balLoaded.toStringAsFixed(2);
+        }
         if (o.status.toUpperCase().contains('CANCEL')) {
           return _buildCancelledOnlineDetail(context, o);
         }
