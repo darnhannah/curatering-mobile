@@ -14778,7 +14778,7 @@ class _CateringPackagesPanel extends StatelessWidget {
 }
 
 /// Card wrapper for inquire-catering wizard steps.
-Widget inquiryWizardTile(Widget child) {
+Widget inquiryWizardTile({required Widget child}) {
   return Card(
     elevation: 1,
     margin: const EdgeInsets.only(bottom: 10),
