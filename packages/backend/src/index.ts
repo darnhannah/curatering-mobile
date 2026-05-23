@@ -1373,7 +1373,7 @@ app.get("/api/mobile/menu/dish-image", async (req, res) => {
     );
     const raw = rows[0] as { image_base64?: string } | undefined;
     const image = raw?.image_base64 != null ? String(raw.image_base64).trim() : "";
-    res.json({ id, image_base64: image.isEmpty ? null : image });
+    res.json({ id, image_base64: image.length === 0 ? null : image });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "menu image query failed" });
