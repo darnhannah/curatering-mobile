@@ -4,13 +4,32 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
-/// Multi-select guest allergens (manager inquiry / new event).
+/// Sentinel chip label for free-text allergens (not stored under this name).
+const String kAllergenOthersChipLabel = 'Others';
+
+Set<String> guestAllergensForSubmit(Set<String> selected, {String othersText = ''}) {
+  final out = Set<String>.from(selected)..remove(kAllergenOthersChipLabel);
+  final custom = othersText.trim();
+  if (custom.isNotEmpty) out.add(custom);
+  return out;
+}
+
+/// Multi-select guest allergens (manager inquiry / new event / inquire catering).
 Widget buildGuestAllergenSelector({
   required List<String> catalog,
   required Set<String> selected,
   required bool enabled,
   required ValueChanged<Set<String>> onChanged,
+  bool showOthers = true,
+  TextEditingController? othersController,
+  ValueChanged<String>? onOthersTextChanged,
 }) {
+  final othersSelected =
+      selected.contains(kAllergenOthersChipLabel) || (othersController?.text.trim().isNotEmpty ?? false);
+  final catalogNames = catalog
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty && e.toLowerCase() != kAllergenOthersChipLabel.toLowerCase())
+      .toList();
   return Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
@@ -19,7 +38,7 @@ Widget buildGuestAllergenSelector({
         style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.35),
       ),
       const SizedBox(height: 10),
-      if (catalog.isEmpty)
+      if (catalogNames.isEmpty && !showOthers)
         Text(
           'Loading allergen list… Pull down to refresh if empty.',
           style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
@@ -29,7 +48,7 @@ Widget buildGuestAllergenSelector({
           spacing: 8,
           runSpacing: 8,
           children: [
-            for (final name in catalog)
+            for (final name in catalogNames)
               FilterChip(
                 label: Text(name, style: const TextStyle(fontSize: 12)),
                 selected: selected.contains(name),
@@ -45,8 +64,41 @@ Widget buildGuestAllergenSelector({
                       }
                     : null,
               ),
+            if (showOthers)
+              FilterChip(
+                label: const Text(kAllergenOthersChipLabel, style: TextStyle(fontSize: 12)),
+                selected: othersSelected,
+                onSelected: enabled
+                    ? (sel) {
+                        final next = Set<String>.from(selected);
+                        if (sel) {
+                          next.add(kAllergenOthersChipLabel);
+                        } else {
+                          next.remove(kAllergenOthersChipLabel);
+                          othersController?.clear();
+                          onOthersTextChanged?.call('');
+                        }
+                        onChanged(next);
+                      }
+                    : null,
+              ),
           ],
         ),
+      if (showOthers && othersSelected) ...[
+        const SizedBox(height: 10),
+        TextField(
+          controller: othersController,
+          enabled: enabled,
+          onChanged: onOthersTextChanged,
+          decoration: const InputDecoration(
+            labelText: 'Specify other allergen(s)',
+            hintText: 'e.g. sulfites, mustard',
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+          maxLines: 2,
+        ),
+      ],
     ],
   );
 }

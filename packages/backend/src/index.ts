@@ -1275,7 +1275,40 @@ app.get("/api/mobile/allergens", async (_req, res) => {
   }
 });
 
-app.get("/api/mobile/menu", async (_req, res) => {
+app.post("/api/mobile/allergens", async (req, res) => {
+  try {
+    const name = String(req.body?.name ?? "").trim();
+    if (!name || name.length > 120) {
+      res.status(400).json({ error: "invalid allergen name" });
+      return;
+    }
+    const pool = getPool();
+    const label = await menuAllergenLabelSql(pool);
+    const { rows: colRows } = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'menu_dishes_allergens'
+         AND column_name IN ('name', 'allergen_name')
+       ORDER BY CASE column_name WHEN 'name' THEN 0 ELSE 1 END
+       LIMIT 1`,
+    );
+    const col = String((colRows[0] as { column_name?: string } | undefined)?.column_name ?? "name");
+    await pool.query(
+      `INSERT INTO menu_dishes_allergens (${col})
+       SELECT $1::text
+       WHERE NOT EXISTS (
+         SELECT 1 FROM menu_dishes_allergens ma
+         WHERE LOWER(TRIM(${label}::text)) = LOWER(TRIM($1::text))
+       )`,
+      [name],
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
+app.get("/api/mobile/menu", async (req, res) => {
   const pool = getPool();
   const sql = await resolveMenuSqlForPool(pool);
   if (!sql) {
@@ -1285,6 +1318,13 @@ app.get("/api/mobile/menu", async (_req, res) => {
     });
     return;
   }
+  const lite =
+    String(req.query.lite ?? "")
+      .trim()
+      .toLowerCase() === "1" ||
+    String(req.query.lite ?? "")
+      .trim()
+      .toLowerCase() === "true";
   try {
     const { rows } = await pool.query(sql);
     res.json(
@@ -1299,9 +1339,11 @@ app.get("/api/mobile/menu", async (_req, res) => {
         ingredients: parseJsonTextArray((r as Record<string, unknown>).ingredients),
         category: String((r as Record<string, unknown>).category ?? ""),
         dish_type: String((r as Record<string, unknown>).dish_type ?? ""),
-        image_base64: (r as Record<string, unknown>).image_base64 != null
-          ? String((r as Record<string, unknown>).image_base64)
-          : null,
+        image_base64: lite
+          ? null
+          : (r as Record<string, unknown>).image_base64 != null
+            ? String((r as Record<string, unknown>).image_base64)
+            : null,
         allergens: parseMenuAllergens((r as Record<string, unknown>).allergens),
       })),
     );
@@ -1310,6 +1352,31 @@ app.get("/api/mobile/menu", async (_req, res) => {
     res.status(500).json({
       error: "menu query failed — check WEB_MENU_SQL / WEB_MENU_* env matches your existing tables",
     });
+  }
+});
+
+/** Lazy-load a single dish photo (used after lite menu list). */
+app.get("/api/mobile/menu/dish-image", async (req, res) => {
+  const id = String(req.query.id ?? "").trim();
+  if (!id) {
+    res.status(400).json({ error: "id required" });
+    return;
+  }
+  try {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT image_base64::text AS image_base64
+       FROM menu_dishes
+       WHERE id::text = $1
+       LIMIT 1`,
+      [id],
+    );
+    const raw = rows[0] as { image_base64?: string } | undefined;
+    const image = raw?.image_base64 != null ? String(raw.image_base64).trim() : "";
+    res.json({ id, image_base64: image.isEmpty ? null : image });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "menu image query failed" });
   }
 });
 
@@ -4222,8 +4289,8 @@ app.post("/api/mobile/inquiries", async (req, res) => {
           total_cost, customer_id, catering_id, payment_method, labor_cost, travel_cost, full_payment_due_at,
           service_included, selected_set_menu, menu_modifications, cost_breakdown, inquiry_additional_costs)
          VALUES
-         ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18, $19, $20, $21, $22,
-          $23, $24, $25::jsonb, $26::jsonb, $27::jsonb)
+         ('online_inquiry', 'online_inquiries', 'catering', $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18, $19, $20, $21,
+          $22, $23, $24::jsonb, $25::jsonb, $26::jsonb)
          RETURNING id::text`
       : `INSERT INTO event_orders
          (source, status, order_type, event_title, event_type, formality_level, event_setting, customer_name, contact_person, contact_number,

@@ -491,6 +491,12 @@ const Duration _apiTimeout = Duration(seconds: 30);
 /// Manager catering list can return many rows; allow a longer read than generic APIs.
 const Duration _managerCateringListTimeout = Duration(seconds: 120);
 const Duration _cashierOrdersCacheDuration = Duration(seconds: 20);
+const Duration _menuLiteCacheDuration = Duration(minutes: 3);
+const Duration _menuFullCacheDuration = Duration(seconds: 45);
+const Duration _allergenCatalogCacheDuration = Duration(minutes: 10);
+const Duration _customerOrdersCacheDuration = Duration(seconds: 30);
+const Duration _customerInquiriesCacheDuration = Duration(seconds: 30);
+const Duration _managerCateringListCacheDuration = Duration(seconds: 45);
 
 /// Local Node backend is HTTP-only; [https] to these hosts breaks TLS handshakes.
 bool _devBackendHttpHost(String host) {
@@ -788,23 +794,7 @@ void appSnack(BuildContext context, String message) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
 
-/// Prevents duplicate routes/dialogs when buttons or tiles are tapped repeatedly.
-final Set<String> _navSingleFlightLocks = {};
-
-String _navLockKey(Object scope, String routeKey) => '${identityHashCode(scope)}|$routeKey';
-
-bool _acquireNavLock(Object scope, String routeKey) {
-  final k = _navLockKey(scope, routeKey);
-  if (_navSingleFlightLocks.contains(k)) return false;
-  _navSingleFlightLocks.add(k);
-  return true;
-}
-
-void _releaseNavLock(Object scope, String routeKey) {
-  _navSingleFlightLocks.remove(_navLockKey(scope, routeKey));
-}
-
-/// Push [screen] once until that route is popped (per [routeKey]).
+/// Navigation helpers (no duplicate-tap lock — locks caused missed navigations after commit 66).
 Future<T?> pushScreenOnce<T extends Object?>(
   BuildContext context,
   Widget screen, {
@@ -812,17 +802,12 @@ Future<T?> pushScreenOnce<T extends Object?>(
   bool rootNavigator = false,
 }) {
   if (!context.mounted) return Future<T?>.value(null);
-  final nav = Navigator.of(context, rootNavigator: rootNavigator);
-  final key = routeKey ?? screen.runtimeType.toString();
-  if (!_acquireNavLock(nav, key)) return Future<T?>.value(null);
-  return nav
-      .push<T>(
-        MaterialPageRoute<T>(
-          settings: RouteSettings(name: key),
-          builder: (_) => screen,
-        ),
-      )
-      .whenComplete(() => _releaseNavLock(nav, key));
+  return Navigator.of(context, rootNavigator: rootNavigator).push<T>(
+    MaterialPageRoute<T>(
+      settings: RouteSettings(name: routeKey ?? screen.runtimeType.toString()),
+      builder: (_) => screen,
+    ),
+  );
 }
 
 Future<T?> pushRouteOnce<T extends Object?>(
@@ -832,10 +817,7 @@ Future<T?> pushRouteOnce<T extends Object?>(
   bool rootNavigator = false,
 }) {
   if (!context.mounted) return Future<T?>.value(null);
-  final nav = Navigator.of(context, rootNavigator: rootNavigator);
-  final key = routeKey ?? route.settings.name ?? route.runtimeType.toString();
-  if (!_acquireNavLock(nav, key)) return Future<T?>.value(null);
-  return nav.push<T>(route).whenComplete(() => _releaseNavLock(nav, key));
+  return Navigator.of(context, rootNavigator: rootNavigator).push<T>(route);
 }
 
 Future<T?> pushReplacementScreenOnce<T extends Object?, TO extends Object?>(
@@ -846,18 +828,13 @@ Future<T?> pushReplacementScreenOnce<T extends Object?, TO extends Object?>(
   bool rootNavigator = false,
 }) {
   if (!context.mounted) return Future<T?>.value(null);
-  final nav = Navigator.of(context, rootNavigator: rootNavigator);
-  final key = routeKey ?? screen.runtimeType.toString();
-  if (!_acquireNavLock(nav, 'replace:$key')) return Future<T?>.value(null);
-  return nav
-      .pushReplacement<T, TO>(
-        MaterialPageRoute<T>(
-          settings: RouteSettings(name: key),
-          builder: (_) => screen,
-        ),
-        result: result,
-      )
-      .whenComplete(() => _releaseNavLock(nav, 'replace:$key'));
+  return Navigator.of(context, rootNavigator: rootNavigator).pushReplacement<T, TO>(
+    MaterialPageRoute<T>(
+      settings: RouteSettings(name: routeKey ?? screen.runtimeType.toString()),
+      builder: (_) => screen,
+    ),
+    result: result,
+  );
 }
 
 Future<T?> showAppDialogOnce<T>(
@@ -867,14 +844,11 @@ Future<T?> showAppDialogOnce<T>(
   bool barrierDismissible = true,
 }) {
   if (!context.mounted) return Future<T?>.value(null);
-  final key = dedupeKey ?? 'app-dialog';
-  final scope = Navigator.of(context, rootNavigator: true);
-  if (!_acquireNavLock(scope, 'dialog:$key')) return Future<T?>.value(null);
   return showDialog<T>(
     context: context,
     barrierDismissible: barrierDismissible,
     builder: builder,
-  ).whenComplete(() => _releaseNavLock(scope, 'dialog:$key'));
+  );
 }
 
 const int kMinCateringOnlyPax = 10;
@@ -1127,6 +1101,26 @@ const List<String> kCateringAllowedRegions = [
   'ncr',
   'national capital region',
   'metro manila',
+  'metropolitan manila',
+  'manila',
+  'quezon city',
+  'makati',
+  'taguig',
+  'pasig',
+  'mandaluyong',
+  'san juan',
+  'caloocan',
+  'malabon',
+  'navotas',
+  'valenzuela',
+  'parañaque',
+  'paranaque',
+  'las piñas',
+  'las pinas',
+  'muntinlupa',
+  'marikina',
+  'pasay',
+  'pateros',
   'bulacan',
   'cavite',
   'rizal',
@@ -1730,6 +1724,8 @@ Widget? cashierPaymentProofSuffixIcon(
   if (!hasImage) return null;
   final b64 = balance ? o.supplementalPaymentProofBase64 : o.paymentProofBase64;
   if (b64 == null || b64.trim().isEmpty) return null;
+  final initB64 = o.paymentProofBase64?.trim() ?? '';
+  if (balance && initB64.isNotEmpty && b64.trim() == initB64) return null;
   return IconButton(
     icon: const Icon(Icons.image_outlined),
     tooltip: balance ? 'View balance payment proof' : 'View proof of payment',
@@ -1762,6 +1758,71 @@ List<Widget> cashierPaymentReferenceOnlyWidgets(OrderData o, {bool includeBalanc
     }
   }
   return widgets;
+}
+
+Widget cashierLockedPaymentWithProofIcon(
+  BuildContext context,
+  OrderData o, {
+  required String label,
+  required String value,
+  required bool balance,
+}) {
+  final icon = cashierPaymentProofSuffixIcon(context, o, balance: balance);
+  if (icon == null) {
+    return LockedField(label: label, value: value);
+  }
+  return Row(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Expanded(child: LockedField(label: label, value: value)),
+      icon,
+    ],
+  );
+}
+
+List<Widget> cashierLockedPaymentSummary(BuildContext context, OrderData o) {
+  final first = o.cashierAmountReceived ?? 0;
+  final second = o.cashierSecondaryAmountReceived;
+  final hasBalance =
+      orderHasBalancePaymentOnFile(o) || (second != null && second > 0.009);
+  return [
+    Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Text(
+        'PAYMENT IS COMPLETE!',
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          fontWeight: FontWeight.w900,
+          fontSize: 17,
+          color: AppColors.success,
+          letterSpacing: 0.5,
+        ),
+      ),
+    ),
+    cashierLockedPaymentWithProofIcon(
+      context,
+      o,
+      label: 'INITIAL PAYMENT',
+      value: first.toStringAsFixed(2),
+      balance: false,
+    ),
+    if (hasBalance) ...[
+      const SizedBox(height: 8),
+      cashierLockedPaymentWithProofIcon(
+        context,
+        o,
+        label: 'BALANCE PAYMENT',
+        value: (second ?? balanceDueFromOrder(o)).toStringAsFixed(2),
+        balance: true,
+      ),
+    ],
+    ...cashierPaymentReferenceOnlyWidgets(o),
+  ];
+}
+
+double balanceDueFromOrder(OrderData o) {
+  final first = o.cashierAmountReceived ?? 0;
+  return o.total > first ? o.total - first : 0;
 }
 
 List<Widget> cashierPaymentProofAndReferenceSection(
@@ -3164,6 +3225,9 @@ class AppState extends ChangeNotifier {
   DateTime? _allergensLoadedAt;
   bool _loadLoyaltyHistoryInFlight = false;
   bool _loadMenuInFlight = false;
+  Completer<void>? _menuLoadCompleter;
+  final Set<String> _menuImageFetchInFlight = <String>{};
+  bool _menuLoadedWithImages = false;
   DateTime? _setMenusLoadedAt;
   DateTime? _loyaltyHistoryLoadedAt;
   bool get hasCashierAttentionBadge => cashierOnlineOrders.any((o) => o.balanceProofPendingReview);
@@ -3191,12 +3255,16 @@ class AppState extends ChangeNotifier {
 
   Future<void> preloadManagerDashboardCounts() async {
     await Future.wait([
-      loadManagerCateringByStage('new_event', force: true),
-      loadManagerCateringByStage('online_inquiries', force: true),
-      loadManagerCateringByStage(kStageForDownPayment, force: true),
-      loadManagerCateringByStage(kStageForOngoing, force: true),
-      loadManagerCateringByStage(kStageForFullPayment, force: true),
+      loadManagerCateringByStage('new_event'),
+      loadManagerCateringByStage('online_inquiries'),
     ]);
+    unawaited(
+      Future.wait([
+        loadManagerCateringByStage(kStageForDownPayment),
+        loadManagerCateringByStage(kStageForOngoing),
+        loadManagerCateringByStage(kStageForFullPayment),
+      ]),
+    );
   }
 
   /// Rows for the last manager tab API stage ([_managerActiveStage]).
@@ -3241,7 +3309,7 @@ class AppState extends ChangeNotifier {
   Future<void> _hydrateSessionAfterLogin() async {
     try {
       if (isCashier) {
-        await loadMenu(force: true);
+        await loadMenu();
         await Future.wait([
           loadCashierOnlineOrders(force: true),
           loadCashierWalkInQueues(force: true),
@@ -3250,20 +3318,20 @@ class AppState extends ChangeNotifier {
       } else if (isSupervisor) {
         _managerActiveStage = kStageForOngoing;
         await Future.wait([
-          loadMenu(force: true),
+          loadMenu(),
           loadManagerCateringByStage(kStageForOngoing, force: true),
         ]);
         await loadNotifications(force: true);
       } else if (isManager) {
         await Future.wait([
-          loadMenu(force: true),
+          loadMenu(),
           loadSetMenus(force: true),
           loadManagerCateringByStage('new_event', force: true),
         ]);
         await loadNotifications(force: true);
       } else {
         await Future.wait([
-          loadMenu(force: true),
+          loadMenu(),
           loadSetMenus(force: true),
           loadProfile(force: true),
           loadOrders(force: true),
@@ -4132,16 +4200,74 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> loadMenu({bool force = false}) async {
-    if (_loadMenuInFlight) return;
-    if (!force && _menuLoadedAt != null) {
-      final age = DateTime.now().difference(_menuLoadedAt!);
-      if (age < const Duration(seconds: 20) && menu.isNotEmpty) return;
+  void _patchMenuItemImage(String id, String? imageBase64) {
+    final i = menu.indexWhere((m) => m.id == id);
+    if (i < 0) return;
+    final m = menu[i];
+    menu[i] = MenuItemData(
+      id: m.id,
+      name: m.name,
+      description: m.description,
+      listingSubtitle: m.listingSubtitle,
+      price: m.price,
+      additionalChargeAmount: m.additionalChargeAmount,
+      dips: m.dips,
+      ingredients: m.ingredients,
+      allergens: m.allergens,
+      category: m.category,
+      dishType: m.dishType,
+      imageBase64: imageBase64,
+    );
+  }
+
+  List<MenuItemData> _menuItemsFromJsonList(List<dynamic> body, {bool stripImages = false}) {
+    return body.map((e) {
+      final map = e as Map<String, dynamic>;
+      final dipValues = map['dips'] is List ? (map['dips'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
+      final ingValues =
+          map['ingredients'] is List ? (map['ingredients'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
+      final allergenValues =
+          map['allergens'] is List ? (map['allergens'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
+      final rawImg = map['image_base64'];
+      final imgStr = rawImg != null ? '$rawImg'.trim() : '';
+      return MenuItemData(
+        id: '${map['id']}',
+        name: '${map['name']}',
+        description: '${map['description']}',
+        listingSubtitle: '${map['listing_subtitle'] ?? ''}',
+        price: jsonToDouble(map['price']),
+        additionalChargeAmount: jsonToDouble(map['additional_charge_amount']),
+        dips: dipValues,
+        ingredients: ingValues,
+        allergens: allergenValues,
+        category: '${map['category'] ?? ''}',
+        dishType: '${map['dish_type'] ?? ''}',
+        imageBase64: stripImages || imgStr.isEmpty ? null : imgStr,
+      );
+    }).toList();
+  }
+
+  /// Loads menu list. Default is lite (no images) for speed; images load per dish via [ensureMenuDishImage].
+  Future<void> loadMenu({bool force = false, bool withImages = false}) async {
+    if (_loadMenuInFlight) {
+      final pending = _menuLoadCompleter;
+      if (pending != null) return pending.future;
+      return;
+    }
+    final cacheMax = withImages ? _menuFullCacheDuration : _menuLiteCacheDuration;
+    if (!force &&
+        _menuLoadedAt != null &&
+        DateTime.now().difference(_menuLoadedAt!) < cacheMax &&
+        menu.isNotEmpty &&
+        (!withImages || _menuLoadedWithImages)) {
+      return;
     }
     _loadMenuInFlight = true;
+    _menuLoadCompleter = Completer<void>();
     try {
       final trayBeforeReload = _trayLinesSnapshot();
-      final res = await http.get(_uri('/api/mobile/menu'));
+      final query = withImages ? const <String, String>{} : const {'lite': '1'};
+      final res = await http.get(_uri('/api/mobile/menu', query)).timeout(_apiTimeout);
       if (res.statusCode != 200) {
         debugPrint('loadMenu failed: ${res.statusCode} ${res.body}');
         return;
@@ -4149,39 +4275,50 @@ class AppState extends ChangeNotifier {
       final List<dynamic> body = jsonDecode(res.body) as List<dynamic>;
       menu
         ..clear()
-        ..addAll(
-          body.map((e) {
-            final map = e as Map<String, dynamic>;
-            final dipValues = map['dips'] is List ? (map['dips'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
-            final ingValues =
-                map['ingredients'] is List ? (map['ingredients'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
-            final allergenValues =
-                map['allergens'] is List ? (map['allergens'] as List<dynamic>).map((d) => '$d').toList() : <String>[];
-            return MenuItemData(
-              id: '${map['id']}',
-              name: '${map['name']}',
-              description: '${map['description']}',
-              listingSubtitle: '${map['listing_subtitle'] ?? ''}',
-              price: jsonToDouble(map['price']),
-              additionalChargeAmount: jsonToDouble(map['additional_charge_amount']),
-              dips: dipValues,
-              ingredients: ingValues,
-              allergens: allergenValues,
-              category: '${map['category'] ?? ''}',
-              dishType: '${map['dish_type'] ?? ''}',
-              imageBase64: map['image_base64'] != null ? '${map['image_base64']}' : null,
-            );
-          }),
-        );
+        ..addAll(_menuItemsFromJsonList(body, stripImages: !withImages));
       if (trayBeforeReload.isNotEmpty) {
         _applyTrayLinesSnapshot(trayBeforeReload);
       } else {
         _reapplyPendingTrayLines();
       }
       _menuLoadedAt = DateTime.now();
+      _menuLoadedWithImages = withImages;
       notifyListeners();
     } finally {
       _loadMenuInFlight = false;
+      final c = _menuLoadCompleter;
+      _menuLoadCompleter = null;
+      c?.complete();
+    }
+  }
+
+  /// Fetches one dish image and merges into [menu] (lite menu + grid thumbnails).
+  Future<void> ensureMenuDishImage(String dishId) async {
+    final id = dishId.trim();
+    if (id.isEmpty || _menuImageFetchInFlight.contains(id)) return;
+    MenuItemData? existing;
+    for (final m in menu) {
+      if (m.id == id) {
+        existing = m;
+        break;
+      }
+    }
+    if (existing != null && (existing.imageBase64?.trim().isNotEmpty ?? false)) return;
+    _menuImageFetchInFlight.add(id);
+    try {
+      final res = await http.get(_uri('/api/mobile/menu/dish-image', {'id': id})).timeout(const Duration(seconds: 20));
+      if (res.statusCode != 200) return;
+      final body = jsonDecode(res.body);
+      if (body is! Map<String, dynamic>) return;
+      final img = body['image_base64'];
+      final b64 = img != null ? '$img'.trim() : '';
+      if (b64.isEmpty) return;
+      _patchMenuItemImage(id, b64);
+      notifyListeners();
+    } catch (e) {
+      debugPrint('ensureMenuDishImage($id): $e');
+    } finally {
+      _menuImageFetchInFlight.remove(id);
     }
   }
 
@@ -4189,7 +4326,7 @@ class AppState extends ChangeNotifier {
     if (_loadAllergensInFlight) return;
     if (!force &&
         _allergensLoadedAt != null &&
-        DateTime.now().difference(_allergensLoadedAt!) < const Duration(seconds: 30) &&
+        DateTime.now().difference(_allergensLoadedAt!) < _allergenCatalogCacheDuration &&
         allergenCatalog.isNotEmpty) {
       return;
     }
@@ -4214,9 +4351,37 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Persists a custom allergen for staff flows (manager / online inquiries).
+  Future<void> persistAllergenToCatalog(String name) async {
+    final n = name.trim();
+    if (n.isEmpty || n.toLowerCase() == kAllergenOthersChipLabel.toLowerCase()) return;
+    try {
+      final res = await http.post(
+        _uri('/api/mobile/allergens'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'name': n}),
+      );
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        if (!allergenCatalog.any((e) => e.toLowerCase() == n.toLowerCase())) {
+          allergenCatalog.add(n);
+          allergenCatalog.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+          notifyListeners();
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> persistCustomGuestAllergens(Set<String> selected, {String othersText = ''}) async {
+    for (final a in guestAllergensForSubmit(selected, othersText: othersText)) {
+      if (!allergenCatalog.any((c) => c.toLowerCase() == a.toLowerCase())) {
+        await persistAllergenToCatalog(a);
+      }
+    }
+  }
+
   Future<void> loadSetMenus({bool force = false}) async {
     if (_loadSetMenusInFlight) return;
-    if (!force && _setMenusLoadedAt != null && DateTime.now().difference(_setMenusLoadedAt!) < const Duration(seconds: 8)) {
+    if (!force && _setMenusLoadedAt != null && DateTime.now().difference(_setMenusLoadedAt!) < const Duration(seconds: 60)) {
       return;
     }
     _loadSetMenusInFlight = true;
@@ -4807,7 +4972,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> loadOrders({bool force = false}) async {
     if (userEmail == null || _loadOrdersInFlight) return;
-    if (!force && _ordersLoadedAt != null && DateTime.now().difference(_ordersLoadedAt!) < const Duration(seconds: 8)) {
+    if (!force && _ordersLoadedAt != null && DateTime.now().difference(_ordersLoadedAt!) < _customerOrdersCacheDuration) {
       return;
     }
     _loadOrdersInFlight = true;
@@ -5050,7 +5215,7 @@ class AppState extends ChangeNotifier {
           return 'Inquiry failed (${res.statusCode})';
         }
       }
-      await loadInquiries(force: true);
+      unawaited(loadInquiries(force: true));
       notifyListeners();
       return null;
     } catch (e) {
@@ -5062,7 +5227,7 @@ class AppState extends ChangeNotifier {
     if (userEmail == null || !isManagerOrSupervisor) return;
     if (_managerCateringInFlightStages.contains(stage)) return;
     final loadedAt = _managerCateringLoadedAt[stage];
-    if (!force && loadedAt != null && DateTime.now().difference(loadedAt) < const Duration(seconds: 20)) {
+    if (!force && loadedAt != null && DateTime.now().difference(loadedAt) < _managerCateringListCacheDuration) {
       return;
     }
     _managerCateringInFlightStages.add(stage);
@@ -5552,7 +5717,9 @@ class AppState extends ChangeNotifier {
 
   Future<void> loadInquiries({bool force = false}) async {
     if (userEmail == null || _loadInquiriesInFlight) return;
-    if (!force && _inquiriesLoadedAt != null && DateTime.now().difference(_inquiriesLoadedAt!) < const Duration(seconds: 4)) {
+    if (!force &&
+        _inquiriesLoadedAt != null &&
+        DateTime.now().difference(_inquiriesLoadedAt!) < _customerInquiriesCacheDuration) {
       return;
     }
     _loadInquiriesInFlight = true;
@@ -5950,7 +6117,7 @@ class AppState extends ChangeNotifier {
           return 'Update failed (${res.statusCode})';
         }
       }
-      await loadCashierOnlineOrders();
+      unawaited(loadCashierOnlineOrders());
       notifyListeners();
       return null;
     } catch (e) {
@@ -7448,6 +7615,7 @@ Widget _cateringInquiryMenuDishTile({
   MenuItemData? dish,
   required bool selected,
   required VoidCallback onToggleSelect,
+  AppState? appState,
   bool showSelectControl = true,
   bool disabled = false,
   Widget? trailing,
@@ -7508,7 +7676,7 @@ Widget _cateringInquiryMenuDishTile({
                     width: 56,
                     height: 56,
                     child: dish != null
-                        ? _MenuThumb(item: dish, compact: true)
+                        ? _MenuThumb(item: dish, compact: true, appState: appState)
                         : const Icon(Icons.fastfood, size: 28),
                   ),
                 ),
@@ -8995,11 +9163,35 @@ class CustomerDashboardScreen extends StatelessWidget {
         screen: InquiryScreen(state: state),
       ),
     ];
-    final otherItems = <({String title, IconData icon, Widget? screen, VoidCallback? onTap})>[
-      (title: 'Your Tray', icon: Icons.shopping_cart_outlined, screen: TrayScreen(state: state), onTap: null),
-      (title: 'My Orders', icon: Icons.receipt_long_outlined, screen: MyOrdersScreen(state: state), onTap: null),
-      (title: 'My Catering Inquiries', icon: Icons.question_answer_outlined, screen: MyInquiriesScreen(state: state), onTap: null),
-      (title: 'My Profile', icon: Icons.person_outline, screen: MyProfileScreen(state: state), onTap: null),
+    final otherItems = <({String title, IconData icon, Color iconColor, Widget? screen, VoidCallback? onTap})>[
+      (
+        title: 'Your Tray',
+        icon: Icons.shopping_cart_outlined,
+        iconColor: const Color(0xFF1565C0),
+        screen: TrayScreen(state: state),
+        onTap: null,
+      ),
+      (
+        title: 'My Orders',
+        icon: Icons.receipt_long_outlined,
+        iconColor: const Color(0xFF6A1B9A),
+        screen: MyOrdersScreen(state: state),
+        onTap: null,
+      ),
+      (
+        title: 'My Catering Inquiries',
+        icon: Icons.question_answer_outlined,
+        iconColor: const Color(0xFFC62828),
+        screen: MyInquiriesScreen(state: state),
+        onTap: null,
+      ),
+      (
+        title: 'My Profile',
+        icon: Icons.person_outline,
+        iconColor: const Color(0xFF455A64),
+        screen: MyProfileScreen(state: state),
+        onTap: null,
+      ),
     ];
     return AppScaffold(
       state: state,
@@ -9038,6 +9230,7 @@ class CustomerDashboardScreen extends StatelessWidget {
                   state.loadOrders(force: true),
                   state.loadInquiries(force: true),
                   state.loadProfile(force: true),
+                  state.loadAllergenCatalog(force: true),
                 ];
                 await Future.wait(wait);
                 await state.loadNotifications(force: true);
@@ -9048,6 +9241,12 @@ class CustomerDashboardScreen extends StatelessWidget {
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
                     children: [
+                      const Text(
+                        'What would you like to do?',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                      ),
+                      const SizedBox(height: 12),
                       Center(
                         child: ConstrainedBox(
                           constraints: const BoxConstraints(maxWidth: 520),
@@ -9097,7 +9296,7 @@ class CustomerDashboardScreen extends StatelessWidget {
                               return _CustomerDashTileCard(
                                 headline: item.title,
                                 icon: item.icon,
-                                iconColor: AppColors.brand,
+                                iconColor: item.iconColor,
                                 onTap: () {
                                   if (item.onTap != null) {
                                     item.onTap!();
@@ -9426,7 +9625,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
           Expanded(
             child: ClipRRect(
               borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
-              child: _MenuThumb(item: item),
+              child: _MenuThumb(item: item, appState: widget.state),
             ),
           ),
           Padding(
@@ -9679,9 +9878,10 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
 }
 
 class _MenuThumb extends StatefulWidget {
-  const _MenuThumb({required this.item, this.compact = false});
+  const _MenuThumb({required this.item, this.compact = false, this.appState});
   final MenuItemData item;
   final bool compact;
+  final AppState? appState;
 
   @override
   State<_MenuThumb> createState() => _MenuThumbState();
@@ -9690,19 +9890,37 @@ class _MenuThumb extends StatefulWidget {
 class _MenuThumbState extends State<_MenuThumb> {
   static final Map<String, Uint8List> _bytesCache = {};
   Uint8List? _bytes;
+  bool _requestedLazyImage = false;
 
   @override
   void initState() {
     super.initState();
     _decode();
+    _maybeRequestLazyImage();
   }
 
   @override
   void didUpdateWidget(covariant _MenuThumb oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.item.id != widget.item.id || oldWidget.item.imageBase64 != widget.item.imageBase64) {
+      _requestedLazyImage = false;
       _decode();
+      _maybeRequestLazyImage();
     }
+  }
+
+  void _maybeRequestLazyImage() {
+    final st = widget.appState;
+    if (st == null || _requestedLazyImage) return;
+    final raw = widget.item.imageBase64?.trim();
+    if (raw != null && raw.isNotEmpty) return;
+    _requestedLazyImage = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await st.ensureMenuDishImage(widget.item.id);
+      if (!mounted) return;
+      _decode();
+      setState(() {});
+    });
   }
 
   void _decode() {
@@ -11935,8 +12153,9 @@ class _PaymentScreenState extends State<PaymentScreen> {
   }
 
   Widget _supplementalProofPreview(OrderData? synced) {
-    final b64 = synced?.supplementalPaymentProofBase64;
-    if (b64 == null || b64.isEmpty) return const SizedBox.shrink();
+    final b64 = synced?.supplementalPaymentProofBase64?.trim() ?? '';
+    final initB64 = (_pinnedInitialProofB64 ?? synced?.paymentProofBase64 ?? '').trim();
+    if (b64.isEmpty || (initB64.isNotEmpty && b64 == initB64)) return const SizedBox.shrink();
     try {
       final bytes = base64Decode(b64);
       return Padding(
@@ -14558,6 +14777,16 @@ class _CateringPackagesPanel extends StatelessWidget {
   }
 }
 
+/// Card wrapper for inquire-catering wizard steps.
+Widget inquiryWizardTile(Widget child) {
+  return Card(
+    elevation: 1,
+    margin: const EdgeInsets.only(bottom: 10),
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    child: Padding(padding: const EdgeInsets.all(14), child: child),
+  );
+}
+
 class InquiryScreen extends StatefulWidget {
   const InquiryScreen({super.key, required this.state});
   final AppState state;
@@ -14575,7 +14804,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
   bool _attemptedSubmit = false;
   static const int _minSelectedDishesRequired = 4;
   static const int _maxSelectedDishesRequired = 8;
-  static const int _maxMainDishSelections = 3;
   String _themeDesignChoice = '';
   String _themeDesignSessionId = 'inquiry-${DateTime.now().microsecondsSinceEpoch}';
   Map<String, dynamic>? _aiThemeDesignPayload;
@@ -14584,6 +14812,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
   final themeNotesController = TextEditingController();
   final List<String> _themeReferenceImagesB64 = <String>[];
   final Set<String> _selectedGuestAllergens = {};
+  final _otherAllergenController = TextEditingController();
   String selectedSetMenu = 'All Dishes';
   final selectedDishes = <String>{};
   final guestCount = TextEditingController();
@@ -14677,8 +14906,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
     foodTastingTime.dispose();
     menuSearchController.dispose();
     themeNotesController.dispose();
+    _otherAllergenController.dispose();
     super.dispose();
   }
+
+  Set<String> get _guestAllergensForSubmit =>
+      guestAllergensForSubmit(_selectedGuestAllergens, othersText: _otherAllergenController.text);
 
   void _resetInquiryForm() {
     setState(() {
@@ -14702,6 +14935,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
       foodTastingRequested = false;
       _themeReferenceImagesB64.clear();
       _selectedGuestAllergens.clear();
+      _otherAllergenController.clear();
       _eventWindows
         ..clear()
         ..add(_InquiryEventWindow());
@@ -15124,15 +15358,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return null;
   }
 
-  int _selectedMainDishCount(List<MenuItemData> cateringMenu) {
-    var n = 0;
-    for (final name in selectedDishes) {
-      final d = _inquiryDishByName(name, cateringMenu);
-      if (d != null && d.dishType.trim().toLowerCase() == 'main') n++;
-    }
-    return n;
-  }
-
   bool _dishBlockedByAllergens(MenuItemData? dish) =>
       dish != null && dishConflictsGuestAllergens(dish, _selectedGuestAllergens);
 
@@ -15141,9 +15366,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
     if (selectedDishes.length >= _maxSelectedDishesRequired) return false;
     final dish = _inquiryDishByName(dishName, cateringMenu);
     if (_dishBlockedByAllergens(dish)) return false;
-    if (dish != null && dish.dishType.trim().toLowerCase() == 'main') {
-      if (_selectedMainDishCount(cateringMenu) >= _maxMainDishSelections) return false;
-    }
     return true;
   }
 
@@ -15352,12 +15574,19 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const Text(
-          'Review our catering packages',
-          style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+        inquiryWizardTile(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: const [
+              Text(
+                'Review our catering packages',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+              ),
+              SizedBox(height: 12),
+              _CateringPackagesPanel(),
+            ],
+          ),
         ),
-        const SizedBox(height: 12),
-        const _CateringPackagesPanel(),
         const SizedBox(height: 20),
         SizedBox(
           width: double.infinity,
@@ -15375,30 +15604,44 @@ class _InquiryScreenState extends State<InquiryScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Text(
-          'How many guests will you have?',
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-        ),
-        const SizedBox(height: 16),
-        TextField(
-          controller: _landingPaxController,
-          keyboardType: TextInputType.number,
-          maxLength: 4,
-          textAlign: TextAlign.center,
-          inputFormatters: [
-            FilteringTextInputFormatter.digitsOnly,
-            LengthLimitingTextInputFormatter(4),
-          ],
-          decoration: const InputDecoration(hintText: 'Number of guests', counterText: ''),
-          onChanged: (_) => setState(() {}),
-        ),
-        if (pax != null && pax > 0) ...[
-          const SizedBox(height: 12),
-          Text(
-            'Estimated base cost for $pax guests is Php ${pax * kPesosPerPax}. Additional charges apply for event styling (below $kInquiryLandingEventStylingMinPax guests), menu modifications, and other requests.',
-            style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey.shade800),
+        inquiryWizardTile(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'How many guests will you have?',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 16),
+              Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 200),
+                  child: TextField(
+                    controller: _landingPaxController,
+                    keyboardType: TextInputType.number,
+                    maxLength: 4,
+                    textAlign: TextAlign.center,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(4),
+                    ],
+                    decoration: const InputDecoration(hintText: 'Number of guests', counterText: ''),
+                    onChanged: (_) => setState(() {}),
+                  ),
+                ),
+              ),
+              if (pax != null && pax > 0) ...[
+                const SizedBox(height: 12),
+                Text(
+                  'Estimated base cost for $pax guests is Php ${pax * kPesosPerPax}. Additional charges apply for event styling (below $kInquiryLandingEventStylingMinPax guests), menu modifications, and other requests.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, height: 1.4, color: Colors.grey.shade800),
+                ),
+              ],
+            ],
           ),
-        ],
+        ),
         const SizedBox(height: 24),
         Row(
           children: [
@@ -15502,18 +15745,24 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 physics: const AlwaysScrollableScrollPhysics(),
                 padding: const EdgeInsets.all(12),
                 children: [
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('Package type', style: TextStyle(fontWeight: FontWeight.w700)),
-                  subtitle: Text(inquiryTypeDisplayLabel(inquiryType)),
+                inquiryWizardTile(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Package type', style: TextStyle(fontWeight: FontWeight.w700)),
+                        subtitle: Text(inquiryTypeDisplayLabel(inquiryType)),
+                      ),
+                      Text(
+                        'Minimum $kMinCateringOnlyPax guests. Base estimate is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer). Event styling below $kInquiryLandingEventStylingMinPax guests adds ₱${kEventStylingSurchargePerPaxBelow50.toStringAsFixed(0)} per guest. Menu modifications may add per-pax charges.',
+                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
                 ),
-                const SizedBox(height: 10),
-                Text(
-                  'Minimum $kMinCateringOnlyPax guests. Base estimate is ₱${kPesosPerPax.toStringAsFixed(0)} × (billable guests + pax buffer). Event styling below $kInquiryLandingEventStylingMinPax guests adds ₱${kEventStylingSurchargePerPaxBelow50.toStringAsFixed(0)} per guest. Menu modifications may add per-pax charges.',
-                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 10),
-                ToggleSection(
+                inquiryWizardTile(
+                  child: ToggleSection(
                   title: 'EVENT INFORMATION',
                   expanded: true,
                   onToggle: () {},
@@ -15782,33 +16031,36 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         decoration: const InputDecoration(labelText: 'Note (optional)'),
                         maxLines: 3,
                       ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Do you wish to include event styling? It will count as additional charge for number of guests below $kInquiryLandingEventStylingMinPax.',
-                        style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
-                      ),
-                      RadioListTile<String>(
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Without event styling'),
-                        value: 'no',
-                        groupValue: serviceIncluded,
-                        onChanged: (v) => _applyEventStylingChoice(false),
-                      ),
-                      RadioListTile<String>(
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('With event styling'),
-                        value: 'yes',
-                        groupValue: serviceIncluded,
-                        onChanged: (v) => _applyEventStylingChoice(true),
-                      ),
+                      if (!isInquiryCateringWithEventStyling(inquiryType)) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Do you wish to include event styling? It will count as additional charge for number of guests below $kInquiryLandingEventStylingMinPax.',
+                          style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        RadioListTile<String>(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Without event styling'),
+                          value: 'no',
+                          groupValue: serviceIncluded,
+                          onChanged: (v) => _applyEventStylingChoice(false),
+                        ),
+                        RadioListTile<String>(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('With event styling'),
+                          value: 'yes',
+                          groupValue: serviceIncluded,
+                          onChanged: (v) => _applyEventStylingChoice(true),
+                        ),
+                      ],
                     ],
                   ),
                 ),
+                ),
                 if (isInquiryCateringWithEventStyling(inquiryType)) ...[
-                  const SizedBox(height: 10),
-                  ToggleSection(
+                  inquiryWizardTile(
+                    child: ToggleSection(
                     title: 'EVENT THEME DESIGN',
                     expanded: true,
                     onToggle: () {},
@@ -15973,54 +16225,34 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       ],
                     ),
                   ),
+                  ),
                 ],
-                const SizedBox(height: 10),
-                ToggleSection(
+                inquiryWizardTile(
+                  child: ToggleSection(
                   title: 'ALLERGENS',
                   expanded: true,
                   onToggle: () {},
                   hideToggleIcon: true,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Text(
-                        'Select all allergens your guests must avoid (optional).',
-                        style: TextStyle(fontSize: 13, color: Colors.grey.shade800, height: 1.35),
-                      ),
-                      const SizedBox(height: 10),
-                      if (state.allergenCatalog.isEmpty)
-                        Text(
-                          'Loading allergen list… Pull down to refresh if empty.',
-                          style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-                        )
-                      else
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children: [
-                            for (final name in state.allergenCatalog)
-                              FilterChip(
-                                label: Text(name, style: const TextStyle(fontSize: 12)),
-                                selected: _selectedGuestAllergens.contains(name),
-                                onSelected: (sel) => setState(() {
-                                  if (sel) {
-                                    _selectedGuestAllergens.add(name);
-                                  } else {
-                                    _selectedGuestAllergens.remove(name);
-                                  }
-                                  selectedDishes.removeWhere((dishName) {
-                                    final d = _inquiryDishByName(dishName, cateringMenu);
-                                    return _dishBlockedByAllergens(d);
-                                  });
-                                }),
-                              ),
-                          ],
-                        ),
-                    ],
+                  child: buildGuestAllergenSelector(
+                    catalog: state.allergenCatalog,
+                    selected: _selectedGuestAllergens,
+                    enabled: true,
+                    othersController: _otherAllergenController,
+                    onOthersTextChanged: (_) => setState(() {}),
+                    onChanged: (next) => setState(() {
+                      _selectedGuestAllergens
+                        ..clear()
+                        ..addAll(next);
+                      selectedDishes.removeWhere((dishName) {
+                        final d = _inquiryDishByName(dishName, cateringMenu);
+                        return _dishBlockedByAllergens(d);
+                      });
+                    }),
                   ),
                 ),
-                const SizedBox(height: 10),
-                ToggleSection(
+                ),
+                inquiryWizardTile(
+                  child: ToggleSection(
                   title: 'MENU',
                   expanded: true,
                   onToggle: () {},
@@ -16064,7 +16296,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                             style: TextStyle(color: Colors.red.shade700, fontSize: 12),
                           ),
                         ),
-                      if (_menuChoicePicked) ...[
+                      if (_menuChoicePicked && curateOwn) ...[
                         const SizedBox(height: 10),
                         Text('Set menu', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
                         const SizedBox(height: 6),
@@ -16160,12 +16392,21 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           onChanged: (_) => setState(() {}),
                         ),
                         const SizedBox(height: 8),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            'Select $_minSelectedDishesRequired–$_maxSelectedDishesRequired dishes (up to $_maxMainDishSelections mains). Set menu items count toward the limit.',
-                            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
-                          ),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                'Select $_minSelectedDishesRequired–$_maxSelectedDishesRequired dishes. Set menu items count toward the limit.',
+                                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: selectedDishes.isEmpty
+                                  ? null
+                                  : () => setState(() => selectedDishes.clear()),
+                              child: const Text('Clear selections'),
+                            ),
+                          ],
                         ),
                         const SizedBox(height: 6),
                         LayoutBuilder(
@@ -16187,16 +16428,13 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                   final sel = selectedDishes.contains(dishName);
                                   final blocked = _dishBlockedByAllergens(dish);
                                   final atMax = !sel && selectedDishes.length >= _maxSelectedDishesRequired;
-                                  final atMainMax = !sel &&
-                                      dish != null &&
-                                      dish.dishType.trim().toLowerCase() == 'main' &&
-                                      _selectedMainDishCount(cateringMenu) >= _maxMainDishSelections;
                                   return _cateringInquiryMenuDishTile(
                                     context: context,
                                     dishName: dishName,
                                     dish: dish,
+                                    appState: widget.state,
                                     selected: sel,
-                                    disabled: blocked || atMax || atMainMax,
+                                    disabled: blocked || atMax,
                                     onToggleSelect: () {
                                       if (sel) {
                                         setState(() => selectedDishes.remove(dishName));
@@ -16210,8 +16448,6 @@ class _InquiryScreenState extends State<InquiryScreen> {
                                           );
                                         } else if (blocked) {
                                           appSnack(context, 'This dish conflicts with your selected allergens.');
-                                        } else if (atMainMax) {
-                                          appSnack(context, 'You can select up to $_maxMainDishSelections main dishes.');
                                         }
                                         return;
                                       }
@@ -16269,6 +16505,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       ],
                     ],
                   ),
+                ),
                 ),
               ],
               ),
@@ -16407,7 +16644,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 'event_setting': eventSetting,
                 'service_included': serviceIncluded,
                 'formality_level': formalityLevel,
-                if (_selectedGuestAllergens.isNotEmpty) 'guest_allergens': _selectedGuestAllergens.toList(),
+                if (_guestAllergensForSubmit.isNotEmpty) 'guest_allergens': _guestAllergensForSubmit.toList(),
                 'food_tasting_requested': foodTastingRequested,
                 'food_tasting_date': foodTastingDate.text.trim(),
                 'food_tasting_time': foodTastingTime.text.trim(),
@@ -17913,13 +18150,13 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
     _tab.addListener(() {
       if (_tab.indexIsChanging) return;
       widget.state.setManagerActiveStage(_stages[_tab.index]);
-      widget.state.loadManagerCateringByStage(_stages[_tab.index], force: true);
+      widget.state.loadManagerCateringByStage(_stages[_tab.index]);
     });
-    widget.state.loadManagerCateringByStage(_stages[idx], force: true);
-    widget.state.preloadManagerDashboardCounts();
-    widget.state.loadAllergenCatalog(force: true);
-    widget.state.loadMenu(force: true);
-    widget.state.loadSetMenus(force: true);
+    widget.state.loadManagerCateringByStage(_stages[idx]);
+    unawaited(widget.state.preloadManagerDashboardCounts());
+    unawaited(widget.state.loadAllergenCatalog());
+    unawaited(widget.state.loadMenu());
+    unawaited(widget.state.loadSetMenus());
   }
 
   @override
@@ -18121,6 +18358,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   bool _forProcessingWindowsLoading = false;
   bool _forProcessingWindowsLoaded = false;
   final Set<String> _selectedGuestAllergens = {};
+  final _otherAllergenController = TextEditingController();
   String _newEventThemeSessionId = 'manager-ne-${DateTime.now().microsecondsSinceEpoch}';
   Map<String, dynamic>? _newEventThemeDesign;
   SeatingPlanData? _newEventSeatingPlan;
@@ -18151,6 +18389,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     serviceIncluded = 'no';
     formalityLevel = 'casual';
     _selectedGuestAllergens.clear();
+    _otherAllergenController.clear();
     _newEventThemeSessionId = 'manager-ne-${DateTime.now().microsecondsSinceEpoch}';
     _newEventThemeDesign = null;
     _newEventSeatingPlan = null;
@@ -18213,8 +18452,12 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     additionalCostLabelController.dispose();
     additionalCostAmountController.dispose();
     menuSearchController.dispose();
+    _otherAllergenController.dispose();
     super.dispose();
   }
+
+  Set<String> get _managerGuestAllergensForSubmit =>
+      guestAllergensForSubmit(_selectedGuestAllergens, othersText: _otherAllergenController.text);
 
   int _minPaxForCurrentInquiry() => kMinCateringOnlyPax;
 
@@ -18673,9 +18916,14 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
         'additional_costs': additionalCosts,
         'labor_manual_costs': laborManualCosts,
         'formality_level': formalityLevel,
-        if (_selectedGuestAllergens.isNotEmpty) 'guest_allergens': _selectedGuestAllergens.toList(),
+        if (_managerGuestAllergensForSubmit.isNotEmpty)
+          'guest_allergens': _managerGuestAllergensForSubmit.toList(),
         if (isInquiryCateringWithEventStyling(inquiryType)) 'theme_suggestion_note': themeSuggestionNote,
       };
+      await widget.state.persistCustomGuestAllergens(
+        _selectedGuestAllergens,
+        othersText: _otherAllergenController.text,
+      );
       final costBreakdown = _managerNewEventCostBreakdown(cateringMenu);
       final yes = await showDialog<bool>(
         context: context,
@@ -19179,6 +19427,8 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 catalog: widget.state.allergenCatalog,
                 selected: _selectedGuestAllergens,
                 enabled: true,
+                othersController: _otherAllergenController,
+                onOthersTextChanged: (_) => setState(() {}),
                 onChanged: (next) => setState(() {
                   _selectedGuestAllergens
                     ..clear()
@@ -20108,6 +20358,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   String _managerDownPaymentMethod = 'Cash';
   String _managerFullPaymentMethod = 'Cash';
   final Set<String> managerGuestAllergens = {};
+  final _managerOtherAllergenController = TextEditingController();
   final List<String> _managerVenueSuggestions = [];
   Timer? _managerVenueDebounce;
 
@@ -21444,11 +21695,21 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     managerInquiryNoteController.text = '${tdInit['note'] ?? ''}';
     managerEventSetting = '${tdInit['event_setting'] ?? 'open'}'.trim().isEmpty ? 'open' : tdInit['event_setting'].toString().trim();
     managerGuestAllergens.clear();
+    _managerOtherAllergenController.clear();
     final gaRaw = tdInit['guest_allergens'] ?? row.postAnalysis['guest_allergens'];
     if (gaRaw is List) {
       for (final e in gaRaw) {
         final s = '$e'.trim();
-        if (s.isNotEmpty) managerGuestAllergens.add(s);
+        if (s.isEmpty) continue;
+        final inCatalog = widget.state.allergenCatalog.any((c) => c.toLowerCase() == s.toLowerCase());
+        if (inCatalog) {
+          managerGuestAllergens.add(
+            widget.state.allergenCatalog.firstWhere((c) => c.toLowerCase() == s.toLowerCase()),
+          );
+        } else {
+          managerGuestAllergens.add(kAllergenOthersChipLabel);
+          _managerOtherAllergenController.text = s;
+        }
       }
     }
     _draftOrderKind = row.orderKind;
@@ -21655,7 +21916,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       'proof_fp': _managerFullPaymentProofBytes?.length ?? 0,
       'proof_ac': _managerAdditionalCostsProofBytes?.length ?? 0,
       'actual_images': imgList,
-      'guest_allergens': (managerGuestAllergens.toList()..sort()),
+      'guest_allergens': (_managerDetailGuestAllergensForSubmit.toList()..sort()),
     });
   }
 
@@ -21737,8 +21998,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
     managerGuestCountController.dispose();
     managerPaxBufferController.dispose();
     managerInquiryNoteController.dispose();
+    _managerOtherAllergenController.dispose();
     super.dispose();
   }
+
+  Set<String> get _managerDetailGuestAllergensForSubmit => guestAllergensForSubmit(
+        managerGuestAllergens,
+        othersText: _managerOtherAllergenController.text,
+      );
 
   Widget _laborTravelPlainTextSection(CateringEventRecord row) {
     final male = int.tryParse(laborMaleController.text.trim()) ?? 0;
@@ -22393,12 +22660,17 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
           'event_type': et,
           'event_setting': managerEventSetting,
           'formality_level': managerFormalityLevel,
-          if (managerGuestAllergens.isNotEmpty) 'guest_allergens': managerGuestAllergens.toList(),
+          if (_managerDetailGuestAllergensForSubmit.isNotEmpty)
+            'guest_allergens': _managerDetailGuestAllergensForSubmit.toList(),
           if (menuModSave != null) 'menu_modifications': menuModSave.toJson(),
         };
         if (menuModSave != null) {
           postAnalysis['menu_modifications'] = menuModSave.toJson();
         }
+        await widget.state.persistCustomGuestAllergens(
+          managerGuestAllergens,
+          othersText: _managerOtherAllergenController.text,
+        );
 
         if (isDraftStageHere) {
           final gc = int.tryParse(managerGuestCountController.text.trim());
@@ -23195,8 +23467,13 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
             managerEventTypeChoice == 'Other' ? managerEventTypeOtherController.text.trim() : managerEventTypeChoice,
         'event_setting': managerEventSetting,
         'formality_level': managerFormalityLevel,
-        if (managerGuestAllergens.isNotEmpty) 'guest_allergens': managerGuestAllergens.toList(),
+        if (_managerDetailGuestAllergensForSubmit.isNotEmpty)
+          'guest_allergens': _managerDetailGuestAllergensForSubmit.toList(),
       };
+      await widget.state.persistCustomGuestAllergens(
+        managerGuestAllergens,
+        othersText: _managerOtherAllergenController.text,
+      );
       final costBreakdown = <Map<String, dynamic>>[
         {'label': 'Base food cost', 'amount': _baseFoodCost()},
         {'label': 'Labor cost', 'amount': laborForSubmit},
@@ -23284,12 +23561,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
               ? 'Order completed'
               : (advancingToFullPayment ? 'Moved to For Full Payment' : 'Moved to next stage'),
         );
-        if (advancingToFullPayment) {
-          await widget.state.loadManagerCateringByStage(kStageForFullPayment, force: true);
-        }
-        await widget.state.loadManagerCateringByStage(kStageForDownPayment, force: true);
-        await widget.state.loadManagerCateringByStage(kStageForOngoing, force: true);
-        await widget.state.loadManagerCateringByStage(widget.stage, force: true);
+        await Future.wait([
+          if (advancingToFullPayment) widget.state.loadManagerCateringByStage(kStageForFullPayment, force: true),
+          widget.state.loadManagerCateringByStage(kStageForDownPayment, force: true),
+          widget.state.loadManagerCateringByStage(kStageForOngoing, force: true),
+          widget.state.loadManagerCateringByStage(widget.stage, force: true),
+        ]);
         if (mounted) Navigator.of(context).pop();
       } finally {
         if (mounted) _hideManagerBlockingProgress();
@@ -24438,6 +24715,8 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       catalog: widget.state.allergenCatalog,
                       selected: managerGuestAllergens,
                       enabled: canEditStage,
+                      othersController: _managerOtherAllergenController,
+                      onOthersTextChanged: (_) => setState(() {}),
                       onChanged: (next) => setState(() {
                         managerGuestAllergens
                           ..clear()
@@ -24537,6 +24816,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                               context: context,
                               dishName: dish.name,
                               dish: dish,
+                              appState: widget.state,
                               selected: sel,
                               disabled: blocked,
                               onToggleSelect: () {
@@ -24993,6 +25273,8 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(Future.wait([
+        widget.state.loadMenu(),
+        widget.state.loadAllergenCatalog(),
         widget.state.loadCashierOnlineOrders(),
         widget.state.loadCashierWalkInQueues(),
       ]));
@@ -25140,7 +25422,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
               children: [
                 ClipRRect(
                   borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
-                  child: _MenuThumb(item: item),
+                  child: _MenuThumb(item: item, appState: widget.state),
                 ),
               ],
             ),
@@ -26879,25 +27161,8 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                       children: [
                         LockedField(label: 'PAYMENT METHOD', value: pm),
                         const SizedBox(height: 8),
-                        if (paymentLocked) ...[
-                          Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                            child: Text(
-                              'PAYMENT IS COMPLETE!',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontWeight: FontWeight.w900,
-                                fontSize: 17,
-                                color: AppColors.success,
-                                letterSpacing: 0.5,
-                              ),
-                            ),
-                          ),
-                          LockedField(
-                            label: 'AMOUNT RECEIVED',
-                            value: (amountLocked ?? parsed ?? 0).toStringAsFixed(2),
-                          ),
-                        ] else if (pendingBalReview) ...[
+                        if (paymentLocked) ...cashierLockedPaymentSummary(context, o)
+                        else if (pendingBalReview) ...[
                           Card(
                             color: Colors.deepOrange.shade50,
                             child: ListTile(
@@ -26913,9 +27178,12 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             ),
                           ),
                           const SizedBox(height: 10),
-                          LockedField(
+                          cashierLockedPaymentWithProofIcon(
+                            context,
+                            o,
                             label: 'FIRST PAYMENT RECORDED',
                             value: (o.cashierAmountReceived ?? 0).toStringAsFixed(2),
+                            balance: false,
                           ),
                           const SizedBox(height: 10),
                           TextField(
@@ -27169,25 +27437,8 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                       children: [
                         LockedField(label: 'PAYMENT METHOD', value: pm),
                         const SizedBox(height: 8),
-                        if (paymentLocked) ...[
-                          Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                            child: Text(
-                              'PAYMENT IS COMPLETE!',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontWeight: FontWeight.w900,
-                                fontSize: 17,
-                                color: AppColors.success,
-                                letterSpacing: 0.5,
-                              ),
-                            ),
-                          ),
-                          LockedField(
-                            label: 'AMOUNT RECEIVED',
-                            value: (amountLocked ?? parsed ?? 0).toStringAsFixed(2),
-                          ),
-                        ] else if (pendingBalReview) ...[
+                        if (paymentLocked) ...cashierLockedPaymentSummary(context, o)
+                        else if (pendingBalReview) ...[
                           Card(
                             color: Colors.deepOrange.shade50,
                             child: ListTile(
@@ -27203,9 +27454,12 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                             ),
                           ),
                           const SizedBox(height: 10),
-                          LockedField(
+                          cashierLockedPaymentWithProofIcon(
+                            context,
+                            o,
                             label: 'FIRST PAYMENT RECORDED',
                             value: (o.cashierAmountReceived ?? 0).toStringAsFixed(2),
+                            balance: false,
                           ),
                           const SizedBox(height: 10),
                           TextField(
