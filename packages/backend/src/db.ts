@@ -588,7 +588,7 @@ export async function initDb(): Promise<void> {
 
 const CATERING_PIPELINE_STATUSES_SQL = `ARRAY[
   'new_event'::text, 'online_inquiries'::text,
-  'for_down_payment'::text, 'for_ongoing'::text, 'for_full_payment'::text,
+  'for_down_payment'::text, 'for_ongoing'::text, 'on_going'::text, 'for_full_payment'::text,
   'for_processing'::text, 'for_post_analysis'::text,
   'completed'::text, 'cancelled'::text
 ]`;
@@ -598,6 +598,7 @@ const CATERING_PIPELINE_STATUS_CANONICAL = [
   "online_inquiries",
   "for_down_payment",
   "for_ongoing",
+  "on_going",
   "for_full_payment",
   "for_processing",
   "for_post_analysis",
@@ -619,11 +620,12 @@ async function normalizeCateringPipelineStatusRows(p: pg.Pool): Promise<void> {
        SET status = CASE
          WHEN LOWER(TRIM(status)) IN ('online_inquiry', 'online inquiry') THEN 'online_inquiries'
          WHEN LOWER(TRIM(status)) = 'for_post_analysis' THEN 'for_full_payment'
+         WHEN LOWER(TRIM(status)) = 'on going' THEN 'on_going'
          WHEN LOWER(TRIM(status)) = 'for_processing' THEN
            CASE
              WHEN COALESCE(LOWER(TRIM(checklist->'post_analysis'->>'processing_phase')), '') = 'down_payment'
                THEN 'for_down_payment'
-             ELSE 'for_ongoing'
+             ELSE 'on_going'
            END
          WHEN LOWER(TRIM(status)) NOT IN (${allowed}) THEN 'cancelled'
          ELSE LOWER(TRIM(status))

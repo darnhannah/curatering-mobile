@@ -2107,6 +2107,7 @@ const kStageForFullPayment = 'for_full_payment';
 String normalizeCateringPipelineStatus(String raw) {
   final s = raw.trim().toLowerCase();
   if (s == 'for_post_analysis') return kStageForFullPayment;
+  if (s == 'on_going') return kStageForOngoing;
   if (s == 'for_full_payment') return kStageForFullPayment;
   if (s == 'for_ongoing' || s == 'for_processing') return kStageForOngoing;
   if (s == 'for_down_payment') return kStageForDownPayment;
@@ -3729,12 +3730,20 @@ class AppState extends ChangeNotifier {
   List<Map<String, dynamic>> _trayLinesSnapshot() {
     return tray
         .map(
-          (e) => <String, dynamic>{
-            'id': e.menu.id,
-            'dip': e.dip,
-            'dip_qty': e.dipQty,
-            'qty': e.qty,
-            'notes': e.lineNote,
+          (e) {
+            final img = (e.menu.imageBase64 ?? '').trim();
+            return <String, dynamic>{
+              'id': e.menu.id,
+              'dish_name': e.menu.name,
+              'price': e.menu.price,
+              'category': e.menu.category,
+              'dish_type': e.menu.dishType,
+              if (img.isNotEmpty) 'image_base64': img,
+              'dip': e.dip,
+              'dip_qty': e.dipQty,
+              'qty': e.qty,
+              'notes': e.lineNote,
+            };
           },
         )
         .toList();
@@ -3756,12 +3765,20 @@ class AppState extends ChangeNotifier {
     final k = syncEmail;
     final lines = tray
         .map(
-          (e) => <String, dynamic>{
-            'id': e.menu.id,
-            'dip': e.dip,
-            'dip_qty': e.dipQty,
-            'qty': e.qty,
-            'notes': e.lineNote,
+          (e) {
+            final img = (e.menu.imageBase64 ?? '').trim();
+            return <String, dynamic>{
+              'id': e.menu.id,
+              'dish_name': e.menu.name,
+              'price': e.menu.price,
+              'category': e.menu.category,
+              'dish_type': e.menu.dishType,
+              if (img.isNotEmpty) 'image_base64': img,
+              'dip': e.dip,
+              'dip_qty': e.dipQty,
+              'qty': e.qty,
+              'notes': e.lineNote,
+            };
           },
         )
         .toList();
@@ -4672,28 +4689,52 @@ class AppState extends ChangeNotifier {
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          if (headerImage != null) ...[
-                            headerImage!,
-                            const SizedBox(width: 12),
-                          ],
-                          Expanded(
-                            child: Column(
+                      LayoutBuilder(
+                        builder: (ctx, c) {
+                          final narrow = c.maxWidth < 420;
+                          if (narrow) {
+                            return Column(
                               crossAxisAlignment: CrossAxisAlignment.stretch,
-                              mainAxisSize: MainAxisSize.min,
                               children: [
+                                if (headerImage != null) ...[
+                                  Center(child: headerImage),
+                                  const SizedBox(height: 10),
+                                ],
                                 if (desc.isNotEmpty) dishDetailSection('Description', desc),
-                                if (ingLines.isNotEmpty)
-                                  dishDetailSection('Ingredients', ingLines.join(', ')),
+                                if (ingLines.isNotEmpty) dishDetailSection('Ingredients', ingLines.join(', ')),
+                                if (allergenLines.isNotEmpty) ...[
+                                  const SizedBox(height: 8),
+                                  dishDetailSection('Allergens', allergenLines.join(', ')),
+                                ],
                                 Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
                               ],
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          SizedBox(width: 108, child: dishDetailAllergenColumn(allergenLines)),
-                        ],
+                            );
+                          }
+                          return Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (headerImage != null) ...[
+                                headerImage,
+                                const SizedBox(width: 12),
+                              ],
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (desc.isNotEmpty) dishDetailSection('Description', desc),
+                                    if (ingLines.isNotEmpty) dishDetailSection('Ingredients', ingLines.join(', ')),
+                                    if (allergenLines.isNotEmpty) ...[
+                                      const SizedBox(height: 8),
+                                      dishDetailSection('Allergens', allergenLines.join(', ')),
+                                    ],
+                                    Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          );
+                        },
                       ),
                     if (item.dips.isNotEmpty) ...[
                       const SizedBox(height: 14),
@@ -16181,6 +16222,69 @@ class _InquiryScreenState extends State<InquiryScreen> {
                       style: TextStyle(fontSize: 13, height: 1.4, color: Colors.grey.shade800),
                     ),
                   ),
+                  inquiryWizardTile(
+                    child: ToggleSection(
+                      title: 'EVENT THEME DESIGN',
+                      expanded: true,
+                      onToggle: () {},
+                      hideToggleIcon: true,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Text(
+                            _themeDesignChoice == 'create_own'
+                                ? 'Create your own event theme design'
+                                : 'Let us suggest a theme design',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          const SizedBox(height: 8),
+                          SegmentedButton<String>(
+                            segments: const [
+                              ButtonSegment(value: 'suggest', label: Text('Suggest')),
+                              ButtonSegment(value: 'create_own', label: Text('Create my own')),
+                            ],
+                            selected: {_themeDesignChoice == 'create_own' ? 'create_own' : 'suggest'},
+                            onSelectionChanged: (next) => setState(() {
+                              _themeDesignChoice = next.first;
+                              if (_themeDesignChoice != 'create_own') _aiThemeDesignPayload = null;
+                            }),
+                          ),
+                          const SizedBox(height: 8),
+                          if (_themeDesignChoice == 'create_own')
+                            OutlinedButton.icon(
+                              onPressed: () async {
+                                final payload = await pushRouteOnce<Map<String, dynamic>?>(
+                                  context,
+                                  MaterialPageRoute<Map<String, dynamic>?>(
+                                    builder: (_) => EventThemeDesignScreen(
+                                      apiBase: state.apiBase,
+                                      userEmail: state.userEmail ?? inquiryEmail.text.trim(),
+                                      designSessionId: _themeDesignSessionId,
+                                      initialEventType: _resolvedEventType(),
+                                      initialThemeDesign: _aiThemeDesignPayload,
+                                      eventTitle: eventTitle.text.trim(),
+                                      formalityLevel: formalityLevel,
+                                      eventSetting: eventSetting,
+                                      persistToOrder: false,
+                                    ),
+                                  ),
+                                  routeKey: 'EventThemeDesign:inquiry',
+                                );
+                                if (!mounted || payload == null) return;
+                                setState(() {
+                                  _themeDesignChoice = 'create_own';
+                                  _aiThemeDesignPayload = payload;
+                                });
+                              },
+                              icon: const Icon(Icons.palette_outlined),
+                              label: Text(
+                                _aiThemeDesignPayload == null ? 'Open theme design studio' : 'Edit saved theme design',
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
                 ],
                 inquiryWizardTile(
                   child: ToggleSection(
@@ -24242,7 +24346,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                 ),
               ),
             ),
-          if (!isCompleted && !isDownPaymentSubstage && !isDraftStage)
+          if (!isCompleted && !isDraftStage)
             _additionalCostsCard(
               draft: isDraftStage,
               processing: isProcessing && !isPost,

@@ -136,7 +136,7 @@ function cateringStatusLegacyWriteFallback(
   const base = post ? { ...post } : {};
   switch (nextStatus.trim().toLowerCase()) {
     case "for_ongoing":
-      return { status: "for_ongoing", post: { ...base, processing_phase: "ongoing" } };
+      return { status: "on_going", post: { ...base, processing_phase: "ongoing" } };
     case "for_down_payment":
       return { status: "for_down_payment", post: { ...base, processing_phase: "down_payment" } };
     case "for_full_payment":
@@ -331,8 +331,9 @@ function processingSubstageFromPostAndChecklist(postAnalysis: unknown, checklist
 /** Map UI stage tabs to DB status values (includes legacy names). */
 function cateringStagesForList(stage: string): string[] {
   const s = stage.trim().toLowerCase();
+  if (s === "on_going") return ["on_going", "for_ongoing", "for_processing"];
   if (s === "for_down_payment") return ["for_down_payment", "for_processing"];
-  if (s === "for_ongoing") return ["for_ongoing", "for_processing"];
+  if (s === "for_ongoing") return ["for_ongoing", "on_going", "for_processing"];
   if (s === "for_full_payment") return ["for_full_payment", "for_post_analysis"];
   return [s];
 }
@@ -340,8 +341,8 @@ function cateringStagesForList(stage: string): string[] {
 function rowMatchesCateringListStage(row: Record<string, unknown>, stage: string): boolean {
   const st = String(row.status ?? "").trim().toLowerCase();
   const s = stage.trim().toLowerCase();
-  if (s === "for_ongoing") {
-    if (st === "for_ongoing") return true;
+  if (s === "for_ongoing" || s === "on_going") {
+    if (st === "for_ongoing" || st === "on_going") return true;
     if (st === "for_processing") return processingSubstageFromRow(row) === "ongoing";
     return false;
   }
@@ -1886,7 +1887,6 @@ app.post("/api/mobile/pos/online-orders/list", async (req, res) => {
               ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")}
        FROM restaurant_orders mo
        LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
-       WHERE ${RESTAURANT_ORDER_ONLINE_WHERE}
        ORDER BY COALESCE(mo.submitted_order_dt_stamp, mo.last_updated_order_status_dt_stamp) DESC`,
     );
     const out = await attachOrderItems(rows as Array<Record<string, unknown>>);
@@ -1920,7 +1920,7 @@ app.post("/api/mobile/pos/online-orders/:id/detail", async (req, res) => {
               ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS, "mo")}
        FROM restaurant_orders mo
        LEFT JOIN customer_accounts cp ON LOWER(TRIM(cp.email)) = LOWER(TRIM(mo.user_email))
-       WHERE mo.mobile_id = $1 AND ${RESTAURANT_ORDER_ONLINE_WHERE}`,
+       WHERE mo.mobile_id = $1`,
       [id],
     );
     if (rows.length === 0) {
@@ -2993,7 +2993,6 @@ app.post("/api/mobile/guest-orders/list", async (req, res) => {
               ${restaurantLoyaltyEarnedSql(RESTAURANT_LOYALTY_STEP_AMOUNT, RESTAURANT_LOYALTY_STEP_POINTS)}
        FROM restaurant_orders
        WHERE LOWER(TRIM(COALESCE(user_email, ''))) = LOWER(TRIM($1))
-          AND upper(COALESCE(order_source, '')) NOT IN ('POS', 'POS_MOBILE', 'POS_WEB')
        ORDER BY COALESCE(submitted_order_dt_stamp, last_updated_order_status_dt_stamp) DESC
        LIMIT 100`,
       [email],
