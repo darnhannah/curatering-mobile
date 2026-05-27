@@ -1551,14 +1551,29 @@ List<OrderLineItem> orderLinesFromApiMap(Map<String, dynamic> map) {
     for (final e in raw) {
       if (e is! Map) continue;
       final m = Map<String, dynamic>.from(e);
+      final dishMap = m['dish'] is Map ? Map<String, dynamic>.from(m['dish'] as Map) : const <String, dynamic>{};
+      final itemName = '${m['item_name'] ?? m['itemName'] ?? m['dish_name'] ?? m['dishName'] ?? dishMap['name'] ?? ''}'
+          .trim();
+      final dip = '${m['dip'] ?? m['selectedSauce'] ?? ''}'.trim();
+      final qty = jsonToInt(m['qty'] ?? m['quantity'], 0);
+      final dipQty = math.max(0, jsonToInt(m['dip_qty'] ?? m['addOnQuantity'], 1));
+      final lineNote =
+          '${m['notes'] ?? m['line_note'] ?? m['specialInstructions'] ?? ''}'.trim();
+      final price = jsonToDouble(
+        m['price'] ??
+            m['unit_price'] ??
+            m['item_price'] ??
+            dishMap['price'],
+      );
+      if (itemName.isEmpty || qty <= 0) continue;
       out.add(
         OrderLineItem(
-          itemName: '${m['item_name'] ?? m['itemName'] ?? ''}',
-          dip: '${m['dip'] ?? ''}',
-          dipQty: math.max(0, jsonToInt(m['dip_qty'], 1)),
-          qty: jsonToInt(m['qty'], 0),
-          price: jsonToDouble(m['price']),
-          lineNote: '${m['notes'] ?? m['line_note'] ?? ''}'.trim(),
+          itemName: itemName,
+          dip: dip,
+          dipQty: dipQty,
+          qty: qty,
+          price: price,
+          lineNote: lineNote,
         ),
       );
     }
@@ -3733,6 +3748,7 @@ class AppState extends ChangeNotifier {
           (e) {
             final img = (e.menu.imageBase64 ?? '').trim();
             return <String, dynamic>{
+              // Legacy mobile shape
               'id': e.menu.id,
               'dish_name': e.menu.name,
               'price': e.menu.price,
@@ -3743,6 +3759,21 @@ class AppState extends ChangeNotifier {
               'dip_qty': e.dipQty,
               'qty': e.qty,
               'notes': e.lineNote,
+              // Web/mobile shared shape
+              'dishId': e.menu.id,
+              'dishName': e.menu.name,
+              'quantity': e.qty,
+              'addOnQuantity': e.dipQty,
+              'selectedSauce': e.dip.trim().isEmpty ? null : e.dip,
+              'specialInstructions': e.lineNote,
+              'dish': {
+                'id': e.menu.id,
+                'name': e.menu.name,
+                'type': e.menu.dishType,
+                'price': e.menu.price.toStringAsFixed(0),
+                'category': e.menu.category,
+                'mealType': e.menu.dishType,
+              },
             };
           },
         )
@@ -3753,7 +3784,7 @@ class AppState extends ChangeNotifier {
     var n = 0;
     for (final e in list) {
       if (e is! Map) continue;
-      n += jsonToInt(e['qty']);
+      n += jsonToInt(e['qty'] ?? e['quantity']);
     }
     return n;
   }
@@ -3763,25 +3794,7 @@ class AppState extends ChangeNotifier {
     if (syncEmail == null) return;
     final prefs = await SharedPreferences.getInstance();
     final k = syncEmail;
-    final lines = tray
-        .map(
-          (e) {
-            final img = (e.menu.imageBase64 ?? '').trim();
-            return <String, dynamic>{
-              'id': e.menu.id,
-              'dish_name': e.menu.name,
-              'price': e.menu.price,
-              'category': e.menu.category,
-              'dish_type': e.menu.dishType,
-              if (img.isNotEmpty) 'image_base64': img,
-              'dip': e.dip,
-              'dip_qty': e.dipQty,
-              'qty': e.qty,
-              'notes': e.lineNote,
-            };
-          },
-        )
-        .toList();
+    final lines = _trayLinesSnapshot();
     await prefs.setString('customer_tray_v1_$k', jsonEncode(lines));
     _markTrayLocallyEdited();
     unawaited(_pushCustomerTrayDraftToServer(lines));
@@ -3818,23 +3831,57 @@ class AppState extends ChangeNotifier {
     final pending = <Map<String, dynamic>>[];
     for (final e in list) {
       if (e is! Map) continue;
-      final id = '${e['id']}';
-      final dip = '${e['dip'] ?? ''}';
-      final dipQty = math.max(0, jsonToInt(e['dip_qty'], 1));
-      final qty = jsonToInt(e['qty']);
-      final lineNote = '${e['notes'] ?? e['line_note'] ?? ''}'.trim();
+      final m = Map<String, dynamic>.from(e);
+      final dishMap = m['dish'] is Map ? Map<String, dynamic>.from(m['dish'] as Map) : const <String, dynamic>{};
+      final id = '${m['id'] ?? m['dish_id'] ?? m['dishId'] ?? dishMap['id'] ?? ''}'.trim();
+      final dishName = '${m['dish_name'] ?? m['dishName'] ?? m['item_name'] ?? m['itemName'] ?? dishMap['name'] ?? ''}'
+          .trim();
+      final dip = '${m['dip'] ?? m['selectedSauce'] ?? ''}'.trim();
+      final dipQty = math.max(0, jsonToInt(m['dip_qty'] ?? m['addOnQuantity'], 1));
+      final qty = jsonToInt(m['qty'] ?? m['quantity']);
+      final lineNote =
+          '${m['notes'] ?? m['line_note'] ?? m['specialInstructions'] ?? ''}'.trim();
       if (qty <= 0) continue;
       MenuItemData? foundItem;
       for (final x in menu) {
-        if (x.id == id) {
+        if (id.isNotEmpty && x.id == id) {
           foundItem = x;
           break;
         }
       }
+      if (foundItem == null && dishName.isNotEmpty) {
+        final want = dishName.toLowerCase();
+        for (final x in menu) {
+          if (x.name.trim().toLowerCase() == want) {
+            foundItem = x;
+            break;
+          }
+        }
+      }
+      if (foundItem == null && dishName.isNotEmpty) {
+        final fallbackId = id.isNotEmpty ? id : 'tray-fallback-${dishName.toLowerCase()}';
+        foundItem = MenuItemData(
+          id: fallbackId,
+          name: dishName,
+          description: '',
+          price: jsonToDouble(m['price'] ?? dishMap['price']),
+          dips: const [],
+          category: '${m['category'] ?? dishMap['category'] ?? ''}'.trim(),
+          dishType: '${m['dish_type'] ?? dishMap['type'] ?? dishMap['mealType'] ?? ''}'.trim(),
+          imageBase64: '${m['image_base64'] ?? ''}'.trim().isEmpty ? null : '${m['image_base64']}',
+        );
+      }
       if (foundItem != null) {
         next.add(CartItem(menu: foundItem, dip: dip, dipQty: dipQty, qty: qty, lineNote: lineNote));
       } else {
-        pending.add({'id': id, 'dip': dip, 'dip_qty': dipQty, 'qty': qty, 'notes': lineNote});
+        pending.add({
+          'id': id,
+          'dish_name': dishName,
+          'dip': dip,
+          'dip_qty': dipQty,
+          'qty': qty,
+          'notes': lineNote,
+        });
       }
     }
     if (next.isNotEmpty || pending.isEmpty) {
