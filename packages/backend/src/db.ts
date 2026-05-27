@@ -517,15 +517,60 @@ export async function initDb(): Promise<void> {
   }
 
   try {
+    const hasAllergenName = (
+      await p.query(
+        `SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'menu_dishes_allergens' AND column_name = 'name'
+         LIMIT 1`,
+      )
+    ).rows.length > 0;
+    const hasLegacyAllergenName = (
+      await p.query(
+        `SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'menu_dishes_allergens' AND column_name = 'allergen_name'
+         LIMIT 1`,
+      )
+    ).rows.length > 0;
+    const hasAllergenId = (
+      await p.query(
+        `SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'menu_dishes_allergens' AND column_name = 'id'
+         LIMIT 1`,
+      )
+    ).rows.length > 0;
+    const hasLegacyAllergenId = (
+      await p.query(
+        `SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'menu_dishes_allergens' AND column_name = 'allergen_id'
+         LIMIT 1`,
+      )
+    ).rows.length > 0;
+
+    const labelExpr = hasAllergenName
+      ? "ma.name"
+      : hasLegacyAllergenName
+        ? "ma.allergen_name"
+        : "NULL";
+    const idExpr = hasAllergenId
+      ? "ma.id"
+      : hasLegacyAllergenId
+        ? "ma.allergen_id"
+        : "NULL";
+
     await p.query(`
       CREATE OR REPLACE VIEW public.menu_dishes_with_allergen_names AS
       SELECT
         md.*,
         COALESCE(
           (
-            SELECT array_agg(ma.name ORDER BY ord)
+            SELECT array_agg(TRIM(${labelExpr}::text) ORDER BY ord)
             FROM unnest(COALESCE(md.allergens, '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
-            INNER JOIN public.menu_dishes_allergens ma ON ma.id = t.allergen_id
+            INNER JOIN public.menu_dishes_allergens ma ON ${idExpr} = t.allergen_id
+            WHERE COALESCE(TRIM(${labelExpr}::text), '') <> ''
           ),
           ARRAY[]::text[]
         ) AS allergen_name_list
