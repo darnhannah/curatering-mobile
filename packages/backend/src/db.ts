@@ -430,16 +430,17 @@ export async function initDb(): Promise<void> {
     // Table/column may not exist in minimal dev DBs.
   }
 
-  // Canonical allergen labels; menu_dishes.allergens holds BIGINT[] allergen_id values.
+  // Canonical allergen catalog (id + name); legacy junction restored via schemaNormalize on startup.
   try {
     await p.query(`
       CREATE TABLE IF NOT EXISTS menu_dishes_allergens (
-        allergen_id BIGSERIAL PRIMARY KEY,
-        allergen_name TEXT NOT NULL UNIQUE
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
     await p.query(`
-      INSERT INTO menu_dishes_allergens (allergen_name) VALUES
+      INSERT INTO menu_dishes_allergens (name) VALUES
         ('Milk / Dairy'),
         ('Eggs'),
         ('Fish'),
@@ -461,7 +462,7 @@ export async function initDb(): Promise<void> {
         ('Chocolate / Cocoa'),
         ('Caffeine'),
         ('Other: [manual input]')
-      ON CONFLICT (allergen_name) DO NOTHING
+      ON CONFLICT (name) DO NOTHING
     `);
     await p.query(`
       DO $$
@@ -480,7 +481,7 @@ export async function initDb(): Promise<void> {
     `);
     await p.query(`
       COMMENT ON COLUMN public.menu_dishes.allergens IS
-        'Array of menu_dishes_allergens.allergen_id. Resolve display text via menu_dishes_allergens.allergen_name.'
+        'Allergen ids or JSON text; resolve display via menu_dishes_allergens.name.'
     `);
     await p.query(`
       DO $$
@@ -522,9 +523,9 @@ export async function initDb(): Promise<void> {
         md.*,
         COALESCE(
           (
-            SELECT array_agg(ma.allergen_name ORDER BY ord)
+            SELECT array_agg(ma.name ORDER BY ord)
             FROM unnest(COALESCE(md.allergens, '{}'::bigint[])) WITH ORDINALITY AS t(allergen_id, ord)
-            INNER JOIN public.menu_dishes_allergens ma ON ma.allergen_id = t.allergen_id
+            INNER JOIN public.menu_dishes_allergens ma ON ma.id = t.allergen_id
           ),
           ARRAY[]::text[]
         ) AS allergen_name_list

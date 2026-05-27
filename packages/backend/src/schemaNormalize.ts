@@ -261,6 +261,7 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await normalizeCateringOrders(pool);
   await normalizeEventOrders(pool);
   await normalizeIdCounters(pool);
+  await restoreMenuDishesAllergensFromLegacy(pool);
   await normalizeMenuDishes(pool);
   await normalizeCustomerTrayDrafts(pool);
   await migratePostAnalysisIntoChecklistAndDrop(pool);
@@ -1620,6 +1621,85 @@ async function normalizeIdCounters(pool: pg.Pool): Promise<void> {
   console.info(
     `[schema] id_counters: ${rows.map((r) => `${r.prefix}=${r.last_number}`).join(", ") || "(empty)"}`,
   );
+}
+
+/** Backfill menu_dishes_allergens from menu_dishes_allergens_legacy_junction, then drop legacy table. */
+async function restoreMenuDishesAllergensFromLegacy(pool: pg.Pool): Promise<void> {
+  const legacyTable = "menu_dishes_allergens_legacy_junction";
+  if (!(await tableExists(pool, legacyTable))) return;
+  if (!(await tableExists(pool, "menu_dishes_allergens"))) return;
+
+  const legacyNameCol = (await columnExists(pool, legacyTable, "allergen_name"))
+    ? "allergen_name"
+    : null;
+  if (!legacyNameCol) return;
+
+  const labelCol = (await columnExists(pool, "menu_dishes_allergens", "name"))
+    ? "name"
+    : (await columnExists(pool, "menu_dishes_allergens", "allergen_name"))
+      ? "allergen_name"
+      : null;
+  if (!labelCol) return;
+
+  const hasCanonicalId = await columnExists(pool, "menu_dishes_allergens", "id");
+  const hasLegacyId = await columnExists(pool, legacyTable, "allergen_id");
+  const hasLegacyCreatedAt = await columnExists(pool, legacyTable, "created_at");
+  const hasCanonicalCreatedAt = await columnExists(pool, "menu_dishes_allergens", "created_at");
+  const createdAtClause =
+    hasCanonicalCreatedAt && hasLegacyCreatedAt ? ", created_at" : "";
+  const createdAtSelect =
+    hasCanonicalCreatedAt && hasLegacyCreatedAt ? ", lj.created_at" : "";
+
+  if (hasCanonicalId && hasLegacyId) {
+    await safeExec(
+      pool,
+      `INSERT INTO menu_dishes_allergens (id, ${labelCol}${createdAtClause})
+       SELECT lj.allergen_id, TRIM(lj.${legacyNameCol})${createdAtSelect}
+       FROM ${legacyTable} lj
+       WHERE TRIM(COALESCE(lj.${legacyNameCol}, '')) <> ''
+         AND NOT EXISTS (SELECT 1 FROM menu_dishes_allergens ma WHERE ma.id = lj.allergen_id)
+         AND NOT EXISTS (
+           SELECT 1 FROM menu_dishes_allergens ma
+           WHERE LOWER(TRIM(ma.${labelCol}::text)) = LOWER(TRIM(lj.${legacyNameCol}))
+         )`,
+    );
+    await safeExec(
+      pool,
+      `UPDATE menu_dishes_allergens ma
+       SET ${labelCol} = TRIM(lj.${legacyNameCol})${hasCanonicalCreatedAt && hasLegacyCreatedAt ? ", created_at = COALESCE(ma.created_at, lj.created_at)" : ""}
+       FROM ${legacyTable} lj
+       WHERE ma.id = lj.allergen_id
+         AND TRIM(COALESCE(lj.${legacyNameCol}, '')) <> ''
+         AND LOWER(TRIM(COALESCE(ma.${labelCol}::text, ''))) <> LOWER(TRIM(lj.${legacyNameCol}))`,
+    );
+    await safeExec(
+      pool,
+      `SELECT setval(
+         pg_get_serial_sequence('menu_dishes_allergens', 'id'),
+         GREATEST(
+           COALESCE((SELECT MAX(id) FROM menu_dishes_allergens), 0),
+           COALESCE((SELECT MAX(allergen_id) FROM ${legacyTable}), 0),
+           1
+         ),
+         true
+       )`,
+    );
+  } else {
+    await safeExec(
+      pool,
+      `INSERT INTO menu_dishes_allergens (${labelCol}${createdAtClause})
+       SELECT DISTINCT TRIM(lj.${legacyNameCol})${createdAtSelect}
+       FROM ${legacyTable} lj
+       WHERE TRIM(COALESCE(lj.${legacyNameCol}, '')) <> ''
+         AND NOT EXISTS (
+           SELECT 1 FROM menu_dishes_allergens ma
+           WHERE LOWER(TRIM(ma.${labelCol}::text)) = LOWER(TRIM(lj.${legacyNameCol}))
+         )`,
+    );
+  }
+
+  await safeExec(pool, `DROP TABLE IF EXISTS ${legacyTable} CASCADE`);
+  console.info("[schema] menu_dishes_allergens restored from legacy_junction; legacy table dropped");
 }
 
 async function normalizeMenuDishes(pool: pg.Pool): Promise<void> {

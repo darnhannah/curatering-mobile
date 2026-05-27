@@ -149,6 +149,16 @@ export async function menuAllergenLabelSql(pool: pg.Pool): Promise<string> {
   return "''";
 }
 
+/** Resolve allergen primary-key column on menu_dishes_allergens (id vs legacy allergen_id). */
+export async function menuAllergenIdSql(pool: pg.Pool): Promise<string> {
+  const hasId = await columnExists(pool, "menu_dishes_allergens", "id");
+  const hasLegacy = await columnExists(pool, "menu_dishes_allergens", "allergen_id");
+  if (hasId && hasLegacy) return "COALESCE(ma.id, ma.allergen_id)";
+  if (hasId) return "ma.id";
+  if (hasLegacy) return "ma.allergen_id";
+  return "NULL";
+}
+
 /** SELECT expression for menu_dishes.allergens (TEXT JSON vs BIGINT[] of allergen_id). */
 export async function menuAllergensSelectExpr(pool: pg.Pool, dishAlias = "md"): Promise<string> {
   const { rows } = await pool.query(
@@ -160,17 +170,33 @@ export async function menuAllergensSelectExpr(pool: pg.Pool, dishAlias = "md"): 
   const dataType = String((rows[0] as { data_type: string }).data_type ?? "").toLowerCase();
   if (dataType === "array") {
     const label = await menuAllergenLabelSql(pool);
+    const idCol = await menuAllergenIdSql(pool);
     return `COALESCE(
       (
         SELECT COALESCE(json_agg(TRIM(${label}::text) ORDER BY ord)::text, '[]')
         FROM unnest(COALESCE(${dishAlias}.allergens, ARRAY[]::bigint[])) WITH ORDINALITY AS u(allergen_id, ord)
-        LEFT JOIN public.menu_dishes_allergens ma ON ma.allergen_id = u.allergen_id
+        LEFT JOIN public.menu_dishes_allergens ma ON ${idCol} = u.allergen_id
         WHERE COALESCE(TRIM(${label}::text), '') <> ''
       ),
       '[]'
     )`;
   }
-  return `COALESCE(NULLIF(TRIM(${dishAlias}.allergens::text), ''), '[]')`;
+  const label = await menuAllergenLabelSql(pool);
+  const idCol = await menuAllergenIdSql(pool);
+  return `CASE
+    WHEN TRIM(COALESCE(${dishAlias}.allergens::text, '')) ~ '^\\s*\\[\\s*"?\\d'
+    THEN COALESCE(
+      (
+        SELECT COALESCE(json_agg(TRIM(${label}::text) ORDER BY ord)::text, '[]')
+        FROM json_array_elements(${dishAlias}.allergens::json) WITH ORDINALITY AS u(elem, ord)
+        LEFT JOIN public.menu_dishes_allergens ma
+          ON ${idCol}::text = trim(both '"' from u.elem::text)
+        WHERE COALESCE(TRIM(${label}::text), '') <> ''
+      ),
+      '[]'
+    )
+    ELSE COALESCE(NULLIF(TRIM(${dishAlias}.allergens::text), ''), '[]')
+  END`;
 }
 
 let cachedMenuSqlWithAllergens: string | null = null;
