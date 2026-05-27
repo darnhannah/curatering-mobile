@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { formatCusId, setIdCounterLastNumber, syncCusCounterFromAccounts } from "./idCounters.js";
+import { resetMenuSqlCache } from "./webMenu.js";
 
 async function columnExists(
   pool: pg.Pool,
@@ -274,6 +275,7 @@ export async function runSchemaNormalize(pool: pg.Pool): Promise<void> {
   await ensureProductionColumns(pool);
   // Never drop extra DB columns in production — pruning removed order_no, seating_plan, etc.
   await dropLegacyTables(pool);
+  resetMenuSqlCache();
   console.info("[schema] normalize complete");
 }
 
@@ -1699,6 +1701,7 @@ async function restoreMenuDishesAllergensFromLegacy(pool: pg.Pool): Promise<void
   }
 
   await safeExec(pool, `DROP TABLE IF EXISTS ${legacyTable} CASCADE`);
+  resetMenuSqlCache();
   console.info("[schema] menu_dishes_allergens restored from legacy_junction; legacy table dropped");
 }
 

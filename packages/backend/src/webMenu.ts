@@ -139,28 +139,83 @@ async function columnExists(pool: pg.Pool, table: string, column: string): Promi
   return rows.length > 0;
 }
 
+async function tableExists(pool: pg.Pool, table: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_name = $1
+     LIMIT 1`,
+    [table],
+  );
+  return rows.length > 0;
+}
+
+type MenuAllergenColumns = { idCol: string; labelCol: string; cacheKey: string };
+
+let cachedAllergenColumns: MenuAllergenColumns | null = null;
+let cachedMenuSqlWithAllergens: string | null = null;
+let cachedMenuSqlKey = "";
+
+/** Clear cached menu SQL (call after allergen schema migrations). */
+export function resetMenuSqlCache(): void {
+  cachedAllergenColumns = null;
+  cachedMenuSqlWithAllergens = null;
+  cachedMenuSqlKey = "";
+}
+
+/**
+ * Pick exactly one PK/label column for menu_dishes_allergens.
+ * Never emit COALESCE(ma.id, ma.allergen_id) — PostgreSQL requires every referenced column to exist.
+ */
+async function resolveMenuAllergenColumns(pool: pg.Pool): Promise<MenuAllergenColumns> {
+  if (cachedAllergenColumns) return cachedAllergenColumns;
+
+  const hasTable = await tableExists(pool, "menu_dishes_allergens");
+  if (!hasTable) {
+    cachedAllergenColumns = { idCol: "NULL", labelCol: "''", cacheKey: "no-table" };
+    return cachedAllergenColumns;
+  }
+
+  const hasId = await columnExists(pool, "menu_dishes_allergens", "id");
+  const hasLegacyId = await columnExists(pool, "menu_dishes_allergens", "allergen_id");
+  const hasName = await columnExists(pool, "menu_dishes_allergens", "name");
+  const hasLegacyName = await columnExists(pool, "menu_dishes_allergens", "allergen_name");
+
+  const idCol = hasId ? "ma.id" : hasLegacyId ? "ma.allergen_id" : "NULL";
+  const labelCol = hasName ? "ma.name" : hasLegacyName ? "ma.allergen_name" : "''";
+  const cacheKey = `${idCol}|${labelCol}`;
+
+  cachedAllergenColumns = { idCol, labelCol, cacheKey };
+  return cachedAllergenColumns;
+}
+
 /** Resolve allergen label column on menu_dishes_allergens (name vs legacy allergen_name). */
 export async function menuAllergenLabelSql(pool: pg.Pool): Promise<string> {
-  const hasName = await columnExists(pool, "menu_dishes_allergens", "name");
-  const hasLegacy = await columnExists(pool, "menu_dishes_allergens", "allergen_name");
-  if (hasName && hasLegacy) return "COALESCE(ma.name, ma.allergen_name)";
-  if (hasName) return "ma.name";
-  if (hasLegacy) return "ma.allergen_name";
-  return "''";
+  const { labelCol } = await resolveMenuAllergenColumns(pool);
+  return labelCol;
 }
 
 /** Resolve allergen primary-key column on menu_dishes_allergens (id vs legacy allergen_id). */
 export async function menuAllergenIdSql(pool: pg.Pool): Promise<string> {
-  const hasId = await columnExists(pool, "menu_dishes_allergens", "id");
-  const hasLegacy = await columnExists(pool, "menu_dishes_allergens", "allergen_id");
-  if (hasId && hasLegacy) return "COALESCE(ma.id, ma.allergen_id)";
-  if (hasId) return "ma.id";
-  if (hasLegacy) return "ma.allergen_id";
-  return "NULL";
+  const { idCol } = await resolveMenuAllergenColumns(pool);
+  return idCol;
+}
+
+/** Raw menu_dishes.allergens column without lookup join. */
+function menuAllergensRawExpr(dishAlias = "md"): string {
+  return `COALESCE(NULLIF(TRIM(${dishAlias}.allergens::text), ''), '[]')`;
 }
 
 /** SELECT expression for menu_dishes.allergens (TEXT JSON vs BIGINT[] of allergen_id). */
-export async function menuAllergensSelectExpr(pool: pg.Pool, dishAlias = "md"): Promise<string> {
+export async function menuAllergensSelectExpr(
+  pool: pg.Pool,
+  dishAlias = "md",
+  cols?: MenuAllergenColumns,
+): Promise<string> {
+  const { idCol, labelCol } = cols ?? (await resolveMenuAllergenColumns(pool));
+  if (idCol === "NULL" || labelCol === "''") {
+    return menuAllergensRawExpr(dishAlias);
+  }
+
   const { rows } = await pool.query(
     `SELECT data_type FROM information_schema.columns
      WHERE table_schema = 'public' AND table_name = 'menu_dishes' AND column_name = 'allergens'
@@ -169,48 +224,51 @@ export async function menuAllergensSelectExpr(pool: pg.Pool, dishAlias = "md"): 
   if (rows.length === 0) return `'[]'::text`;
   const dataType = String((rows[0] as { data_type: string }).data_type ?? "").toLowerCase();
   if (dataType === "array") {
-    const label = await menuAllergenLabelSql(pool);
-    const idCol = await menuAllergenIdSql(pool);
     return `COALESCE(
       (
-        SELECT COALESCE(json_agg(TRIM(${label}::text) ORDER BY ord)::text, '[]')
+        SELECT COALESCE(json_agg(TRIM(${labelCol}::text) ORDER BY ord)::text, '[]')
         FROM unnest(COALESCE(${dishAlias}.allergens, ARRAY[]::bigint[])) WITH ORDINALITY AS u(allergen_id, ord)
         LEFT JOIN public.menu_dishes_allergens ma ON ${idCol} = u.allergen_id
-        WHERE COALESCE(TRIM(${label}::text), '') <> ''
+        WHERE COALESCE(TRIM(${labelCol}::text), '') <> ''
       ),
       '[]'
     )`;
   }
-  const label = await menuAllergenLabelSql(pool);
-  const idCol = await menuAllergenIdSql(pool);
   return `CASE
     WHEN TRIM(COALESCE(${dishAlias}.allergens::text, '')) ~ '^\\s*\\[\\s*"?\\d'
     THEN COALESCE(
       (
-        SELECT COALESCE(json_agg(TRIM(${label}::text) ORDER BY ord)::text, '[]')
+        SELECT COALESCE(json_agg(TRIM(${labelCol}::text) ORDER BY ord)::text, '[]')
         FROM json_array_elements(${dishAlias}.allergens::json) WITH ORDINALITY AS u(elem, ord)
         LEFT JOIN public.menu_dishes_allergens ma
           ON ${idCol}::text = trim(both '"' from u.elem::text)
-        WHERE COALESCE(TRIM(${label}::text), '') <> ''
+        WHERE COALESCE(TRIM(${labelCol}::text), '') <> ''
       ),
       '[]'
     )
-    ELSE COALESCE(NULLIF(TRIM(${dishAlias}.allergens::text), ''), '[]')
+    ELSE ${menuAllergensRawExpr(dishAlias)}
   END`;
 }
 
-let cachedMenuSqlWithAllergens: string | null = null;
-
 /** Default public menu SQL with allergens expression matched to the live DB schema. */
-export async function resolveMenuSqlForPool(pool: pg.Pool): Promise<string | null> {
+export async function resolveMenuSqlForPool(
+  pool: pg.Pool,
+  opts?: { force?: boolean },
+): Promise<string | null> {
   const base = resolveMenuSql();
   if (!base) return null;
   if (!base.includes(DEFAULT_MENU_ALLERGENS_LEGACY.split(" AS ")[0]!)) {
     return base;
   }
-  if (cachedMenuSqlWithAllergens) return cachedMenuSqlWithAllergens;
-  const allergenExpr = await menuAllergensSelectExpr(pool);
+
+  const allergenCols = await resolveMenuAllergenColumns(pool);
+  if (!opts?.force && cachedMenuSqlWithAllergens && cachedMenuSqlKey === allergenCols.cacheKey) {
+    return cachedMenuSqlWithAllergens;
+  }
+
+  const allergenExpr = await menuAllergensSelectExpr(pool, "md", allergenCols);
   cachedMenuSqlWithAllergens = base.replace(DEFAULT_MENU_ALLERGENS_LEGACY, `${allergenExpr} AS allergens`);
+  cachedMenuSqlKey = allergenCols.cacheKey;
   return cachedMenuSqlWithAllergens;
 }
 

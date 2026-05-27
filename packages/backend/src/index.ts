@@ -73,7 +73,12 @@ import {
   sendGuestOrderProofConfirmation,
 } from "./guestNotify.js";
 import { ensureIdCounterRow, nextCusIdFromCounter, nextTrIdFromCounter } from "./idCounters.js";
-import { menuAllergenLabelSql, resolveMenuSqlForPool, resolveSetMenusSql } from "./webMenu.js";
+import {
+  menuAllergenLabelSql,
+  resetMenuSqlCache,
+  resolveMenuSqlForPool,
+  resolveSetMenusSql,
+} from "./webMenu.js";
 
 if (isMailConfigured()) {
   if (mailUsesResend()) {
@@ -1327,7 +1332,18 @@ app.get("/api/mobile/menu", async (req, res) => {
       .trim()
       .toLowerCase() === "true";
   try {
-    const { rows } = await pool.query(sql);
+    let rows: Record<string, unknown>[];
+    try {
+      rows = (await pool.query(sql)).rows as Record<string, unknown>[];
+    } catch (queryErr) {
+      const code = (queryErr as { code?: string }).code;
+      if (code !== "42703") throw queryErr;
+      console.warn("[menu] allergen column mismatch; retrying without allergen join:", queryErr);
+      resetMenuSqlCache();
+      const retrySql = await resolveMenuSqlForPool(pool, { force: true });
+      if (!retrySql || retrySql === sql) throw queryErr;
+      rows = (await pool.query(retrySql)).rows as Record<string, unknown>[];
+    }
     res.json(
       rows.map((r) => ({
         id: String((r as Record<string, unknown>).id ?? ""),
