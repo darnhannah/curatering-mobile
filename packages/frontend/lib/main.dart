@@ -19777,6 +19777,55 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
           ),
           const SizedBox(height: 10),
           ToggleSection(
+            title: 'Event Theme Design',
+            expanded: true,
+            onToggle: () {},
+            hideToggleIcon: true,
+            child: buildManagerThemeDesignBlock(
+              context: context,
+              themeDesign: _newEventThemeDesign ?? const {},
+              eventTitle: eventTitle.text.trim(),
+              transactionNo: '',
+              openEditorLabel: hasEventThemeDesign(_newEventThemeDesign ?? const {})
+                  ? 'Edit theme design'
+                  : 'Create my own theme design',
+              onOpenEditor: () async {
+                final email = inquiryEmail.text.trim().isNotEmpty
+                    ? inquiryEmail.text.trim()
+                    : (widget.state.userEmail ?? '');
+                if (email.isEmpty) {
+                  appSnack(context, 'Enter customer email before editing theme design.');
+                  return;
+                }
+                final payload = await pushRouteOnce<Map<String, dynamic>?>(
+                  context,
+                  MaterialPageRoute<Map<String, dynamic>?>(
+                    builder: (_) => EventThemeDesignScreen(
+                      apiBase: widget.state.apiBase,
+                      userEmail: email,
+                      designSessionId: _newEventThemeSessionId,
+                      initialEventType: _resolvedEventType(),
+                      initialThemeDesign: _newEventThemeDesign,
+                      eventTitle: eventTitle.text.trim(),
+                      formalityLevel: formalityLevel,
+                      eventSetting: eventSetting,
+                      persistToOrder: false,
+                    ),
+                  ),
+                  routeKey: 'EventThemeDesign:manager-new',
+                );
+                if (payload != null && mounted) {
+                  setState(() => _newEventThemeDesign = payload);
+                }
+              },
+              showCostFields: true,
+              noteController: note,
+              costController: themeCostController,
+              readOnlyCostFields: false,
+            ),
+          ),
+          const SizedBox(height: 10),
+          ToggleSection(
             title: 'Seating layout',
             expanded: true,
             onToggle: () {},
