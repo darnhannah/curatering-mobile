@@ -11656,6 +11656,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
         appSnack(context, 'Delivery time must be between 8:00 am and 7:00 pm.');
         return false;
       }
+      if (!dt.isAfter(DateTime.now())) {
+        appSnack(context, 'Delivery time cannot be in the past.');
+        return false;
+      }
       return true;
     } catch (_) {
       appSnack(context, 'Invalid delivery time.');
@@ -11665,16 +11669,33 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 
   Future<void> _pickScheduledDelivery() async {
     final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    // After closing time, today has no valid future slots within restaurant hours.
+    final pastClosingToday = now.hour > kRestaurantCloseHour ||
+        (now.hour == kRestaurantCloseHour && now.minute > 0);
+    final firstDate = pastClosingToday ? today.add(const Duration(days: 1)) : today;
     final d = await showDatePicker(
       context: context,
-      initialDate: now,
-      firstDate: now,
-      lastDate: now.add(const Duration(days: 60)),
+      initialDate: firstDate,
+      firstDate: firstDate,
+      lastDate: today.add(const Duration(days: 60)),
     );
     if (d == null || !mounted) return;
+    final pickedDay = DateTime(d.year, d.month, d.day);
+    final isToday = pickedDay == today;
+    var initial = clampToRestaurantHours(TimeOfDay.now());
+    if (isToday) {
+      final earliest = TimeOfDay(hour: now.hour, minute: now.minute);
+      final earliestMins = earliest.hour * 60 + earliest.minute;
+      final initialMins = initial.hour * 60 + initial.minute;
+      if (initialMins < earliestMins) initial = earliest;
+      initial = clampToRestaurantHours(initial);
+    } else {
+      initial = const TimeOfDay(hour: kRestaurantOpenHour, minute: 0);
+    }
     final t = await showTimePicker(
       context: context,
-      initialTime: clampToRestaurantHours(TimeOfDay.now()),
+      initialTime: initial,
       helpText: 'Select time (8:00 am – 7:00 pm)',
     );
     if (t == null || !mounted) return;
@@ -11683,6 +11704,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
       return;
     }
     final dt = DateTime(d.year, d.month, d.day, t.hour, t.minute);
+    if (!dt.isAfter(DateTime.now())) {
+      appSnack(context, 'Delivery time cannot be in the past.');
+      return;
+    }
     final label = DateFormat('yyyy-MM-dd HH:mm').format(dt);
     setState(() => _selectedDeliveryTime = label);
     widget.state.updateCheckoutDraftDeliveryTime(label);
