@@ -1449,11 +1449,13 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
       await getPool().query("DELETE FROM customer_accounts WHERE email = $1 AND is_verified = FALSE", [email]);
     }
     await getPool().query(
-      `INSERT INTO customer_accounts (email, password_hash, full_name, is_verified, signup_otp_code, signup_otp_code_expiry, created_account_dt_stamp)
-       VALUES ($1, '', '', FALSE, $2, $3, NOW())
+      `INSERT INTO customer_accounts (email, password_hash, full_name, is_verified, signup_otp_code, signup_otp_code_expiry, signup_otp_expires_at, created_account_dt_stamp)
+       VALUES ($1, '', '', FALSE, $2, $3, $3, NOW())
        ON CONFLICT (email) DO UPDATE SET
          signup_otp_code = EXCLUDED.signup_otp_code,
          signup_otp_code_expiry = EXCLUDED.signup_otp_code_expiry,
+         signup_otp_expires_at = EXCLUDED.signup_otp_expires_at,
+         archived = FALSE,
          ${CUSTOMER_ACCOUNT_TOUCH}`,
       [email, code, expiresAt.toISOString()],
     );
@@ -1486,9 +1488,54 @@ app.post("/api/mobile/auth/signup/request-otp", async (req, res) => {
   res.json({ ok: true });
 });
 
+/** Validates signup OTP before showing the password step (does not consume the OTP). */
+app.post("/api/mobile/auth/signup/check-otp", async (req, res) => {
+  const email = String(req.body?.email ?? "").trim().toLowerCase();
+  const otp = String(req.body?.otp ?? "").replace(/\D/g, "").trim();
+  if (!email || !otp) {
+    res.status(400).json({ error: "email and otp are required" });
+    return;
+  }
+  try {
+    const { rows } = await getPool().query(
+      `SELECT signup_otp_code AS otp_code,
+              COALESCE(signup_otp_code_expiry, signup_otp_expires_at) AS otp_expires_at,
+              COALESCE(is_verified, FALSE) AS is_verified,
+              COALESCE(archived, FALSE) AS archived
+       FROM customer_accounts
+       WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+       LIMIT 1`,
+      [email],
+    );
+    const row = rows[0] as
+      | { otp_code: string | null; otp_expires_at: Date | null; is_verified: boolean; archived: boolean }
+      | undefined;
+    if (row?.archived) {
+      res.status(400).json({ error: "this account was deleted — sign up again with a new email or contact support" });
+      return;
+    }
+    if (row?.is_verified) {
+      res.status(409).json({ error: "account already exists — log in instead" });
+      return;
+    }
+    const stored = String(row?.otp_code ?? "").replace(/\D/g, "").trim();
+    const codeOk = stored.length > 0 && stored === otp;
+    const notExpired =
+      row?.otp_expires_at != null && new Date(row.otp_expires_at) >= new Date();
+    if (!row || !codeOk || !notExpired) {
+      res.status(400).json({ error: "invalid or expired code" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
 app.post("/api/mobile/auth/signup/complete", async (req, res) => {
   const email = String(req.body?.email ?? "").trim().toLowerCase();
-  const otp = String(req.body?.otp ?? "").trim();
+  const otp = String(req.body?.otp ?? "").replace(/\D/g, "").trim();
   const password = String(req.body?.password ?? "");
   if (!email || !otp || password.length < 8) {
     res.status(400).json({ error: "email, otp, and password (min 8 chars) are required" });
@@ -1496,12 +1543,14 @@ app.post("/api/mobile/auth/signup/complete", async (req, res) => {
   }
   try {
     const { rows } = await getPool().query(
-      `SELECT signup_otp_code AS otp_code, signup_otp_code_expiry AS otp_expires_at
-       FROM customer_accounts WHERE email = $1`,
+      `SELECT signup_otp_code AS otp_code,
+              COALESCE(signup_otp_code_expiry, signup_otp_expires_at) AS otp_expires_at
+       FROM customer_accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))`,
       [email],
     );
     const row = rows[0] as { otp_code: string | null; otp_expires_at: Date | null } | undefined;
-    const codeOk = row?.otp_code === otp;
+    const stored = String(row?.otp_code ?? "").replace(/\D/g, "").trim();
+    const codeOk = stored.length > 0 && stored === otp;
     const notExpired =
       row?.otp_expires_at != null && new Date(row.otp_expires_at) >= new Date();
     if (!row || !codeOk || !notExpired) {
@@ -1523,6 +1572,8 @@ app.post("/api/mobile/auth/signup/complete", async (req, res) => {
          is_verified = TRUE,
          signup_otp_code = NULL,
          signup_otp_code_expiry = NULL,
+         signup_otp_expires_at = NULL,
+         archived = FALSE,
          updated_pw_dt_stamp = NOW()`,
       [email, hash],
     );
@@ -1583,11 +1634,13 @@ app.post("/api/mobile/auth/login", async (req, res) => {
       return;
     }
     const { rows } = await getPool().query(
-      "SELECT password_hash, full_name, is_verified FROM customer_accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))",
+      "SELECT password_hash, full_name, is_verified, COALESCE(archived, FALSE) AS archived FROM customer_accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))",
       [email],
     );
-    let row = rows[0] as { password_hash: string; full_name: string; is_verified: boolean } | undefined;
-    if (!row) {
+    let row = rows[0] as
+      | { password_hash: string; full_name: string; is_verified: boolean; archived: boolean }
+      | undefined;
+    if (!row || row.archived) {
       res.status(401).json({ error: "invalid email or password" });
       return;
     }
@@ -2932,6 +2985,80 @@ app.put("/api/mobile/profile", async (req, res) => {
   }
 });
 
+/** Soft-delete customer account (requires password). Frees email for re-registration. */
+app.post("/api/mobile/account/delete", async (req, res) => {
+  const userEmail = String(req.body?.user_email ?? req.body?.email ?? "").trim().toLowerCase();
+  const password = String(req.body?.password ?? "");
+  if (!userEmail || !password) {
+    res.status(400).json({ error: "user_email and password are required" });
+    return;
+  }
+  if (userEmail.endsWith("@guest.curatering.internal")) {
+    res.status(400).json({ error: "guest sessions cannot be deleted" });
+    return;
+  }
+  try {
+    const { rows } = await getPool().query(
+      `SELECT email, password_hash, COALESCE(archived, FALSE) AS archived, COALESCE(customer_id, '') AS customer_id
+       FROM customer_accounts
+       WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+       LIMIT 1`,
+      [userEmail],
+    );
+    const row = rows[0] as
+      | { email: string; password_hash: string; archived: boolean; customer_id: string }
+      | undefined;
+    if (!row || row.archived) {
+      res.status(404).json({ error: "account not found" });
+      return;
+    }
+    const hash = String(row.password_hash ?? "");
+    if (!hash || !(await bcrypt.compare(password, hash))) {
+      res.status(401).json({ error: "incorrect password" });
+      return;
+    }
+    const tombstone = `deleted_${Date.now()}_${row.email}`;
+    await getPool().query(
+      `UPDATE customer_accounts
+       SET archived = TRUE,
+           email = $2,
+           password_hash = '',
+           signup_otp_code = NULL,
+           signup_otp_code_expiry = NULL,
+           signup_otp_expires_at = NULL,
+           forgot_password_otp_code = NULL,
+           forgot_password_otp_code_expiry = NULL,
+           password_reset_otp = NULL,
+           password_reset_expires_at = NULL,
+           contact_number = '',
+           phone_number = '',
+           primary_delivery_address = '',
+           delivery_address = '',
+           other_delivery_addresses = '[]'::jsonb,
+           delivery_map_confirmed = FALSE,
+           delivery_lat = NULL,
+           delivery_lng = NULL,
+           updated_pw_dt_stamp = NOW()
+       WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))`,
+      [userEmail, tombstone],
+    );
+    try {
+      await getPool().query(`DELETE FROM customer_tray_drafts WHERE LOWER(TRIM(user_email)) = LOWER(TRIM($1))`, [
+        userEmail,
+      ]);
+    } catch {
+      /* optional table */
+    }
+    await logActionBestEffort("account.delete", userEmail, "Customer account deleted", {
+      customer_id: row.customer_id,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "database error" });
+  }
+});
+
 /** Guest / walk-in customer: email OTP then list restaurant orders placed with that contact email. */
 app.post("/api/mobile/guest-orders/request-track-otp", async (req, res) => {
   const email = String(req.body?.email ?? "").trim().toLowerCase();
@@ -3280,6 +3407,12 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
     return;
   }
   try {
+    await ensureRestaurantOrderApiColumnsOnce();
+    // Free-form payment/fulfillment statuses must not be blocked by a narrow CHECK.
+    await getPool().query(`ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_status_check`);
+    await getPool().query(
+      `ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_order_status_check`,
+    );
     const { rows: found } = await getPool().query(
       `SELECT mobile_id AS id,
               COALESCE(order_status, 'PENDING_CASHIER') AS status,

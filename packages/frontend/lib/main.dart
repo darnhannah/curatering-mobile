@@ -19,6 +19,8 @@ import 'package:printing/printing.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'customer_local_notifications.dart';
+import 'cms/cms_block_renderer.dart';
+import 'cms/mobile_ui_config_store.dart';
 import 'features/event_design/event_design_admin_screen.dart';
 import 'features/event_design/event_theme_design_screen.dart';
 import 'features/event_design/theme_design_export.dart';
@@ -57,12 +59,12 @@ Future<void> main() async {
   await runCurateringApp();
 }
 
-ThemeData buildAppLightTheme() {
+ThemeData buildAppLightTheme({Color? seed}) {
   return ThemeData(
     useMaterial3: true,
     brightness: Brightness.light,
     scaffoldBackgroundColor: Colors.white,
-    colorScheme: ColorScheme.fromSeed(seedColor: AppColors.brand, brightness: Brightness.light),
+    colorScheme: ColorScheme.fromSeed(seedColor: seed ?? AppColors.brand, brightness: Brightness.light),
     cardTheme: CardThemeData(
       color: Colors.white,
       elevation: 2,
@@ -87,12 +89,12 @@ ThemeData buildAppLightTheme() {
   );
 }
 
-ThemeData buildAppDarkTheme() {
+ThemeData buildAppDarkTheme({Color? seed}) {
   return ThemeData(
     useMaterial3: true,
     brightness: Brightness.dark,
     scaffoldBackgroundColor: const Color(0xFF1A1A1A),
-    colorScheme: ColorScheme.fromSeed(seedColor: AppColors.brand, brightness: Brightness.dark),
+    colorScheme: ColorScheme.fromSeed(seedColor: seed ?? AppColors.brand, brightness: Brightness.dark),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: const Color(0xFF2C2C2C),
@@ -356,7 +358,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: appState,
+      animation: Listenable.merge([appState, MobileUiConfigStore.instance]),
       builder: (context, _) {
         final email = appState.userEmail;
         if (email == null) {
@@ -398,6 +400,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           }
         }
 
+        final brandSeed = AppColors.brandResolved;
         return MaterialApp(
           key: ValueKey(appState.authSessionKey),
           navigatorKey: _rootNavKey,
@@ -405,8 +408,8 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           title: widget.forcePosLogin
               ? "Macrina's Kitchen and Catering Management"
               : "Macrina's Kitchen and Catering",
-          theme: buildAppLightTheme(),
-          darkTheme: buildAppDarkTheme(),
+          theme: buildAppLightTheme(seed: brandSeed),
+          darkTheme: buildAppDarkTheme(seed: brandSeed),
           themeMode: appState.themeMode,
           builder: (context, child) => Listener(
             behavior: HitTestBehavior.translucent,
@@ -1219,6 +1222,13 @@ const String kGuestPostPaymentProofNotice =
     'After you submit payment proof, watch your email or track your order with your entered email address through the app for payment confirmation and order updates!';
 
 Widget guestPostPaymentProofNoticeBanner() {
+  final cmsBlocks = MobileUiConfigStore.instance.blocksFor('payment_banner');
+  if (cmsBlocks.isNotEmpty) {
+    return const Padding(
+      padding: EdgeInsets.only(bottom: 8),
+      child: CmsBannerStrip(screenId: 'payment_banner'),
+    );
+  }
   return Container(
     width: double.infinity,
     padding: const EdgeInsets.all(14),
@@ -1276,6 +1286,27 @@ class AppColors {
   static const border = Color(0xFF9B8F82);
   static const success = Color(0xFF2FCB76);
   static const ink = Color(0xFF201B16);
+
+  /// CMS `mobileUi.brand.primary` when set; else compile-time [brand].
+  static Color get brandResolved {
+    final hex = MobileUiConfigStore.instance.config.brand.primary.trim();
+    return _parseHex(hex) ?? brand;
+  }
+
+  /// CMS `mobileUi.brand.accent` when set; else compile-time [accent].
+  static Color get accentResolved {
+    final hex = MobileUiConfigStore.instance.config.brand.accent.trim();
+    return _parseHex(hex) ?? accent;
+  }
+
+  static Color? _parseHex(String hex) {
+    var h = hex;
+    if (h.startsWith('#')) h = h.substring(1);
+    if (h.length != 6) return null;
+    final v = int.tryParse(h, radix: 16);
+    if (v == null) return null;
+    return Color(0xFF000000 | v);
+  }
 }
 
 /// Customer inquiry + manager new-event dropdown (display labels).
@@ -4139,11 +4170,11 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly; omit for menu tab.
+  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly;
+  /// omit to show guest landing (CMS or hardcoded tiles) first.
   Future<void> enterGuestCheckoutSession({int? initialShellTabIndex}) async {
-    guestShellOpenLanding = false;
+    guestShellOpenLanding = initialShellTabIndex == null;
     guestShellInitialTabIndex = (initialShellTabIndex ?? 0).clamp(0, 3);
-    // Default guest entry is restaurant menu (tab 0), not a separate landing page.
     final salt = DateTime.now().millisecondsSinceEpoch;
     final r = math.Random().nextInt(1 << 30);
     userEmail = 'guest_${salt}_$r@guest.curatering.internal'.toLowerCase();
@@ -4632,6 +4663,38 @@ class AppState extends ChangeNotifier {
         deliveryAddresses: updated.deliveryAddresses,
       );
       notifyListeners();
+    }
+  }
+
+  /// Soft-deletes the signed-in customer account. Returns null on success.
+  Future<String?> deleteCustomerAccount({required String password}) async {
+    final email = userEmail?.trim().toLowerCase() ?? '';
+    if (email.isEmpty || isGuestSession) return 'Not signed in';
+    if (password.isEmpty) return 'Enter your password to confirm';
+    try {
+      final res = await http
+          .post(
+            _uri('/api/mobile/account/delete'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'user_email': email,
+              'password': password,
+            }),
+          )
+          .timeout(_apiTimeout);
+      if (res.statusCode != 200) {
+        try {
+          final err = jsonDecode(res.body) as Map<String, dynamic>;
+          return '${err['error'] ?? 'Could not delete account'}';
+        } catch (_) {
+          return 'Could not delete account (${res.statusCode})';
+        }
+      }
+      await clearPersistedCustomerDraft();
+      logout();
+      return null;
+    } catch (e) {
+      return describeApiNetworkError(e, normalizeApiBase(apiBase));
     }
   }
 
@@ -6453,6 +6516,10 @@ class _AuthScreenState extends State<AuthScreen> {
                         signupMode ? 'SIGN UP' : 'LOG IN',
                         style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
                       ),
+                      if (!widget.cashierMode) ...[
+                        const SizedBox(height: 10),
+                        const CmsBannerStrip(screenId: 'auth_banner'),
+                      ],
                       const SizedBox(height: 16),
                       _LabeledInput(label: 'EMAIL ADDRESS', controller: emailController),
                       const SizedBox(height: 10),
@@ -8531,6 +8598,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
       body: _verified
           ? Column(
               children: [
+                const CmsBannerStrip(screenId: 'track_orders'),
                 Material(
                   color: Colors.white,
                   child: TabBar(
@@ -8560,6 +8628,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  const CmsBannerStrip(screenId: 'track_orders'),
                   Text(
                     'Enter the email you used when placing your order. We will send a one-time code to verify it is you.',
                     style: TextStyle(height: 1.4, color: Colors.grey.shade800),
@@ -8706,6 +8775,7 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900, color: Colors.grey.shade900),
             ),
+            const CmsBannerStrip(screenId: 'auth_banner'),
             const SizedBox(height: 14),
             _LabeledInput(label: 'EMAIL ADDRESS', controller: emailController),
             const SizedBox(height: 10),
@@ -8991,6 +9061,7 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
 
   Future<void> _bootGuestMenu() async {
     if (widget.state.isGuestSession) {
+      unawaited(MobileUiConfigStore.instance.ensureLoaded());
       if (mounted) setState(() => _booting = false);
       return;
     }
@@ -8999,7 +9070,10 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
       _bootError = null;
     });
     try {
-      await widget.state.enterGuestCheckoutSession(initialShellTabIndex: 0);
+      await Future.wait([
+        widget.state.enterGuestCheckoutSession(),
+        MobileUiConfigStore.instance.ensureLoaded(),
+      ]);
     } catch (e) {
       if (mounted) {
         setState(() => _bootError = describeApiNetworkError(e, normalizeApiBase(widget.state.apiBase)));
@@ -9055,6 +9129,46 @@ class _CustomerGuestLandingBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final cms = MobileUiConfigStore.instance;
+    if (cms.screenHasBlocks('guest_landing')) {
+      return ListenableBuilder(
+        listenable: cms,
+        builder: (context, _) {
+          return CmsScreenBody(
+            screenId: 'guest_landing',
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            onRoute: (route, {url = ''}) {
+              final shell = context.findAncestorStateOfType<_GuestCustomerShellState>();
+              switch (route) {
+                case 'menu':
+                  onOrderNow();
+                  break;
+                case 'inquire':
+                  onInquireCatering();
+                  break;
+                case 'track':
+                  shell?._openTab(2);
+                  break;
+                case 'login':
+                  shell?._openTab(3);
+                  break;
+                case 'url':
+                  if (url.trim().isNotEmpty) {
+                    final uri = Uri.tryParse(url.trim());
+                    if (uri != null) launchUrl(uri, mode: LaunchMode.externalApplication);
+                  }
+                  break;
+              }
+            },
+            fallback: _hardcodedLanding(context),
+          );
+        },
+      );
+    }
+    return _hardcodedLanding(context);
+  }
+
+  Widget _hardcodedLanding(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
       child: Column(
@@ -9216,7 +9330,7 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
   void initState() {
     super.initState();
     _tab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
-    widget.state.guestShellOpenLanding = false;
+    unawaited(MobileUiConfigStore.instance.ensureLoaded());
   }
 
   void _openTab(int i) {
@@ -9258,19 +9372,33 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: widget.state,
+      animation: Listenable.merge([widget.state, MobileUiConfigStore.instance]),
       builder: (context, _) {
         final syncedTab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
-        if (_tab != syncedTab) {
+        if (_tab != syncedTab && !widget.state.guestShellOpenLanding) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) setState(() => _tab = syncedTab);
           });
         }
+        final showLanding = widget.state.guestShellOpenLanding;
         return Scaffold(
           backgroundColor: Colors.white,
-          body: _page(_tab),
+          body: showLanding
+              ? SafeArea(
+                  child: Column(
+                    children: [
+                      Expanded(
+                        child: _CustomerGuestLandingBody(
+                          onOrderNow: () => _openTab(0),
+                          onInquireCatering: () => _openTab(1),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              : _page(_tab),
           bottomNavigationBar: _GuestBottomNavBar(
-            selectedIndex: _tab,
+            selectedIndex: showLanding ? null : _tab,
             onSelected: (i) {
               if (i == 3) {
                 showCustomerAuthDialog(context, widget.state);
@@ -9300,12 +9428,58 @@ class _GuestMenuNavHost extends StatelessWidget {
   }
 }
 
-class CustomerDashboardScreen extends StatelessWidget {
+class CustomerDashboardScreen extends StatefulWidget {
   const CustomerDashboardScreen({super.key, required this.state});
   final AppState state;
 
   @override
+  State<CustomerDashboardScreen> createState() => _CustomerDashboardScreenState();
+}
+
+class _CustomerDashboardScreenState extends State<CustomerDashboardScreen> {
+  @override
+  void initState() {
+    super.initState();
+    unawaited(MobileUiConfigStore.instance.ensureLoaded());
+  }
+
+  void _cmsRoute(String route, {String url = ''}) {
+    final state = widget.state;
+    Widget? screen;
+    switch (route) {
+      case 'menu':
+        screen = RestaurantMenuScreen(state: state);
+        break;
+      case 'inquire':
+        screen = InquiryScreen(state: state);
+        break;
+      case 'tray':
+        screen = TrayScreen(state: state);
+        break;
+      case 'orders':
+        screen = MyOrdersScreen(state: state);
+        break;
+      case 'inquiries':
+        screen = MyInquiriesScreen(state: state);
+        break;
+      case 'settings':
+        screen = MyProfileScreen(state: state);
+        break;
+      case 'url':
+        if (url.trim().isNotEmpty) {
+          final uri = Uri.tryParse(url.trim());
+          if (uri != null) launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
+        return;
+      default:
+        return;
+    }
+    pushScreenOnce(context, screen, routeKey: 'cms:$route');
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final state = widget.state;
     final who = state.profile.fullName.trim().isNotEmpty
         ? state.profile.fullName.trim()
         : (state.userEmail ?? '').trim();
@@ -9386,6 +9560,7 @@ class CustomerDashboardScreen extends StatelessWidget {
           Expanded(
             child: RefreshIndicator(
               onRefresh: () async {
+                await MobileUiConfigStore.instance.ensureLoaded(force: true);
                 final wait = <Future<void>>[
                   state.loadMenu(force: true),
                   state.loadSetMenus(force: true),
@@ -9396,85 +9571,19 @@ class CustomerDashboardScreen extends StatelessWidget {
                 ];
                 await Future.wait(wait);
                 await state.loadNotifications(force: true);
+                if (mounted) setState(() {});
               },
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  return ListView(
-                    physics: const AlwaysScrollableScrollPhysics(),
-                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
-                    children: [
-                      const Text(
-                        'What would you like to do?',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
-                      ),
-                      const SizedBox(height: 12),
-                      Center(
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 520),
-                          child: IntrinsicHeight(
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                for (var i = 0; i < primaryPair.length; i++) ...[
-                                  if (i > 0) const SizedBox(width: 10),
-                                  Expanded(
-                                    child: _CustomerDashTileCard(
-                                      headline: primaryPair[i].headline,
-                                      subtitle: primaryPair[i].subtitle,
-                                      icon: primaryPair[i].icon,
-                                      iconColor: primaryPair[i].iconColor,
-                                      onTap: () => pushScreenOnce(
-                                        context,
-                                        primaryPair[i].screen,
-                                        routeKey: primaryPair[i].subtitle,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 14),
-                      const Divider(height: 1),
-                      const SizedBox(height: 12),
-                      Center(
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 520),
-                          child: GridView.builder(
-                            shrinkWrap: true,
-                            physics: const NeverScrollableScrollPhysics(),
-                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: 2,
-                              crossAxisSpacing: 10,
-                              mainAxisSpacing: 10,
-                              childAspectRatio: 1.35,
-                            ),
-                            itemCount: otherItems.length,
-                            itemBuilder: (context, index) {
-                              final item = otherItems[index];
-                              return _CustomerDashTileCard(
-                                headline: item.title,
-                                icon: item.icon,
-                                iconColor: item.iconColor,
-                                onTap: () {
-                                  if (item.onTap != null) {
-                                    item.onTap!();
-                                    return;
-                                  }
-                                  final screen = item.screen;
-                                  if (screen == null) return;
-                                  pushScreenOnce(context, screen, routeKey: item.title);
-                                },
-                              );
-                            },
-                          ),
-                        ),
-                      ),
-                    ],
-                  );
+              child: ListenableBuilder(
+                listenable: MobileUiConfigStore.instance,
+                builder: (context, _) {
+                  final cms = MobileUiConfigStore.instance.screenHasBlocks('customer_dashboard');
+                  return cms
+                      ? CmsScreenBody(
+                          screenId: 'customer_dashboard',
+                          onRoute: _cmsRoute,
+                          fallback: _hardcodedDashList(context, primaryPair, otherItems),
+                        )
+                      : _hardcodedDashList(context, primaryPair, otherItems);
                 },
               ),
             ),
@@ -9482,6 +9591,93 @@ class CustomerDashboardScreen extends StatelessWidget {
         ],
         ),
       ),
+    );
+  }
+
+  Widget _hardcodedDashList(
+    BuildContext context,
+    List<({String headline, String subtitle, IconData icon, Color iconColor, Widget screen})> primaryPair,
+    List<({String title, IconData icon, Color iconColor, Widget? screen, VoidCallback? onTap})> otherItems,
+  ) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
+          children: [
+            const Text(
+              'What would you like to do?',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+            ),
+            const SizedBox(height: 12),
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 520),
+                child: IntrinsicHeight(
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      for (var i = 0; i < primaryPair.length; i++) ...[
+                        if (i > 0) const SizedBox(width: 10),
+                        Expanded(
+                          child: _CustomerDashTileCard(
+                            headline: primaryPair[i].headline,
+                            subtitle: primaryPair[i].subtitle,
+                            icon: primaryPair[i].icon,
+                            iconColor: primaryPair[i].iconColor,
+                            onTap: () => pushScreenOnce(
+                              context,
+                              primaryPair[i].screen,
+                              routeKey: primaryPair[i].subtitle,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            const Divider(height: 1),
+            const SizedBox(height: 12),
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 520),
+                child: GridView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    crossAxisSpacing: 10,
+                    mainAxisSpacing: 10,
+                    childAspectRatio: 1.35,
+                  ),
+                  itemCount: otherItems.length,
+                  itemBuilder: (context, index) {
+                    final item = otherItems[index];
+                    return _CustomerDashTileCard(
+                      headline: item.title,
+                      icon: item.icon,
+                      iconColor: item.iconColor,
+                      onTap: () {
+                        if (item.onTap != null) {
+                          item.onTap!();
+                          return;
+                        }
+                        final screen = item.screen;
+                        if (screen == null) return;
+                        pushScreenOnce(context, screen, routeKey: item.title);
+                      },
+                    );
+                  },
+                ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -9928,7 +10124,8 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
         final allAlpha = List<MenuItemData>.from(filtered)
           ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
         final subtotal = widget.state.tray.fold<double>(0, (s, e) => s + cartLineSubtotal(e));
-        final menuBody = Column(
+        final useCmsMenu = MobileUiConfigStore.instance.screenHasBlocks('restaurant_menu');
+        final menuChrome = Column(
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
@@ -9937,7 +10134,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                 onChanged: (v) => setState(() => _search = v),
               ),
             ),
-            if (!widget.state.isGuestSession)
+            if (!useCmsMenu && !widget.state.isGuestSession)
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
                 child: Align(
@@ -9979,6 +10176,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
             Expanded(
               child: RefreshIndicator(
                 onRefresh: () async {
+                  await MobileUiConfigStore.instance.ensureLoaded(force: true);
                   await Future.wait([
                     widget.state.loadMenu(force: true),
                     widget.state.loadSetMenus(force: true),
@@ -10010,6 +10208,13 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
             ),
           ],
         );
+        final menuBody = useCmsMenu
+            ? CmsFlexShell(
+                screenId: 'restaurant_menu',
+                slots: {'menu_body': Expanded(child: menuChrome)},
+                fallback: menuChrome,
+              )
+            : menuChrome;
         return AppScaffold(
           state: widget.state,
           title: 'MENU',
@@ -11753,6 +11958,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                 physics: const AlwaysScrollableScrollPhysics(),
                 padding: const EdgeInsets.all(12),
                 children: [
+                const CmsBannerStrip(screenId: 'checkout_banner'),
                 ToggleSection(
                   title: 'DELIVERY INFORMATION',
                   expanded: showDelivery,
@@ -11925,10 +12131,11 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                         ],
                       ),
                       const SizedBox(height: 6),
-                      Text(
-                        kRestaurantHoursHint,
-                        style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3),
-                      ),
+                      if (!MobileUiConfigStore.instance.screenHasBlocks('checkout_banner'))
+                        Text(
+                          kRestaurantHoursHint,
+                          style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3),
+                        ),
                       if (!asapAvailable) ...[
                         const SizedBox(height: 4),
                         Text(
@@ -13703,6 +13910,10 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
           title: 'MY ORDERS',
           body: Column(
             children: [
+              const Padding(
+                padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: CmsBannerStrip(screenId: 'my_orders'),
+              ),
               Padding(
                 padding: const EdgeInsets.all(12),
                 child: Row(
@@ -15776,28 +15987,54 @@ class _InquiryScreenState extends State<InquiryScreen> {
   }
 
   Widget _buildInquiryPackagesStep() {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        inquiryWizardTile(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: const [
-              Text(
-                'Review our catering packages',
-                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+    final useCms = MobileUiConfigStore.instance.screenHasBlocks('inquire_packages');
+    final packagesContent = useCms
+        ? CmsScreenBody(
+            screenId: 'inquire_packages',
+            padding: const EdgeInsets.all(16),
+            fallback: inquiryWizardTile(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: const [
+                  Text(
+                    'Review our catering packages',
+                    style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                  ),
+                  SizedBox(height: 12),
+                  _CateringPackagesPanel(),
+                ],
               ),
-              SizedBox(height: 12),
-              _CateringPackagesPanel(),
+            ),
+          )
+        : ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              inquiryWizardTile(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: const [
+                    Text(
+                      'Review our catering packages',
+                      style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                    ),
+                    SizedBox(height: 12),
+                    _CateringPackagesPanel(),
+                  ],
+                ),
+              ),
             ],
-          ),
-        ),
-        const SizedBox(height: 20),
-        SizedBox(
-          width: double.infinity,
-          child: FilledButton(
-            onPressed: () => setState(() => _inquiryStep = 1),
-            child: const Text('NEXT'),
+          );
+    return Column(
+      children: [
+        Expanded(child: packagesContent),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: SizedBox(
+            width: double.infinity,
+            child: FilledButton(
+              onPressed: () => setState(() => _inquiryStep = 1),
+              child: const Text('NEXT'),
+            ),
           ),
         ),
       ],
@@ -16802,19 +17039,32 @@ class _InquiryScreenState extends State<InquiryScreen> {
       state: state,
       title: 'INQUIRE CATERING SERVICE',
       showTrayShortcut: false,
-      body: Column(
-        children: [
-          _InquiryWizardProgressBar(currentStep: _inquiryStep),
-          Expanded(
-            child: switch (_inquiryStep) {
-              0 => _buildInquiryPackagesStep(),
-              1 => _buildInquiryGuestsStep(),
-              2 => formColumn,
-              3 => _buildInquiryCompletedStep(),
-              _ => _buildInquiryPackagesStep(),
-            },
-          ),
-        ],
+      body: ListenableBuilder(
+        listenable: MobileUiConfigStore.instance,
+        builder: (context, _) {
+          final wizard = Column(
+            children: [
+              _InquiryWizardProgressBar(currentStep: _inquiryStep),
+              Expanded(
+                child: switch (_inquiryStep) {
+                  0 => _buildInquiryPackagesStep(),
+                  1 => _buildInquiryGuestsStep(),
+                  2 => formColumn,
+                  3 => _buildInquiryCompletedStep(),
+                  _ => _buildInquiryPackagesStep(),
+                },
+              ),
+            ],
+          );
+          if (!MobileUiConfigStore.instance.screenHasBlocks('inquire_form_chrome')) {
+            return wizard;
+          }
+          return CmsFlexShell(
+            screenId: 'inquire_form_chrome',
+            slots: {'inquire_wizard': Expanded(child: wizard)},
+            fallback: wizard,
+          );
+        },
       ),
     );
   }
@@ -17490,11 +17740,13 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
             padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
             child: Align(
               alignment: Alignment.center,
-              child: Text(
-                kCustomerCateringInquiriesAreaNotice,
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
-              ),
+              child: MobileUiConfigStore.instance.screenHasBlocks('my_inquiries')
+                  ? const CmsBannerStrip(screenId: 'my_inquiries')
+                  : Text(
+                      kCustomerCateringInquiriesAreaNotice,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 12, height: 1.35, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
+                    ),
             ),
           ),
           TabBar(
@@ -17590,6 +17842,69 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _confirmDeleteAccount() async {
+    final passwordCtl = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete account?'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'This removes your login and profile. Past orders stay on file for the restaurant but you will not be able to sign in with this email again unless you create a new account.',
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: passwordCtl,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Confirm with password',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete account'),
+          ),
+        ],
+      ),
+    );
+    final password = passwordCtl.text;
+    passwordCtl.dispose();
+    if (confirmed != true || !mounted) return;
+    if (password.trim().isEmpty) {
+      appSnack(context, 'Enter your password to delete your account.');
+      return;
+    }
+    setState(() => _loggingOut = true);
+    try {
+      final err = await widget.state.deleteCustomerAccount(password: password);
+      if (!mounted) return;
+      if (err != null) {
+        appSnack(context, err);
+        return;
+      }
+      await Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+        MaterialPageRoute<void>(
+          builder: (_) => CustomerPreAuthShell(state: widget.state),
+        ),
+        (_) => false,
+      );
+      if (mounted) appSnack(context, 'Your account has been deleted.');
+    } finally {
+      if (mounted) setState(() => _loggingOut = false);
+    }
+  }
+
   void _openHelp() {
     showDialog<void>(
       context: context,
@@ -17650,6 +17965,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       padding: const EdgeInsets.all(14),
       child: RefreshIndicator(
         onRefresh: () async {
+          await MobileUiConfigStore.instance.ensureLoaded(force: true);
           if (widget.state.userRole == 'customer') {
             await widget.state.loadProfile(force: true);
             if (mounted) setState(() {});
@@ -17660,6 +17976,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              const CmsBannerStrip(screenId: 'settings'),
               if (widget.state.isManagerOrSupervisor)
                 const ListTile(
                   leading: Icon(Icons.restaurant_menu),
@@ -17720,6 +18037,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 subtitle: const Text('Describe your issue so we can help'),
                 onTap: _openHelp,
               ),
+              if (widget.state.userEmail != null &&
+                  !widget.state.isGuestSession &&
+                  widget.state.userRole == 'customer')
+                ListTile(
+                  leading: Icon(Icons.delete_forever_outlined, color: Colors.red.shade700),
+                  title: Text('Delete account', style: TextStyle(color: Colors.red.shade800)),
+                  subtitle: const Text('Permanently remove your login and profile data'),
+                  onTap: _confirmDeleteAccount,
+                ),
               if (widget.state.userEmail != null && !widget.state.isGuestSession)
                 ListTile(
                   leading: const Icon(Icons.logout),

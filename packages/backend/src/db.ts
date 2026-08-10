@@ -234,10 +234,17 @@ export async function initDb(): Promise<void> {
   // Keep web PK `id` (UUID) separate from business `order_id` (ORD-*). repairRestaurantOrdersIdentity() in schemaNormalize fixes mistaken renames.
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS id UUID`);
   await p.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
-  try {
-    await p.query(`ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_status_check`);
-  } catch {
-    // Constraint may not exist in all environments.
+  // Mobile/POS use free-form statuses (PENDING_CASHIER, ORDER CONFIRMED, WAITING FOR BALANCE…).
+  // Drop both legacy constraint names — a narrow snake_case CHECK blocks payment uploads and stage moves.
+  for (const constraint of [
+    "restaurant_orders_status_check",
+    "restaurant_orders_order_status_check",
+  ]) {
+    try {
+      await p.query(`ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS ${constraint}`);
+    } catch {
+      // Constraint may not exist in all environments.
+    }
   }
   if (await columnExists(p, "restaurant_orders", "status")) {
     await p.query(`

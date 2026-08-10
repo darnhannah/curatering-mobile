@@ -756,8 +756,10 @@ async function normalizeCustomerAccountsAndMergeProfiles(pool: pg.Pool): Promise
   await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS contact_number TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS signup_otp_code TEXT`);
   await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS signup_otp_code_expiry TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS signup_otp_expires_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS forgot_password_otp_code TEXT`);
   await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS forgot_password_otp_code_expiry TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(
     `ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS restaurant_loyalty_points INTEGER NOT NULL DEFAULT 0`,
   );
@@ -1057,6 +1059,11 @@ async function repairRestaurantOrdersIdentityInner(pool: pg.Pool): Promise<void>
 
 async function normalizeRestaurantOrders(pool: pg.Pool): Promise<void> {
   if (!(await tableExists(pool, "restaurant_orders"))) return;
+
+  // App statuses are free-form labels; never keep a restrictive CHECK that only allows
+  // pending_cashier / in_preparation / out_for_delivery / delivered / cancelled.
+  await safeExec(pool, `ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_status_check`);
+  await safeExec(pool, `ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_order_status_check`);
 
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS order_id TEXT`);
   await pool.query(`ALTER TABLE restaurant_orders ADD COLUMN IF NOT EXISTS pos_customer_label TEXT`);
