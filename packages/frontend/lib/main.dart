@@ -1208,6 +1208,61 @@ String cateringCoverageErrorText() {
   return 'Service area is limited to NCR, Bulacan, Cavite, Rizal, and Laguna (Philippines).';
 }
 
+/// Letters and spaces only (e.g. "Juan Dela Cruz").
+final RegExp kAlphabetNamePattern = RegExp(r'^[A-Za-z]+(?:\s+[A-Za-z]+)*$');
+
+/// Basic email shape: local@domain.tld
+final RegExp kEmailFormatPattern = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
+/// Digits only (no spaces, dashes, or +).
+final RegExp kPhoneDigitsPattern = RegExp(r'^\d+$');
+
+TextInputFormatter get alphabetNameInputFormatter =>
+    FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z\s]'));
+
+bool isValidAlphabetName(String value) {
+  final t = value.trim();
+  if (t.isEmpty) return false;
+  return kAlphabetNamePattern.hasMatch(t);
+}
+
+String? alphabetNameError(String value, {String label = 'name'}) {
+  final t = value.trim();
+  if (t.isEmpty) return 'Enter $label.';
+  if (!isValidAlphabetName(t)) return 'Invalid $label format (letters only).';
+  return null;
+}
+
+bool isValidEmailFormat(String value) {
+  final t = value.trim();
+  if (t.isEmpty) return false;
+  return kEmailFormatPattern.hasMatch(t);
+}
+
+String? emailFormatError(String value, {bool required = true}) {
+  final t = value.trim();
+  if (t.isEmpty) return required ? 'Enter email address.' : null;
+  if (!isValidEmailFormat(t)) return 'Invalid email format.';
+  return null;
+}
+
+bool isValidPhoneDigits(String value, {int minLen = 7, int maxLen = 11}) {
+  final t = value.trim();
+  if (t.isEmpty) return false;
+  if (!kPhoneDigitsPattern.hasMatch(t)) return false;
+  return t.length >= minLen && t.length <= maxLen;
+}
+
+String? phoneDigitsError(String value, {int minLen = 7, int maxLen = 11}) {
+  final t = value.trim();
+  if (t.isEmpty) return 'Enter contact number.';
+  if (!kPhoneDigitsPattern.hasMatch(t)) return 'Invalid phone number format (digits only).';
+  if (t.length < minLen || t.length > maxLen) {
+    return 'Contact number must be $minLen–$maxLen digits.';
+  }
+  return null;
+}
+
 /// Shown at top of Restaurant Menu and My Catering Inquiries for customer awareness.
 const String kCustomerOnlineOrdersAreaNotice =
     'Online orders are available within 5 km of our restaurant in Taguig City.';
@@ -3486,6 +3541,8 @@ class AppState extends ChangeNotifier {
   }
 
   Future<String?> requestSignupOtp(String email) async {
+    final emailErr = emailFormatError(email);
+    if (emailErr != null) return emailErr;
     try {
       final res = await http
           .post(
@@ -4944,16 +5001,17 @@ class AppState extends ChangeNotifier {
       if (nameParts.length < 2 || nameParts.sublist(1).join(' ').trim().isEmpty) {
         return SubmitOrderResult(error: 'Enter your last name.');
       }
-      if (profile.contactNumber.trim().isEmpty) {
-        return SubmitOrderResult(error: 'Enter your contact number.');
-      }
+      final firstErr = alphabetNameError(nameParts.first, label: 'first name');
+      if (firstErr != null) return SubmitOrderResult(error: firstErr);
+      final lastErr = alphabetNameError(nameParts.sublist(1).join(' '), label: 'last name');
+      if (lastErr != null) return SubmitOrderResult(error: lastErr);
+      final phoneErr = phoneDigitsError(profile.contactNumber);
+      if (phoneErr != null) return SubmitOrderResult(error: phoneErr);
       if (profile.deliveryAddress.trim().isEmpty) {
         return SubmitOrderResult(error: 'Enter your delivery address.');
       }
-      final em = profile.contactEmail.trim();
-      if (em.isEmpty || !em.contains('@') || !em.contains('.')) {
-        return SubmitOrderResult(error: 'Enter a valid contact email.');
-      }
+      final emailErr = emailFormatError(profile.contactEmail);
+      if (emailErr != null) return SubmitOrderResult(error: emailErr);
       if (checkoutDeliveryTime.trim().isEmpty) {
         return SubmitOrderResult(error: 'Choose a delivery time.');
       }
@@ -5261,8 +5319,9 @@ class AppState extends ChangeNotifier {
   }
 
   Future<String?> requestGuestTrackOtp(String email) async {
+    final emailErr = emailFormatError(email);
+    if (emailErr != null) return emailErr;
     final em = email.trim().toLowerCase();
-    if (!em.contains('@')) return 'Enter a valid email address';
     try {
       final res = await http
           .post(
@@ -5349,8 +5408,9 @@ class AppState extends ChangeNotifier {
   ) async {
     final em = email.trim().toLowerCase();
     final code = otp.trim();
-    if (!em.contains('@')) {
-      return (error: 'Enter a valid email address', orders: <OrderData>[], inquiries: <InquiryRecord>[]);
+    final emailErr = emailFormatError(em);
+    if (emailErr != null) {
+      return (error: emailErr, orders: <OrderData>[], inquiries: <InquiryRecord>[]);
     }
     if (code.isEmpty) {
       return (error: 'Enter the verification code from your email', orders: <OrderData>[], inquiries: <InquiryRecord>[]);
@@ -6531,6 +6591,11 @@ class _AuthScreenState extends State<AuthScreen> {
                           onPressed: busyMessage != null
                               ? null
                               : () async {
+                                  final emailErr = emailFormatError(emailController.text);
+                                  if (emailErr != null) {
+                                    await _toast(emailErr);
+                                    return;
+                                  }
                                   setState(() => busyMessage = 'Sending code...');
                                   try {
                                     final err = await widget.state.requestSignupOtp(emailController.text);
@@ -6667,6 +6732,11 @@ class _AuthScreenState extends State<AuthScreen> {
                           onPressed: busyMessage != null
                               ? null
                               : () async {
+                                  final emailErr = emailFormatError(emailController.text);
+                                  if (emailErr != null) {
+                                    await _toast(emailErr);
+                                    return;
+                                  }
                                   setState(() => busyMessage = 'Logging in...');
                                   try {
                                     final err = await widget.state.login(
@@ -6766,7 +6836,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                             fillColor: Colors.white,
                                             border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                                           );
-                                      bool emailOk(String v) => v.contains('@') && v.contains('.');
+                                      bool emailOk(String v) => isValidEmailFormat(v);
                                       String? emailForRequest() {
                                         final v = forgotEmailController.text.trim().toLowerCase();
                                         return v.isEmpty ? null : v;
@@ -8263,6 +8333,11 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
   }
 
   Future<void> _sendOtp() async {
+    final emailErr = emailFormatError(emailController.text);
+    if (emailErr != null) {
+      setState(() => _error = emailErr);
+      return;
+    }
     setState(() {
       _busy = true;
       _error = null;
@@ -8786,6 +8861,11 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
                 onPressed: busy != null
                     ? null
                     : () async {
+                        final emailErr = emailFormatError(emailController.text);
+                        if (emailErr != null) {
+                          await _toast(emailErr);
+                          return;
+                        }
                         setState(() => busy = 'Sending code…');
                         try {
                           final err = await state.requestSignupOtp(emailController.text);
@@ -8882,6 +8962,11 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
                 onPressed: busy != null
                     ? null
                     : () async {
+                        final emailErr = emailFormatError(emailController.text);
+                        if (emailErr != null) {
+                          await _toast(emailErr);
+                          return;
+                        }
                         setState(() => busy = 'Logging in…');
                         try {
                           final err = await state.login(emailController.text, passwordController.text);
@@ -11969,12 +12054,16 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                         TextField(
                           controller: _guestFirstNameCtl,
                           decoration: const InputDecoration(labelText: 'FIRST NAME'),
+                          inputFormatters: [alphabetNameInputFormatter],
+                          textCapitalization: TextCapitalization.words,
                           onChanged: (_) => _syncGuestFullName(),
                         ),
                         const SizedBox(height: 10),
                         TextField(
                           controller: _guestLastNameCtl,
                           decoration: const InputDecoration(labelText: 'LAST NAME'),
+                          inputFormatters: [alphabetNameInputFormatter],
+                          textCapitalization: TextCapitalization.words,
                           onChanged: (_) => _syncGuestFullName(),
                         ),
                         const SizedBox(height: 10),
@@ -12202,21 +12291,24 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   contactEmail: _guestEmailCtl.text.trim(),
                   deliveryAddress: _guestDeliveryCtl.text.trim(),
                 );
-                if (_guestFirstNameCtl.text.trim().isEmpty) {
-                  appSnack(context, 'Enter your first name.');
+                final firstErr = alphabetNameError(_guestFirstNameCtl.text, label: 'first name');
+                if (firstErr != null) {
+                  appSnack(context, firstErr);
                   return;
                 }
-                if (_guestLastNameCtl.text.trim().isEmpty) {
-                  appSnack(context, 'Enter your last name.');
+                final lastErr = alphabetNameError(_guestLastNameCtl.text, label: 'last name');
+                if (lastErr != null) {
+                  appSnack(context, lastErr);
                   return;
                 }
-                if (s.profile.contactNumber.trim().isEmpty) {
-                  appSnack(context, 'Enter your contact number.');
+                final phoneErr = phoneDigitsError(_guestContactCtl.text);
+                if (phoneErr != null) {
+                  appSnack(context, phoneErr);
                   return;
                 }
-                final em = s.profile.contactEmail.trim();
-                if (em.isEmpty || !em.contains('@') || !em.contains('.')) {
-                  appSnack(context, 'Enter a valid email address.');
+                final emailErr = emailFormatError(_guestEmailCtl.text);
+                if (emailErr != null) {
+                  appSnack(context, emailErr);
                   return;
                 }
                 if (s.profile.deliveryAddress.trim().isEmpty) {
@@ -14319,7 +14411,12 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                 child: ListView(
                   physics: const AlwaysScrollableScrollPhysics(),
                   children: [
-                  TextField(controller: nameController, decoration: const InputDecoration(labelText: 'Full Name')),
+                  TextField(
+                    controller: nameController,
+                    decoration: const InputDecoration(labelText: 'Full Name'),
+                    inputFormatters: [alphabetNameInputFormatter],
+                    textCapitalization: TextCapitalization.words,
+                  ),
                   const SizedBox(height: 10),
                   TextField(
                     controller: contactController,
@@ -14517,6 +14614,16 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
             ),
             FilledButton(
               onPressed: () async {
+                final nameErr = alphabetNameError(nameController.text, label: 'full name');
+                if (nameErr != null) {
+                  if (mounted) appSnack(context, nameErr);
+                  return;
+                }
+                final phoneErr = phoneDigitsError(contactController.text);
+                if (phoneErr != null) {
+                  if (mounted) appSnack(context, phoneErr);
+                  return;
+                }
                 final primary = addressController.text.trim();
                 if (primary.isNotEmpty) {
                   if (mapLat == null || mapLng == null) {
@@ -15795,16 +15902,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
   }
 
   bool get _contactNumberInvalid {
-    final phone = contactNumber.text.trim();
-    if (phone.isEmpty) return true;
-    if (phone.length > 11) return true;
-    return phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone);
+    return phoneDigitsError(contactNumber.text) != null;
   }
 
   bool get _emailInvalid {
-    final email = inquiryEmail.text.trim();
-    if (email.isEmpty) return true;
-    return !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email);
+    return emailFormatError(inquiryEmail.text) != null;
   }
 
   bool get _eventTypeOtherInvalid => eventTypeChoice == 'Other' && eventTypeOther.text.trim().isEmpty;
@@ -15885,19 +15987,14 @@ class _InquiryScreenState extends State<InquiryScreen> {
 
   /// Returns null if valid; otherwise an error message for the user.
   String? _validateInquiry() {
-    if (customerName.text.trim().isEmpty) return 'Enter customer name.';
-    if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
-    final phone = contactNumber.text.trim();
-    if (phone.isEmpty) return 'Enter contact number.';
-    if (phone.length > 11) return 'Contact number must be at most 11 characters.';
-    if (phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone)) {
-      return 'Enter a valid contact number.';
-    }
-    final email = inquiryEmail.text.trim();
-    if (email.isEmpty) return 'Enter email address.';
-    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
-      return 'Enter a valid email address.';
-    }
+    final customerErr = alphabetNameError(customerName.text, label: 'customer name');
+    if (customerErr != null) return customerErr;
+    final contactErr = alphabetNameError(contactPerson.text, label: 'contact person');
+    if (contactErr != null) return contactErr;
+    final phoneErr = phoneDigitsError(contactNumber.text);
+    if (phoneErr != null) return phoneErr;
+    final emailErr = emailFormatError(inquiryEmail.text);
+    if (emailErr != null) return emailErr;
     if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
     if (!isAllowedCateringAddressInCoverage(eventCity.text.trim())) {
       return cateringCoverageErrorText();
@@ -16241,8 +16338,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         controller: customerName,
                         decoration: _requiredDecoration(
                           label: 'Customer',
-                          invalid: customerName.text.trim().isEmpty,
+                          invalid: alphabetNameError(customerName.text, label: 'customer name') != null,
                         ),
+                        inputFormatters: [alphabetNameInputFormatter],
+                        textCapitalization: TextCapitalization.words,
                         onChanged: (_) => setState(() {}),
                       ),
                       const SizedBox(height: 2),
@@ -16276,8 +16375,11 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         controller: contactPerson,
                         decoration: _requiredDecoration(
                           label: 'Contact person',
-                          invalid: contactPerson.text.trim().isEmpty,
+                          invalid: alphabetNameError(contactPerson.text, label: 'contact person') != null,
                         ),
+                        inputFormatters: [alphabetNameInputFormatter],
+                        textCapitalization: TextCapitalization.words,
+                        onChanged: (_) => setState(() {}),
                       ),
                       const SizedBox(height: 8),
                       TextField(
@@ -19195,19 +19297,14 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
   }
 
   String? _validateManagerNewEvent() {
-    if (customerName.text.trim().isEmpty) return 'Enter customer name.';
-    if (contactPerson.text.trim().isEmpty) return 'Enter contact person.';
-    final phone = contactNumber.text.trim();
-    if (phone.isEmpty) return 'Enter contact number.';
-    if (phone.length > 11) return 'Contact number must be at most 11 characters.';
-    if (phone.length < 7 || !RegExp(r'^[0-9+\-\s()]+$').hasMatch(phone)) {
-      return 'Enter a valid contact number.';
-    }
-    final email = inquiryEmail.text.trim();
-    if (email.isEmpty) return 'Enter email address.';
-    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
-      return 'Enter a valid email address.';
-    }
+    final customerErr = alphabetNameError(customerName.text, label: 'customer name');
+    if (customerErr != null) return customerErr;
+    final contactErr = alphabetNameError(contactPerson.text, label: 'contact person');
+    if (contactErr != null) return contactErr;
+    final phoneErr = phoneDigitsError(contactNumber.text);
+    if (phoneErr != null) return phoneErr;
+    final emailErr = emailFormatError(inquiryEmail.text);
+    if (emailErr != null) return emailErr;
     if (eventCity.text.trim().isEmpty) return 'Enter event venue.';
     if (!isAllowedCateringAddressInCoverage(eventCity.text.trim())) {
       return cateringCoverageErrorText();
@@ -19665,8 +19762,10 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 controller: customerName,
                 decoration: const InputDecoration(
                   labelText: 'Customer',
-                  helperText: 'Required',
+                  helperText: 'Required · letters only',
                 ),
+                inputFormatters: [alphabetNameInputFormatter],
+                textCapitalization: TextCapitalization.words,
               ),
               const SizedBox(height: 2),
               CheckboxListTile(
@@ -19693,7 +19792,15 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                 ),
               ),
               const SizedBox(height: 8),
-              TextField(controller: contactPerson, decoration: const InputDecoration(labelText: 'Contact person')),
+              TextField(
+                controller: contactPerson,
+                decoration: const InputDecoration(
+                  labelText: 'Contact person',
+                  helperText: 'Letters only',
+                ),
+                inputFormatters: [alphabetNameInputFormatter],
+                textCapitalization: TextCapitalization.words,
+              ),
               const SizedBox(height: 8),
               TextField(
                 controller: contactNumber,
@@ -23109,6 +23216,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       if (managerCustomerNameController.text.trim().isEmpty) {
         return 'Enter the customer name.';
       }
+      final customerErr = alphabetNameError(managerCustomerNameController.text, label: 'customer name');
+      if (customerErr != null) return customerErr;
+      final contactErr = alphabetNameError(managerContactPersonController.text, label: 'contact person');
+      if (contactErr != null) return contactErr;
+      final phoneErr = phoneDigitsError(managerContactNumberController.text);
+      if (phoneErr != null) return phoneErr;
+      final emailErr = emailFormatError(managerEmailController.text);
+      if (emailErr != null) return emailErr;
       if (widget.stage == 'new_event' && managerDraftEventTitleController.text.trim().isEmpty) {
         return 'Enter event title.';
       }
@@ -25019,8 +25134,10 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                       readOnly: !canEditStage,
                       decoration: const InputDecoration(
                         labelText: 'Customer',
-                        helperText: 'Required',
+                        helperText: 'Required · letters only',
                       ),
+                      inputFormatters: [alphabetNameInputFormatter],
+                      textCapitalization: TextCapitalization.words,
                     ),
                     const SizedBox(height: 2),
                     CheckboxListTile(
@@ -25053,7 +25170,12 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
                     TextField(
                       controller: managerContactPersonController,
                       readOnly: !canEditStage,
-                      decoration: const InputDecoration(labelText: 'Contact person'),
+                      decoration: const InputDecoration(
+                        labelText: 'Contact person',
+                        helperText: 'Letters only',
+                      ),
+                      inputFormatters: [alphabetNameInputFormatter],
+                      textCapitalization: TextCapitalization.words,
                     ),
                     const SizedBox(height: 8),
                     TextField(
