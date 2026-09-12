@@ -3409,10 +3409,22 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
   try {
     await ensureRestaurantOrderApiColumnsOnce();
     // Free-form payment/fulfillment statuses must not be blocked by a narrow CHECK.
-    await getPool().query(`ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_status_check`);
-    await getPool().query(
-      `ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS restaurant_orders_order_status_check`,
-    );
+    // (Web migrations used to recreate this; drop on every payment write.)
+    for (const constraint of [
+      "restaurant_orders_status_check",
+      "restaurant_orders_order_status_check",
+    ]) {
+      try {
+        await getPool().query(
+          `ALTER TABLE restaurant_orders DROP CONSTRAINT IF EXISTS ${constraint}`,
+        );
+      } catch (dropErr) {
+        console.warn(
+          `[payment] could not drop ${constraint}:`,
+          dropErr instanceof Error ? dropErr.message : dropErr,
+        );
+      }
+    }
     const { rows: found } = await getPool().query(
       `SELECT mobile_id AS id,
               COALESCE(order_status, 'PENDING_CASHIER') AS status,
@@ -3526,8 +3538,20 @@ app.patch("/api/mobile/orders/:id/payment", async (req, res) => {
     });
     res.json(rows[0]);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "database error" });
+    console.error("[payment] upload failed:", err);
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/order_status_check|violates check constraint/i.test(msg)) {
+      res.status(500).json({
+        error:
+          "Order status constraint blocked this upload. Please try again — the server is clearing a legacy database rule.",
+      });
+      return;
+    }
+    if (/value too long|payload|request entity too large/i.test(msg)) {
+      res.status(413).json({ error: "Payment proof image is too large. Try a smaller photo." });
+      return;
+    }
+    res.status(500).json({ error: "database error", detail: msg.slice(0, 200) });
   }
 });
 
