@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'api_config.dart';
 import 'event_design_categories.dart';
 import '../seating/seating_plan.dart';
+import '../../utils/theme_design_venue_refs.dart';
 
 class EventsFeatureApi {
   EventsFeatureApi({required this.apiBase});
@@ -91,17 +92,19 @@ class EventsFeatureApi {
     String? cashierEmail,
     String? cashierPassword,
   }) async {
-    final res = await http.put(
-      _uri('/api/mobile/events/$orderId/theme-design'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'order_kind': orderKind,
-        'user_email': userEmail,
-        if (cashierEmail != null) 'cashier_email': cashierEmail,
-        if (cashierPassword != null) 'cashier_password': cashierPassword,
-        'theme_design': themeDesign,
-      }),
-    );
+    final res = await http
+        .put(
+          _uri('/api/mobile/events/$orderId/theme-design'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'order_kind': orderKind,
+            'user_email': userEmail,
+            if (cashierEmail != null) 'cashier_email': cashierEmail,
+            if (cashierPassword != null) 'cashier_password': cashierPassword,
+            'theme_design': slimThemeDesignForPersist(themeDesign),
+          }),
+        )
+        .timeout(const Duration(seconds: 120));
     if (res.statusCode != 200) {
       throw Exception(_errorFromBody(res.body) ?? 'Could not save theme design');
     }

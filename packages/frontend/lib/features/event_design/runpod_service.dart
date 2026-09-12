@@ -170,15 +170,15 @@ class RunPodService {
     }
   }
 
-  /// RunPod execution timeout is often 600s; poll long enough for cold GPU + inference.
-  static const int _pollIntervalSeconds = 5;
-  static const int _maxPollAttempts = 130;
+  /// Prefer faster completion; cold GPU + full 600s executionTimeout felt like “>10 min”.
+  static const int _pollIntervalSeconds = 4;
+  static const int _maxPollAttempts = 90; // ~6 minutes
 
   static String _formatRunpodFailure(Map<String, dynamic> data) {
     final err = data['error']?.toString() ?? 'Unknown error';
     if (err.contains('executionTimeout')) {
-      return 'AI generation exceeded the server time limit (~10 min). '
-          'Redeploy the RunPod worker image, then try again — the second attempt is usually faster.';
+      return 'AI generation exceeded the server time limit. '
+          'Try again with a clearer venue photo — the second attempt is usually faster.';
     }
     return 'Job failed: $err';
   }

@@ -627,6 +627,50 @@ function toNum(v: unknown, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/** Drop multi‑MB venue blobs before JSONB persist (keep URLs + small refs). */
+function slimThemeDesignForPersist(themeDesign: unknown): Record<string, unknown> {
+  if (!themeDesign || typeof themeDesign !== "object" || Array.isArray(themeDesign)) {
+    return {};
+  }
+  const out: Record<string, unknown> = { ...(themeDesign as Record<string, unknown>) };
+  const dropIfHuge = [
+    "venuePhotoBase64",
+    "venue_photo_base64",
+    "picksBase64",
+    "picks_base64",
+    "generatedImageBase64",
+    "generated_image_base64",
+  ];
+  for (const key of dropIfHuge) {
+    const v = out[key];
+    if (typeof v === "string" && v.length > 200_000) delete out[key];
+  }
+  const slimList = (raw: unknown, maxItems = 2): string[] => {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((v) => String(v ?? "").trim())
+      .filter((v) => v.length > 0 && v.length <= 200_000)
+      .slice(0, maxItems);
+  };
+  const photos = slimList(out.venuePhotos);
+  if (photos.length) {
+    out.venuePhotos = photos;
+    out.venuePhotoBase64 = photos[0];
+  } else {
+    delete out.venuePhotos;
+  }
+  const refs = slimList(out.reference_images);
+  if (refs.length) out.reference_images = refs;
+  else delete out.reference_images;
+  if (Array.isArray(out.previousGeneratedImageUrls)) {
+    out.previousGeneratedImageUrls = out.previousGeneratedImageUrls
+      .map((v) => String(v ?? "").trim())
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+  return out;
+}
+
 function normalizeServiceIncluded(v: unknown): "yes" | "no" {
   return String(v ?? "no").trim().toLowerCase() === "yes" ? "yes" : "no";
 }
@@ -4451,10 +4495,11 @@ app.post("/api/mobile/inquiries", async (req, res) => {
     const inquiryAdditionalCosts = inquiryAdditionalCostsFromBody(bodyRec);
     const laborCost = toNum(req.body?.labor_cost, 0);
     const travelCost = toNum(req.body?.travel_cost, 0);
-    const themeFromClient =
+    const themeFromClient = slimThemeDesignForPersist(
       req.body?.theme_design != null && typeof req.body.theme_design === "object"
         ? (req.body.theme_design as Record<string, unknown>)
-        : {};
+        : {},
+    );
     const themeDesignMerged: Record<string, unknown> = {
       inquiry_type: inquiryType,
       service_included: serviceIncluded,
@@ -4898,10 +4943,11 @@ app.post("/api/mobile/pos/catering/new-event", async (req, res) => {
   const paymentMethod = String(req.body?.payment_method ?? "cash").trim().toLowerCase();
   const costBreakdown = Array.isArray(req.body?.cost_breakdown) ? req.body.cost_breakdown : [];
   const bodyRec = req.body as Record<string, unknown>;
-  const themeDesign =
+  const themeDesign = slimThemeDesignForPersist(
     req.body?.theme_design != null && typeof req.body.theme_design === "object"
       ? (req.body.theme_design as Record<string, unknown>)
-      : {};
+      : {},
+  );
   const serviceIncluded = normalizeServiceIncluded(themeDesign.service_included ?? req.body?.service_included);
   const menuMod = menuModificationsFromBody(bodyRec);
   const selectedSetMenu = String(req.body?.selected_set_menu ?? themeDesign.selected_set_menu ?? "").trim();

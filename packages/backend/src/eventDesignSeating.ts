@@ -207,13 +207,54 @@ function imageUrlFromRunpodOutput(output: unknown): string | null {
 async function runpodRun(input: Record<string, unknown>): Promise<Record<string, unknown>> {
   const cfg = runpodConfig();
   if (!cfg) throw new Error("RunPod is not configured on the server (RUNPOD_API_KEY / RUNPOD_ENDPOINT_ID)");
+
+  // Cap heavy init images so workers finish sooner.
+  const prepared: Record<string, unknown> = { ...input };
+  if (typeof prepared.init_image_base64 === "string" && prepared.init_image_base64.length > 2_500_000) {
+    prepared.init_image_base64 = prepared.init_image_base64.slice(0, 2_500_000);
+  }
+  if (prepared.output_format == null) prepared.output_format = "jpg";
+  if (prepared.num_inference_steps == null) prepared.num_inference_steps = 22;
+
+  // Prefer runsync (often 1–3 min). Fall back to async /run for long cold starts.
+  try {
+    const syncTimeoutMs = Math.max(60_000, Number(process.env.RUNPOD_RUNSYNC_TIMEOUT_MS || 180_000));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), syncTimeoutMs);
+    try {
+      const syncRes = await fetch(`https://api.runpod.ai/v2/${cfg.endpointId}/runsync`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${cfg.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: prepared }),
+        signal: controller.signal,
+      });
+      const syncData = (await syncRes.json()) as Record<string, unknown>;
+      if (syncRes.ok) {
+        console.log("[runpod] runsync:", syncData.id ?? "(no id)", "status:", syncData.status);
+        return syncData;
+      }
+      console.warn(
+        "[runpod] runsync non-OK, falling back to /run:",
+        syncRes.status,
+        String(syncData.error ?? syncData.message ?? "").slice(0, 200),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    console.warn("[runpod] runsync failed, falling back to /run:", e instanceof Error ? e.message : e);
+  }
+
   const res = await fetch(`https://api.runpod.ai/v2/${cfg.endpointId}/run`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${cfg.apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ input }),
+    body: JSON.stringify({ input: prepared }),
   });
   const data = (await res.json()) as Record<string, unknown>;
   if (!res.ok) {
@@ -417,7 +458,28 @@ export function registerEventDesignSeatingRoutes(app: Express, deps: Deps): void
         access.row.theme_design && typeof access.row.theme_design === "object"
           ? (access.row.theme_design as Record<string, unknown>)
           : {};
-      const merged = { ...existing, ...(themeDesign as Record<string, unknown>) };
+      const slimIncoming = (() => {
+        const out: Record<string, unknown> = { ...(themeDesign as Record<string, unknown>) };
+        for (const key of [
+          "venuePhotoBase64",
+          "venue_photo_base64",
+          "picksBase64",
+          "picks_base64",
+          "generatedImageBase64",
+          "generated_image_base64",
+        ]) {
+          const v = out[key];
+          if (typeof v === "string" && v.length > 200_000) delete out[key];
+        }
+        if (Array.isArray(out.venuePhotos)) {
+          out.venuePhotos = out.venuePhotos
+            .map((v) => String(v ?? "").trim())
+            .filter((v) => v.length > 0 && v.length <= 200_000)
+            .slice(0, 2);
+        }
+        return out;
+      })();
+      const merged = { ...existing, ...slimIncoming };
       await pool().query(
         `UPDATE event_orders SET theme_design = $2::jsonb, updated_at = NOW() WHERE id::text = $1`,
         [orderId, JSON.stringify(merged)],

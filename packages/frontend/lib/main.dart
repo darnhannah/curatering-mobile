@@ -29,6 +29,7 @@ import 'utils/image_pick_limits.dart';
 import 'features/seating/seating_plan.dart';
 import 'utils/allergen_ui.dart';
 import 'utils/order_type_utils.dart';
+import 'utils/theme_design_venue_refs.dart';
 import 'widgets/manager_theme_seating_blocks.dart';
 
 /// Optional logical flavor at Dart level (`customer` / `staff`).
@@ -5479,17 +5480,22 @@ class AppState extends ChangeNotifier {
   Future<String?> submitInquiry(Map<String, dynamic> payload) async {
     if (userEmail == null) return 'Not signed in';
     try {
+      final body = Map<String, dynamic>.from(payload);
+      final theme = body['theme_design'];
+      if (theme is Map) {
+        body['theme_design'] = slimThemeDesignForPersist(Map<String, dynamic>.from(theme));
+      }
       final res = await http
           .post(
             _uri('/api/mobile/inquiries'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({...payload, 'user_email': userEmail}),
+            body: jsonEncode({...body, 'user_email': userEmail}),
           )
-          .timeout(_apiTimeout);
+          .timeout(const Duration(seconds: 120));
       if (res.statusCode != 201) {
         try {
           final err = jsonDecode(res.body) as Map<String, dynamic>;
-          return '${err['error'] ?? 'Inquiry failed'}';
+          return '${err['error'] ?? err['message'] ?? 'Inquiry failed'}';
         } catch (_) {
           return 'Inquiry failed (${res.statusCode})';
         }
@@ -5609,6 +5615,7 @@ class AppState extends ChangeNotifier {
   }) async {
     if (userEmail == null || !isManagerOrSupervisor) return 'Not signed in';
     try {
+      final slimTheme = slimThemeDesignForPersist(themeDesign);
       final res = await http
           .post(
             _uri('/api/mobile/pos/catering/new-event'),
@@ -5638,17 +5645,18 @@ class AppState extends ChangeNotifier {
               if (manualTotalCost != null) 'manual_total_cost': manualTotalCost,
               'schedule_slots': scheduleSlots,
               'menu': menu,
-              'theme_design': themeDesign,
+              'theme_design': slimTheme,
               'formality_level': formalityLevel,
               if (seatingPlan != null && seatingPlan.isNotEmpty) 'seating_plan': seatingPlan,
             }),
           )
-          .timeout(_apiTimeout);
+          .timeout(const Duration(seconds: 120));
       if (res.statusCode != 201) {
         try {
           final body = jsonDecode(res.body);
-          if (body is Map && body['error'] != null) {
-            return '${body['error']}';
+          if (body is Map) {
+            final err = body['error'] ?? body['message'] ?? body['detail'];
+            if (err != null) return '$err';
           }
         } catch (_) {}
         return 'Could not create event (${res.statusCode})';

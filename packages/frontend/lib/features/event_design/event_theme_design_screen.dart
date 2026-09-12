@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../utils/image_pick_limits.dart';
+import '../../utils/theme_design_venue_refs.dart';
 import 'event_design_categories.dart';
 import 'events_feature_api.dart';
 import 'runpod_service.dart';
@@ -185,24 +185,19 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
 
   Future<String?> _encodeVenueForRunpod(String b64) async {
     if (b64.isEmpty) return null;
-    try {
-      final raw = base64Decode(b64);
-      final codec = await ui.instantiateImageCodec(raw, targetWidth: 768);
-      final frame = await codec.getNextFrame();
-      final png = await frame.image.toByteData(format: ui.ImageByteFormat.png);
-      frame.image.dispose();
-      if (png == null) return b64;
-      return base64Encode(png.buffer.asUint8List());
-    } catch (_) {
-      return b64;
-    }
+    return shrinkBase64ForAi(b64, maxSide: 768);
   }
 
   Future<void> _pickVenuePhotos() async {
-    final added = await pickImagesBase64(context: context, allowMultiple: true, maxWidth: 1600);
+    final added = await pickImagesBase64(context: context, allowMultiple: true, maxWidth: 1280);
     if (!mounted || added.isEmpty) return;
+    final shrunk = <String>[];
+    for (final b in added) {
+      shrunk.add(await shrinkBase64ForAi(b, maxSide: 1280));
+    }
+    if (!mounted) return;
     setState(() {
-      for (final b in added) {
+      for (final b in shrunk) {
         if (!_venuePhotosB64.contains(b)) _venuePhotosB64.add(b);
       }
     });
@@ -308,9 +303,12 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
         _composePrompt(),
         user_id: widget.userEmail,
         initImageBase64: venue,
-        strength: 0.58,
+        strength: 0.78,
         numInferenceSteps: 22,
-        designMeta: _runpodDesignMeta(),
+        designMeta: {
+          ..._runpodDesignMeta(),
+          'output_format': 'jpg',
+        },
       );
       if (!mounted) return;
       if (url == null || url.isEmpty) {
@@ -353,7 +351,7 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       if (_generatedUrl != null) _generatedUrl!.trim(),
     }..removeWhere((u) => u.isEmpty);
 
-    return {
+    return slimThemeDesignForPersist({
       'serviceType': 'catering+event',
       'menuChoice': 'custom_menu',
       'eventDesignSource': 'customer_ai',
@@ -373,7 +371,7 @@ class _EventThemeDesignScreenState extends State<EventThemeDesignScreen> {
       if (_generatedUrl != null) 'generatedImageUrl': _generatedUrl,
       'previousGeneratedImageUrls': prev.toList(),
       'wantsCustomDesign': true,
-    };
+    });
   }
 
   Future<bool> _confirmCancel() async {
