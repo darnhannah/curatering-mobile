@@ -28,7 +28,8 @@ function Test-ApkFile([string]$path) {
 
 Write-Host "Building CUSTOMER release APK..."
 flutter build apk --flavor customer --release `
-    --dart-define=APP_FLAVOR=customer
+    --dart-define=APP_FLAVOR=customer `
+    --dart-define=DEFAULT_API_BASE=https://curatering-mobile-production.up.railway.app
 $customerApk = Join-Path $apkOut "app-customer-release.apk"
 $customerBytes = Test-ApkFile $customerApk
 $customerDist = Join-Path $dist "curatering-customer-release.apk"
@@ -43,7 +44,8 @@ Write-Host ""
 Write-Host "Building STAFF release APK..."
 flutter build apk --flavor staff --release `
     --dart-define=APP_FLAVOR=staff `
-    --dart-define=POS_LOGIN=true
+    --dart-define=POS_LOGIN=true `
+    --dart-define=DEFAULT_API_BASE=https://curatering-mobile-production.up.railway.app
 $staffApk = Join-Path $apkOut "app-staff-release.apk"
 $staffBytes = Test-ApkFile $staffApk
 $staffDist = Join-Path $dist "curatering-staff-release.apk"

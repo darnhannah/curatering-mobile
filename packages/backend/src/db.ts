@@ -401,7 +401,7 @@ export async function initDb(): Promise<void> {
     await p.query(`
       ALTER TABLE users
       ADD CONSTRAINT users_role_check
-      CHECK (role IN ('admin', 'manager', 'supervisor', 'cashier', 'customer'))
+      CHECK (role IN ('admin', 'manager', 'supervisor', 'cashier', 'customer', 'super_admin'))
     `);
   } catch {
     // Some environments may define role constraints differently; keep startup resilient.

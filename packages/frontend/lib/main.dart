@@ -739,7 +739,7 @@ const String kNominatimUserAgent = 'CurateringMobile/1.0 (support@macrina.local)
 /// - `flutter run ... --dart-define=API_BASE=http://192.168.x.x:8080` for local dev only
 ///
 /// Resolution order: `API_BASE` → `DEFAULT_API_BASE` → [kProductionApiBase] → localhost (dev/emulator).
-const String kProductionApiBase = '';
+const String kProductionApiBase = 'https://curatering-mobile-production.up.railway.app';
 
 String resolveInitialApiBase() {
   const env = String.fromEnvironment('API_BASE', defaultValue: '');
@@ -3485,7 +3485,7 @@ class AppState extends ChangeNotifier {
   }
 
   /// Returns null on success, or an error message.
-  Future<String?> login(String email, String password) async {
+  Future<String?> login(String email, String password, {bool staffOnly = false}) async {
     try {
       final res = await http
           .post(
@@ -3497,15 +3497,21 @@ class AppState extends ChangeNotifier {
       if (res.statusCode != 200) {
         try {
           final err = jsonDecode(res.body) as Map<String, dynamic>;
-          return '${err['error'] ?? 'Login failed'}';
+          final msg = '${err['error'] ?? err['message'] ?? ''}'.trim();
+          return msg.isNotEmpty ? msg : 'Login failed (${res.statusCode})';
         } catch (_) {
           return 'Login failed (${res.statusCode})';
         }
       }
       final bodyMap = jsonDecode(res.body) as Map<String, dynamic>;
+      final role = '${bodyMap['role'] ?? 'customer'}'.trim().toLowerCase();
+      const staffRoles = {'cashier', 'manager', 'supervisor'};
+      if ((staffOnly || kPosLoginBuild) && !staffRoles.contains(role)) {
+        return 'This staff app only accepts cashier, manager, or supervisor accounts.';
+      }
       userEmail = email.trim().toLowerCase();
       loginPassword = password;
-      userRole = '${bodyMap['role'] ?? 'customer'}'.trim().toLowerCase();
+      userRole = role;
       cashierDisplayName = '${bodyMap['display_name'] ?? ''}'.trim();
       showLoginWelcomeDialog = true;
       reopenAuthAsStaff = false;
@@ -6750,6 +6756,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                     final err = await widget.state.login(
                                       emailController.text,
                                       passwordController.text,
+                                      staffOnly: widget.cashierMode,
                                     );
                                     if (!mounted) return;
                                     if (err != null) {

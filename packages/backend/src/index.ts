@@ -1642,7 +1642,12 @@ app.post("/api/mobile/auth/login", async (req, res) => {
   }
   try {
     const cashierFirst = await getPool().query(
-      "SELECT password_hash, role, pos_role, COALESCE(NULLIF(TRIM(full_name), ''), '') AS display_name FROM users WHERE email = $1",
+      `SELECT password_hash, role, pos_role,
+              COALESCE(NULLIF(TRIM(full_name), ''), '') AS display_name,
+              COALESCE(archived, FALSE) AS archived
+         FROM users
+        WHERE LOWER(TRIM(email)) = $1
+        LIMIT 1`,
       [email],
     );
     const cRow = cashierFirst.rows[0] as {
@@ -1650,33 +1655,45 @@ app.post("/api/mobile/auth/login", async (req, res) => {
       role: string;
       pos_role: string;
       display_name: string;
+      archived: boolean;
     } | undefined;
-    if (cRow) {
-      if (!(await bcrypt.compare(password, cRow.password_hash))) {
-        res.status(401).json({ error: "invalid email or password" });
-        return;
+
+    let staffPasswordOk = false;
+    if (cRow && !cRow.archived && cRow.password_hash) {
+      try {
+        staffPasswordOk = await bcrypt.compare(password, cRow.password_hash);
+      } catch (hashErr) {
+        console.error("mobile staff login bcrypt error:", hashErr);
+        staffPasswordOk = false;
       }
+    }
+
+    if (staffPasswordOk && cRow) {
       const posRole = resolveStaffPosRole({
         role: String(cRow.role ?? ""),
         pos_role: String(cRow.pos_role ?? ""),
       });
-      const role = posRole ?? "customer";
-      let displayName = String(cRow.display_name ?? "").trim();
-      if (!displayName && posRole === "manager") {
-        displayName = "Manager";
+      if (posRole) {
+        let displayName = String(cRow.display_name ?? "").trim();
+        if (!displayName && posRole === "manager") {
+          displayName = "Manager";
+        }
+        await logActionBestEffort("auth.login", email, "Staff login successful", { role: posRole });
+        const tsStaff = new Date().toISOString();
+        void sendMailSafe(
+          email,
+          "Macrina's Kitchen login notice",
+          `A cashier/staff login was completed for ${email} at ${tsStaff}. If this was not you, change your password immediately.`,
+        ).catch((mailErr) => {
+          console.warn("[mail] staff login notice email failed (login still succeeds):", mailErr);
+        });
+        res.json({ ok: true, email, role: posRole, display_name: displayName });
+        return;
       }
-      await logActionBestEffort("auth.login", email, "Staff login successful", { role });
-      const tsStaff = new Date().toISOString();
-      void sendMailSafe(
-        email,
-        "Macrina's Kitchen login notice",
-        `A cashier/staff login was completed for ${email} at ${tsStaff}. If this was not you, change your password immediately.`,
-      ).catch((mailErr) => {
-        console.warn("[mail] staff login notice email failed (login still succeeds):", mailErr);
-      });
-      res.json({ ok: true, email, role, display_name: displayName });
-      return;
+      // Web-only staff with no POS mapping: try the customer password next
+      // (same email can exist in both tables with different hashes).
     }
+
     const { rows } = await getPool().query(
       "SELECT password_hash, full_name, is_verified, COALESCE(archived, FALSE) AS archived FROM customer_accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))",
       [email],
@@ -1684,29 +1701,41 @@ app.post("/api/mobile/auth/login", async (req, res) => {
     let row = rows[0] as
       | { password_hash: string; full_name: string; is_verified: boolean; archived: boolean }
       | undefined;
-    if (!row || row.archived) {
-      res.status(401).json({ error: "invalid email or password" });
+    if (row && !row.archived) {
+      const hash = row.password_hash ?? "";
+      let customerOk = false;
+      try {
+        customerOk = !!hash && (await bcrypt.compare(password, hash));
+      } catch (hashErr) {
+        console.error("mobile customer login bcrypt error:", hashErr);
+        customerOk = false;
+      }
+      if (customerOk) {
+        const ts = new Date().toISOString();
+        try {
+          await sendMailSafe(
+            email,
+            "Macrina's Kitchen login notice",
+            `A login was completed for ${email} at ${ts}. If this was not you, change your password.`,
+          );
+        } catch (mailErr) {
+          console.warn("[mail] login notice email failed (login still succeeds):", mailErr);
+        }
+        const displayName = String(row.full_name ?? "").trim();
+        await logActionBestEffort("auth.login", email, "Customer login successful", { role: "customer" });
+        res.json({ ok: true, email, role: "customer", display_name: displayName });
+        return;
+      }
+    }
+
+    if (staffPasswordOk && cRow && !cRow.archived) {
+      res.status(403).json({
+        error:
+          "This staff account is not enabled for the mobile app. Ask an admin to set a POS role (cashier, manager, or supervisor).",
+      });
       return;
     }
-    const hash = row?.password_hash ?? "";
-    if (!hash || !(await bcrypt.compare(password, hash))) {
-      res.status(401).json({ error: "invalid email or password" });
-      return;
-    }
-    const ts = new Date().toISOString();
-    try {
-      await sendMailSafe(
-        email,
-        "Macrina's Kitchen login notice",
-        `A login was completed for ${email} at ${ts}. If this was not you, change your password.`,
-      );
-    } catch (mailErr) {
-      console.warn("[mail] login notice email failed (login still succeeds):", mailErr);
-    }
-    const role = "customer";
-    const displayName = String(row?.full_name ?? "").trim();
-    await logActionBestEffort("auth.login", email, "Customer login successful", { role: "customer" });
-    res.json({ ok: true, email, role, display_name: displayName });
+    res.status(401).json({ error: "invalid email or password" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "database error" });
@@ -1948,11 +1977,12 @@ app.post("/api/mobile/auth/reset-password", async (req, res) => {
 type PosStaffRole = "cashier" | "manager" | "supervisor";
 
 function mapDbRoleToPosRole(dbRole: string): PosStaffRole | null {
-  const r = String(dbRole ?? "").trim().toLowerCase();
-  if (r === "manager") return "manager";
+  const r = String(dbRole ?? "").trim().toLowerCase().replace(/-/g, "_");
+  if (r === "manager" || r === "admin" || r === "super_admin" || r === "superadmin") {
+    return "manager";
+  }
   if (r === "supervisor") return "supervisor";
   if (r === "cashier") return "cashier";
-  // Admin/super_admin are web platform roles and should not auto-map to cashier POS.
   return null;
 }
 
@@ -1971,12 +2001,29 @@ async function verifyPosStaff(
   allowedRoles: PosStaffRole[] = ["cashier", "manager", "supervisor"],
 ): Promise<{ ok: boolean; role: PosStaffRole | null }> {
   const e = email.trim().toLowerCase();
-  const { rows } = await getPool().query(`SELECT password_hash, role, pos_role FROM users WHERE email = $1`, [e]);
-  const row = rows[0] as { password_hash: string; role: string; pos_role: string } | undefined;
-  if (!row) return { ok: false, role: null };
+  const { rows } = await getPool().query(
+    `SELECT password_hash, role, pos_role, COALESCE(archived, FALSE) AS archived
+       FROM users
+      WHERE LOWER(TRIM(email)) = $1
+      LIMIT 1`,
+    [e],
+  );
+  const row = rows[0] as {
+    password_hash: string;
+    role: string;
+    pos_role: string;
+    archived: boolean;
+  } | undefined;
+  if (!row || row.archived) return { ok: false, role: null };
   const role = resolveStaffPosRole(row);
   if (!role || !allowedRoles.includes(role)) return { ok: false, role: null };
-  const ok = await bcrypt.compare(password, row.password_hash);
+  let ok = false;
+  try {
+    ok = await bcrypt.compare(password, row.password_hash);
+  } catch (hashErr) {
+    console.error("verifyPosStaff bcrypt error:", hashErr);
+    return { ok: false, role: null };
+  }
   return { ok, role: ok ? role : null };
 }
 
@@ -6475,17 +6522,18 @@ async function seedCashierAccount(): Promise<void> {
       await pool.query(
         `INSERT INTO users (id, staff_id, email, password_hash, role, pos_role, full_name)
          VALUES (gen_random_uuid()::text, 'USR-0001', $1, $2, 'cashier', 'cashier', $3)
-         ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, full_name = EXCLUDED.full_name, role = 'cashier', pos_role = 'cashier', staff_id = COALESCE(users.staff_id, EXCLUDED.staff_id)`,
+         ON CONFLICT (email) DO NOTHING`,
         [email, hash, displayName],
       );
       console.log("[db] seeded cashier (users):", email);
     } else {
-      await pool.query(`UPDATE users SET full_name = $2, password_hash = $3, role = 'cashier', pos_role = 'cashier' WHERE email = $1`, [
-        email,
-        displayName,
-        hash,
-      ]);
-      console.log("[db] cashier users row updated:", email);
+      await pool.query(
+        `UPDATE users SET full_name = COALESCE(NULLIF(TRIM(full_name), ''), $2),
+                          pos_role = COALESCE(NULLIF(TRIM(pos_role), ''), 'cashier')
+          WHERE LOWER(TRIM(email)) = $1`,
+        [email, displayName],
+      );
+      console.log("[db] cashier users row present:", email);
     }
   } catch (e) {
     console.warn("[db] cashier seed skipped:", e);
@@ -6499,20 +6547,16 @@ async function seedManagerSupervisorAccounts(): Promise<void> {
   await pool.query(
     `INSERT INTO users (id, staff_id, email, password_hash, role, full_name, pos_role)
      VALUES (gen_random_uuid()::text, 'USR-0002', 'manager@curatering.com', $1, 'manager', 'Manager Sample', 'manager')
-     ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash,
-       full_name = EXCLUDED.full_name,
-       role = EXCLUDED.role,
-       pos_role = EXCLUDED.pos_role,
+     ON CONFLICT (email) DO UPDATE SET
+       pos_role = COALESCE(NULLIF(TRIM(users.pos_role), ''), EXCLUDED.pos_role),
        staff_id = COALESCE(users.staff_id, EXCLUDED.staff_id)`,
     [managerHash],
   );
   await pool.query(
     `INSERT INTO users (id, staff_id, email, password_hash, role, full_name, pos_role)
      VALUES (gen_random_uuid()::text, 'USR-0003', 'supervisor@curatering.com', $1, 'supervisor', 'Supervisor Sample', 'supervisor')
-     ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash,
-       full_name = EXCLUDED.full_name,
-       role = EXCLUDED.role,
-       pos_role = EXCLUDED.pos_role,
+     ON CONFLICT (email) DO UPDATE SET
+       pos_role = COALESCE(NULLIF(TRIM(users.pos_role), ''), EXCLUDED.pos_role),
        staff_id = COALESCE(users.staff_id, EXCLUDED.staff_id)`,
     [supervisorHash],
   );
