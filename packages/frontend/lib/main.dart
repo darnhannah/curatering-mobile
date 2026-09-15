@@ -61,28 +61,35 @@ Future<void> main() async {
 }
 
 ThemeData buildAppLightTheme({Color? seed}) {
+  const surface = Colors.white;
   return ThemeData(
     useMaterial3: true,
     brightness: Brightness.light,
-    scaffoldBackgroundColor: Colors.white,
+    scaffoldBackgroundColor: surface,
+    canvasColor: const Color(0xFFF1F1F1),
+    cardColor: surface,
     colorScheme: ColorScheme.fromSeed(seedColor: seed ?? AppColors.brand, brightness: Brightness.light),
     cardTheme: CardThemeData(
-      color: Colors.white,
+      color: surface,
       elevation: 2,
       shadowColor: Colors.black26,
+      surfaceTintColor: Colors.transparent,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
     ),
     dialogTheme: const DialogThemeData(
-      backgroundColor: Colors.white,
-      surfaceTintColor: Colors.white,
+      backgroundColor: surface,
+      surfaceTintColor: Colors.transparent,
     ),
     bottomSheetTheme: const BottomSheetThemeData(
-      backgroundColor: Colors.white,
-      surfaceTintColor: Colors.white,
+      backgroundColor: surface,
+      surfaceTintColor: Colors.transparent,
     ),
+    drawerTheme: const DrawerThemeData(backgroundColor: surface),
+    popupMenuTheme: const PopupMenuThemeData(color: surface),
+    listTileTheme: const ListTileThemeData(tileColor: Colors.transparent),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
-      fillColor: Colors.white,
+      fillColor: surface,
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(10),
       ),
@@ -91,14 +98,72 @@ ThemeData buildAppLightTheme({Color? seed}) {
 }
 
 ThemeData buildAppDarkTheme({Color? seed}) {
+  const page = Color(0xFF121212);
+  const surface = Color(0xFF2C2C2C);
+  const onSurface = Color(0xFFF3EEE8);
+  final scheme = ColorScheme.fromSeed(
+    seedColor: seed ?? AppColors.brand,
+    brightness: Brightness.dark,
+  ).copyWith(
+    surface: surface,
+    onSurface: onSurface,
+    onSurfaceVariant: const Color(0xFFB8B0A8),
+    outline: const Color(0xFF6B645C),
+  );
   return ThemeData(
     useMaterial3: true,
     brightness: Brightness.dark,
-    scaffoldBackgroundColor: const Color(0xFF1A1A1A),
-    colorScheme: ColorScheme.fromSeed(seedColor: seed ?? AppColors.brand, brightness: Brightness.dark),
+    colorScheme: scheme,
+    scaffoldBackgroundColor: page,
+    canvasColor: page,
+    cardColor: surface,
+    dividerColor: const Color(0xFF4A4540),
+    appBarTheme: const AppBarTheme(
+      backgroundColor: Color(0xFF1F1F1F),
+      foregroundColor: onSurface,
+      surfaceTintColor: Colors.transparent,
+    ),
+    cardTheme: CardThemeData(
+      color: surface,
+      elevation: 2,
+      shadowColor: Colors.black54,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    ),
+    dialogTheme: const DialogThemeData(
+      backgroundColor: surface,
+      surfaceTintColor: Colors.transparent,
+    ),
+    bottomSheetTheme: const BottomSheetThemeData(
+      backgroundColor: surface,
+      surfaceTintColor: Colors.transparent,
+    ),
+    drawerTheme: const DrawerThemeData(backgroundColor: Color(0xFF1A1A1A)),
+    popupMenuTheme: const PopupMenuThemeData(color: surface),
+    listTileTheme: const ListTileThemeData(
+      iconColor: onSurface,
+      textColor: onSurface,
+      tileColor: Colors.transparent,
+    ),
+    tabBarTheme: const TabBarThemeData(
+      labelColor: onSurface,
+      unselectedLabelColor: Color(0xFFB8B0A8),
+    ),
+    expansionTileTheme: const ExpansionTileThemeData(
+      backgroundColor: surface,
+      collapsedBackgroundColor: surface,
+      iconColor: onSurface,
+      collapsedIconColor: Color(0xFFB8B0A8),
+    ),
+    snackBarTheme: const SnackBarThemeData(backgroundColor: Color(0xFF323232)),
+    chipTheme: const ChipThemeData(
+      backgroundColor: Color(0xFF3A3A3A),
+      selectedColor: Color(0xFF4A3B16),
+      labelStyle: TextStyle(color: onSurface),
+    ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
-      fillColor: const Color(0xFF2C2C2C),
+      fillColor: surface,
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(10),
       ),
@@ -412,13 +477,16 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           theme: buildAppLightTheme(seed: brandSeed),
           darkTheme: buildAppDarkTheme(seed: brandSeed),
           themeMode: appState.themeMode,
-          builder: (context, child) => Listener(
-            behavior: HitTestBehavior.translucent,
-            onPointerDown: (_) => _onUserActivity(),
-            onPointerMove: (_) => _onUserActivity(),
-            onPointerSignal: (_) => _onUserActivity(),
-            child: child ?? const SizedBox.shrink(),
-          ),
+          builder: (context, child) {
+            AppColors.applyBrightness(Theme.of(context).brightness);
+            return Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: (_) => _onUserActivity(),
+              onPointerMove: (_) => _onUserActivity(),
+              onPointerSignal: (_) => _onUserActivity(),
+              child: child ?? const SizedBox.shrink(),
+            );
+          },
           home: appState.userEmail == null
               ? (widget.forcePosLogin || kPosLoginBuild || appState.reopenAuthAsStaff
                   ? AuthScreen(
@@ -1336,12 +1404,29 @@ int cateringLoyaltyPointsForOrderTotal(double totalAmount) {
 }
 
 class AppColors {
+  static bool _dark = false;
+  static bool get isDark => _dark;
+
+  static void applyBrightness(Brightness brightness) {
+    _dark = brightness == Brightness.dark;
+  }
+
   static const brand = Color(0xFFFFC233);
-  static const canvas = Color(0xFFF1F1F1);
   static const accent = Color(0xFFEE4B3C);
-  static const border = Color(0xFF9B8F82);
   static const success = Color(0xFF2FCB76);
+  /// Dark brown for text on brand/accent yellow-red buttons (both themes).
   static const ink = Color(0xFF201B16);
+
+  static const _lightCanvas = Color(0xFFF1F1F1);
+  static const _lightBorder = Color(0xFF9B8F82);
+
+  static Color get canvas => _dark ? const Color(0xFF1A1A1A) : _lightCanvas;
+  static Color get border => _dark ? const Color(0xFF6B645C) : _lightBorder;
+  static Color get surface => _dark ? const Color(0xFF2C2C2C) : Colors.white;
+  static Color get mutedFill => _dark ? const Color(0xFF3A3A3A) : const Color(0xFFEEEEEE);
+  static Color get hairline => _dark ? const Color(0xFF4A4540) : const Color(0xFFE0E0E0);
+  static Color get onSurface => _dark ? const Color(0xFFF3EEE8) : ink;
+  static Color get onSurfaceMuted => _dark ? const Color(0xFFB8B0A8) : const Color(0xFF616161);
 
   /// CMS `mobileUi.brand.primary` when set; else compile-time [brand].
   static Color get brandResolved {
@@ -2333,7 +2418,7 @@ Future<void> showInquiryDetailDialog(
   await showDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
-      backgroundColor: Colors.white,
+      backgroundColor: AppColors.surface,
       title: Text(r.displayTransactionRef),
       content: SingleChildScrollView(
         child: Column(
@@ -2544,7 +2629,7 @@ List<Widget> orderPaymentProofDetailWidgets(BuildContext context, OrderData o) {
     widgets.add(
       Padding(
         padding: const EdgeInsets.only(top: 8),
-        child: Text('No payment proof on file.', style: TextStyle(color: Colors.grey.shade700)),
+        child: Text('No payment proof on file.', style: TextStyle(color: AppColors.onSurfaceMuted)),
       ),
     );
   }
@@ -2593,7 +2678,7 @@ List<Widget> inquiryPaymentProofDetailWidgets(BuildContext context, InquiryRecor
     widgets.add(
       Padding(
         padding: const EdgeInsets.only(top: 8),
-        child: Text('No payment proof on file.', style: TextStyle(color: Colors.grey.shade700)),
+        child: Text('No payment proof on file.', style: TextStyle(color: AppColors.onSurfaceMuted)),
       ),
     );
   }
@@ -2769,13 +2854,13 @@ Future<bool> confirmManagerPaymentAmountMismatch(
             ),
           ),
           const SizedBox(height: 12),
-          Text('Amount entered', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+          Text('Amount entered', style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted)),
           Text(
             'PHP ${amountEntered.toStringAsFixed(2)}',
             style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
           ),
           const SizedBox(height: 8),
-          Text('Amount due', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+          Text('Amount due', style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted)),
           Text(
             'PHP ${amountDue.toStringAsFixed(2)}',
             style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
@@ -3286,7 +3371,9 @@ bool cateringDownPaymentConfirmed(CateringEventRecord r, double downDue) {
 class AppState extends ChangeNotifier {
   AppState({String? savedThemeMode})
       : apiBase = resolveInitialApiBase(),
-        themeMode = savedThemeMode == 'dark' ? ThemeMode.dark : ThemeMode.light;
+        themeMode = savedThemeMode == 'dark' ? ThemeMode.dark : ThemeMode.light {
+    AppColors.applyBrightness(themeMode == ThemeMode.dark ? Brightness.dark : Brightness.light);
+  }
 
   String apiBase;
   ThemeMode themeMode;
@@ -3432,6 +3519,7 @@ class AppState extends ChangeNotifier {
   void setThemeMode(ThemeMode mode) {
     if (themeMode == mode) return;
     themeMode = mode;
+    AppColors.applyBrightness(mode == ThemeMode.dark ? Brightness.dark : Brightness.light);
     notifyListeners();
     SharedPreferences.getInstance().then(
       (p) => p.setString('theme_mode', mode == ThemeMode.dark ? 'dark' : 'light'),
@@ -4854,7 +4942,7 @@ class AppState extends ChangeNotifier {
         return StatefulBuilder(
           builder: (ctx, setSt) {
             return AlertDialog(
-              backgroundColor: Colors.white,
+              backgroundColor: AppColors.surface,
               title: Text(item.name, maxLines: 3, style: const TextStyle(fontSize: 16)),
               content: SizedBox(
                 width: math.min(MediaQuery.sizeOf(ctx).width * 0.92, 520),
@@ -4944,7 +5032,7 @@ class AppState extends ChangeNotifier {
                         ),
                         Text(
                           'First add-on is included; +₱${kRestaurantAddonExtraPhp.toStringAsFixed(0)} for each extra (per main dish).',
-                          style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                          style: TextStyle(fontSize: 11, color: AppColors.onSurfaceMuted),
                         ),
                       ],
                     ],
@@ -6848,7 +6936,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                       InputDecoration deco(String label) => InputDecoration(
                                             labelText: label,
                                             filled: true,
-                                            fillColor: Colors.white,
+                                            fillColor: AppColors.surface,
                                             border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                                           );
                                       bool emailOk(String v) => isValidEmailFormat(v);
@@ -7011,15 +7099,13 @@ class _AuthScreenState extends State<AuthScreen> {
                                                       ),
                                                     ],
                                                     if (step[0] == 2) ...[
-                                                      TextField(
+                                                      _ObscurableTextField(
                                                         controller: forgotNewPasswordController,
-                                                        obscureText: true,
                                                         decoration: deco('New password (min 8)'),
                                                       ),
                                                       const SizedBox(height: 10),
-                                                      TextField(
+                                                      _ObscurableTextField(
                                                         controller: forgotConfirmPasswordController,
-                                                        obscureText: true,
                                                         decoration: deco('Confirm new password'),
                                                       ),
                                                       const SizedBox(height: 12),
@@ -7115,7 +7201,7 @@ class _AuthScreenState extends State<AuthScreen> {
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
                       decoration: BoxDecoration(
-                        color: Colors.white,
+                        color: AppColors.surface,
                         borderRadius: BorderRadius.circular(12),
                       ),
                       child: Row(
@@ -7144,6 +7230,43 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 }
 
+class _ObscurableTextField extends StatefulWidget {
+  const _ObscurableTextField({
+    required this.controller,
+    this.decoration,
+    this.enabled = true,
+  });
+
+  final TextEditingController controller;
+  final InputDecoration? decoration;
+  final bool enabled;
+
+  @override
+  State<_ObscurableTextField> createState() => _ObscurableTextFieldState();
+}
+
+class _ObscurableTextFieldState extends State<_ObscurableTextField> {
+  bool _obscured = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final base = widget.decoration ?? const InputDecoration();
+    return TextField(
+      controller: widget.controller,
+      enabled: widget.enabled,
+      obscureText: _obscured,
+      decoration: base.copyWith(
+        suffixIcon: IconButton(
+          tooltip: _obscured ? 'Show password' : 'Hide password',
+          visualDensity: VisualDensity.compact,
+          onPressed: widget.enabled ? () => setState(() => _obscured = !_obscured) : null,
+          icon: Icon(_obscured ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+        ),
+      ),
+    );
+  }
+}
+
 class _LabeledInput extends StatelessWidget {
   const _LabeledInput({
     required this.label,
@@ -7160,7 +7283,11 @@ class _LabeledInput extends StatelessWidget {
     return Row(
       children: [
         SizedBox(width: 130, child: Text(label, style: const TextStyle(fontWeight: FontWeight.w700))),
-        Expanded(child: TextField(controller: controller, obscureText: obscure, enabled: enabled)),
+        Expanded(
+          child: obscure
+              ? _ObscurableTextField(controller: controller, enabled: enabled)
+              : TextField(controller: controller, enabled: enabled),
+        ),
       ],
     );
   }
@@ -7228,7 +7355,7 @@ class AppScaffold extends StatelessWidget {
             .any((o) => state.orderNosWithUnreadAttention.contains(o.orderNo));
     final showAttentionDot = isCustomer ? pendingAttentionExists : (state.unreadNotificationsCount > 0 || pendingAttentionExists);
     return Scaffold(
-      backgroundColor: isCustomer ? Colors.white : Theme.of(context).scaffoldBackgroundColor,
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         foregroundColor: headerFg,
         iconTheme: IconThemeData(color: headerFg),
@@ -7697,7 +7824,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Material(
-                    color: Colors.white,
+                    color: AppColors.surface,
                     elevation: 2,
                     borderRadius: BorderRadius.circular(12),
                     child: InkWell(
@@ -7718,7 +7845,7 @@ class SupervisorDashboardScreen extends StatelessWidget {
                                   const Text('On Going', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
                                   Text(
                                     '$count active ${count == 1 ? 'order' : 'orders'}',
-                                    style: TextStyle(color: Colors.grey.shade700),
+                                    style: TextStyle(color: AppColors.onSurfaceMuted),
                                   ),
                                   const SizedBox(height: 4),
                                   Text(
@@ -7765,7 +7892,7 @@ class _SupervisorOngoingShellScreenState extends State<SupervisorOngoingShellScr
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: AppColors.surface,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -7937,7 +8064,7 @@ Widget _cateringInquiryMenuDishTile({
     child: Opacity(
       opacity: disabled ? 0.45 : 1,
       child: Material(
-      color: Colors.white,
+      color: AppColors.surface,
       borderRadius: BorderRadius.circular(10),
       child: InkWell(
         borderRadius: BorderRadius.circular(10),
@@ -7947,8 +8074,8 @@ Widget _cateringInquiryMenuDishTile({
             borderRadius: BorderRadius.circular(10),
             border: Border.all(color: selected ? AppColors.brand : AppColors.border, width: selected ? 2 : 1),
             color: disabled
-                ? Colors.grey.shade100
-                : (selected ? AppColors.brand.withValues(alpha: 0.1) : Colors.white),
+                ? AppColors.mutedFill
+                : (selected ? AppColors.brand.withValues(alpha: 0.1) : AppColors.surface),
           ),
           padding: const EdgeInsets.fromLTRB(8, 10, 10, 10),
           child: Row(
@@ -8012,7 +8139,7 @@ Widget _cateringInquiryMenuDishTile({
                           : 'Tap the image for full description and allergens',
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 11, height: 1.25, color: Colors.grey.shade700),
+                      style: TextStyle(fontSize: 11, height: 1.25, color: AppColors.onSurfaceMuted),
                     ),
                   ],
                 ),
@@ -8030,7 +8157,7 @@ Widget _cateringInquiryMenuDishTile({
 Widget _buildTrayLineCard(AppState state, CartItem item, {VoidCallback? onChanged}) {
   void refresh() => onChanged?.call();
   return Card(
-    color: Colors.white,
+    color: AppColors.surface,
     child: Padding(
       padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
       child: Row(
@@ -8097,7 +8224,7 @@ Widget _orderDetailLineWidget(String label, String value) {
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+        Text(label, style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted, fontWeight: FontWeight.w700)),
         const SizedBox(height: 4),
         SelectableText(v, style: const TextStyle(height: 1.35)),
       ],
@@ -8121,7 +8248,7 @@ Future<void> showRestaurantOrderConfirmationDialog(BuildContext context, AppStat
         final od = odHolder[0];
         final trackUrl = od.deliveryTrackingUrl.trim();
         return AlertDialog(
-      backgroundColor: Colors.white,
+      backgroundColor: AppColors.surface,
       title: Text(uiOrderNo(od.orderNo)),
       content: SingleChildScrollView(
         child: Column(
@@ -8477,7 +8604,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
       DropdownMenuItem(value: 'cancelled', child: Text('Cancelled')),
     ];
     return Material(
-      color: Colors.white,
+      color: AppColors.surface,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
         child: Row(
@@ -8532,7 +8659,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(24),
         children: [
-          Text('No restaurant orders match your search.', style: TextStyle(color: Colors.grey.shade700)),
+          Text('No restaurant orders match your search.', style: TextStyle(color: AppColors.onSurfaceMuted)),
         ],
       );
     }
@@ -8545,7 +8672,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
         final trackUrl = o.deliveryTrackingUrl.trim();
         final showTrack = orderShowsDeliveryTrackingLink(o) && trackUrl.isNotEmpty;
         return Card(
-          color: Colors.white,
+          color: AppColors.surface,
           child: ListTile(
             title: Text(uiOrderNo(o.orderNo), style: const TextStyle(fontWeight: FontWeight.w800)),
             subtitle: Column(
@@ -8609,7 +8736,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(24),
         children: [
-          Text('No catering inquiries match your search.', style: TextStyle(color: Colors.grey.shade700)),
+          Text('No catering inquiries match your search.', style: TextStyle(color: AppColors.onSurfaceMuted)),
         ],
       );
     }
@@ -8620,7 +8747,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
       itemBuilder: (context, i) {
         final r = rows[i];
         return Card(
-          color: Colors.white,
+          color: AppColors.surface,
           child: ListTile(
             title: Text(
               r.eventTitle.trim().isEmpty ? r.displayTransactionRef : r.eventTitle,
@@ -8690,7 +8817,7 @@ class _GuestTrackOrdersScreenState extends State<GuestTrackOrdersScreen> with Si
               children: [
                 const CmsBannerStrip(screenId: 'track_orders'),
                 Material(
-                  color: Colors.white,
+                  color: AppColors.surface,
                   child: TabBar(
                     controller: _tab,
                     labelColor: AppColors.brand,
@@ -9015,7 +9142,7 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
               Text(
                 'OR',
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.grey.shade700),
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.onSurfaceMuted),
               ),
               const SizedBox(height: 8),
               OutlinedButton(
@@ -9189,14 +9316,14 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
       return GuestCustomerShell(state: widget.state);
     }
     if (_booting) {
-      return const Scaffold(
-        backgroundColor: Colors.white,
-        body: Center(child: CircularProgressIndicator()),
+      return Scaffold(
+        backgroundColor: AppColors.surface,
+        body: const Center(child: CircularProgressIndicator()),
       );
     }
     if (_bootError != null) {
       return Scaffold(
-        backgroundColor: Colors.white,
+        backgroundColor: AppColors.surface,
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
@@ -9212,9 +9339,9 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
         ),
       );
     }
-    return const Scaffold(
-      backgroundColor: Colors.white,
-      body: Center(child: CircularProgressIndicator()),
+    return Scaffold(
+      backgroundColor: AppColors.surface,
+      body: const Center(child: CircularProgressIndicator()),
     );
   }
 }
@@ -9390,7 +9517,7 @@ class _GuestLandingTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: Colors.white,
+      color: AppColors.surface,
       borderRadius: BorderRadius.circular(12),
       elevation: 2,
       child: InkWell(
@@ -9404,9 +9531,9 @@ class _GuestLandingTile extends StatelessWidget {
             children: [
               Icon(icon, size: 32, color: iconColor),
               const SizedBox(height: 10),
-              Text(title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: Colors.black87)),
+              Text(title, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.onSurface)),
               const SizedBox(height: 4),
-              Text(subtitle, style: TextStyle(fontSize: 11.5, height: 1.25, color: Colors.grey.shade700)),
+              Text(subtitle, style: TextStyle(fontSize: 11.5, height: 1.25, color: AppColors.onSurfaceMuted)),
             ],
           ),
         ),
@@ -9482,7 +9609,7 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
         }
         final showLanding = widget.state.guestShellOpenLanding;
         return Scaffold(
-          backgroundColor: Colors.white,
+          backgroundColor: AppColors.surface,
           body: showLanding
               ? SafeArea(
                   child: Column(
@@ -9800,7 +9927,7 @@ class _CustomerDashTileCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      color: Colors.white,
+      color: AppColors.surface,
       elevation: 2,
       shadowColor: Colors.black26,
       child: InkWell(
@@ -9818,7 +9945,7 @@ class _CustomerDashTileCard extends StatelessWidget {
                 const SizedBox(height: 2),
                 Text(
                   subtitle!,
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.grey.shade700),
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.onSurfaceMuted),
                 ),
               ],
             ],
@@ -9871,7 +9998,7 @@ class _ManagerDashboardScreenState extends State<ManagerDashboardScreen> {
       animation: state,
       builder: (context, _) {
         return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: AppColors.surface,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -10073,7 +10200,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   Widget _dishCard(BuildContext context, MenuItemData item) {
     return Container(
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: AppColors.surface,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: AppColors.border),
       ),
@@ -10104,7 +10231,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                     IconButton(
                       onPressed: () => _addToTray(context, item),
                       icon: const Icon(Icons.add_box_outlined),
-                      color: AppColors.ink,
+                      color: AppColors.onSurface,
                       tooltip: 'Add to tray',
                     ),
                   ],
@@ -10121,7 +10248,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
     return Container(
       width: 300,
       decoration: BoxDecoration(
-        color: Colors.grey.shade50,
+        color: AppColors.mutedFill,
         border: Border(left: BorderSide(color: Colors.grey.shade300)),
       ),
       child: Column(
@@ -11070,12 +11197,12 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                       ? Image.memory(
                           base64Decode(_baseImageB64!),
                           fit: BoxFit.cover,
-                          errorBuilder: (context, error, stackTrace) => Container(color: Colors.grey.shade200),
+                          errorBuilder: (context, error, stackTrace) => Container(color: AppColors.mutedFill),
                         )
                       : Image.network(
                           previewUrl,
                           fit: BoxFit.cover,
-                          errorBuilder: (context, error, stackTrace) => Container(color: Colors.grey.shade200),
+                          errorBuilder: (context, error, stackTrace) => Container(color: AppColors.mutedFill),
                         ),
                   if (candidateData.isNotEmpty) Container(color: Colors.black.withValues(alpha: 0.08)),
                   ..._placements.asMap().entries.map((entry) {
@@ -11187,7 +11314,7 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                   errorBuilder: (context, error, stackTrace) => Container(
                     width: 46,
                     height: 46,
-                    color: Colors.grey.shade200,
+                    color: AppColors.mutedFill,
                     child: const Icon(Icons.image_not_supported),
                   ),
                 ),
@@ -11325,7 +11452,7 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Before', style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+                          Text('Before', style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted, fontWeight: FontWeight.w700)),
                           const SizedBox(height: 4),
                           Expanded(
                             child: ClipRRect(
@@ -11336,13 +11463,13 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                                       fit: BoxFit.cover,
                                       width: double.infinity,
                                       errorBuilder: (context, error, stackTrace) => Container(
-                                        color: Colors.grey.shade200,
+                                        color: AppColors.mutedFill,
                                         alignment: Alignment.center,
                                         child: const Icon(Icons.broken_image),
                                       ),
                                     )
                                   : Container(
-                                      color: Colors.grey.shade200,
+                                      color: AppColors.mutedFill,
                                       alignment: Alignment.center,
                                       child: const Text('No base'),
                                     ),
@@ -11356,7 +11483,7 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('After', style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+                          Text('After', style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted, fontWeight: FontWeight.w700)),
                           const SizedBox(height: 4),
                           Expanded(
                             child: ClipRRect(
@@ -11367,13 +11494,13 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                                       fit: BoxFit.cover,
                                       width: double.infinity,
                                       errorBuilder: (context, error, stackTrace) => Container(
-                                        color: Colors.grey.shade200,
+                                        color: AppColors.mutedFill,
                                         alignment: Alignment.center,
                                         child: const Icon(Icons.broken_image),
                                       ),
                                     )
                                   : Container(
-                                      color: Colors.grey.shade200,
+                                      color: AppColors.mutedFill,
                                       alignment: Alignment.center,
                                       child: const Text('No preview yet'),
                                     ),
@@ -11429,7 +11556,7 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
             const SizedBox(height: 6),
             Text(
               'Selected: ${_elementIdx.length}  |  Found: ${_extractedObjects.length}  |  Arranged: ${_placements.length}  |  Preview: ${_renderedB64.trim().isEmpty ? 'No' : 'Yes'}',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+              style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted),
             ),
             const SizedBox(height: 8),
             if (_step == 0)
@@ -11437,14 +11564,14 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                 _lastTemplateSearchCount > 0
                     ? 'Showing $_lastTemplateSearchCount template(s).'
                     : 'Showing ${_templateSuggestions.length} template(s).',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted),
               ),
             if (_step > 0)
               Text(
                 _lastElementSearchCount > 0
                     ? 'Showing $_lastElementSearchCount element candidate(s).'
                     : 'Showing ${_elementSuggestions.length} element candidate(s).',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted),
               ),
             if (_step == 0) const SizedBox(height: 8),
             if (_step == 0)
@@ -11461,7 +11588,7 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                 const SizedBox(height: 6),
                 Text(
                   'Drag object chips into the preview to place them.',
-                  style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted),
                 ),
                 const SizedBox(height: 6),
                 SizedBox(
@@ -11480,7 +11607,7 @@ class _AiThemeStudioPageState extends State<AiThemeStudioPage> {
                           child: Container(
                             width: 62,
                             height: 62,
-                            color: Colors.white,
+                            color: AppColors.surface,
                             child: b64.isNotEmpty ? Image.memory(base64Decode(b64), fit: BoxFit.cover) : const Icon(Icons.image),
                           ),
                         ),
@@ -12238,7 +12365,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                       if (!MobileUiConfigStore.instance.screenHasBlocks('checkout_banner'))
                         Text(
                           kRestaurantHoursHint,
-                          style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3),
+                          style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted, height: 1.3),
                         ),
                       if (!asapAvailable) ...[
                         const SizedBox(height: 4),
@@ -12800,7 +12927,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
                           Container(
                             height: 140,
                             width: double.infinity,
-                            color: Colors.white,
+                            color: AppColors.surface,
                             alignment: Alignment.center,
                             padding: const EdgeInsets.all(8),
                             child: Image.asset(
@@ -13952,7 +14079,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+          Text(label, style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted, fontWeight: FontWeight.w700)),
           const SizedBox(height: 4),
           if (ok)
             InkWell(
@@ -13994,7 +14121,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w700)),
+          Text(label, style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted, fontWeight: FontWeight.w700)),
           const SizedBox(height: 4),
           SelectableText(v, style: const TextStyle(height: 1.35)),
         ],
@@ -14150,12 +14277,12 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> with SingleTickerProvid
                 ),
               ),
               Material(
-                color: Colors.white,
+                color: AppColors.surface,
                 child: TabBar(
                   controller: _tab,
                   isScrollable: true,
-                  labelColor: AppColors.ink,
-                  unselectedLabelColor: Colors.grey.shade700,
+                  labelColor: AppColors.onSurface,
+                  unselectedLabelColor: AppColors.onSurfaceMuted,
                   indicatorColor: AppColors.brand,
                   tabs: [
                     Tab(
@@ -14579,7 +14706,7 @@ class _MyProfileScreenState extends State<MyProfileScreen> {
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: Colors.white,
+                      color: AppColors.surface,
                       borderRadius: BorderRadius.circular(10),
                       border: Border.all(color: AppColors.border),
                     ),
@@ -15037,7 +15164,7 @@ class _MapPinPickerDialogState extends State<_MapPinPickerDialog> {
               const SizedBox(height: 6),
               Text(
                 'Optional: grant location permission for a quicker, more accurate starting point.',
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade700, height: 1.35),
+                style: TextStyle(fontSize: 11, color: AppColors.onSurfaceMuted, height: 1.35),
               ),
               const SizedBox(height: 10),
               SizedBox(
@@ -15208,7 +15335,7 @@ class _InquiryWizardProgressBar extends StatelessWidget {
                       fontSize: 10,
                       height: 1.2,
                       fontWeight: active ? FontWeight.w800 : FontWeight.w600,
-                      color: reached ? Colors.black87 : Colors.grey.shade600,
+                      color: reached ? AppColors.onSurface : Colors.grey.shade600,
                     ),
                   ),
                 ],
@@ -15255,7 +15382,7 @@ class _CateringPackagesPanel extends StatelessWidget {
                       const SizedBox(height: 6),
                       Text(
                         'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
-                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                        style: TextStyle(fontSize: 12, height: 1.35, color: AppColors.onSurfaceMuted),
                       ),
                       const SizedBox(height: 16),
                       const Text('Catering with Event Styling', style: TextStyle(fontWeight: FontWeight.w800)),
@@ -15266,7 +15393,7 @@ class _CateringPackagesPanel extends StatelessWidget {
                       const SizedBox(height: 6),
                       Text(
                         'For extensive event styling and other requests, please include in your notes upon inquiry submission.',
-                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                        style: TextStyle(fontSize: 12, height: 1.35, color: AppColors.onSurfaceMuted),
                       ),
                     ],
                   ),
@@ -15283,7 +15410,7 @@ class _CateringPackagesPanel extends StatelessWidget {
                       const SizedBox(height: 6),
                       Text(
                         'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
-                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                        style: TextStyle(fontSize: 12, height: 1.35, color: AppColors.onSurfaceMuted),
                       ),
                       const SizedBox(height: 16),
                       const Text('Catering with Event Styling', style: TextStyle(fontWeight: FontWeight.w800)),
@@ -15293,7 +15420,7 @@ class _CateringPackagesPanel extends StatelessWidget {
                       const SizedBox(height: 6),
                       Text(
                         'For requests such as event styling, menu modifications, tables and chairs, etc., please include in your notes upon inquiry submission.',
-                        style: TextStyle(fontSize: 12, height: 1.35, color: Colors.grey.shade700),
+                        style: TextStyle(fontSize: 12, height: 1.35, color: AppColors.onSurfaceMuted),
                       ),
                     ],
                   ),
@@ -15971,7 +16098,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
     required VoidCallback onTap,
   }) {
     return Material(
-      color: selected ? const Color(0xFFFFF8E1) : Colors.white,
+      color: selected ? (AppColors.isDark ? AppColors.brand.withValues(alpha: 0.22) : const Color(0xFFFFF8E1)) : AppColors.surface,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12),
         side: BorderSide(color: selected ? const Color(0xFFE8B923) : Colors.grey.shade400, width: selected ? 2 : 1),
@@ -15992,7 +16119,7 @@ class _InquiryScreenState extends State<InquiryScreen> {
                 ],
               ),
               const SizedBox(height: 6),
-              Text(subtitle, style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3)),
+              Text(subtitle, style: TextStyle(fontSize: 12, color: AppColors.onSurfaceMuted, height: 1.3)),
             ],
           ),
         ),
@@ -17534,7 +17661,7 @@ class _MyInquiriesScreenState extends State<MyInquiriesScreen> with SingleTicker
                 const SizedBox(height: 6),
                 Text(
                   eventDesignSourceLabel(r.themeDesign),
-                  style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
+                  style: TextStyle(color: AppColors.onSurfaceMuted, fontSize: 13),
                 ),
                 const SizedBox(height: 8),
                 if (themeImg.isNotEmpty)
@@ -17974,9 +18101,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 'This removes your login and profile. Past orders stay on file for the restaurant but you will not be able to sign in with this email again unless you create a new account.',
               ),
               const SizedBox(height: 14),
-              TextField(
+              _ObscurableTextField(
                 controller: passwordCtl,
-                obscureText: true,
                 decoration: const InputDecoration(
                   labelText: 'Confirm with password',
                   border: OutlineInputBorder(),
@@ -18185,7 +18311,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: AppColors.surface,
               borderRadius: BorderRadius.circular(12),
             ),
             child: Row(
@@ -18212,7 +18338,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           return Stack(
             children: [
               Scaffold(
-                backgroundColor: Colors.white,
+                backgroundColor: AppColors.surface,
                 appBar: AppBar(
                   backgroundColor: const Color(0xFF242424),
                   foregroundColor: const Color(0xFFFFC024),
@@ -18240,7 +18366,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           return Stack(
             children: [
               Scaffold(
-                backgroundColor: Colors.white,
+                backgroundColor: AppColors.surface,
                 appBar: AppBar(
                   backgroundColor: Colors.black87,
                   foregroundColor: Colors.white,
@@ -18289,7 +18415,7 @@ class ToggleSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      decoration: BoxDecoration(color: Colors.white, border: Border.all(color: AppColors.border), borderRadius: BorderRadius.circular(14)),
+      decoration: BoxDecoration(color: AppColors.surface, border: Border.all(color: AppColors.border), borderRadius: BorderRadius.circular(14)),
       child: Column(
         children: [
           InkWell(
@@ -18326,7 +18452,7 @@ class LockedField extends StatelessWidget {
           Expanded(
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-              decoration: BoxDecoration(color: Colors.grey.shade200, borderRadius: BorderRadius.circular(8), border: Border.all(color: AppColors.border)),
+              decoration: BoxDecoration(color: AppColors.mutedFill, borderRadius: BorderRadius.circular(8), border: Border.all(color: AppColors.border)),
               child: Text(value),
             ),
           ),
@@ -18345,7 +18471,7 @@ class _OrderNoCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: AppColors.brand)),
+      decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(12), border: Border.all(color: AppColors.brand)),
       child: displayNo != null && displayNo!.trim().isNotEmpty
           ? Text(displayNo!.trim(), style: const TextStyle(fontWeight: FontWeight.w700))
           : Column(
@@ -18388,7 +18514,7 @@ class SummaryFooter extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      decoration: const BoxDecoration(color: Colors.white, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
+      decoration: BoxDecoration(color: AppColors.surface, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -18743,7 +18869,7 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
       animation: widget.state,
       builder: (context, _) {
         return Scaffold(
-          backgroundColor: Colors.white,
+          backgroundColor: AppColors.surface,
           appBar: AppBar(
             backgroundColor: const Color(0xFF242424),
             foregroundColor: const Color(0xFFFFC024),
@@ -18753,7 +18879,7 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
             bottom: PreferredSize(
               preferredSize: const Size.fromHeight(48),
               child: Material(
-                color: Colors.white,
+                color: AppColors.surface,
                 elevation: 2,
                 shadowColor: Colors.black26,
                 child: TabBar(
@@ -18761,7 +18887,7 @@ class _ManagerCateringShellScreenState extends State<ManagerCateringShellScreen>
                   isScrollable: true,
                   indicatorColor: const Color(0xFFFFC024),
                   labelColor: const Color(0xFFFFC024),
-                  unselectedLabelColor: Colors.grey.shade700,
+                  unselectedLabelColor: AppColors.onSurfaceMuted,
                   tabs: List.generate(_labels.length, (i) {
                     final count = widget.state.managerCateringCountForTab(i);
                     return Tab(
@@ -19687,7 +19813,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
     }
 
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: AppColors.surface,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -20205,7 +20331,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                       return Padding(
                         padding: const EdgeInsets.only(bottom: 6),
                         child: Material(
-                          color: sel ? AppColors.brand.withValues(alpha: 0.35) : Colors.grey.shade100,
+                          color: sel ? AppColors.brand.withValues(alpha: 0.35) : AppColors.mutedFill,
                           borderRadius: BorderRadius.circular(10),
                           child: InkWell(
                             borderRadius: BorderRadius.circular(10),
@@ -20257,7 +20383,7 @@ class _ManagerNewEventCreateScreenState extends State<ManagerNewEventCreateScree
                                         if (dishItem != null && dishItem.allergens.isNotEmpty)
                                           Text(
                                             'Allergens: ${dishItem.allergens.join(', ')}',
-                                            style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                                            style: TextStyle(fontSize: 11, color: AppColors.onSurfaceMuted),
                                           )
                                         else if (dishItem != null)
                                           Text(
@@ -23141,7 +23267,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
   Widget build(BuildContext context) {
     if (!_detailReady) {
       return Scaffold(
-        backgroundColor: Colors.white,
+        backgroundColor: AppColors.surface,
         appBar: AppBar(
           backgroundColor: const Color(0xFF242424),
           foregroundColor: const Color(0xFFFFC024),
@@ -23916,7 +24042,7 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
 
     if (widget.supervisorMode) {
       return Scaffold(
-        backgroundColor: Colors.white,
+        backgroundColor: AppColors.surface,
         appBar: AppBar(
           backgroundColor: const Color(0xFF242424),
           foregroundColor: const Color(0xFFFFC024),
@@ -24335,14 +24461,14 @@ class _ManagerCateringDetailScreenState extends State<ManagerCateringDetailScree
       },
       child: Theme(
         data: Theme.of(context).copyWith(
-          cardTheme: const CardThemeData(
+          cardTheme: CardThemeData(
             color: AppColors.canvas,
             elevation: 0,
             surfaceTintColor: AppColors.canvas,
           ),
         ),
         child: Scaffold(
-      backgroundColor: isDraftStage ? AppColors.canvas : Colors.white,
+      backgroundColor: isDraftStage ? AppColors.canvas : AppColors.surface,
       appBar: AppBar(
         backgroundColor: const Color(0xFF242424),
         foregroundColor: const Color(0xFFFFC024),
@@ -26070,7 +26196,7 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
       animation: widget.state,
       builder: (context, _) {
         return Scaffold(
-          backgroundColor: Colors.white,
+          backgroundColor: AppColors.surface,
           appBar: AppBar(
             backgroundColor: Colors.black87,
             foregroundColor: Colors.white,
@@ -26118,14 +26244,14 @@ class _PosShellScreenState extends State<PosShellScreen> with SingleTickerProvid
             bottom: PreferredSize(
               preferredSize: const Size.fromHeight(48),
               child: Material(
-                color: Colors.white,
+                color: AppColors.surface,
                 elevation: 2,
                 shadowColor: Colors.black26,
                 child: TabBar(
                   controller: _tab,
                   indicatorColor: AppColors.brand,
                   labelColor: AppColors.brand,
-                  unselectedLabelColor: Colors.grey.shade700,
+                  unselectedLabelColor: AppColors.onSurfaceMuted,
                   onTap: (_) => setState(() {}),
                   tabs: [
                     const Tab(text: 'New Order'),
@@ -26183,7 +26309,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
   Widget _posDishCard(MenuItemData item) {
     return Container(
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: AppColors.surface,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: AppColors.border),
       ),
@@ -26219,7 +26345,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
                     IconButton(
                       onPressed: () => widget.state.promptAndAddRestaurantDish(context, item),
                       icon: const Icon(Icons.add_box_outlined),
-                      color: AppColors.ink,
+                      color: AppColors.onSurface,
                     ),
                   ],
                 ),
@@ -26235,7 +26361,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
     return Container(
       width: 300,
       decoration: BoxDecoration(
-        color: Colors.grey.shade50,
+        color: AppColors.mutedFill,
         border: Border(left: BorderSide(color: Colors.grey.shade300)),
       ),
       child: Column(
@@ -26365,7 +26491,7 @@ class _PosNewOrderTabState extends State<PosNewOrderTab> {
               children: [
                 Expanded(child: menuBody),
                 Container(
-                  decoration: const BoxDecoration(color: Colors.white, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
+                  decoration: BoxDecoration(color: AppColors.surface, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
                   padding: const EdgeInsets.all(12),
                   child: Row(
                     children: [
@@ -26969,13 +27095,13 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
               ),
             ),
             Material(
-              color: Colors.white,
+              color: AppColors.surface,
               elevation: 2,
               shadowColor: Colors.black26,
               child: TabBar(
                 controller: _walkTab,
                 labelColor: AppColors.brand,
-                unselectedLabelColor: Colors.grey.shade700,
+                unselectedLabelColor: AppColors.onSurfaceMuted,
                 indicatorColor: AppColors.brand,
                 tabs: const [
                   Tab(text: 'Preparing'),
@@ -27070,7 +27196,7 @@ class _PosWalkInOngoingTabState extends State<PosWalkInOngoingTab> with SingleTi
             o.updatedAt != null ? formatDateTimeLocal(o.updatedAt!) : '';
         return Card(
           elevation: 2,
-          color: Colors.white,
+          color: AppColors.surface,
           shadowColor: Colors.black26,
           child: InkWell(
             onTap: () => _showWalkInDetail(o),
@@ -27450,14 +27576,14 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
               ),
             ),
             Material(
-              color: Colors.white,
+              color: AppColors.surface,
               elevation: 2,
               shadowColor: Colors.black26,
               child: TabBar(
                 controller: _fulTab,
                 isScrollable: true,
                 labelColor: AppColors.brand,
-                unselectedLabelColor: Colors.grey.shade700,
+                unselectedLabelColor: AppColors.onSurfaceMuted,
                 indicatorColor: AppColors.brand,
                 tabs: const [
                   Tab(text: 'Pending'),
@@ -27496,7 +27622,7 @@ class _PosOnlineOrdersTabState extends State<PosOnlineOrdersTab> with SingleTick
                               final track = o.deliveryTrackingUrl.trim();
                               return Card(
                                 elevation: 2,
-                                color: Colors.white,
+                                color: AppColors.surface,
                                 shadowColor: Colors.black26,
                                 child: ListTile(
                                   leading: o.balanceProofPendingReview
@@ -28099,7 +28225,7 @@ class _PosOnlineOrderDetailScreenState extends State<PosOnlineOrderDetailScreen>
                               labelText: 'Delivery tracking link (shown to customer)',
                               hintText: 'https://...',
                               filled: trackingReadOnly,
-                              fillColor: trackingReadOnly ? Colors.grey.shade200 : null,
+                              fillColor: trackingReadOnly ? AppColors.mutedFill : null,
                             ),
                             onChanged: (_) => setState(() {}),
                           ),

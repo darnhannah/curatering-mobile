@@ -210,7 +210,7 @@ class CmsBlockRenderer extends StatelessWidget {
                 SizedBox(
                   width: (MediaQuery.sizeOf(context).width - 44) / 2,
                   child: Material(
-                    color: Colors.white,
+                    color: Theme.of(context).colorScheme.surface,
                     borderRadius: BorderRadius.circular(12),
                     child: InkWell(
                       borderRadius: BorderRadius.circular(12),
@@ -223,7 +223,7 @@ class CmsBlockRenderer extends StatelessWidget {
                             Text(t.title, style: const TextStyle(fontWeight: FontWeight.w800)),
                             if (t.subtitle.isNotEmpty) ...[
                               const SizedBox(height: 4),
-                              Text(t.subtitle, style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+                              Text(t.subtitle, style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
                             ],
                           ],
                         ),
