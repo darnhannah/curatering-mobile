@@ -23,6 +23,7 @@ import 'cms/cms_block_renderer.dart';
 import 'cms/mobile_ui_config_store.dart';
 import 'features/event_design/event_design_admin_screen.dart';
 import 'features/event_design/event_theme_design_screen.dart';
+import 'features/inquiry/menu_recommendation_service.dart';
 import 'features/event_design/theme_design_export.dart';
 import 'features/seating/seating_layout_editor_screen.dart';
 import 'utils/image_pick_limits.dart';
@@ -15466,6 +15467,12 @@ class _InquiryScreenState extends State<InquiryScreen> {
   String _themeDesignSessionId = 'inquiry-${DateTime.now().microsecondsSinceEpoch}';
   Map<String, dynamic>? _aiThemeDesignPayload;
   String menuSuggestionNote = '';
+  bool _generatingMenuRecommendation = false;
+  MenuRecommendationResult? _menuRecommendation;
+  String? _menuRecommendationError;
+  bool _menuWasAiRecommended = false;
+  final GlobalKey _menuRecommendationCardKey = GlobalKey();
+  int _menuRecommendationRequestId = 0;
   String themeSuggestionNote = '';
   final themeNotesController = TextEditingController();
   final List<String> _themeReferenceImagesB64 = <String>[];
@@ -15583,6 +15590,10 @@ class _InquiryScreenState extends State<InquiryScreen> {
       _themeDesignSessionId = 'inquiry-${DateTime.now().microsecondsSinceEpoch}';
       _aiThemeDesignPayload = null;
       menuSuggestionNote = '';
+      _generatingMenuRecommendation = false;
+      _menuRecommendation = null;
+      _menuRecommendationError = null;
+      _menuWasAiRecommended = false;
       themeSuggestionNote = '';
       selectedSetMenu = 'All Dishes';
       selectedDishes.clear();
@@ -16041,6 +16052,318 @@ class _InquiryScreenState extends State<InquiryScreen> {
     final dish = _inquiryDishByName(dishName, cateringMenu);
     if (_dishBlockedByAllergens(dish)) return false;
     return true;
+  }
+
+  List<MenuItemData> get _inquiryCateringMenu =>
+      widget.state.menu.where((m) => m.isCateringDish).toList();
+
+  List<Map<String, dynamic>> _menuRecommendationCatalogue() {
+    return _inquiryCateringMenu
+        .map(
+          (dish) => <String, dynamic>{
+            'id': dish.id,
+            'name': dish.name,
+            'description': dish.description,
+            'category': dish.category,
+            'allergens': dish.allergens,
+          },
+        )
+        .toList();
+  }
+
+  List<String> _resolveRecommendedDishNames(MenuRecommendationResult recommendation) {
+    final menu = _inquiryCateringMenu;
+    final byId = <String, MenuItemData>{for (final d in menu) d.id: d};
+    final byName = <String, MenuItemData>{
+      for (final d in menu) d.name.trim().toLowerCase(): d,
+    };
+
+    String? resolveRef(String raw) {
+      final key = raw.trim();
+      if (key.isEmpty) return null;
+      if (byId.containsKey(key)) return byId[key]!.name;
+      final byNameHit = byName[key.toLowerCase()];
+      if (byNameHit != null) return byNameHit.name;
+      return null;
+    }
+
+    final resolved = <String>[];
+    final seen = <String>{};
+    void addName(String? name) {
+      final n = name?.trim() ?? '';
+      if (n.isEmpty || seen.contains(n.toLowerCase())) return;
+      seen.add(n.toLowerCase());
+      resolved.add(n);
+    }
+
+    for (final dish in recommendation.dishes) {
+      addName(resolveRef(dish['id']?.toString() ?? ''));
+      addName(resolveRef(dish['name']?.toString() ?? ''));
+      addName(dish['name']?.toString());
+    }
+    for (final id in recommendation.dishIds) {
+      addName(resolveRef(id));
+    }
+    return resolved;
+  }
+
+  List<MenuItemData> _resolveRecommendedDishes(MenuRecommendationResult recommendation) {
+    final menu = _inquiryCateringMenu;
+    final names = _resolveRecommendedDishNames(recommendation);
+    final found = <MenuItemData>[];
+    for (final name in names) {
+      final dish = _inquiryDishByName(name, menu);
+      if (dish != null) found.add(dish);
+    }
+    return found;
+  }
+
+  Future<void> _suggestInquiryMenu() async {
+    if (_generatingMenuRecommendation) return;
+    final guests = _guestCountForSubmit();
+    if (guests < 1) {
+      appSnack(context, 'Enter the number of guests first.');
+      return;
+    }
+    final dishes = _menuRecommendationCatalogue();
+    if (dishes.length < _minSelectedDishesRequired) {
+      appSnack(context, 'There are not enough available dishes to generate a menu.');
+      return;
+    }
+    final requestId = ++_menuRecommendationRequestId;
+    setState(() {
+      _generatingMenuRecommendation = true;
+      _menuRecommendationError = null;
+      _menuRecommendation = null;
+    });
+    try {
+      final result = await MenuRecommendationService.instance.recommend(
+        eventType: _resolvedEventType(),
+        eventTitle: eventTitle.text.trim(),
+        eventSetting: eventSetting == 'closed' ? 'indoor' : 'outdoor',
+        guestCount: guests,
+        allergens: _guestAllergensForSubmit.toList(),
+        dishes: dishes,
+      );
+      if (!mounted || requestId != _menuRecommendationRequestId) return;
+      setState(() => _menuRecommendation = result);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final ctx = _menuRecommendationCardKey.currentContext;
+        if (ctx == null || !ctx.mounted) return;
+        Scrollable.ensureVisible(
+          ctx,
+          duration: const Duration(milliseconds: 400),
+          alignment: 0.12,
+          curve: Curves.easeOut,
+        );
+      });
+    } catch (e) {
+      if (!mounted || requestId != _menuRecommendationRequestId) return;
+      final message = e is MenuRecommendationException && e.message.trim().isNotEmpty
+          ? e.message
+          : 'We could not generate a menu right now. Please try again.';
+      setState(() => _menuRecommendationError = message);
+      appSnack(context, 'Menu suggestion failed. Please try again.');
+    } finally {
+      if (mounted && requestId == _menuRecommendationRequestId) {
+        setState(() => _generatingMenuRecommendation = false);
+      }
+    }
+  }
+
+  void _useRecommendedInquiryMenu() {
+    final recommendation = _menuRecommendation;
+    if (recommendation == null) return;
+    final names = _resolveRecommendedDishNames(recommendation).take(_maxSelectedDishesRequired).toList();
+    if (names.length < _minSelectedDishesRequired) {
+      appSnack(context, 'The recommended menu does not contain enough valid dishes.');
+      return;
+    }
+    setState(() {
+      _menuWasAiRecommended = true;
+      selectedSetMenu = 'All Dishes';
+      selectedDishes
+        ..clear()
+        ..addAll(names);
+      menuSuggestionNote = 'Menu recommended by Macrina AI based on the event details.';
+      _menuRecommendation = null;
+      _menuRecommendationError = null;
+    });
+    appSnack(context, 'Recommended menu added. You can review it before submitting.');
+  }
+
+  Widget _inquiryRecommendedDishThumb(MenuItemData? dish) {
+    final raw = dish?.imageBase64?.trim() ?? '';
+    Widget fallback = Container(
+      width: 56,
+      height: 56,
+      color: AppColors.mutedFill,
+      child: Icon(Icons.restaurant, size: 22, color: AppColors.onSurfaceMuted),
+    );
+    if (raw.isEmpty) {
+      return ClipRRect(borderRadius: BorderRadius.circular(8), child: fallback);
+    }
+    try {
+      var b64 = raw;
+      if (b64.startsWith('data:')) {
+        final comma = b64.indexOf(',');
+        if (comma >= 0) b64 = b64.substring(comma + 1);
+      }
+      final bytes = base64Decode(b64);
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.memory(bytes, width: 56, height: 56, fit: BoxFit.cover, gaplessPlayback: true),
+      );
+    } catch (_) {
+      return ClipRRect(borderRadius: BorderRadius.circular(8), child: fallback);
+    }
+  }
+
+  Widget _inquiryRecommendedDishRow(MenuItemData dish) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          _inquiryRecommendedDishThumb(dish),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(dish.name, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                if (dish.description.trim().isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    dish.description.trim(),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 12, height: 1.3, color: AppColors.onSurfaceMuted),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInquiryMenuRecommendationCard() {
+    final recommendation = _menuRecommendation!;
+    final dishes = _resolveRecommendedDishes(recommendation);
+    return Container(
+      key: _menuRecommendationCardKey,
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.amber.shade300, width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.auto_awesome, color: Colors.amber.shade700),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Macrina recommends this menu',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                ),
+              ),
+            ],
+          ),
+          if (recommendation.summary.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Text(recommendation.summary, style: const TextStyle(height: 1.4)),
+          ],
+          const SizedBox(height: 12),
+          if (dishes.isEmpty)
+            Text(
+              'No dish names were returned. Tap Suggest Another to try again.',
+              style: TextStyle(color: Colors.red.shade700),
+            )
+          else
+            ...dishes.map(_inquiryRecommendedDishRow),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _generatingMenuRecommendation ? null : _suggestInquiryMenu,
+                  child: const Text('SUGGEST ANOTHER'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton(
+                  onPressed: dishes.length >= _minSelectedDishesRequired ? _useRecommendedInquiryMenu : null,
+                  child: const Text('USE THIS MENU'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAcceptedAiInquiryMenuCard() {
+    final dishes = selectedDishes
+        .map((name) => _inquiryDishByName(name, _inquiryCateringMenu))
+        .whereType<MenuItemData>()
+        .toList();
+    return Container(
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.amber.shade300, width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'Your recommended menu',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 12),
+          if (dishes.isEmpty)
+            ...selectedDishes.map(
+              (name) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(name, style: const TextStyle(fontWeight: FontWeight.w700)),
+              ),
+            )
+          else
+            ...dishes.map(_inquiryRecommendedDishRow),
+          Text(
+            'You can review this menu before submitting, or switch to curate your own to adjust dishes.',
+            style: TextStyle(color: AppColors.onSurfaceMuted, height: 1.4),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: _generatingMenuRecommendation
+                ? null
+                : () {
+                    setState(() {
+                      _menuWasAiRecommended = false;
+                      selectedDishes.clear();
+                      _menuRecommendation = null;
+                      _menuRecommendationError = null;
+                      menuSuggestionNote = 'No, suggest me a menu instead.';
+                    });
+                    _suggestInquiryMenu();
+                  },
+            child: const Text('SUGGEST ANOTHER'),
+          ),
+        ],
+      ),
+    );
   }
 
   bool get _contactNumberInvalid {
@@ -16885,6 +17208,9 @@ class _InquiryScreenState extends State<InquiryScreen> {
                           menuSuggestionNote = '';
                           selectedSetMenu = 'All Dishes';
                           selectedDishes.clear();
+                          _menuWasAiRecommended = false;
+                          _menuRecommendation = null;
+                          _menuRecommendationError = null;
                         }),
                       ),
                       RadioListTile<bool>(
@@ -16892,12 +17218,15 @@ class _InquiryScreenState extends State<InquiryScreen> {
                         contentPadding: EdgeInsets.zero,
                         value: false,
                         groupValue: _menuChoicePicked ? curateOwn : null,
-                        title: const Text('No, suggest a menu'),
+                        title: const Text('Have Macrina suggest a menu'),
                         onChanged: (v) => setState(() {
                           _menuChoicePicked = true;
                           curateOwn = false;
                           selectedDishes.clear();
                           menuSuggestionNote = 'No, suggest me a menu instead.';
+                          _menuWasAiRecommended = false;
+                          _menuRecommendation = null;
+                          _menuRecommendationError = null;
                         }),
                       ),
                       if (_attemptedSubmit && !_menuChoicePicked)
@@ -16908,6 +17237,60 @@ class _InquiryScreenState extends State<InquiryScreen> {
                             style: TextStyle(color: Colors.red.shade700, fontSize: 12),
                           ),
                         ),
+                      if (_menuChoicePicked && !curateOwn) ...[
+                        if (_menuWasAiRecommended)
+                          _buildAcceptedAiInquiryMenuCard()
+                        else ...[
+                          const SizedBox(height: 10),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: AppColors.isDark
+                                  ? Colors.amber.shade900.withValues(alpha: 0.25)
+                                  : Colors.amber.shade50,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.amber.shade200),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                const Text(
+                                  'Have Macrina suggest me a menu',
+                                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  'We will use your event type, event details, venue setting, guest count, and dietary restrictions to recommend dishes from our catering menu.',
+                                  style: TextStyle(color: AppColors.onSurfaceMuted, height: 1.4),
+                                ),
+                                const SizedBox(height: 12),
+                                FilledButton.icon(
+                                  onPressed: _generatingMenuRecommendation ? null : _suggestInquiryMenu,
+                                  icon: _generatingMenuRecommendation
+                                      ? const SizedBox(
+                                          width: 18,
+                                          height: 18,
+                                          child: CircularProgressIndicator(strokeWidth: 2),
+                                        )
+                                      : const Icon(Icons.auto_awesome),
+                                  label: Text(
+                                    _generatingMenuRecommendation ? 'CREATING YOUR MENU…' : 'SUGGEST MY MENU',
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (_menuRecommendationError != null) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              _menuRecommendationError!,
+                              style: TextStyle(color: Colors.red.shade700),
+                            ),
+                          ],
+                          if (_menuRecommendation != null) _buildInquiryMenuRecommendationCard(),
+                        ],
+                      ],
                       if (_menuChoicePicked && curateOwn) ...[
                         const SizedBox(height: 10),
                         Text('Set menu', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
