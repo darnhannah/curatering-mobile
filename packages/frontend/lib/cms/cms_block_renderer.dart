@@ -157,20 +157,31 @@ class CmsBlockRenderer extends StatelessWidget {
           ),
         );
       case 'banner_notice':
+        final dark = Theme.of(context).brightness == Brightness.dark;
         return Container(
           margin: const EdgeInsets.only(bottom: 12),
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
-            color: const Color(0xFFFFF3CD),
-            border: Border.all(color: const Color(0xFFFFC107)),
+            color: dark ? const Color(0xFF3D3420) : const Color(0xFFFFF3CD),
+            border: Border.all(color: dark ? const Color(0xFFC9A227) : const Color(0xFFFFC107)),
             borderRadius: BorderRadius.circular(8),
           ),
-          child: Text(block.body.isNotEmpty ? block.body : block.title, style: const TextStyle(height: 1.35)),
+          child: Text(
+            block.body.isNotEmpty ? block.body : block.title,
+            style: TextStyle(height: 1.35, color: Theme.of(context).colorScheme.onSurface),
+          ),
         );
       case 'heading':
         return Padding(
           padding: const EdgeInsets.only(bottom: 10),
-          child: Text(block.title, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+          child: Text(
+            block.title,
+            style: TextStyle(
+              fontWeight: FontWeight.w800,
+              fontSize: 16,
+              color: Theme.of(context).colorScheme.onSurface,
+            ),
+          ),
         );
       case 'rich_text':
         return Padding(
@@ -194,7 +205,10 @@ class CmsBlockRenderer extends StatelessWidget {
         return Padding(
           padding: const EdgeInsets.only(bottom: 12),
           child: FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: _primary(context)),
+            style: FilledButton.styleFrom(
+              backgroundColor: _primary(context),
+              foregroundColor: const Color(0xFF201B16),
+            ),
             onPressed: () => _handleRoute(block.route, url: block.url),
             child: Text(block.ctaLabel.isEmpty ? 'Continue' : block.ctaLabel),
           ),
@@ -210,7 +224,8 @@ class CmsBlockRenderer extends StatelessWidget {
                 SizedBox(
                   width: (MediaQuery.sizeOf(context).width - 44) / 2,
                   child: Material(
-                    color: Theme.of(context).colorScheme.surface,
+                    color: Theme.of(context).colorScheme.surfaceContainer,
+                    elevation: 1,
                     borderRadius: BorderRadius.circular(12),
                     child: InkWell(
                       borderRadius: BorderRadius.circular(12),
@@ -220,7 +235,13 @@ class CmsBlockRenderer extends StatelessWidget {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(t.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                            Text(
+                              t.title,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w800,
+                                color: Theme.of(context).colorScheme.onSurface,
+                              ),
+                            ),
                             if (t.subtitle.isNotEmpty) ...[
                               const SizedBox(height: 4),
                               Text(t.subtitle, style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
@@ -254,18 +275,25 @@ class CmsBlockRenderer extends StatelessWidget {
           children: [
             for (final p in block.packages)
               Card(
+                color: Theme.of(context).colorScheme.surfaceContainer,
                 margin: const EdgeInsets.only(bottom: 10),
                 child: Padding(
                   padding: const EdgeInsets.all(14),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(p.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+                      Text(
+                        p.title,
+                        style: TextStyle(
+                          fontWeight: FontWeight.w800,
+                          color: Theme.of(context).colorScheme.onSurface,
+                        ),
+                      ),
                       const SizedBox(height: 6),
                       for (final line in p.lines)
                         Padding(
                           padding: const EdgeInsets.only(bottom: 2),
-                          child: Text(line),
+                          child: Text(line, style: TextStyle(color: Theme.of(context).colorScheme.onSurface)),
                         ),
                     ],
                   ),

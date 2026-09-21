@@ -62,14 +62,46 @@ Future<void> main() async {
 }
 
 ThemeData buildAppLightTheme({Color? seed}) {
+  const page = Color(0xFFF1F1F1);
   const surface = Colors.white;
+  const onSurface = Color(0xFF201B16);
+  const muted = Color(0xFF616161);
+  final primary = seed ?? AppColors.brand;
+  final scheme = ColorScheme.light(
+    primary: primary,
+    onPrimary: AppColors.ink,
+    primaryContainer: const Color(0xFFFFE08A),
+    onPrimaryContainer: AppColors.ink,
+    secondary: AppColors.brand,
+    onSecondary: AppColors.ink,
+    surface: surface,
+    onSurface: onSurface,
+    onSurfaceVariant: muted,
+    outline: const Color(0xFF9B8F82),
+    error: AppColors.accent,
+    onError: Colors.white,
+  );
   return ThemeData(
     useMaterial3: true,
+    useSystemColors: false,
     brightness: Brightness.light,
+    colorScheme: scheme,
     scaffoldBackgroundColor: surface,
-    canvasColor: const Color(0xFFF1F1F1),
+    canvasColor: page,
     cardColor: surface,
-    colorScheme: ColorScheme.fromSeed(seedColor: seed ?? AppColors.brand, brightness: Brightness.light),
+    dividerColor: const Color(0xFFE0E0E0),
+    applyElevationOverlayColor: false,
+    iconTheme: const IconThemeData(color: onSurface),
+    textTheme: Typography.blackMountainView.apply(bodyColor: onSurface, displayColor: onSurface),
+    primaryTextTheme: Typography.blackMountainView.apply(bodyColor: onSurface, displayColor: onSurface),
+    filledButtonTheme: FilledButtonThemeData(
+      style: FilledButton.styleFrom(
+        backgroundColor: AppColors.brand,
+        foregroundColor: AppColors.ink,
+        disabledBackgroundColor: const Color(0xFFE0D6C8),
+        disabledForegroundColor: muted,
+      ),
+    ),
     cardTheme: CardThemeData(
       color: surface,
       elevation: 2,
@@ -87,13 +119,24 @@ ThemeData buildAppLightTheme({Color? seed}) {
     ),
     drawerTheme: const DrawerThemeData(backgroundColor: surface),
     popupMenuTheme: const PopupMenuThemeData(color: surface),
-    listTileTheme: const ListTileThemeData(tileColor: Colors.transparent),
+    listTileTheme: const ListTileThemeData(
+      iconColor: onSurface,
+      textColor: onSurface,
+      tileColor: Colors.transparent,
+    ),
+    tabBarTheme: const TabBarThemeData(
+      labelColor: onSurface,
+      unselectedLabelColor: muted,
+      indicatorColor: AppColors.brand,
+    ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: surface,
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
-      ),
+      labelStyle: const TextStyle(color: muted),
+      hintStyle: const TextStyle(color: muted),
+      prefixIconColor: muted,
+      suffixIconColor: muted,
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
     ),
   );
 }
@@ -102,23 +145,58 @@ ThemeData buildAppDarkTheme({Color? seed}) {
   const page = Color(0xFF121212);
   const surface = Color(0xFF2C2C2C);
   const onSurface = Color(0xFFF3EEE8);
-  final scheme = ColorScheme.fromSeed(
-    seedColor: seed ?? AppColors.brand,
+  const muted = Color(0xFFB8B0A8);
+  const scheme = ColorScheme(
     brightness: Brightness.dark,
-  ).copyWith(
-    surface: surface,
+    primary: Color(0xFFFFC233),
+    onPrimary: Color(0xFF201B16),
+    primaryContainer: Color(0xFF4A3B16),
+    onPrimaryContainer: onSurface,
+    secondary: Color(0xFFFFC233),
+    onSecondary: Color(0xFF201B16),
+    secondaryContainer: Color(0xFF3A3A3A),
+    onSecondaryContainer: onSurface,
+    tertiary: Color(0xFFD7C3A0),
+    onTertiary: Color(0xFF201B16),
+    error: Color(0xFFCF6679),
+    onError: Color(0xFF201B16),
+    surface: page,
     onSurface: onSurface,
-    onSurfaceVariant: const Color(0xFFB8B0A8),
-    outline: const Color(0xFF6B645C),
+    onSurfaceVariant: muted,
+    outline: Color(0xFF6B645C),
+    outlineVariant: Color(0xFF4A4540),
+    inverseSurface: Color(0xFFE8E2DC),
+    onInverseSurface: page,
+    inversePrimary: Color(0xFF201B16),
+    surfaceDim: page,
+    surfaceBright: surface,
+    surfaceContainerLowest: page,
+    surfaceContainerLow: Color(0xFF1A1A1A),
+    surfaceContainer: surface,
+    surfaceContainerHigh: surface,
+    surfaceContainerHighest: Color(0xFF3A3A3A),
   );
   return ThemeData(
     useMaterial3: true,
+    useSystemColors: false,
     brightness: Brightness.dark,
     colorScheme: scheme,
     scaffoldBackgroundColor: page,
     canvasColor: page,
     cardColor: surface,
     dividerColor: const Color(0xFF4A4540),
+    applyElevationOverlayColor: false,
+    iconTheme: const IconThemeData(color: onSurface),
+    textTheme: Typography.whiteMountainView.apply(bodyColor: onSurface, displayColor: onSurface),
+    primaryTextTheme: Typography.whiteMountainView.apply(bodyColor: onSurface, displayColor: onSurface),
+    filledButtonTheme: FilledButtonThemeData(
+      style: FilledButton.styleFrom(
+        backgroundColor: AppColors.brand,
+        foregroundColor: AppColors.ink,
+        disabledBackgroundColor: const Color(0xFF3A3A3A),
+        disabledForegroundColor: muted,
+      ),
+    ),
     appBarTheme: const AppBarTheme(
       backgroundColor: Color(0xFF1F1F1F),
       foregroundColor: onSurface,
@@ -144,30 +222,58 @@ ThemeData buildAppDarkTheme({Color? seed}) {
     listTileTheme: const ListTileThemeData(
       iconColor: onSurface,
       textColor: onSurface,
+      subtitleTextStyle: TextStyle(color: muted, fontSize: 14),
       tileColor: Colors.transparent,
     ),
     tabBarTheme: const TabBarThemeData(
-      labelColor: onSurface,
-      unselectedLabelColor: Color(0xFFB8B0A8),
+      labelColor: AppColors.brand,
+      unselectedLabelColor: muted,
+      indicatorColor: AppColors.brand,
     ),
     expansionTileTheme: const ExpansionTileThemeData(
       backgroundColor: surface,
       collapsedBackgroundColor: surface,
       iconColor: onSurface,
-      collapsedIconColor: Color(0xFFB8B0A8),
+      collapsedIconColor: muted,
     ),
     snackBarTheme: const SnackBarThemeData(backgroundColor: Color(0xFF323232)),
     chipTheme: const ChipThemeData(
       backgroundColor: Color(0xFF3A3A3A),
       selectedColor: Color(0xFF4A3B16),
+      disabledColor: Color(0xFF2A2A2A),
       labelStyle: TextStyle(color: onSurface),
+      secondaryLabelStyle: TextStyle(color: onSurface),
+      side: BorderSide(color: Color(0xFF6B645C)),
+    ),
+    segmentedButtonTheme: SegmentedButtonThemeData(
+      style: ButtonStyle(
+        backgroundColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) return const Color(0xFF4A3B16);
+          return surface;
+        }),
+        foregroundColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) return AppColors.brand;
+          return muted;
+        }),
+      ),
     ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: surface,
-      border: OutlineInputBorder(
+      labelStyle: const TextStyle(color: muted),
+      floatingLabelStyle: const TextStyle(color: AppColors.brand),
+      hintStyle: const TextStyle(color: muted),
+      prefixIconColor: muted,
+      suffixIconColor: muted,
+      enabledBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(10),
+        borderSide: const BorderSide(color: Color(0xFF6B645C)),
       ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(10),
+        borderSide: const BorderSide(color: AppColors.brand, width: 1.5),
+      ),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
     ),
   );
 }
@@ -467,6 +573,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           }
         }
 
+        AppColors.applyThemeMode(appState.themeMode);
         final brandSeed = AppColors.brandResolved;
         return MaterialApp(
           key: ValueKey(appState.authSessionKey),
@@ -479,7 +586,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           darkTheme: buildAppDarkTheme(seed: brandSeed),
           themeMode: appState.themeMode,
           builder: (context, child) {
-            AppColors.applyBrightness(Theme.of(context).brightness);
+            AppColors.applyThemeMode(appState.themeMode);
             return Listener(
               behavior: HitTestBehavior.translucent,
               onPointerDown: (_) => _onUserActivity(),
@@ -1358,9 +1465,9 @@ Widget guestPostPaymentProofNoticeBanner() {
     width: double.infinity,
     padding: const EdgeInsets.all(14),
     decoration: BoxDecoration(
-      color: const Color(0xFFFFF3CD),
+      color: AppColors.noticeFill,
       borderRadius: BorderRadius.circular(10),
-      border: Border.all(color: const Color(0xFFFFC107), width: 2),
+      border: Border.all(color: AppColors.noticeBorder, width: 2),
     ),
     child: Row(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1374,7 +1481,7 @@ Widget guestPostPaymentProofNoticeBanner() {
               fontSize: 14,
               height: 1.4,
               fontWeight: FontWeight.w800,
-              color: Colors.brown.shade900,
+              color: AppColors.noticeFg,
             ),
           ),
         ),
@@ -1412,22 +1519,48 @@ class AppColors {
     _dark = brightness == Brightness.dark;
   }
 
+  static void applyThemeMode(ThemeMode mode) {
+    applyBrightness(mode == ThemeMode.dark ? Brightness.dark : Brightness.light);
+  }
+
+  static bool darkOf(BuildContext context) => Theme.of(context).brightness == Brightness.dark;
+
   static const brand = Color(0xFFFFC233);
   static const accent = Color(0xFFEE4B3C);
   static const success = Color(0xFF2FCB76);
   /// Dark brown for text on brand/accent yellow-red buttons (both themes).
   static const ink = Color(0xFF201B16);
 
+  static const pageDark = Color(0xFF121212);
+  static const surfaceDark = Color(0xFF2C2C2C);
+  static const onDark = Color(0xFFF3EEE8);
+  static const onDarkMuted = Color(0xFFB8B0A8);
+
   static const _lightCanvas = Color(0xFFF1F1F1);
   static const _lightBorder = Color(0xFF9B8F82);
 
-  static Color get canvas => _dark ? const Color(0xFF1A1A1A) : _lightCanvas;
+  static Color get canvas => _dark ? pageDark : _lightCanvas;
   static Color get border => _dark ? const Color(0xFF6B645C) : _lightBorder;
-  static Color get surface => _dark ? const Color(0xFF2C2C2C) : Colors.white;
+  static Color get surface => _dark ? surfaceDark : Colors.white;
   static Color get mutedFill => _dark ? const Color(0xFF3A3A3A) : const Color(0xFFEEEEEE);
   static Color get hairline => _dark ? const Color(0xFF4A4540) : const Color(0xFFE0E0E0);
-  static Color get onSurface => _dark ? const Color(0xFFF3EEE8) : ink;
-  static Color get onSurfaceMuted => _dark ? const Color(0xFFB8B0A8) : const Color(0xFF616161);
+  static Color get onSurface => _dark ? onDark : ink;
+  static Color get onSurfaceMuted => _dark ? onDarkMuted : const Color(0xFF616161);
+  static Color get noticeFill => _dark ? const Color(0xFF3D3420) : const Color(0xFFFFF3CD);
+  static Color get noticeBorder => _dark ? const Color(0xFFC9A227) : const Color(0xFFFFC107);
+  static Color get noticeFg => _dark ? onDark : const Color(0xFF5D4037);
+
+  static Color pageOf(BuildContext context) => darkOf(context) ? pageDark : Colors.white;
+  static Color canvasOf(BuildContext context) => darkOf(context) ? pageDark : _lightCanvas;
+  static Color surfaceOf(BuildContext context) => darkOf(context) ? surfaceDark : Colors.white;
+  static Color onOf(BuildContext context) => darkOf(context) ? onDark : ink;
+  static Color mutedOf(BuildContext context) => darkOf(context) ? onDarkMuted : const Color(0xFF616161);
+  static Color noticeFillOf(BuildContext context) =>
+      darkOf(context) ? const Color(0xFF3D3420) : const Color(0xFFFFF3CD);
+  static Color noticeBorderOf(BuildContext context) =>
+      darkOf(context) ? const Color(0xFFC9A227) : const Color(0xFFFFC107);
+  static Color noticeFgOf(BuildContext context) =>
+      darkOf(context) ? onDark : const Color(0xFF5D4037);
 
   /// CMS `mobileUi.brand.primary` when set; else compile-time [brand].
   static Color get brandResolved {
@@ -3373,7 +3506,7 @@ class AppState extends ChangeNotifier {
   AppState({String? savedThemeMode})
       : apiBase = resolveInitialApiBase(),
         themeMode = savedThemeMode == 'dark' ? ThemeMode.dark : ThemeMode.light {
-    AppColors.applyBrightness(themeMode == ThemeMode.dark ? Brightness.dark : Brightness.light);
+    AppColors.applyThemeMode(themeMode);
   }
 
   String apiBase;
@@ -3520,7 +3653,7 @@ class AppState extends ChangeNotifier {
   void setThemeMode(ThemeMode mode) {
     if (themeMode == mode) return;
     themeMode = mode;
-    AppColors.applyBrightness(mode == ThemeMode.dark ? Brightness.dark : Brightness.light);
+    AppColors.applyThemeMode(mode);
     notifyListeners();
     SharedPreferences.getInstance().then(
       (p) => p.setString('theme_mode', mode == ThemeMode.dark ? 'dark' : 'light'),
@@ -7355,8 +7488,10 @@ class AppScaffold extends StatelessWidget {
             .where((o) => customerOrderPendingTab(o))
             .any((o) => state.orderNosWithUnreadAttention.contains(o.orderNo));
     final showAttentionDot = isCustomer ? pendingAttentionExists : (state.unreadNotificationsCount > 0 || pendingAttentionExists);
+    final pageColor = AppColors.pageOf(context);
+    final onPage = AppColors.onOf(context);
     return Scaffold(
-      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      backgroundColor: pageColor,
       appBar: AppBar(
         foregroundColor: headerFg,
         iconTheme: IconThemeData(color: headerFg),
@@ -7449,7 +7584,16 @@ class AppScaffold extends StatelessWidget {
         ],
       ),
       drawer: guestNoDrawer ? null : AppDrawer(state: state),
-      body: _adaptiveScaffoldBody(context, body),
+      body: ColoredBox(
+        color: pageColor,
+        child: DefaultTextStyle.merge(
+          style: TextStyle(color: onPage),
+          child: IconTheme.merge(
+            data: IconThemeData(color: onPage),
+            child: _adaptiveScaffoldBody(context, body),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -9413,7 +9557,7 @@ class _CustomerGuestLandingBody extends StatelessWidget {
           Text(
             'Choose how you would like to continue.',
             textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: Colors.grey.shade800),
+            style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: AppColors.onOf(context)),
           ),
           const SizedBox(height: 16),
           IntrinsicHeight(
@@ -9518,7 +9662,7 @@ class _GuestLandingTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: AppColors.surface,
+      color: AppColors.surfaceOf(context),
       borderRadius: BorderRadius.circular(12),
       elevation: 2,
       child: InkWell(
@@ -9532,9 +9676,9 @@ class _GuestLandingTile extends StatelessWidget {
             children: [
               Icon(icon, size: 32, color: iconColor),
               const SizedBox(height: 10),
-              Text(title, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.onSurface)),
+              Text(title, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.onOf(context))),
               const SizedBox(height: 4),
-              Text(subtitle, style: TextStyle(fontSize: 11.5, height: 1.25, color: AppColors.onSurfaceMuted)),
+              Text(subtitle, style: TextStyle(fontSize: 11.5, height: 1.25, color: AppColors.mutedOf(context))),
             ],
           ),
         ),
@@ -9763,7 +9907,7 @@ class _CustomerDashboardScreenState extends State<CustomerDashboardScreen> {
       showTrayShortcut: false,
       forceDrawerLeading: true,
       body: ColoredBox(
-        color: const Color(0xFFF5F4F0),
+        color: AppColors.pageOf(context),
         child: Column(
         children: [
           Container(
@@ -9833,10 +9977,10 @@ class _CustomerDashboardScreenState extends State<CustomerDashboardScreen> {
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
           children: [
-            const Text(
+            Text(
               'What would you like to do?',
               textAlign: TextAlign.center,
-              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16, color: AppColors.onOf(context)),
             ),
             const SizedBox(height: 12),
             Center(
@@ -9928,7 +10072,7 @@ class _CustomerDashTileCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      color: AppColors.surface,
+      color: AppColors.surfaceOf(context),
       elevation: 2,
       shadowColor: Colors.black26,
       child: InkWell(
@@ -9941,12 +10085,15 @@ class _CustomerDashTileCard extends StatelessWidget {
             children: [
               Icon(icon, color: iconColor, size: 30),
               const Spacer(),
-              Text(headline, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+              Text(
+                headline,
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.onOf(context)),
+              ),
               if (subtitle != null && subtitle!.trim().isNotEmpty) ...[
                 const SizedBox(height: 2),
                 Text(
                   subtitle!,
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.onSurfaceMuted),
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.mutedOf(context)),
                 ),
               ],
             ],
@@ -10201,7 +10348,7 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
   Widget _dishCard(BuildContext context, MenuItemData item) {
     return Container(
       decoration: BoxDecoration(
-        color: AppColors.surface,
+        color: AppColors.surfaceOf(context),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: AppColors.border),
       ),
@@ -10211,7 +10358,10 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
           Expanded(
             child: ClipRRect(
               borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
-              child: _MenuThumb(item: item, appState: widget.state),
+              child: ColoredBox(
+                color: AppColors.mutedFill,
+                child: _MenuThumb(item: item, appState: widget.state),
+              ),
             ),
           ),
           Padding(
@@ -10223,16 +10373,19 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
                   item.name,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12),
+                  style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12, color: AppColors.onOf(context)),
                 ),
                 Row(
                   children: [
-                    Text('₱${item.price.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.w800)),
+                    Text(
+                      '₱${item.price.toStringAsFixed(2)}',
+                      style: TextStyle(fontWeight: FontWeight.w800, color: AppColors.onOf(context)),
+                    ),
                     const Spacer(),
                     IconButton(
                       onPressed: () => _addToTray(context, item),
                       icon: const Icon(Icons.add_box_outlined),
-                      color: AppColors.onSurface,
+                      color: AppColors.onOf(context),
                       tooltip: 'Add to tray',
                     ),
                   ],
@@ -10250,18 +10403,18 @@ class _RestaurantMenuScreenState extends State<RestaurantMenuScreen> {
       width: 300,
       decoration: BoxDecoration(
         color: AppColors.mutedFill,
-        border: Border(left: BorderSide(color: Colors.grey.shade300)),
+        border: Border(left: BorderSide(color: AppColors.hairline)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
-            child: Text('YOUR TRAY', style: TextStyle(fontWeight: FontWeight.w900, color: Colors.grey.shade900)),
+            child: Text('YOUR TRAY', style: TextStyle(fontWeight: FontWeight.w900, color: AppColors.onOf(context))),
           ),
           Expanded(
             child: widget.state.tray.isEmpty
-                ? Center(child: Text('No dishes yet.', style: TextStyle(color: Colors.grey.shade600)))
+                ? Center(child: Text('No dishes yet.', style: TextStyle(color: AppColors.mutedOf(context))))
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 8),
                     itemCount: widget.state.tray.length,
@@ -15288,7 +15441,7 @@ class _InquiryWizardProgressBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: const Color(0xFFF5F4F0),
+      color: AppColors.canvasOf(context),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(8, 10, 8, 6),
         child: Row(
@@ -15437,12 +15590,14 @@ class _CateringPackagesPanel extends StatelessWidget {
 
 /// Card wrapper for inquire-catering wizard steps.
 Widget inquiryWizardTile({required Widget child}) {
-  return Card(
-    color: AppColors.canvas,
-    elevation: 1,
-    margin: const EdgeInsets.only(bottom: 10),
-    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-    child: Padding(padding: const EdgeInsets.all(14), child: child),
+  return Builder(
+    builder: (context) => Card(
+      color: AppColors.surfaceOf(context),
+      elevation: 1,
+      margin: const EdgeInsets.only(bottom: 10),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(padding: const EdgeInsets.all(14), child: child),
+    ),
   );
 }
 
