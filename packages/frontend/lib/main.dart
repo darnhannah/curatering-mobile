@@ -587,12 +587,18 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
           themeMode: appState.themeMode,
           builder: (context, child) {
             AppColors.applyThemeMode(appState.themeMode);
-            return Listener(
-              behavior: HitTestBehavior.translucent,
-              onPointerDown: (_) => _onUserActivity(),
-              onPointerMove: (_) => _onUserActivity(),
-              onPointerSignal: (_) => _onUserActivity(),
-              child: child ?? const SizedBox.shrink(),
+            final themed = appState.themeMode == ThemeMode.dark
+                ? buildAppDarkTheme(seed: brandSeed)
+                : buildAppLightTheme(seed: brandSeed);
+            return Theme(
+              data: themed,
+              child: Listener(
+                behavior: HitTestBehavior.translucent,
+                onPointerDown: (_) => _onUserActivity(),
+                onPointerMove: (_) => _onUserActivity(),
+                onPointerSignal: (_) => _onUserActivity(),
+                child: child ?? const SizedBox.shrink(),
+              ),
             );
           },
           home: appState.userEmail == null
@@ -613,7 +619,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                               ? ManagerDashboardScreen(state: appState)
                               : (appState.userRole == 'customer' && appState.isGuestSession
                                   ? GuestCustomerShell(state: appState)
-                                  : CustomerDashboardScreen(state: appState)),
+                                  : RestaurantMenuScreen(state: appState)),
                 ),
         );
       },
@@ -3547,7 +3553,7 @@ class AppState extends ChangeNotifier {
   /// First bottom-nav tab on [GuestCustomerShell] after [enterGuestCheckoutSession] (0–3).
   int guestShellInitialTabIndex = 0;
   /// When true, [GuestCustomerShell] shows the landing tiles instead of a tab page.
-  bool guestShellOpenLanding = true;
+  bool guestShellOpenLanding = false;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
   final Set<String> _readAttentionOrderNos = <String>{};
@@ -4456,10 +4462,10 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly;
-  /// omit to show guest landing (CMS or hardcoded tiles) first.
+  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly.
+  /// Defaults to the restaurant menu (no separate landing page).
   Future<void> enterGuestCheckoutSession({int? initialShellTabIndex}) async {
-    guestShellOpenLanding = initialShellTabIndex == null;
+    guestShellOpenLanding = false;
     guestShellInitialTabIndex = (initialShellTabIndex ?? 0).clamp(0, 3);
     final salt = DateTime.now().millisecondsSinceEpoch;
     final r = math.Random().nextInt(1 << 30);
@@ -6995,7 +7001,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                               ? SupervisorOngoingShellScreen(state: st)
                                               : st.isManager
                                                   ? ManagerDashboardScreen(state: st)
-                                                  : CustomerDashboardScreen(state: st);
+                                                  : RestaurantMenuScreen(state: st);
                                       pushReplacementScreenOnce(context, landing, routeKey: landing.runtimeType.toString());
                                     });
                                   } finally {
@@ -9264,7 +9270,7 @@ class _CustomerLoginDialogBodyState extends State<_CustomerLoginDialogBody> {
                           }
                           Navigator.of(context).pop();
                           if (!context.mounted) return;
-                          pushReplacementScreenOnce(context, CustomerDashboardScreen(state: state));
+                          pushReplacementScreenOnce(context, RestaurantMenuScreen(state: state));
                         } finally {
                           if (mounted) setState(() => busy = null);
                         }
@@ -9462,13 +9468,13 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
     }
     if (_booting) {
       return Scaffold(
-        backgroundColor: AppColors.surface,
+        backgroundColor: AppColors.pageOf(context),
         body: const Center(child: CircularProgressIndicator()),
       );
     }
     if (_bootError != null) {
       return Scaffold(
-        backgroundColor: AppColors.surface,
+        backgroundColor: AppColors.pageOf(context),
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
@@ -9485,7 +9491,7 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
       );
     }
     return Scaffold(
-      backgroundColor: AppColors.surface,
+      backgroundColor: AppColors.pageOf(context),
       body: const Center(child: CircularProgressIndicator()),
     );
   }
@@ -9747,30 +9753,16 @@ class _GuestCustomerShellState extends State<GuestCustomerShell> {
       animation: Listenable.merge([widget.state, MobileUiConfigStore.instance]),
       builder: (context, _) {
         final syncedTab = widget.state.guestShellInitialTabIndex.clamp(0, 3);
-        if (_tab != syncedTab && !widget.state.guestShellOpenLanding) {
+        if (_tab != syncedTab) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) setState(() => _tab = syncedTab);
           });
         }
-        final showLanding = widget.state.guestShellOpenLanding;
         return Scaffold(
-          backgroundColor: AppColors.surface,
-          body: showLanding
-              ? SafeArea(
-                  child: Column(
-                    children: [
-                      Expanded(
-                        child: _CustomerGuestLandingBody(
-                          onOrderNow: () => _openTab(0),
-                          onInquireCatering: () => _openTab(1),
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              : _page(_tab),
+          backgroundColor: AppColors.pageOf(context),
+          body: _page(_tab),
           bottomNavigationBar: _GuestBottomNavBar(
-            selectedIndex: showLanding ? null : _tab,
+            selectedIndex: _tab,
             onSelected: (i) {
               if (i == 3) {
                 showCustomerAuthDialog(context, widget.state);
@@ -13007,7 +12999,7 @@ class _PaymentScreenState extends State<PaymentScreen> {
               return;
             }
             Navigator.of(context).pushAndRemoveUntil(
-              MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: s)),
+              MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: s)),
               (_) => false,
             );
           },
@@ -13426,7 +13418,7 @@ class _OrderStatusScreenState extends State<OrderStatusScreen> {
           return;
         }
         Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute<void>(builder: (_) => CustomerDashboardScreen(state: state)),
+          MaterialPageRoute<void>(builder: (_) => RestaurantMenuScreen(state: state)),
           (_) => false,
         );
       },
