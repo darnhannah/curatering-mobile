@@ -3551,9 +3551,8 @@ class AppState extends ChangeNotifier {
   /// Guest tapped Sign Up — after account creation, require a fresh login (no auto session).
   bool signupFromGuestPrompt = false;
   /// First bottom-nav tab on [GuestCustomerShell] after [enterGuestCheckoutSession] (0–3).
+  /// 0 = restaurant menu (default home).
   int guestShellInitialTabIndex = 0;
-  /// When true, [GuestCustomerShell] shows the landing tiles instead of a tab page.
-  bool guestShellOpenLanding = false;
   int unreadNotificationsCount = 0;
   final Set<String> orderNosWithUnreadAttention = <String>{};
   final Set<String> _readAttentionOrderNos = <String>{};
@@ -4441,7 +4440,6 @@ class AppState extends ChangeNotifier {
     _setMenusLoadedAt = null;
     _loyaltyHistoryLoadedAt = null;
     guestShellInitialTabIndex = 0;
-    guestShellOpenLanding = false;
     if (persistedEmail != null) {
       SharedPreferences.getInstance().then((p) async {
         await p.remove('customer_tray_v1_$persistedEmail');
@@ -4457,15 +4455,13 @@ class AppState extends ChangeNotifier {
   /// Local-only session for ordering without an account (see [isGuestSession]).
   /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly.
   void setGuestShellTab(int tab) {
-    guestShellOpenLanding = false;
     guestShellInitialTabIndex = tab.clamp(0, 3);
     notifyListeners();
   }
 
-  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track directly.
-  /// Defaults to the restaurant menu (no separate landing page).
+  /// Pass [initialShellTabIndex] 0–3 to open Order Now / Inquire / Track.
+  /// Defaults to the restaurant menu.
   Future<void> enterGuestCheckoutSession({int? initialShellTabIndex}) async {
-    guestShellOpenLanding = false;
     guestShellInitialTabIndex = (initialShellTabIndex ?? 0).clamp(0, 3);
     final salt = DateTime.now().millisecondsSinceEpoch;
     final r = math.Random().nextInt(1 << 30);
@@ -9449,7 +9445,7 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
     });
     try {
       await Future.wait([
-        widget.state.enterGuestCheckoutSession(),
+        widget.state.enterGuestCheckoutSession(initialShellTabIndex: 0),
         MobileUiConfigStore.instance.ensureLoaded(),
       ]);
     } catch (e) {
@@ -9493,107 +9489,6 @@ class _CustomerPreAuthShellState extends State<CustomerPreAuthShell> {
     return Scaffold(
       backgroundColor: AppColors.pageOf(context),
       body: const Center(child: CircularProgressIndicator()),
-    );
-  }
-}
-
-class _CustomerGuestLandingBody extends StatelessWidget {
-  const _CustomerGuestLandingBody({
-    required this.onOrderNow,
-    required this.onInquireCatering,
-  });
-  final VoidCallback onOrderNow;
-  final VoidCallback onInquireCatering;
-
-  @override
-  Widget build(BuildContext context) {
-    final cms = MobileUiConfigStore.instance;
-    if (cms.screenHasBlocks('guest_landing')) {
-      return ListenableBuilder(
-        listenable: cms,
-        builder: (context, _) {
-          return CmsScreenBody(
-            screenId: 'guest_landing',
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-            onRoute: (route, {url = ''}) {
-              final shell = context.findAncestorStateOfType<_GuestCustomerShellState>();
-              switch (route) {
-                case 'menu':
-                  onOrderNow();
-                  break;
-                case 'inquire':
-                  onInquireCatering();
-                  break;
-                case 'track':
-                  shell?._openTab(2);
-                  break;
-                case 'login':
-                  shell?._openTab(3);
-                  break;
-                case 'url':
-                  if (url.trim().isNotEmpty) {
-                    final uri = Uri.tryParse(url.trim());
-                    if (uri != null) launchUrl(uri, mode: LaunchMode.externalApplication);
-                  }
-                  break;
-              }
-            },
-            fallback: _hardcodedLanding(context),
-          );
-        },
-      );
-    }
-    return _hardcodedLanding(context);
-  }
-
-  Widget _hardcodedLanding(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Center(
-            child: Image.asset(
-              AppBrandAssets.logoDashboard,
-              height: _customerLandingLogoHeight(context),
-              fit: BoxFit.contain,
-            ),
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Choose how you would like to continue.',
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 16, height: 1.35, fontWeight: FontWeight.w700, color: AppColors.onOf(context)),
-          ),
-          const SizedBox(height: 16),
-          IntrinsicHeight(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(
-                  child: _GuestLandingTile(
-                    icon: Icons.restaurant_menu_outlined,
-                    iconColor: const Color(0xFFE65100),
-                    title: 'Order Now',
-                    subtitle: 'Restaurant menu & delivery',
-                    onTap: onOrderNow,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _GuestLandingTile(
-                    icon: Icons.event_available_outlined,
-                    iconColor: const Color(0xFF1565C0),
-                    title: 'Inquire Catering',
-                    subtitle: 'Events & catering quotes',
-                    onTap: onInquireCatering,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
     );
   }
 }
@@ -9644,48 +9539,6 @@ class _GuestBottomNavBar extends StatelessWidget {
                 ),
               );
             }),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _GuestLandingTile extends StatelessWidget {
-  const _GuestLandingTile({
-    required this.icon,
-    required this.iconColor,
-    required this.title,
-    required this.subtitle,
-    required this.onTap,
-  });
-  final IconData icon;
-  final Color iconColor;
-  final String title;
-  final String subtitle;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: AppColors.surfaceOf(context),
-      borderRadius: BorderRadius.circular(12),
-      elevation: 2,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(icon, size: 32, color: iconColor),
-              const SizedBox(height: 10),
-              Text(title, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.onOf(context))),
-              const SizedBox(height: 4),
-              Text(subtitle, style: TextStyle(fontSize: 11.5, height: 1.25, color: AppColors.mutedOf(context))),
-            ],
           ),
         ),
       ),

@@ -365,11 +365,7 @@ MobileUiConfig defaultMobileUiConfig() {
     screens: {
       'guest_landing': MobileUiScreen(
         id: 'guest_landing',
-        blocks: [
-          MobileUiBlock(id: 'gl_hero', type: 'hero', title: "Macrina's Kitchen", body: 'Choose how you would like to continue.'),
-          MobileUiBlock.create('tile_grid'),
-          MobileUiBlock.create('nav_tabs'),
-        ],
+        blocks: const [],
       ),
       'customer_dashboard': MobileUiScreen(
         id: 'customer_dashboard',
