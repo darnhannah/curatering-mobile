@@ -160,7 +160,7 @@ ThemeData buildAppDarkTheme({Color? seed}) {
     onTertiary: Color(0xFF201B16),
     error: Color(0xFFCF6679),
     onError: Color(0xFF201B16),
-    surface: page,
+    surface: surface,
     onSurface: onSurface,
     onSurfaceVariant: muted,
     outline: Color(0xFF6B645C),
@@ -576,7 +576,7 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
         AppColors.applyThemeMode(appState.themeMode);
         final brandSeed = AppColors.brandResolved;
         return MaterialApp(
-          key: ValueKey(appState.authSessionKey),
+          key: ValueKey('${appState.authSessionKey}-${appState.themeMode.name}'),
           navigatorKey: _rootNavKey,
           debugShowCheckedModeBanner: false,
           title: widget.forcePosLogin
@@ -592,12 +592,21 @@ class _CurateringAppState extends State<CurateringApp> with WidgetsBindingObserv
                 : buildAppLightTheme(seed: brandSeed);
             return Theme(
               data: themed,
-              child: Listener(
-                behavior: HitTestBehavior.translucent,
-                onPointerDown: (_) => _onUserActivity(),
-                onPointerMove: (_) => _onUserActivity(),
-                onPointerSignal: (_) => _onUserActivity(),
-                child: child ?? const SizedBox.shrink(),
+              child: ColoredBox(
+                color: themed.scaffoldBackgroundColor,
+                child: DefaultTextStyle(
+                  style: themed.textTheme.bodyMedium ?? const TextStyle(),
+                  child: IconTheme(
+                    data: themed.iconTheme,
+                    child: Listener(
+                      behavior: HitTestBehavior.translucent,
+                      onPointerDown: (_) => _onUserActivity(),
+                      onPointerMove: (_) => _onUserActivity(),
+                      onPointerSignal: (_) => _onUserActivity(),
+                      child: child ?? const SizedBox.shrink(),
+                    ),
+                  ),
+                ),
               ),
             );
           },
@@ -7703,6 +7712,12 @@ class AppDrawer extends StatelessWidget {
               },
             ),
           ],
+          const Divider(height: 28),
+          const ListTile(
+            dense: true,
+            title: Text('App v1.0.3 (8)', style: TextStyle(fontSize: 12)),
+            subtitle: Text('Home = Menu', style: TextStyle(fontSize: 11)),
+          ),
         ],
       ),
     );
@@ -9507,9 +9522,9 @@ class _GuestBottomNavBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final muted = AppColors.mutedOf(context);
     return Material(
-      color: scheme.surface,
+      color: AppColors.surfaceOf(context),
       elevation: 3,
       child: SafeArea(
         top: false,
@@ -9519,7 +9534,7 @@ class _GuestBottomNavBar extends StatelessWidget {
             children: List.generate(_items.length, (i) {
               final item = _items[i];
               final selected = selectedIndex == i;
-              final color = selected ? AppColors.brand : Colors.grey.shade600;
+              final color = selected ? AppColors.brand : muted;
               return Expanded(
                 child: InkWell(
                   onTap: () => onSelected(i),
@@ -15310,17 +15325,17 @@ class _InquiryWizardProgressBar extends StatelessWidget {
                             child: Container(
                               height: 2,
                               margin: const EdgeInsets.only(right: 28),
-                              color: done || active ? AppColors.brand : Colors.grey.shade300,
+                              color: done || active ? AppColors.brand : AppColors.hairline,
                             ),
                           ),
                         ),
                       CircleAvatar(
                         radius: active ? 16 : 14,
-                        backgroundColor: reached ? AppColors.brand : Colors.grey.shade300,
+                        backgroundColor: reached ? AppColors.brand : AppColors.mutedFill,
                         child: Icon(
                           done ? Icons.check : _kInquiryWizardStepIcons[i],
                           size: active ? 18 : 16,
-                          color: reached ? AppColors.ink : Colors.grey.shade600,
+                          color: reached ? AppColors.ink : AppColors.onSurfaceMuted,
                         ),
                       ),
                     ],
@@ -18897,7 +18912,10 @@ class SummaryFooter extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      decoration: BoxDecoration(color: AppColors.surface, border: Border(top: BorderSide(color: Color(0xFF8ADFC1)))),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceOf(context),
+        border: Border(top: BorderSide(color: AppColors.isDark ? const Color(0xFF4A8F78) : const Color(0xFF8ADFC1))),
+      ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -18908,8 +18926,24 @@ class SummaryFooter extends StatelessWidget {
                   .map(
                     (l) => Row(
                       children: [
-                        Expanded(child: Text(l.label, style: TextStyle(fontWeight: l.isTotal ? FontWeight.w800 : FontWeight.w500, fontSize: l.isTotal ? 22 : 14))),
-                        Text(l.value, style: TextStyle(fontWeight: FontWeight.w800, fontSize: l.isTotal ? 22 : 14)),
+                        Expanded(
+                          child: Text(
+                            l.label,
+                            style: TextStyle(
+                              fontWeight: l.isTotal ? FontWeight.w800 : FontWeight.w500,
+                              fontSize: l.isTotal ? 22 : 14,
+                              color: AppColors.onOf(context),
+                            ),
+                          ),
+                        ),
+                        Text(
+                          l.value,
+                          style: TextStyle(
+                            fontWeight: FontWeight.w800,
+                            fontSize: l.isTotal ? 22 : 14,
+                            color: AppColors.onOf(context),
+                          ),
+                        ),
                       ],
                     ),
                   )

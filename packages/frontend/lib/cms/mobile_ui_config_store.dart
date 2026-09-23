@@ -22,8 +22,8 @@ class MobileUiConfigStore extends ChangeNotifier {
   MobileUiConfigStore._();
   static final MobileUiConfigStore instance = MobileUiConfigStore._();
 
-  static const _cacheKey = 'mobile_ui_config_v1';
-  static const _cacheAtKey = 'mobile_ui_config_v1_at';
+  static const _cacheKey = 'mobile_ui_config_v2';
+  static const _cacheAtKey = 'mobile_ui_config_v2_at';
   static const _ttl = Duration(minutes: 5);
 
   MobileUiConfig config = MobileUiConfig();
@@ -76,9 +76,17 @@ class MobileUiConfigStore extends ChangeNotifier {
         }
       }
       config = mobileRaw == null ? MobileUiConfig() : MobileUiConfig.fromJson(mobileRaw);
+      // Guest home is always the native restaurant menu — never show CMS guest_landing.
+      config.screens['guest_landing'] = MobileUiScreen(id: 'guest_landing', blocks: const []);
       loadedAt = DateTime.now();
       loaded = true;
       await _persistCache();
+      // Drop legacy cache so an old guest_landing layout cannot resurface.
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('mobile_ui_config_v1');
+        await prefs.remove('mobile_ui_config_v1_at');
+      } catch (_) {}
     } catch (e) {
       lastError = '$e';
       if (!loaded) {
@@ -99,6 +107,7 @@ class MobileUiConfigStore extends ChangeNotifier {
       if (raw == null || raw.isEmpty) return;
       final decoded = jsonDecode(raw);
       config = MobileUiConfig.fromJson(decoded);
+      config.screens['guest_landing'] = MobileUiScreen(id: 'guest_landing', blocks: const []);
       final at = prefs.getString(_cacheAtKey);
       if (at != null) loadedAt = DateTime.tryParse(at);
     } catch (_) {}
